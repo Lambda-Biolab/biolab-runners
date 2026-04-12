@@ -1,0 +1,105 @@
+[project]
+name = "biolab-runners"
+version = "0.1.0"
+description = "Standalone modular runners for Boltz-2 structure prediction and OpenMM MD simulations"
+requires-python = ">=3.11"
+authors = [{ name = "Lambda-Biolab" }]
+license = { text = "MIT" }
+readme = "README.md"
+keywords = ["boltz2", "openmm", "structure-prediction", "molecular-dynamics", "bioinformatics"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Chemistry",
+]
+
+dependencies = []
+
+[project.optional-dependencies]
+boltz2 = [
+    "boltz>=2.2",
+    "PyYAML",
+]
+openmm = [
+    "openmm>=8.5.0",
+    "pdbfixer>=1.9",
+    "numpy>=1.26",
+]
+all = [
+    "biolab-runners[boltz2,openmm]",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.4",
+    "pyright>=1.1",
+    "pytest>=8.0",
+    "pytest-cov",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["biolab_runners"]
+
+# --- Ruff ---
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["biolab_runners", "tests"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "D",   # pydocstyle
+    "N",   # pep8-naming
+    "S",   # bandit (security)
+    "B",   # flake8-bugbear
+    "A",   # flake8-builtins
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+    "TCH", # flake8-type-checking
+    "ARG", # flake8-unused-arguments
+]
+ignore = [
+    "D100",  # missing module docstring (allow for __init__.py)
+    "D104",  # missing public package docstring
+    "D107",  # missing docstring in __init__
+    "S101",  # assert used (needed for tests)
+    "S108",  # hardcoded temp paths (/tmp)
+    "S603",  # subprocess call — pipeline shells out to boltz CLI
+    "S607",  # partial path for subprocess — boltz binary is on PATH
+    "S602",  # subprocess shell — not used
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D", "S", "ARG", "TC003", "SIM117"]
+
+# --- Pyright ---
+[tool.pyright]
+include = ["biolab_runners"]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+reportMissingImports = false
+reportMissingModuleSource = false
+reportAttributeAccessIssue = "warning"
+
+# --- Pytest ---
+[tool.pytest.ini_options]
+testpaths = ["tests"]
