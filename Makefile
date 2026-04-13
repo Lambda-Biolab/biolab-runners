@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help setup_dev ruff check_types check_complexity test validate
+.PHONY: help setup_dev ruff check_types check_complexity test validate check_links check_docs
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Setup
@@ -22,6 +22,20 @@ check_complexity: ## Check cognitive complexity (max 15/function)
 
 test: ## Run tests
 	uv run pytest tests/ -v --tb=short
+
+check_links: ## Check links with lychee
+	@if command -v lychee > /dev/null 2>&1; then \
+		lychee --config .lychee.toml .; \
+	else \
+		echo "lychee not installed — see https://github.com/lycheeverse/lychee"; \
+	fi
+
+check_docs: ## Lint markdown files
+	@if command -v markdownlint-cli2 > /dev/null 2>&1; then \
+		markdownlint-cli2 "README.md" "AGENTS.md" "CLAUDE.md"; \
+	else \
+		echo "markdownlint-cli2 not installed — npm install -g markdownlint-cli2"; \
+	fi
 
 validate: ## Full gate: ruff → pyright → complexity → pytest
 	$(MAKE) ruff
