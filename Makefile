@@ -1,16 +1,20 @@
 .DEFAULT_GOAL := help
-.PHONY: help setup_dev ruff check_types check_complexity test validate check_links check_docs
+.PHONY: help setup_dev ruff lint_fix check_types check_complexity test validate quick_validate check_links check_docs
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Setup
+# MARK: Setup
 # ──────────────────────────────────────────────────────────────────────────────
 setup_dev: ## Install all dependencies (dev + all extras)
 	uv sync --all-extras
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Quality assurance
+# MARK: Validation (read-only — CI-safe)
 # ──────────────────────────────────────────────────────────────────────────────
-ruff: ## Format + lint (ruff format + ruff check --fix)
+ruff: ## Check formatting + linting (read-only)
+	uv run ruff format --check biolab_runners/ tests/
+	uv run ruff check biolab_runners/ tests/
+
+lint_fix: ## Auto-fix formatting + linting
 	uv run ruff format biolab_runners/ tests/
 	uv run ruff check --fix biolab_runners/ tests/
 
@@ -32,17 +36,22 @@ check_links: ## Check links with lychee
 
 check_docs: ## Lint markdown files
 	@if command -v markdownlint-cli2 > /dev/null 2>&1; then \
-		markdownlint-cli2 "README.md" "AGENTS.md" "CLAUDE.md"; \
+		markdownlint-cli2 "README.md" "AGENTS.md" "CLAUDE.md" "CONTRIBUTING.md" "AGENT_LEARNINGS.md"; \
 	else \
 		echo "markdownlint-cli2 not installed — npm install -g markdownlint-cli2"; \
 	fi
 
-validate: ## Full gate: ruff → pyright → complexity → pytest
+validate: ## Full gate: ruff → pyright → complexity → pytest (read-only, CI-safe)
 	$(MAKE) ruff
 	$(MAKE) check_types
 	$(MAKE) check_complexity
 	$(MAKE) test
 	@echo "All checks passed."
+
+quick_validate: ## Fast gate: ruff + pyright (skip complexity + tests)
+	$(MAKE) ruff
+	$(MAKE) check_types
+	@echo "Quick checks passed."
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Help
