@@ -40,6 +40,7 @@ dev = [
     "pyright>=1.1",
     "pytest>=8.0",
     "pytest-cov",
+    "complexipy>=0.8",
 ]
 
 [build-system]
@@ -73,6 +74,7 @@ select = [
     "SIM", # flake8-simplify
     "TCH", # flake8-type-checking
     "ARG", # flake8-unused-arguments
+    "C90", # mccabe cyclomatic complexity
 ]
 ignore = [
     "D100",  # missing module docstring (allow for __init__.py)
@@ -84,6 +86,9 @@ ignore = [
     "S607",  # partial path for subprocess — boltz binary is on PATH
     "S602",  # subprocess shell — not used
 ]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"

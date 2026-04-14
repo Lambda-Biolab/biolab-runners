@@ -103,6 +103,44 @@ def is_boltz_output_complete(output_dir: Path) -> bool:
     return has_structure and has_confidence
 
 
+def _find_structure_file(output_dir: Path) -> str:
+    """Return the first structure file under output_dir, or ""."""
+    for pattern in ["**/predictions/**/*.pdb", "**/*.pdb", "**/*.cif"]:
+        matches = sorted(output_dir.glob(pattern))
+        if matches:
+            return str(matches[0])
+    return ""
+
+
+def _populate_confidence_from_data(confidence: ConfidenceScores, data: dict) -> None:
+    """Populate a ConfidenceScores from a parsed confidence JSON dict."""
+    confidence.ptm = float(data.get("ptm", 0))
+    confidence.iptm = float(data.get("iptm", data.get("protein_iptm", 0)))
+    confidence.ranking_score = float(data.get("confidence_score", confidence.iptm))
+
+    # Boltz-2 v2 reports complex_plddt on 0-1 scale; quality gates use 0-100.
+    raw_plddt = float(data.get("complex_plddt", 0))
+    confidence.plddt_mean = raw_plddt * 100.0 if 0 < raw_plddt <= 1.0 else raw_plddt
+
+    if "binding_affinity" in data:
+        confidence.binding_affinity = float(data["binding_affinity"])
+    if "complex_iplddt" in data:
+        confidence.complex_iplddt = float(data["complex_iplddt"])
+    if "complex_ipde" in data:
+        confidence.complex_ipde = float(data["complex_ipde"])
+
+
+def _parse_confidence_file(output_dir: Path, confidence: ConfidenceScores) -> None:
+    """Load the first confidence JSON under output_dir into confidence."""
+    for conf_file in sorted(output_dir.glob("**/confidence_*.json")):
+        try:
+            data = json.loads(conf_file.read_text())
+            _populate_confidence_from_data(confidence, data)
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.warning("Failed to parse Boltz-2 confidence: %s", exc)
+        return
+
+
 def parse_boltz_output(output_dir: Path) -> tuple[str, ConfidenceScores]:
     """Parse Boltz-2 output for structure path and confidence scores.
 
@@ -116,39 +154,7 @@ def parse_boltz_output(output_dir: Path) -> tuple[str, ConfidenceScores]:
     Returns:
         Tuple of (structure_path, ConfidenceScores).
     """
-    structure_path = ""
     confidence = ConfidenceScores()
-
-    for pattern in ["**/predictions/**/*.pdb", "**/*.pdb", "**/*.cif"]:
-        matches = sorted(output_dir.glob(pattern))
-        if matches:
-            structure_path = str(matches[0])
-            break
-
-    for conf_file in sorted(output_dir.glob("**/confidence_*.json")):
-        try:
-            data = json.loads(conf_file.read_text())
-
-            confidence.ptm = float(data.get("ptm", 0))
-            confidence.iptm = float(data.get("iptm", data.get("protein_iptm", 0)))
-            confidence.ranking_score = float(data.get("confidence_score", confidence.iptm))
-
-            # Boltz-2 v2 reports complex_plddt on 0-1 scale; quality gates
-            # use 0-100. Auto-detect and rescale. Zero means missing data.
-            raw_plddt = float(data.get("complex_plddt", 0))
-            if 0 < raw_plddt <= 1.0:
-                confidence.plddt_mean = raw_plddt * 100.0
-            else:
-                confidence.plddt_mean = raw_plddt
-
-            if "binding_affinity" in data:
-                confidence.binding_affinity = float(data["binding_affinity"])
-            if "complex_iplddt" in data:
-                confidence.complex_iplddt = float(data["complex_iplddt"])
-            if "complex_ipde" in data:
-                confidence.complex_ipde = float(data["complex_ipde"])
-        except (json.JSONDecodeError, ValueError) as exc:
-            logger.warning("Failed to parse Boltz-2 confidence: %s", exc)
-        break
-
+    structure_path = _find_structure_file(output_dir)
+    _parse_confidence_file(output_dir, confidence)
     return structure_path, confidence

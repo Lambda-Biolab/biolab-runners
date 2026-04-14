@@ -1,0 +1,46 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git branch:*)",
+      "Bash(git tag:*)",
+      "Bash(make:*)",
+      "Bash(uv sync:*)",
+      "Bash(uv run:*)",
+      "Bash(ls:*)",
+      "Bash(pwd:*)",
+      "Bash(wc:*)",
+      "Bash(gh repo view:*)",
+      "Bash(gh issue:*)",
+      "Bash(gh pr:*)"
+    ],
+    "deny": [
+      "Bash(rm -rf /)",
+      "Bash(git push --force:*)",
+      "Bash(git reset --hard:*)"
+    ]
+  },
+  "enabledPlugins": {
+    "context7@claude-plugins-official": true,
+    "tdd-core@qte77-claude-code-utils": true,
+    "python-dev@qte77-claude-code-utils": true,
+    "commit-helper@qte77-claude-code-utils": true,
+    "codebase-tools@qte77-claude-code-utils": true,
+    "simplify@qte77-claude-code-utils": true,
+    "docs-governance@qte77-claude-code-utils": true,
+    "makefile-core@qte77-claude-code-utils": true,
+    "cc-meta@qte77-claude-code-utils": true,
+    "workspace-setup@qte77-claude-code-utils": true,
+    "security-audit@qte77-claude-code-utils": true
+  },
+  "extraKnownMarketplaces": {
+    "qte77-claude-code-utils": {
+      "source": {
+        "source": "github",
+        "repo": "qte77/claude-code-utils-plugin"
+      }
+    }
+  }
+}

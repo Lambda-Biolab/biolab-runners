@@ -30,6 +30,10 @@ htmlcov/
 # Type checking
 .pyright/
 
+# Tooling caches
+.ruff_cache/
+.complexipy_cache/
+
 # OS
 .DS_Store
 Thumbs.db
