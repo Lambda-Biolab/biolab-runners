@@ -43,6 +43,7 @@ from biolab_runners.boltz2.config import (
     PLDDT_CONDITIONAL,
     PLDDT_PASS,
     Boltz2Config,
+    ConfidenceScores,
     PredictionResult,
     QualityGate,
 )
@@ -54,6 +55,83 @@ from biolab_runners.boltz2.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+_GATE_SEVERITY = {
+    QualityGate.PASS: 0,
+    QualityGate.CONDITIONAL: 1,
+    QualityGate.FAIL: 2,
+    QualityGate.PENDING: 0,
+}
+
+
+def _max_gate(a: QualityGate, b: QualityGate) -> QualityGate:
+    """Return the more severe of two gate verdicts."""
+    return a if _GATE_SEVERITY[a] >= _GATE_SEVERITY[b] else b
+
+
+def _evaluate_clashes(conf: ConfidenceScores) -> tuple[QualityGate, list[str]]:
+    """Clash check — SEVERE clashes are physically impossible."""
+    if conf.clash_severe_count > 0:
+        return QualityGate.FAIL, [
+            f"SEVERE CLASH: {conf.clash_severe_count} atom pairs with sub-2.0A overlap "
+            f"— structure physically impossible"
+        ]
+    if conf.clash_count > MAX_CLASHES_CONDITIONAL:
+        return QualityGate.FAIL, [
+            f"CLASH: {conf.clash_count} steric clashes in predicted structure "
+            f"(max {MAX_CLASHES_CONDITIONAL} for CONDITIONAL)"
+        ]
+    if conf.clash_count > MAX_CLASHES_PASS:
+        return QualityGate.CONDITIONAL, [
+            f"CLASH WARNING: {conf.clash_count} mild clashes (may resolve during MD)"
+        ]
+    return QualityGate.PASS, []
+
+
+def _evaluate_iptm(conf: ConfidenceScores) -> tuple[QualityGate, list[str]]:
+    """Interface confidence check (complexes only)."""
+    if conf.iptm <= 0:
+        return QualityGate.PASS, []
+    if conf.iptm < IPTM_CONDITIONAL:
+        return QualityGate.FAIL, [
+            f"LOW INTERFACE CONFIDENCE: ipTM={conf.iptm:.3f} < {IPTM_CONDITIONAL} threshold"
+        ]
+    if conf.iptm < IPTM_PASS:
+        return QualityGate.CONDITIONAL, [
+            f"MODERATE INTERFACE: ipTM={conf.iptm:.3f} (threshold for PASS: {IPTM_PASS})"
+        ]
+    return QualityGate.PASS, []
+
+
+def _evaluate_plddt(conf: ConfidenceScores) -> tuple[QualityGate, list[str]]:
+    """Per-residue confidence check."""
+    if conf.plddt_mean <= 0:
+        return QualityGate.PASS, []
+    if conf.plddt_mean < PLDDT_CONDITIONAL:
+        return QualityGate.FAIL, [
+            f"LOW CONFIDENCE: mean pLDDT={conf.plddt_mean:.1f} < {PLDDT_CONDITIONAL}"
+        ]
+    if conf.plddt_mean < PLDDT_PASS:
+        return QualityGate.CONDITIONAL, [
+            f"MODERATE CONFIDENCE: mean pLDDT={conf.plddt_mean:.1f} (PASS: >={PLDDT_PASS})"
+        ]
+    return QualityGate.PASS, []
+
+
+def _evaluate_ranking_score(conf: ConfidenceScores) -> tuple[QualityGate, list[str]]:
+    """Boltz-2 composite confidence score check."""
+    if conf.ranking_score is None:
+        return QualityGate.PASS, []
+    if conf.ranking_score < CONFIDENCE_SCORE_CONDITIONAL:
+        return QualityGate.FAIL, [
+            f"LOW CONFIDENCE SCORE: {conf.ranking_score:.3f} < {CONFIDENCE_SCORE_CONDITIONAL}"
+        ]
+    if conf.ranking_score < CONFIDENCE_SCORE_PASS:
+        return QualityGate.CONDITIONAL, [
+            f"MODERATE CONFIDENCE SCORE: {conf.ranking_score:.3f} (PASS: >={CONFIDENCE_SCORE_PASS})"
+        ]
+    return QualityGate.PASS, []
 
 
 def apply_quality_gate(result: PredictionResult) -> PredictionResult:
@@ -77,9 +155,6 @@ def apply_quality_gate(result: PredictionResult) -> PredictionResult:
     Returns:
         PredictionResult with quality_gate and gate_reasons populated.
     """
-    reasons: list[str] = []
-    gate = QualityGate.PASS
-
     if result.error:
         result.quality_gate = QualityGate.FAIL
         result.gate_reasons = [f"Prediction error: {result.error}"]
@@ -91,63 +166,17 @@ def apply_quality_gate(result: PredictionResult) -> PredictionResult:
         return result
 
     conf = result.confidence
-
-    # Clash check — SEVERE clashes are physically impossible
-    if conf.clash_severe_count > 0:
-        gate = QualityGate.FAIL
-        reasons.append(
-            f"SEVERE CLASH: {conf.clash_severe_count} atom pairs with sub-2.0A overlap "
-            f"— structure physically impossible"
-        )
-    elif conf.clash_count > MAX_CLASHES_CONDITIONAL:
-        gate = QualityGate.FAIL
-        reasons.append(
-            f"CLASH: {conf.clash_count} steric clashes in predicted structure "
-            f"(max {MAX_CLASHES_CONDITIONAL} for CONDITIONAL)"
-        )
-    elif conf.clash_count > MAX_CLASHES_PASS:
-        if gate == QualityGate.PASS:
-            gate = QualityGate.CONDITIONAL
-        reasons.append(f"CLASH WARNING: {conf.clash_count} mild clashes (may resolve during MD)")
-
-    # Interface confidence (for complexes)
-    if conf.iptm > 0 and conf.iptm < IPTM_CONDITIONAL:
-        gate = QualityGate.FAIL
-        reasons.append(
-            f"LOW INTERFACE CONFIDENCE: ipTM={conf.iptm:.3f} < {IPTM_CONDITIONAL} threshold"
-        )
-    elif conf.iptm > 0 and conf.iptm < IPTM_PASS:
-        if gate == QualityGate.PASS:
-            gate = QualityGate.CONDITIONAL
-        reasons.append(
-            f"MODERATE INTERFACE: ipTM={conf.iptm:.3f} (threshold for PASS: {IPTM_PASS})"
-        )
-
-    # Per-residue confidence
-    if conf.plddt_mean > 0 and conf.plddt_mean < PLDDT_CONDITIONAL:
-        gate = QualityGate.FAIL
-        reasons.append(f"LOW CONFIDENCE: mean pLDDT={conf.plddt_mean:.1f} < {PLDDT_CONDITIONAL}")
-    elif conf.plddt_mean > 0 and conf.plddt_mean < PLDDT_PASS:
-        if gate == QualityGate.PASS:
-            gate = QualityGate.CONDITIONAL
-        reasons.append(
-            f"MODERATE CONFIDENCE: mean pLDDT={conf.plddt_mean:.1f} (PASS: >={PLDDT_PASS})"
-        )
-
-    # Boltz-2 composite confidence score
-    if conf.ranking_score is not None:
-        if conf.ranking_score < CONFIDENCE_SCORE_CONDITIONAL:
-            gate = QualityGate.FAIL
-            reasons.append(
-                f"LOW CONFIDENCE SCORE: {conf.ranking_score:.3f} < {CONFIDENCE_SCORE_CONDITIONAL}"
-            )
-        elif conf.ranking_score < CONFIDENCE_SCORE_PASS:
-            if gate == QualityGate.PASS:
-                gate = QualityGate.CONDITIONAL
-            reasons.append(
-                f"MODERATE CONFIDENCE SCORE: {conf.ranking_score:.3f} "
-                f"(PASS: >={CONFIDENCE_SCORE_PASS})"
-            )
+    gate = QualityGate.PASS
+    reasons: list[str] = []
+    for evaluator in (
+        _evaluate_clashes,
+        _evaluate_iptm,
+        _evaluate_plddt,
+        _evaluate_ranking_score,
+    ):
+        sub_gate, sub_reasons = evaluator(conf)
+        gate = _max_gate(gate, sub_gate)
+        reasons.extend(sub_reasons)
 
     if not reasons:
         reasons.append("All quality checks passed")
@@ -210,6 +239,68 @@ class Boltz2Runner:
                     csv.stat().st_size // 1024,
                 )
                 return
+
+    def _load_cached_prediction(
+        self, boltz_output: Path, name: str, result: PredictionResult, label: str
+    ) -> bool:
+        """Populate result from a completed prediction on disk. Returns True on cache hit."""
+        if not (boltz_output.exists() and is_boltz_output_complete(boltz_output)):
+            return False
+        existing_structure, existing_confidence = parse_boltz_output(boltz_output)
+        if not existing_structure:
+            return False
+        logger.info(
+            "Skipping Boltz-2 %s for %s — prediction already exists at %s. "
+            "Use force=True to re-run.",
+            label,
+            name,
+            existing_structure,
+        )
+        result.structure_path = existing_structure
+        result.confidence = existing_confidence
+        return True
+
+    def _resolve_msa_paths(self, receptor_sequence: str, output_dir: Path) -> dict[str, str]:
+        """Resolve MSA paths for a receptor, consulting in-memory and on-disk caches."""
+        msa_paths: dict[str, str] = {}
+        cached_msa = self._msa_cache.get(receptor_sequence)
+        if cached_msa is None:
+            disk_cache = output_dir / ".msa_cache" / "receptor_msa.csv"
+            if disk_cache.exists() and disk_cache.stat().st_size > 100:
+                self._msa_cache[receptor_sequence] = disk_cache
+                cached_msa = disk_cache
+        if cached_msa and cached_msa.exists():
+            msa_paths["A"] = str(cached_msa)
+            msa_paths["B"] = "empty"
+            logger.info("Using cached receptor MSA: %s", cached_msa)
+        return msa_paths
+
+    def _run_boltz_subprocess(
+        self, cmd: list[str], result: PredictionResult, stderr_limit: int = 500
+    ) -> bool:
+        """Invoke the boltz CLI, populating result.error/runtime. Returns True on success."""
+        start = time.time()
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=self.config.timeout_seconds,
+                check=False,
+            )
+            result.runtime_seconds = time.time() - start
+        except subprocess.TimeoutExpired:
+            result.error = f"Boltz-2 timed out after {self.config.timeout_seconds} seconds"
+            result.runtime_seconds = time.time() - start
+            return False
+
+        if proc.returncode != 0:
+            result.error = (
+                f"Boltz-2 exited with code {proc.returncode}: {proc.stderr[:stderr_limit]}"
+            )
+            logger.error(result.error)
+            return False
+        return True
 
     def predict_complex(
         self,
@@ -282,36 +373,13 @@ class Boltz2Runner:
 
         run_dir = output_dir / name / "boltz2"
         run_dir.mkdir(parents=True, exist_ok=True)
-
-        # Idempotency: return cached prediction if output is complete
         boltz_output = run_dir / "output"
-        if not force and boltz_output.exists() and is_boltz_output_complete(boltz_output):
-            existing_structure, existing_confidence = parse_boltz_output(boltz_output)
-            if existing_structure:
-                logger.info(
-                    "Skipping Boltz-2 for %s — prediction already exists at %s. "
-                    "Use force=True to re-run.",
-                    name,
-                    existing_structure,
-                )
-                result.structure_path = existing_structure
-                result.confidence = existing_confidence
-                return apply_quality_gate(result)
 
-        # Write YAML input
+        if not force and self._load_cached_prediction(boltz_output, name, result, "complex"):
+            return apply_quality_gate(result)
+
         yaml_path = run_dir / "input.yaml"
-        msa_paths: dict[str, str] = {}
-        cached_msa = self._msa_cache.get(receptor_sequence)
-        if cached_msa is None:
-            disk_cache = output_dir / ".msa_cache" / "receptor_msa.csv"
-            if disk_cache.exists() and disk_cache.stat().st_size > 100:
-                self._msa_cache[receptor_sequence] = disk_cache
-                cached_msa = disk_cache
-        if cached_msa and cached_msa.exists():
-            msa_paths["A"] = str(cached_msa)
-            msa_paths["B"] = "empty"
-            logger.info("Using cached receptor MSA: %s", cached_msa)
-
+        msa_paths = self._resolve_msa_paths(receptor_sequence, output_dir)
         write_boltz_yaml(
             {"A": receptor_sequence, "B": peptide_sequence},
             yaml_path,
@@ -319,53 +387,58 @@ class Boltz2Runner:
             pocket_contacts=pocket_contacts,
         )
 
-        # Run Boltz-2
         cmd = self._build_command(
             yaml_path=yaml_path,
             boltz_output=boltz_output,
             num_seeds=seeds,
             seed=seed,
         )
-
         logger.info("Running Boltz-2: %s", " ".join(cmd))
-        start = time.time()
 
-        try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=self.config.timeout_seconds,
-                check=False,
+        if not self._run_boltz_subprocess(cmd, result):
+            return apply_quality_gate(result)
+
+        structure_path, confidence = parse_boltz_output(boltz_output)
+        result.structure_path = structure_path
+        result.confidence = confidence
+
+        if structure_path:
+            logger.info(
+                "Boltz-2 prediction complete: %s (ipTM=%.3f, pTM=%.3f, %.1fs)",
+                name,
+                confidence.iptm,
+                confidence.ptm,
+                result.runtime_seconds,
             )
-            result.runtime_seconds = time.time() - start
-
-            if proc.returncode != 0:
-                result.error = f"Boltz-2 exited with code {proc.returncode}: {proc.stderr[:500]}"
-                logger.error(result.error)
-                return apply_quality_gate(result)
-
-            structure_path, confidence = parse_boltz_output(boltz_output)
-            result.structure_path = structure_path
-            result.confidence = confidence
-
-            if structure_path:
-                logger.info(
-                    "Boltz-2 prediction complete: %s (ipTM=%.3f, pTM=%.3f, %.1fs)",
-                    name,
-                    confidence.iptm,
-                    confidence.ptm,
-                    result.runtime_seconds,
-                )
-                self._cache_receptor_msa(receptor_sequence, boltz_output)
-            else:
-                result.error = "No structure file in Boltz-2 output"
-
-        except subprocess.TimeoutExpired:
-            result.error = f"Boltz-2 timed out after {self.config.timeout_seconds} seconds"
-            result.runtime_seconds = time.time() - start
+            self._cache_receptor_msa(receptor_sequence, boltz_output)
+        else:
+            result.error = "No structure file in Boltz-2 output"
 
         return apply_quality_gate(result)
+
+    def _build_monomer_command(self, yaml_path: Path, boltz_output: Path) -> list[str]:
+        """Build the boltz predict CLI command for a monomer run."""
+        cfg = self.config
+        cmd = [
+            cfg.boltz_binary,
+            "predict",
+            str(yaml_path),
+            "--out_dir",
+            str(boltz_output),
+            "--accelerator",
+            cfg.accelerator,
+            "--model",
+            "boltz2",
+            "--output_format",
+            cfg.output_format,
+        ]
+        if cfg.use_msa_server:
+            cmd.append("--use_msa_server")
+        if cfg.no_kernels:
+            cmd.append("--no_kernels")
+        if cfg.use_potentials:
+            cmd.append("--use_potentials")
+        return cmd
 
     def predict_monomer(
         self,
@@ -412,63 +485,20 @@ class Boltz2Runner:
 
         run_dir = output_dir / name / "boltz2"
         run_dir.mkdir(parents=True, exist_ok=True)
-
         boltz_output = run_dir / "output"
-        if not force and boltz_output.exists() and is_boltz_output_complete(boltz_output):
-            existing_structure, existing_confidence = parse_boltz_output(boltz_output)
-            if existing_structure:
-                logger.info(
-                    "Skipping Boltz-2 monomer for %s — already exists at %s.",
-                    name,
-                    existing_structure,
-                )
-                result.structure_path = existing_structure
-                result.confidence = existing_confidence
-                return apply_quality_gate(result)
+
+        if not force and self._load_cached_prediction(boltz_output, name, result, "monomer"):
+            return apply_quality_gate(result)
 
         yaml_path = write_boltz_yaml({"A": sequence}, run_dir / "input.yaml")
+        cmd = self._build_monomer_command(yaml_path, boltz_output)
 
-        cmd = [
-            self.config.boltz_binary,
-            "predict",
-            str(yaml_path),
-            "--out_dir",
-            str(boltz_output),
-            "--accelerator",
-            self.config.accelerator,
-            "--model",
-            "boltz2",
-            "--output_format",
-            self.config.output_format,
-        ]
-        if self.config.use_msa_server:
-            cmd.append("--use_msa_server")
-        if self.config.no_kernels:
-            cmd.append("--no_kernels")
-        if self.config.use_potentials:
-            cmd.append("--use_potentials")
+        if not self._run_boltz_subprocess(cmd, result, stderr_limit=300):
+            return apply_quality_gate(result)
 
-        start = time.time()
-        try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=self.config.timeout_seconds,
-                check=False,
-            )
-            result.runtime_seconds = time.time() - start
-
-            if proc.returncode == 0:
-                structure_path, confidence = parse_boltz_output(boltz_output)
-                result.structure_path = structure_path
-                result.confidence = confidence
-            else:
-                result.error = f"Boltz-2 failed: {proc.stderr[:300]}"
-        except subprocess.TimeoutExpired:
-            result.error = "Boltz-2 timed out"
-            result.runtime_seconds = time.time() - start
-
+        structure_path, confidence = parse_boltz_output(boltz_output)
+        result.structure_path = structure_path
+        result.confidence = confidence
         return apply_quality_gate(result)
 
     def _build_command(
