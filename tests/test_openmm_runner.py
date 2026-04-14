@@ -89,6 +89,44 @@ class TestOpenMMConfig:
         assert config.equilibration[0]["restraint_k"] == 1000.0
         assert config.equilibration[2]["restraint_k"] == 0.0
 
+    def test_preset_saliva(self) -> None:
+        config = OpenMMConfig.saliva()
+        assert config.nacl_mol == 0.140
+        assert config.cacl2_mol == 0.0014
+        assert config.kh2po4_mol == 0.0005
+        assert config.protonation_ph == 6.2
+        assert config.temperature_k == 310.0
+
+    def test_preset_physiological(self) -> None:
+        config = OpenMMConfig.physiological()
+        assert config.nacl_mol == 0.150
+        assert config.cacl2_mol == 0.0
+        assert config.kh2po4_mol == 0.0
+        assert config.protonation_ph == 7.4
+        assert config.temperature_k == 310.0
+
+    def test_preset_gastric(self) -> None:
+        config = OpenMMConfig.gastric()
+        assert config.nacl_mol == 0.150
+        assert config.protonation_ph == 2.0
+
+    def test_preset_intestinal(self) -> None:
+        config = OpenMMConfig.intestinal()
+        assert config.nacl_mol == 0.150
+        assert config.protonation_ph == 6.8
+
+    def test_preset_accepts_overrides(self) -> None:
+        config = OpenMMConfig.physiological(
+            receptor_pdb="rec.pdb",
+            peptide_pdb="pep.pdb",
+            production_ns=25.0,
+            protonation_ph=7.0,  # caller override wins over preset
+        )
+        assert config.receptor_pdb == "rec.pdb"
+        assert config.production_ns == 25.0
+        assert config.protonation_ph == 7.0
+        assert config.nacl_mol == 0.150  # preset value preserved
+
 
 class TestEquilibrationStage:
     """Tests for EquilibrationStage dataclass."""

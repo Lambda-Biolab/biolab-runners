@@ -5,8 +5,10 @@ The runner handles system building (PDBFixer + solvation), multi-stage
 equilibration, and production NPT with periodic checkpointing, early abort
 checks, and trajectory/energy output.
 
-Designed for salivary ionic conditions (140 mM NaCl, 310 K) with
-CHARMM36m/TIP3P force fields on GPU (OpenCL or CUDA).
+Defaults to saliva-like conditions (140 mM NaCl, pH 6.2, 310 K) with
+CHARMM36m/TIP3P force fields on GPU (OpenCL or CUDA). Use the
+``OpenMMConfig.physiological``, ``gastric``, ``intestinal``, or ``saliva``
+preset classmethods to target other buffer environments.
 
 Requires: openmm>=8.5.0, pdbfixer>=1.9
 

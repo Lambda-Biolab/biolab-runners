@@ -6,13 +6,15 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Salivary ionic conditions (literature defaults)
-NACL_CONCENTRATION = 0.140  # 140 mM
-CACL2_CONCENTRATION = 0.0014  # 1.4 mM
-KH2PO4_CONCENTRATION = 0.0005  # 0.5 mM
+# Default ionic conditions (saliva-like; override with presets below or explicit args)
+DEFAULT_NACL_M = 0.140
+DEFAULT_CACL2_M = 0.0014
+DEFAULT_KH2PO4_M = 0.0005
+DEFAULT_PH = 6.2
 
 # Simulation parameters
 TEMPERATURE_K = 310.0  # Oral cavity temperature (37 C)
@@ -73,7 +75,10 @@ class EquilibrationStage:
 class OpenMMConfig:
     """Complete configuration for an OpenMM MD simulation.
 
-    Designed for peptide-protein complex simulations in salivary conditions.
+    Defaults are saliva-like (140 mM NaCl, pH 6.2) to preserve backward
+    compatibility. For other environments use the preset classmethods
+    (``physiological``, ``gastric``, ``intestinal``, ``saliva``) or override
+    fields directly.
 
     Attributes:
         receptor_pdb: Path to receptor PDB file.
@@ -111,9 +116,9 @@ class OpenMMConfig:
     peptide_id: str = ""
 
     # Ionic conditions
-    nacl_mol: float = NACL_CONCENTRATION
-    cacl2_mol: float = CACL2_CONCENTRATION
-    kh2po4_mol: float = KH2PO4_CONCENTRATION
+    nacl_mol: float = DEFAULT_NACL_M
+    cacl2_mol: float = DEFAULT_CACL2_M
+    kh2po4_mol: float = DEFAULT_KH2PO4_M
 
     # Simulation parameters
     temperature_k: float = TEMPERATURE_K
@@ -141,7 +146,7 @@ class OpenMMConfig:
     checkpoint_interval_hours: float = 2.0
 
     # Protonation pH
-    protonation_ph: float = 6.2
+    protonation_ph: float = DEFAULT_PH
 
     # Computed fields
     total_steps: int = 0
@@ -234,9 +239,9 @@ class OpenMMConfig:
             output_dir=data.get("output_dir", ""),
             target=data.get("target", ""),
             peptide_id=data.get("peptide_id", ""),
-            nacl_mol=ions.get("NaCl_M", NACL_CONCENTRATION),
-            cacl2_mol=ions.get("CaCl2_M", CACL2_CONCENTRATION),
-            kh2po4_mol=ions.get("KH2PO4_M", KH2PO4_CONCENTRATION),
+            nacl_mol=ions.get("NaCl_M", DEFAULT_NACL_M),
+            cacl2_mol=ions.get("CaCl2_M", DEFAULT_CACL2_M),
+            kh2po4_mol=ions.get("KH2PO4_M", DEFAULT_KH2PO4_M),
             temperature_k=sim.get("temperature_K", TEMPERATURE_K),
             production_ns=sim.get("production_ns", 100.0),
             save_interval_ps=sim.get("save_interval_ps", 10.0),
@@ -244,9 +249,94 @@ class OpenMMConfig:
             protein_ff=ff.get("protein", PROTEIN_FF),
             water_model=ff.get("water", WATER_MODEL),
             ligand_ff=ff.get("ligand", LIGAND_FF),
-            protonation_ph=data.get("protonation_ph", 6.2),
+            protonation_ph=data.get("protonation_ph", DEFAULT_PH),
             solvated_atoms=int(data.get("solvated_atoms", 0)),
         )
+
+    @classmethod
+    def saliva(cls, **overrides: Any) -> OpenMMConfig:
+        """Saliva-like buffer: 140 mM NaCl + 1.4 mM CaCl2 + 0.5 mM KH2PO4, pH 6.2, 310 K.
+
+        Literature reference values for unstimulated whole saliva. Matches the
+        OralBiome-AMP pipeline defaults.
+        """
+        return cls(
+            **_preset(
+                nacl_mol=0.140,
+                cacl2_mol=0.0014,
+                kh2po4_mol=0.0005,
+                temperature_k=310.0,
+                protonation_ph=6.2,
+                overrides=overrides,
+            )
+        )
+
+    @classmethod
+    def physiological(cls, **overrides: Any) -> OpenMMConfig:
+        """Physiological buffer (PBS / plasma-like): 150 mM NaCl, pH 7.4, 310 K."""
+        return cls(
+            **_preset(
+                nacl_mol=0.150,
+                cacl2_mol=0.0,
+                kh2po4_mol=0.0,
+                temperature_k=310.0,
+                protonation_ph=7.4,
+                overrides=overrides,
+            )
+        )
+
+    @classmethod
+    def gastric(cls, **overrides: Any) -> OpenMMConfig:
+        """Gastric fluid: 150 mM NaCl, pH 2.0, 310 K.
+
+        Note: very low pH affects protonation of His/Asp/Glu/N-termini. Verify
+        that the selected protein force field handles this regime.
+        """
+        return cls(
+            **_preset(
+                nacl_mol=0.150,
+                cacl2_mol=0.0,
+                kh2po4_mol=0.0,
+                temperature_k=310.0,
+                protonation_ph=2.0,
+                overrides=overrides,
+            )
+        )
+
+    @classmethod
+    def intestinal(cls, **overrides: Any) -> OpenMMConfig:
+        """Small-intestinal fluid: 150 mM NaCl, pH 6.8, 310 K."""
+        return cls(
+            **_preset(
+                nacl_mol=0.150,
+                cacl2_mol=0.0,
+                kh2po4_mol=0.0,
+                temperature_k=310.0,
+                protonation_ph=6.8,
+                overrides=overrides,
+            )
+        )
+
+
+def _preset(
+    *,
+    nacl_mol: float,
+    cacl2_mol: float,
+    kh2po4_mol: float,
+    temperature_k: float,
+    protonation_ph: float,
+    overrides: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge preset values with caller overrides. Caller overrides win."""
+    values: dict[str, Any] = {
+        "nacl_mol": nacl_mol,
+        "cacl2_mol": cacl2_mol,
+        "kh2po4_mol": kh2po4_mol,
+        "temperature_k": temperature_k,
+        "protonation_ph": protonation_ph,
+    }
+    values.update(overrides)
+    return values
 
 
 @dataclass

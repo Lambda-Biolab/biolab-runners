@@ -103,7 +103,7 @@ config = OpenMMConfig(
     target="GtfB",
     peptide_id="PEP001",
     production_ns=100.0,         # 100 ns production run
-    temperature_k=310.0,         # Oral cavity temperature
+    temperature_k=310.0,         # 37 C (body temperature)
     protein_ff="charmm36m",      # Force field
     openmm_platform="OpenCL",    # GPU platform
 )
@@ -117,6 +117,45 @@ print(f"Total: {result.total_ns} ns in {result.elapsed_seconds:.0f}s")
 print(f"Performance: {result.ns_per_day:.0f} ns/day")
 print(f"Early abort: {result.early_abort} ({result.abort_reason})")
 ```
+
+### OpenMM Buffer Presets
+
+`OpenMMConfig` ships with preset classmethods for common biological environments. Presets set ionic concentrations, pH, and temperature; all other fields can still be passed as keyword overrides.
+
+```python
+# Saliva-like (140 mM NaCl + 1.4 mM CaCl2 + 0.5 mM KH2PO4, pH 6.2, 310 K)
+config = OpenMMConfig.saliva(
+    receptor_pdb="receptor.pdb",
+    peptide_pdb="peptide.pdb",
+    output_dir="results/md/oral",
+    production_ns=100.0,
+)
+
+# Physiological / PBS-like (150 mM NaCl, pH 7.4, 310 K)
+config = OpenMMConfig.physiological(receptor_pdb=..., peptide_pdb=..., output_dir=...)
+
+# Gastric fluid (150 mM NaCl, pH 2.0, 310 K)
+config = OpenMMConfig.gastric(receptor_pdb=..., peptide_pdb=..., output_dir=...)
+
+# Small-intestinal fluid (150 mM NaCl, pH 6.8, 310 K)
+config = OpenMMConfig.intestinal(receptor_pdb=..., peptide_pdb=..., output_dir=...)
+```
+
+Caller keywords always win over preset values, so you can mix and match:
+
+```python
+# Physiological buffer but with a custom temperature
+config = OpenMMConfig.physiological(
+    receptor_pdb="rec.pdb",
+    peptide_pdb="pep.pdb",
+    output_dir="out/",
+    temperature_k=300.0,
+)
+```
+
+For environments not covered by a preset, instantiate `OpenMMConfig` directly and set `nacl_mol`, `cacl2_mol`, `kh2po4_mol`, `protonation_ph`, and `temperature_k` explicitly.
+
+Note: very low pH (e.g. gastric) affects protonation of His/Asp/Glu/N-termini. Verify that the selected protein force field handles the target regime.
 
 ### OpenMM Dry Run
 
@@ -160,7 +199,7 @@ Per-target thresholds (expert-calibrated):
 2. **NPT 100 ps** — Reduced restraints (k=100 kJ/mol/nm^2)
 3. **NPT 200 ps** — Gradual ramp (100->0) + 100 ps unrestrained
 
-Ionic conditions: 140 mM NaCl, dodecahedral box, TIP3P water.
+Solvation: dodecahedral box with TIP3P water. Ionic conditions are configurable via `OpenMMConfig` fields or the buffer presets (`saliva`, `physiological`, `gastric`, `intestinal`) — defaults are saliva-like (140 mM NaCl + 1.4 mM CaCl2 + 0.5 mM KH2PO4, pH 6.2, 310 K).
 
 ## Development
 

@@ -41,7 +41,8 @@ biolab_runners/
 
 - **Input:** `OpenMMConfig` with receptor/peptide PDB paths, simulation parameters
 - **Output:** `SimulationResult` with trajectory DCD, energy CSV, state XML
-- **Force fields:** CHARMM36m protein, TIP3P water, 140mM NaCl, 310K
+- **Force fields:** CHARMM36m protein, TIP3P water, dodecahedral solvent box
+- **Buffer environment:** Configurable via `OpenMMConfig` fields or the `saliva` / `physiological` / `gastric` / `intestinal` preset classmethods. Field defaults are saliva-like (140 mM NaCl + 1.4 mM CaCl2 + 0.5 mM KH2PO4, pH 6.2, 310 K) for backward compatibility with OralBiome-AMP
 - **Early abort:** 5ns/10ns checkpoint — if peptide dissociates (PBC-corrected RMSD > 2x threshold), abort
 - **Resume safety:** Always load original topology.pdb — re-solvating produces different water counts
 - **Restraint force on resume:** Must add restraint force (k=0) to system even on resume, or loadState() fails
