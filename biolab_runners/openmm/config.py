@@ -10,14 +10,19 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Default ionic conditions (saliva-like; override with presets below or explicit args)
-DEFAULT_NACL_M = 0.140
-DEFAULT_CACL2_M = 0.0014
-DEFAULT_KH2PO4_M = 0.0005
-DEFAULT_PH = 6.2
+# Default ionic conditions (physiological PBS-like; override with presets or explicit args)
+DEFAULT_NACL_M = 0.150
+DEFAULT_CACL2_M = 0.0
+DEFAULT_KH2PO4_M = 0.0
+DEFAULT_PH = 7.4
+
+# Default early-abort iRMSD threshold (Å). Override per-system via
+# OpenMMConfig.target_irmsd_threshold_a. 3.5 Å is a common mid-range value
+# used in peptide-protein binding stability assessment.
+DEFAULT_IRMSD_THRESHOLD_A = 3.5
 
 # Simulation parameters
-TEMPERATURE_K = 310.0  # Oral cavity temperature (37 C)
+TEMPERATURE_K = 310.0  # Body temperature (37 C)
 PRESSURE_ATM = 1.0
 TIMESTEP_FS = 2.0
 BOX_PADDING_NM = 0.8  # 8 A padding
@@ -75,17 +80,21 @@ class EquilibrationStage:
 class OpenMMConfig:
     """Complete configuration for an OpenMM MD simulation.
 
-    Defaults are saliva-like (140 mM NaCl, pH 6.2) to preserve backward
-    compatibility. For other environments use the preset classmethods
-    (``physiological``, ``gastric``, ``intestinal``, ``saliva``) or override
-    fields directly.
+    Defaults are physiological PBS-like (150 mM NaCl, pH 7.4, 310 K). For
+    other environments use the preset classmethods (``physiological``,
+    ``saliva``, ``gastric``, ``intestinal``) or override fields directly.
 
     Attributes:
         receptor_pdb: Path to receptor PDB file.
         peptide_pdb: Path to peptide PDB file.
         output_dir: Output directory for simulation files.
-        target: Target protein name (e.g. "GtfB").
+        target: Optional free-form tag used to group jobs and appear in
+            result metadata. Not interpreted by the runner.
         peptide_id: Peptide identifier.
+        target_irmsd_threshold_a: Reference iRMSD (Å) for the peptide used
+            by the early-abort logic. Runner aborts at 5 ns if peptide Cα
+            RMSD > 2× this value. Override per-system for tighter/looser
+            gating.
         nacl_mol: NaCl concentration in mol/L.
         cacl2_mol: CaCl2 concentration in mol/L.
         kh2po4_mol: KH2PO4 concentration in mol/L.
@@ -148,6 +157,9 @@ class OpenMMConfig:
     # Protonation pH
     protonation_ph: float = DEFAULT_PH
 
+    # Early-abort reference threshold (Å). See DEFAULT_IRMSD_THRESHOLD_A docstring.
+    target_irmsd_threshold_a: float = DEFAULT_IRMSD_THRESHOLD_A
+
     # Computed fields
     total_steps: int = 0
     save_every_steps: int = 0
@@ -198,6 +210,7 @@ class OpenMMConfig:
             },
             "openmm_platform": self.openmm_platform,
             "protonation_ph": self.protonation_ph,
+            "target_irmsd_threshold_a": self.target_irmsd_threshold_a,
             "equilibration": self.equilibration,
             "solvated_atoms": self.solvated_atoms,
         }
@@ -250,6 +263,9 @@ class OpenMMConfig:
             water_model=ff.get("water", WATER_MODEL),
             ligand_ff=ff.get("ligand", LIGAND_FF),
             protonation_ph=data.get("protonation_ph", DEFAULT_PH),
+            target_irmsd_threshold_a=float(
+                data.get("target_irmsd_threshold_a", DEFAULT_IRMSD_THRESHOLD_A)
+            ),
             solvated_atoms=int(data.get("solvated_atoms", 0)),
         )
 
@@ -257,8 +273,7 @@ class OpenMMConfig:
     def saliva(cls, **overrides: Any) -> OpenMMConfig:
         """Saliva-like buffer: 140 mM NaCl + 1.4 mM CaCl2 + 0.5 mM KH2PO4, pH 6.2, 310 K.
 
-        Literature reference values for unstimulated whole saliva. Matches the
-        OralBiome-AMP pipeline defaults.
+        Literature reference values for unstimulated whole saliva.
         """
         return cls(
             **_preset(

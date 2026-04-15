@@ -7,7 +7,7 @@ affinity estimates (unique among structure predictors).
 Key advantages:
 - No job limits, no queue wait
 - Commercially usable (Apache 2.0 license)
-- Lower clash rate with steering potentials (~0% vs 30-60% without)
+- Much lower clash rate when steering potentials are enabled (see `use_potentials`)
 - Binding affinity prediction (Pearson r=0.62)
 - ~4 minutes for 100-500 residue complexes on RTX 4090
 
@@ -21,7 +21,7 @@ Usage::
     result = runner.predict_complex(
         receptor_sequence="MVKLTAEG...",
         peptide_sequence="RWKLFKKIEK",
-        name="GtfB_PEP001",
+        name="demo_complex",
         output_dir=Path("results/predictions"),
     )
 """

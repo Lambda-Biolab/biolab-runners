@@ -43,8 +43,8 @@ class Boltz2Config:
         no_kernels: Disable cuequivariance custom kernels (use PyTorch fallback).
             Set to True if cuequivariance is not installed.
         use_potentials: Enable steering potentials to reduce steric clashes.
-            Without this, Boltz-2 produces physically impossible structures
-            in 30-60% of predictions.
+            Without this, Boltz-2 frequently produces structures with severe
+            clashes. See the Boltz-2 docs for the underlying discussion.
         output_format: Output structure format (pdb or cif).
         timeout_seconds: Maximum time per prediction before abort.
         boltz_binary: Name or path of the boltz CLI binary.
@@ -62,7 +62,7 @@ class Boltz2Config:
     boltz_binary: str = "boltz"
 
 
-# Quality gate thresholds (calibrated from OralBiome-AMP pipeline)
+# Quality gate thresholds (literature-standard ranges for ipTM / pLDDT)
 IPTM_PASS = 0.7
 IPTM_CONDITIONAL = 0.5
 PLDDT_PASS = 70.0

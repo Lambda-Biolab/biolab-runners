@@ -5,9 +5,9 @@ The runner handles system building (PDBFixer + solvation), multi-stage
 equilibration, and production NPT with periodic checkpointing, early abort
 checks, and trajectory/energy output.
 
-Defaults to saliva-like conditions (140 mM NaCl, pH 6.2, 310 K) with
-CHARMM36m/TIP3P force fields on GPU (OpenCL or CUDA). Use the
-``OpenMMConfig.physiological``, ``gastric``, ``intestinal``, or ``saliva``
+Defaults to physiological PBS-like conditions (150 mM NaCl, pH 7.4, 310 K)
+with CHARMM36m/TIP3P force fields on GPU (OpenCL or CUDA). Use the
+``OpenMMConfig.physiological``, ``saliva``, ``gastric``, or ``intestinal``
 preset classmethods to target other buffer environments.
 
 Requires: openmm>=8.5.0, pdbfixer>=1.9
@@ -19,7 +19,7 @@ Usage::
     config = OpenMMConfig(
         receptor_pdb="receptor.pdb",
         peptide_pdb="peptide.pdb",
-        output_dir="results/md/GtfB/PEP001",
+        output_dir="results/md",
         production_ns=100.0,
     )
     runner = OpenMMRunner(config)
@@ -62,17 +62,6 @@ class _MdContext:
 
 logger = logging.getLogger(__name__)
 
-# Per-target iRMSD thresholds for early abort (expert-validated)
-TARGET_IRMSD_THRESHOLDS: dict[str, float] = {
-    "FadA": 3.0,
-    "FimA": 3.0,
-    "HmuY": 3.5,
-    "VicK": 3.5,
-    "SpaP": 4.0,
-    "GtfB": 4.0,
-}
-DEFAULT_IRMSD_THRESHOLD = 3.5
-
 # Sub-chunk size for production loop (~5 min wall-clock on RTX 3090)
 SUB_CHUNK_STEPS = 150_000
 
@@ -87,7 +76,7 @@ class OpenMMRunner:
     The runner supports:
     - Resuming from checkpoints (idempotent re-runs)
     - Dry-run mode (validates config without GPU)
-    - Per-target early abort thresholds at 5 ns and 10 ns
+    - Early abort at 5 ns / 10 ns using a per-config iRMSD threshold
     - SIGTERM handling for clean shutdown on preemption
     - Periodic checkpointing to state.xml
 
@@ -158,7 +147,7 @@ class OpenMMRunner:
 
         ref_pep_ca, ref_pep_ca_idx, ref_rec_ca_idx = self._compute_reference_ca(ctx)
 
-        irmsd_thresh = TARGET_IRMSD_THRESHOLDS.get(config.target, DEFAULT_IRMSD_THRESHOLD)
+        irmsd_thresh = config.target_irmsd_threshold_a
         abort_thresh = irmsd_thresh * 2.0
         abort_step_5ns = int(5_000_000 / config.timestep_fs)
         abort_step_10ns = int(10_000_000 / config.timestep_fs)
