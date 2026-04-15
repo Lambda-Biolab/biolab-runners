@@ -33,7 +33,7 @@ biolab_runners/
 - **Input:** Receptor sequence + peptide sequence (strings), optional pocket constraints
 - **Output:** `PredictionResult` with structure path, confidence scores, quality gate
 - **Quality gate:** PASS / CONDITIONAL / FAIL based on ipTM, pLDDT, clash thresholds
-- **Steering potentials:** Always enabled by default — without them, 30-60% of predictions have physically impossible structures
+- **Steering potentials:** Always enabled by default — without them a substantial fraction of predictions carry severe steric clashes (see the Boltz-2 paper / docs on `use_potentials`)
 - **pLDDT rescaling:** Boltz-2 v2 reports 0-1 scale; parser auto-detects and rescales to 0-100
 - **MSA caching:** Receptor MSA CSV reused across predictions against the same target
 
@@ -42,8 +42,8 @@ biolab_runners/
 - **Input:** `OpenMMConfig` with receptor/peptide PDB paths, simulation parameters
 - **Output:** `SimulationResult` with trajectory DCD, energy CSV, state XML
 - **Force fields:** CHARMM36m protein, TIP3P water, dodecahedral solvent box
-- **Buffer environment:** Configurable via `OpenMMConfig` fields or the `saliva` / `physiological` / `gastric` / `intestinal` preset classmethods. Field defaults are saliva-like (140 mM NaCl + 1.4 mM CaCl2 + 0.5 mM KH2PO4, pH 6.2, 310 K) for backward compatibility with OralBiome-AMP
-- **Early abort:** 5ns/10ns checkpoint — if peptide dissociates (PBC-corrected RMSD > 2x threshold), abort
+- **Buffer environment:** Configurable via `OpenMMConfig` fields or the `physiological` / `saliva` / `gastric` / `intestinal` preset classmethods. Field defaults are physiological PBS-like (150 mM NaCl, pH 7.4, 310 K)
+- **Early abort:** 5 ns / 10 ns checkpoint — if peptide dissociates (PBC-corrected Cα RMSD > 2 × `config.target_irmsd_threshold_a`), abort. Threshold is per-system and defaults to 3.5 Å — override for tighter/looser gating
 - **Resume safety:** Always load original topology.pdb — re-solvating produces different water counts
 - **Restraint force on resume:** Must add restraint force (k=0) to system even on resume, or loadState() fails
 - **PBC correction:** All RMSD checks use minimum image convention — without it, RMSD can be ~100A

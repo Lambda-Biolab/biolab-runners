@@ -49,7 +49,7 @@ from biolab_runners.boltz2 import Boltz2Runner, Boltz2Config
 config = Boltz2Config(
     accelerator="gpu",
     recycling_steps=3,
-    use_potentials=True,  # Reduces steric clashes from ~36% to ~0%
+    use_potentials=True,  # Steering potentials — substantially reduces clashes
 )
 
 # Run prediction
@@ -57,7 +57,7 @@ runner = Boltz2Runner(config)
 result = runner.predict_complex(
     receptor_sequence="MVKLTAEG...",
     peptide_sequence="RWKLFKKIEK",
-    name="GtfB_PEP001",
+    name="demo_complex",
     output_dir=Path("results/predictions"),
 )
 
@@ -99,13 +99,14 @@ from biolab_runners.openmm import OpenMMRunner, OpenMMConfig
 config = OpenMMConfig(
     receptor_pdb="receptor.pdb",
     peptide_pdb="peptide.pdb",
-    output_dir="results/md/GtfB/PEP001",
-    target="GtfB",
+    output_dir="results/md/demo",
+    target="demo",
     peptide_id="PEP001",
-    production_ns=100.0,         # 100 ns production run
-    temperature_k=310.0,         # 37 C (body temperature)
-    protein_ff="charmm36m",      # Force field
-    openmm_platform="OpenCL",    # GPU platform
+    production_ns=100.0,            # 100 ns production run
+    temperature_k=310.0,            # 37 C (body temperature)
+    protein_ff="charmm36m",         # Force field
+    openmm_platform="OpenCL",       # GPU platform
+    target_irmsd_threshold_a=3.5,   # Early-abort reference (per-system)
 )
 
 # Run simulation
@@ -177,29 +178,20 @@ Predictions are automatically classified:
 
 The MD runner checks peptide stability at 5 ns and 10 ns:
 
-- **5 ns check:** Peptide Ca RMSD vs post-equilibration reference. Abort if > 2x target iRMSD threshold.
-- **10 ns check:** RMSD slope between 5-10 ns. Abort if > 0.05 A/ns (drift).
+- **5 ns check:** Peptide Cα RMSD vs post-equilibration reference. Abort if it exceeds `2 × config.target_irmsd_threshold_a`.
+- **10 ns check:** RMSD slope between 5–10 ns. Abort if > 0.05 Å/ns (drift).
 
-Per-target thresholds (expert-calibrated):
-
-| Target | iRMSD Threshold | Abort Threshold |
-|--------|----------------|-----------------|
-| FadA | 3.0 A | 6.0 A |
-| FimA | 3.0 A | 6.0 A |
-| HmuY | 3.5 A | 7.0 A |
-| VicK | 3.5 A | 7.0 A |
-| SpaP | 4.0 A | 8.0 A |
-| GtfB | 4.0 A | 8.0 A |
+`target_irmsd_threshold_a` defaults to 3.5 Å, which is a reasonable mid-range value for peptide-protein complexes. Tighter binders (small pockets, rigid peptides) justify lower values; floppier binders justify higher values. Set it per system rather than relying on the default — binding-site geometry varies and there is no universal threshold.
 
 ## Equilibration Protocol
 
 3-stage protocol for peptide-protein complexes:
 
-1. **NVT 100 ps** — Strong backbone restraints (k=1000 kJ/mol/nm^2)
-2. **NPT 100 ps** — Reduced restraints (k=100 kJ/mol/nm^2)
-3. **NPT 200 ps** — Gradual ramp (100->0) + 100 ps unrestrained
+1. **NVT 100 ps** — Strong backbone restraints (k=1000 kJ/mol/nm²)
+2. **NPT 100 ps** — Reduced restraints (k=100 kJ/mol/nm²)
+3. **NPT 200 ps** — Gradual ramp (100→0) + 100 ps unrestrained
 
-Solvation: dodecahedral box with TIP3P water. Ionic conditions are configurable via `OpenMMConfig` fields or the buffer presets (`saliva`, `physiological`, `gastric`, `intestinal`) — defaults are saliva-like (140 mM NaCl + 1.4 mM CaCl2 + 0.5 mM KH2PO4, pH 6.2, 310 K).
+Solvation: dodecahedral box with TIP3P water. Ionic conditions are configurable via `OpenMMConfig` fields or the buffer presets (`physiological`, `saliva`, `gastric`, `intestinal`). Defaults are physiological PBS-like (150 mM NaCl, pH 7.4, 310 K).
 
 ## Development
 

@@ -6,7 +6,7 @@ Patterns and incidents discovered during development. Use this as a lookup befor
 
 **Context:** Boltz2Runner structure predictions.
 
-**Problem:** Without steering potentials, 30-60% of predictions produce physically impossible structures with severe steric clashes.
+**Problem:** Without steering potentials, a substantial fraction of predictions carry severe steric clashes (see the Boltz-2 paper's `use_potentials` discussion).
 
 **Solution:** Steering potentials always enabled by default. Promoted to `.claude/rules/steering-potentials.md`.
 

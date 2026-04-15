@@ -8,15 +8,12 @@ from unittest.mock import patch
 
 import pytest
 from biolab_runners.openmm.config import (
+    DEFAULT_IRMSD_THRESHOLD_A,
     EquilibrationStage,
     OpenMMConfig,
     SimulationResult,
 )
-from biolab_runners.openmm.runner import (
-    DEFAULT_IRMSD_THRESHOLD,
-    TARGET_IRMSD_THRESHOLDS,
-    OpenMMRunner,
-)
+from biolab_runners.openmm.runner import OpenMMRunner
 from biolab_runners.openmm.utils import (
     load_checkpoint_step,
     verify_production_outputs,
@@ -33,12 +30,13 @@ class TestOpenMMConfig:
     def test_defaults(self) -> None:
         config = OpenMMConfig()
         assert config.temperature_k == 310.0
-        assert config.nacl_mol == 0.140
+        assert config.nacl_mol == 0.150
         assert config.protein_ff == "charmm36m"
         assert config.water_model == "tip3p"
         assert config.box_shape == "dodecahedron"
-        assert config.protonation_ph == 6.2
+        assert config.protonation_ph == 7.4
         assert config.production_ns == 100.0
+        assert config.target_irmsd_threshold_a == 3.5
 
     def test_step_computation(self) -> None:
         config = OpenMMConfig(production_ns=100.0, timestep_fs=2.0)
@@ -55,13 +53,13 @@ class TestOpenMMConfig:
             receptor_pdb="rec.pdb",
             peptide_pdb="pep.pdb",
             output_dir="/tmp/out",
-            target="GtfB",
+            target="demo",
             peptide_id="PEP001",
         )
         d = config.to_dict()
         assert d["receptor_pdb"] == "rec.pdb"
-        assert d["target"] == "GtfB"
-        assert d["ionic_conditions"]["NaCl_M"] == 0.140
+        assert d["target"] == "demo"
+        assert d["ionic_conditions"]["NaCl_M"] == 0.150
         assert d["simulation"]["temperature_K"] == 310.0
         assert d["force_fields"]["protein"] == "charmm36m"
 
@@ -70,16 +68,16 @@ class TestOpenMMConfig:
             receptor_pdb="rec.pdb",
             peptide_pdb="pep.pdb",
             output_dir=str(tmp_path),
-            target="FadA",
+            target="demo",
             production_ns=50.0,
         )
         path = config.save()
         assert path.exists()
 
         loaded = OpenMMConfig.from_json(path)
-        assert loaded.target == "FadA"
+        assert loaded.target == "demo"
         assert loaded.production_ns == 50.0
-        assert loaded.nacl_mol == 0.140
+        assert loaded.nacl_mol == 0.150
         assert loaded.protein_ff == "charmm36m"
 
     def test_equilibration_stages_default(self) -> None:
@@ -159,7 +157,7 @@ class TestSimulationResult:
     """Tests for SimulationResult dataclass."""
 
     def test_to_dict(self) -> None:
-        config = OpenMMConfig(target="GtfB", peptide_id="PEP001")
+        config = OpenMMConfig(target="demo", peptide_id="PEP001")
         result = SimulationResult(
             config=config,
             trajectory_path="/tmp/traj.dcd",
@@ -169,7 +167,7 @@ class TestSimulationResult:
             num_atoms=50000,
         )
         d = result.to_dict()
-        assert d["target"] == "GtfB"
+        assert d["target"] == "demo"
         assert d["total_ns"] == 100.0
         assert d["ns_per_day"] == 240.0
 
@@ -256,7 +254,7 @@ class TestOpenMMRunner:
             receptor_pdb=str(tmp_path / "rec.pdb"),
             peptide_pdb=str(tmp_path / "pep.pdb"),
             output_dir=str(tmp_path / "output"),
-            target="GtfB",
+            target="demo",
             peptide_id="PEP001",
             production_ns=100.0,
         )
@@ -302,21 +300,40 @@ class TestOpenMMRunner:
 
 
 # ---------------------------------------------------------------------------
-# Target threshold tests
+# iRMSD threshold tests
 # ---------------------------------------------------------------------------
 
 
-class TestTargetThresholds:
-    """Tests for per-target iRMSD thresholds."""
+class TestIrmsdThreshold:
+    """Tests for the per-config iRMSD early-abort threshold."""
 
-    def test_known_targets(self) -> None:
-        assert TARGET_IRMSD_THRESHOLDS["FadA"] == 3.0
-        assert TARGET_IRMSD_THRESHOLDS["GtfB"] == 4.0
-        assert TARGET_IRMSD_THRESHOLDS["VicK"] == 3.5
+    def test_default_value(self) -> None:
+        assert DEFAULT_IRMSD_THRESHOLD_A == 3.5
 
-    def test_default_threshold(self) -> None:
-        assert DEFAULT_IRMSD_THRESHOLD == 3.5
+    def test_default_applied_to_config(self) -> None:
+        config = OpenMMConfig(
+            receptor_pdb="r.pdb",
+            peptide_pdb="p.pdb",
+            output_dir="out",
+        )
+        assert config.target_irmsd_threshold_a == DEFAULT_IRMSD_THRESHOLD_A
 
-    def test_unknown_target_uses_default(self) -> None:
-        thresh = TARGET_IRMSD_THRESHOLDS.get("UnknownTarget", DEFAULT_IRMSD_THRESHOLD)
-        assert thresh == 3.5
+    def test_override_via_config(self) -> None:
+        config = OpenMMConfig(
+            receptor_pdb="r.pdb",
+            peptide_pdb="p.pdb",
+            output_dir="out",
+            target_irmsd_threshold_a=4.0,
+        )
+        assert config.target_irmsd_threshold_a == 4.0
+
+    def test_roundtrip_through_json(self, tmp_path: Path) -> None:
+        config = OpenMMConfig(
+            receptor_pdb="r.pdb",
+            peptide_pdb="p.pdb",
+            output_dir=str(tmp_path),
+            target_irmsd_threshold_a=2.75,
+        )
+        path = config.save()
+        loaded = OpenMMConfig.from_json(path)
+        assert loaded.target_irmsd_threshold_a == 2.75
