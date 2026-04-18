@@ -657,7 +657,7 @@ class OpenMMRunner:
             modeller.topology.getNumChains(),
         )
 
-        modeller.addSolvent(
+        modeller.addSolvent(  # pyright: ignore[reportOperatorIssue, reportAttributeAccessIssue]
             forcefield,
             model=config.water_model,
             padding=config.box_padding_nm * unit.nanometers,
