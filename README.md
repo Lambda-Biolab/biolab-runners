@@ -1,5 +1,9 @@
 # biolab-runners
 
+[![CodeFactor](https://www.codefactor.io/repository/github/lambda-biolab/biolab-runners/badge)](https://www.codefactor.io/repository/github/lambda-biolab/biolab-runners)
+[![CodeQL](https://github.com/Lambda-Biolab/biolab-runners/actions/workflows/codeql.yml/badge.svg)](https://github.com/Lambda-Biolab/biolab-runners/actions/workflows/codeql.yml)
+[![Dependabot](https://img.shields.io/badge/dependabot-enabled-blue?logo=dependabot)](https://github.com/Lambda-Biolab/biolab-runners/network/updates)
+
 Standalone, modular Python runners for **Boltz-2 structure prediction** and **OpenMM molecular dynamics simulations**.
 
 Extracted from the [OralBiome-AMP](https://github.com/Lambda-Biolab/OralBiome-AMP) pipeline for use in other research projects.
