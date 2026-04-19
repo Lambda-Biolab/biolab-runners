@@ -1,0 +1,26 @@
+# biolab-runners
+
+> Standalone, modular Python runners for Boltz-2 structure prediction and OpenMM molecular dynamics simulations.
+
+## Documentation
+
+- [README](https://github.com/Lambda-Biolab/biolab-runners/blob/8d9b401a8344a183a9d6ea104650db77bfe49f5b/README.md): Project overview, architecture, usage, and dependency notes
+- [CLAUDE.md](https://github.com/Lambda-Biolab/biolab-runners/blob/8d9b401a8344a183a9d6ea104650db77bfe49f5b/CLAUDE.md): Agent instructions, architecture details, and common gotchas
+
+## Source — biolab_runners
+
+### Core
+
+- [biolab_runners/__init__.py](https://github.com/Lambda-Biolab/biolab-runners/blob/8d9b401a8344a183a9d6ea104650db77bfe49f5b/biolab_runners/__init__.py): Package root and version
+
+### Boltz-2 structure prediction (boltz2/)
+
+- [boltz2/runner.py](https://github.com/Lambda-Biolab/biolab-runners/blob/8d9b401a8344a183a9d6ea104650db77bfe49f5b/biolab_runners/boltz2/runner.py): Boltz2Runner class — invokes boltz predict CLI, parses confidence scores, applies quality gate
+- [boltz2/config.py](https://github.com/Lambda-Biolab/biolab-runners/blob/8d9b401a8344a183a9d6ea104650db77bfe49f5b/biolab_runners/boltz2/config.py): Boltz2Config, ConfidenceScores, PredictionResult, QualityGate dataclasses
+- [boltz2/utils.py](https://github.com/Lambda-Biolab/biolab-runners/blob/8d9b401a8344a183a9d6ea104650db77bfe49f5b/biolab_runners/boltz2/utils.py): YAML input writer, output parser, boltz CLI availability check
+
+### OpenMM molecular dynamics (openmm/)
+
+- [openmm/runner.py](https://github.com/Lambda-Biolab/biolab-runners/blob/8d9b401a8344a183a9d6ea104650db77bfe49f5b/biolab_runners/openmm/runner.py): OpenMMRunner class — system building, multi-stage equilibration, production NPT with checkpointing
+- [openmm/config.py](https://github.com/Lambda-Biolab/biolab-runners/blob/8d9b401a8344a183a9d6ea104650db77bfe49f5b/biolab_runners/openmm/config.py): OpenMMConfig, SimulationResult, EquilibrationStage dataclasses
+- [openmm/utils.py](https://github.com/Lambda-Biolab/biolab-runners/blob/8d9b401a8344a183a9d6ea104650db77bfe49f5b/biolab_runners/openmm/utils.py): Output verification, checkpoint loading, OpenMM availability check
