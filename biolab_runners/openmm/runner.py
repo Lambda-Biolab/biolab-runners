@@ -346,11 +346,17 @@ class OpenMMRunner:
 
     @staticmethod
     def _build_forcefield(config: OpenMMConfig, app: object) -> object:
-        """Construct the OpenMM ForceField for the configured protein FF + water."""
+        """Construct the OpenMM ForceField for the configured protein FF + water.
+
+        ``config.extra_forcefields`` is appended after the protein and water
+        XMLs so later entries take precedence for overlapping atom types.
+        """
         ff_name = config.protein_ff
         if "charmm" in ff_name.lower():
-            return app.ForceField("charmm36.xml", "charmm36/water.xml")  # type: ignore[union-attr]
-        return app.ForceField(f"{ff_name}.xml", f"{config.water_model}.xml")  # type: ignore[union-attr]
+            base = ["charmm36.xml", "charmm36/water.xml"]
+        else:
+            base = [f"{ff_name}.xml", f"{config.water_model}.xml"]
+        return app.ForceField(*base, *config.extra_forcefields)  # type: ignore[union-attr]
 
     def _build_or_load_modeller(
         self,
