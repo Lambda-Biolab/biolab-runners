@@ -106,6 +106,13 @@ class OpenMMConfig:
         protein_ff: Protein force field name.
         water_model: Water model name.
         ligand_ff: Ligand force field name.
+        extra_forcefields: Additional OpenMM force-field XML files to load
+            alongside ``protein_ff`` and ``water_model``. Each entry is the
+            path (str) to an XML file accepted by ``openmm.app.ForceField``.
+            Use for non-canonical residues, small molecules, or user-supplied
+            parameter overrides. Entries are appended in order; later files
+            take precedence for overlapping atom types. Defaults to the empty
+            list.
         openmm_platform: OpenMM platform ("OpenCL", "CUDA", "CPU").
         equilibration: List of equilibration stage dicts.
         production_ns: Production simulation length in nanoseconds.
@@ -140,6 +147,7 @@ class OpenMMConfig:
     protein_ff: str = PROTEIN_FF
     water_model: str = WATER_MODEL
     ligand_ff: str = LIGAND_FF
+    extra_forcefields: list[str] = field(default_factory=list)
 
     # GPU platform
     openmm_platform: str = OPENMM_PLATFORM
@@ -207,6 +215,7 @@ class OpenMMConfig:
                 "protein": self.protein_ff,
                 "water": self.water_model,
                 "ligand": self.ligand_ff,
+                "extra": list(self.extra_forcefields),
             },
             "openmm_platform": self.openmm_platform,
             "protonation_ph": self.protonation_ph,
@@ -262,6 +271,7 @@ class OpenMMConfig:
             protein_ff=ff.get("protein", PROTEIN_FF),
             water_model=ff.get("water", WATER_MODEL),
             ligand_ff=ff.get("ligand", LIGAND_FF),
+            extra_forcefields=list(ff.get("extra", []) or []),
             protonation_ph=data.get("protonation_ph", DEFAULT_PH),
             target_irmsd_threshold_a=float(
                 data.get("target_irmsd_threshold_a", DEFAULT_IRMSD_THRESHOLD_A)

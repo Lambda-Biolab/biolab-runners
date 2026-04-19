@@ -87,6 +87,42 @@ class TestOpenMMConfig:
         assert config.equilibration[0]["restraint_k"] == 1000.0
         assert config.equilibration[2]["restraint_k"] == 0.0
 
+    def test_extra_forcefields_default_empty(self) -> None:
+        config = OpenMMConfig()
+        assert config.extra_forcefields == []
+
+    def test_extra_forcefields_not_shared_between_instances(self) -> None:
+        """Default list must be per-instance (no mutable default aliasing)."""
+        a = OpenMMConfig()
+        b = OpenMMConfig()
+        a.extra_forcefields.append("/tmp/a.xml")
+        assert b.extra_forcefields == []
+
+    def test_extra_forcefields_roundtrip(self, tmp_path: Path) -> None:
+        extras = [str(tmp_path / "custom_a.xml"), str(tmp_path / "custom_b.xml")]
+        config = OpenMMConfig(
+            receptor_pdb="rec.pdb",
+            output_dir=str(tmp_path),
+            extra_forcefields=extras,
+        )
+        d = config.to_dict()
+        assert d["force_fields"]["extra"] == extras
+
+        path = config.save()
+        loaded = OpenMMConfig.from_json(path)
+        assert loaded.extra_forcefields == extras
+
+    def test_extra_forcefields_absent_in_legacy_json(self, tmp_path: Path) -> None:
+        """JSONs written before this field existed must still load cleanly."""
+        legacy = {
+            "receptor_pdb": "rec.pdb",
+            "force_fields": {"protein": "amber14/protein.ff14SB", "water": "tip3p"},
+        }
+        path = tmp_path / "legacy.json"
+        path.write_text(json.dumps(legacy))
+        loaded = OpenMMConfig.from_json(path)
+        assert loaded.extra_forcefields == []
+
     def test_preset_saliva(self) -> None:
         config = OpenMMConfig.saliva()
         assert config.nacl_mol == 0.140
@@ -124,6 +160,51 @@ class TestOpenMMConfig:
         assert config.production_ns == 25.0
         assert config.protonation_ph == 7.0
         assert config.nacl_mol == 0.150  # preset value preserved
+
+
+class _RecordingForceField:
+    """Fake ``app.ForceField`` that records the XML paths it was constructed with."""
+
+    def __init__(self, *paths: str) -> None:
+        self.paths: tuple[str, ...] = paths
+
+
+class _FakeApp:
+    """Minimal stand-in for ``openmm.app`` used by ``_build_forcefield``."""
+
+    ForceField = _RecordingForceField
+
+
+class TestBuildForcefield:
+    """Tests for ``OpenMMRunner._build_forcefield`` extra_forcefields pass-through."""
+
+    def test_amber_no_extras(self) -> None:
+        config = OpenMMConfig(protein_ff="amber14/protein.ff14SB", water_model="tip3p")
+        ff = OpenMMRunner._build_forcefield(config, _FakeApp())
+        assert ff.paths == ("amber14/protein.ff14SB.xml", "tip3p.xml")
+
+    def test_amber_with_extras(self, tmp_path: Path) -> None:
+        extra = str(tmp_path / "custom.xml")
+        config = OpenMMConfig(
+            protein_ff="amber14/protein.ff14SB",
+            water_model="tip3p",
+            extra_forcefields=[extra],
+        )
+        ff = OpenMMRunner._build_forcefield(config, _FakeApp())
+        assert ff.paths == ("amber14/protein.ff14SB.xml", "tip3p.xml", extra)
+
+    def test_charmm_with_extras(self, tmp_path: Path) -> None:
+        """CHARMM branch must still honour extra_forcefields."""
+        extra = str(tmp_path / "custom.xml")
+        config = OpenMMConfig(protein_ff="charmm36m", extra_forcefields=[extra])
+        ff = OpenMMRunner._build_forcefield(config, _FakeApp())
+        assert ff.paths == ("charmm36.xml", "charmm36/water.xml", extra)
+
+    def test_extras_preserve_order(self, tmp_path: Path) -> None:
+        extras = [str(tmp_path / "a.xml"), str(tmp_path / "b.xml")]
+        config = OpenMMConfig(protein_ff="amber14/protein.ff14SB", extra_forcefields=extras)
+        ff = OpenMMRunner._build_forcefield(config, _FakeApp())
+        assert ff.paths[-2:] == tuple(extras)
 
 
 class TestEquilibrationStage:
