@@ -293,11 +293,11 @@ class OpenMMRunner:
         self._write_topology(modeller, output_dir, app, result)
 
         system, integrator = self._assemble_system(forcefield, modeller, config, openmm, app, unit)
-        chains = list(modeller.topology.chains())
+        chains = list(modeller.topology.chains())  # type: ignore[union-attr]
         restraint_force, ca_indices = self._add_ca_restraint(system, modeller, chains, openmm)
 
-        simulation = app.Simulation(modeller.topology, system, integrator, platform)
-        simulation.context.setPositions(modeller.positions)
+        simulation = app.Simulation(modeller.topology, system, integrator, platform)  # type: ignore[union-attr]
+        simulation.context.setPositions(modeller.positions)  # type: ignore[union-attr]
 
         if is_resuming:
             logger.info("Resuming from checkpoint: %s", resume_xml)
@@ -660,9 +660,9 @@ class OpenMMRunner:
         modeller.addSolvent(  # pyright: ignore[reportOperatorIssue, reportAttributeAccessIssue]
             forcefield,
             model=config.water_model,
-            padding=config.box_padding_nm * unit.nanometers,
+            padding=config.box_padding_nm * unit.nanometers,  # pyright: ignore[reportAttributeAccessIssue, reportOperatorIssue]
             boxShape=config.box_shape,
-            ionicStrength=config.nacl_mol * unit.molar,
+            ionicStrength=config.nacl_mol * unit.molar,  # pyright: ignore[reportOperatorIssue]
         )
         logger.info("Solvated: %d atoms", modeller.topology.getNumAtoms())
 
