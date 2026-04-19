@@ -65,6 +65,22 @@ logger = logging.getLogger(__name__)
 # Sub-chunk size for production loop (~5 min wall-clock on RTX 3090)
 SUB_CHUNK_STEPS = 150_000
 
+# Early-abort thresholds
+_ABORT_MULTIPLIER = 2.0  # abort_thresh = irmsd_thresh * this
+_EARLY_ABORT_5NS_FS = 5_000_000  # 5 ns in femtoseconds
+_EARLY_ABORT_10NS_FS = 10_000_000  # 10 ns in femtoseconds
+_SLOPE_THRESHOLD_A_PER_NS = 0.05  # RMSD drift threshold (A/ns)
+
+# Post-equilibration displacement
+_DISPLACEMENT_THRESHOLD_A = 8.0  # peptide-receptor Ca min distance (A)
+
+# Energy minimization
+_MAX_MINIMIZATION_ITERS = 1000
+
+# Equilibration restraint strengths (kJ/mol/nm^2)
+_RESTRAINT_K_STRONG = 1000.0
+_RESTRAINT_K_MEDIUM = 100.0
+
 
 class OpenMMRunner:
     """OpenMM production MD simulation runner.
@@ -148,9 +164,9 @@ class OpenMMRunner:
         ref_pep_ca, ref_pep_ca_idx, ref_rec_ca_idx = self._compute_reference_ca(ctx)
 
         irmsd_thresh = config.target_irmsd_threshold_a
-        abort_thresh = irmsd_thresh * 2.0
-        abort_step_5ns = int(5_000_000 / config.timestep_fs)
-        abort_step_10ns = int(10_000_000 / config.timestep_fs)
+        abort_thresh = irmsd_thresh * _ABORT_MULTIPLIER
+        abort_step_5ns = int(_EARLY_ABORT_5NS_FS / config.timestep_fs)
+        abort_step_10ns = int(_EARLY_ABORT_10NS_FS / config.timestep_fs)
 
         traj_path = str(output_dir / "trajectory.dcd")
         energy_path = str(output_dir / "energy.csv")
@@ -293,11 +309,11 @@ class OpenMMRunner:
         self._write_topology(modeller, output_dir, app, result)
 
         system, integrator = self._assemble_system(forcefield, modeller, config, openmm, app, unit)
-        chains = list(modeller.topology.chains())
+        chains = list(modeller.topology.chains())  # type: ignore[union-attr]
         restraint_force, ca_indices = self._add_ca_restraint(system, modeller, chains, openmm)
 
-        simulation = app.Simulation(modeller.topology, system, integrator, platform)
-        simulation.context.setPositions(modeller.positions)
+        simulation = app.Simulation(modeller.topology, system, integrator, platform)  # type: ignore[union-attr]
+        simulation.context.setPositions(modeller.positions)  # type: ignore[union-attr]
 
         if is_resuming:
             logger.info("Resuming from checkpoint: %s", resume_xml)
@@ -660,9 +676,9 @@ class OpenMMRunner:
         modeller.addSolvent(  # pyright: ignore[reportOperatorIssue, reportAttributeAccessIssue]
             forcefield,
             model=config.water_model,
-            padding=config.box_padding_nm * unit.nanometers,
+            padding=config.box_padding_nm * unit.nanometers,  # pyright: ignore[reportAttributeAccessIssue, reportOperatorIssue]
             boxShape=config.box_shape,
-            ionicStrength=config.nacl_mol * unit.molar,
+            ionicStrength=config.nacl_mol * unit.molar,  # pyright: ignore[reportOperatorIssue]
         )
         logger.info("Solvated: %d atoms", modeller.topology.getNumAtoms())
 
@@ -686,7 +702,7 @@ class OpenMMRunner:
         Stage 3: NPT 200ps with gradual restraint ramp (100->0) + unrestrained
         """
         logger.info("Minimizing energy...")
-        simulation.minimizeEnergy(maxIterations=1000)  # type: ignore[union-attr]
+        simulation.minimizeEnergy(maxIterations=_MAX_MINIMIZATION_ITERS)  # type: ignore[union-attr]
 
         # Update restraint reference positions to post-minimization coords
         init_positions = (
@@ -702,15 +718,13 @@ class OpenMMRunner:
         timestep_fs = config.timestep_fs
 
         # Stage 1: NVT with strong restraints
-        k_strong = 1000.0
-        simulation.context.setParameter("k", k_strong)  # type: ignore[union-attr]
-        logger.info("Equilibrating (NVT 100ps, k=%.0f kJ/mol/nm^2)...", k_strong)
+        simulation.context.setParameter("k", _RESTRAINT_K_STRONG)  # type: ignore[union-attr]
+        logger.info("Equilibrating (NVT 100ps, k=%.0f kJ/mol/nm^2)...", _RESTRAINT_K_STRONG)
         simulation.step(int(100_000 / timestep_fs))  # type: ignore[union-attr]
 
         # Stage 2: NPT with reduced restraints
-        k_medium = 100.0
-        simulation.context.setParameter("k", k_medium)  # type: ignore[union-attr]
-        logger.info("Equilibrating (NPT 100ps, k=%.0f kJ/mol/nm^2)...", k_medium)
+        simulation.context.setParameter("k", _RESTRAINT_K_MEDIUM)  # type: ignore[union-attr]
+        logger.info("Equilibrating (NPT 100ps, k=%.0f kJ/mol/nm^2)...", _RESTRAINT_K_MEDIUM)
         simulation.step(int(100_000 / timestep_fs))  # type: ignore[union-attr]
 
         # Stage 3: Gradual restraint ramp + unrestrained
@@ -758,7 +772,7 @@ class OpenMMRunner:
             "Post-equilibration peptide-receptor Ca min distance: %.1f A",
             min_dist,
         )
-        if min_dist > 8.0:
+        if min_dist > _DISPLACEMENT_THRESHOLD_A:
             logger.warning(
                 "DISPLACEMENT: peptide-receptor distance %.1f A after equilibration",
                 min_dist,
@@ -766,8 +780,8 @@ class OpenMMRunner:
 
         eq_meta = {
             "min_ca_distance_A": round(min_dist, 2),
-            "displaced": min_dist > 8.0,
-            "threshold_A": 8.0,
+            "displaced": min_dist > _DISPLACEMENT_THRESHOLD_A,
+            "threshold_A": _DISPLACEMENT_THRESHOLD_A,
         }
         (output_dir / "equilibration_metadata.json").write_text(json.dumps(eq_meta, indent=2))
 
@@ -787,15 +801,37 @@ class OpenMMRunner:
         return rec_ca, pep_ca
 
     @staticmethod
+    def _pbc_correct(diff: object, box_vecs: object, np: object) -> object:
+        """Apply minimum-image PBC correction to displacement vectors."""
+        box_diag = np.array([box_vecs[0][0], box_vecs[1][1], box_vecs[2][2]])  # type: ignore[union-attr,index]
+        diff -= np.round(diff / box_diag) * box_diag  # type: ignore[union-attr]
+        return diff
+
+    @staticmethod
+    def _peptide_ca_rmsd(
+        simulation: object,
+        ref_pep_ca: object,
+        ref_pep_ca_idx: list[int],
+        unit: object,
+        np: object,
+    ) -> float:
+        """Compute PBC-corrected peptide Ca RMSD vs reference positions."""
+        state = simulation.context.getState(getPositions=True)  # type: ignore[union-attr]
+        cur_pos = state.getPositions(asNumpy=True).value_in_unit(unit.angstroms)  # type: ignore[union-attr]
+        box_vecs = state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.angstroms)  # type: ignore[union-attr]
+        diff = cur_pos[ref_pep_ca_idx] - ref_pep_ca
+        diff = OpenMMRunner._pbc_correct(diff, box_vecs, np)
+        return float(np.sqrt((diff**2).sum(axis=1).mean()))  # type: ignore[union-attr]
+
+    @staticmethod
     def _min_pbc_distance(
         rec_ca: list[object], pep_ca: list[object], box_vecs: object, np: object
     ) -> float:
         """Compute min PBC-corrected distance between two sets of positions."""
         rec_arr = np.array(rec_ca)  # type: ignore[union-attr]
         pep_arr = np.array(pep_ca)  # type: ignore[union-attr]
-        box_diag = np.array([box_vecs[0][0], box_vecs[1][1], box_vecs[2][2]])  # type: ignore[union-attr,index]
         diffs = rec_arr[:, None, :] - pep_arr[None, :, :]
-        diffs -= np.round(diffs / box_diag) * box_diag  # type: ignore[union-attr]
+        diffs = OpenMMRunner._pbc_correct(diffs, box_vecs, np)
         dists = np.sqrt((np.square(diffs)).sum(axis=-1))  # type: ignore[union-attr]
         return float(dists.min())
 
@@ -817,18 +853,7 @@ class OpenMMRunner:
 
         Returns the peptide RMSD, or None if check could not be performed.
         """
-        state = simulation.context.getState(getPositions=True)  # type: ignore[union-attr]
-        cur_pos = state.getPositions(asNumpy=True).value_in_unit(unit.angstroms)  # type: ignore[union-attr]
-        cur_pep_ca = cur_pos[ref_pep_ca_idx]
-
-        # PBC correction
-        box_vecs = state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.angstroms)  # type: ignore[union-attr]
-        box_diag = np.array([box_vecs[0][0], box_vecs[1][1], box_vecs[2][2]])  # type: ignore[union-attr]
-
-        diff = cur_pep_ca - ref_pep_ca
-        diff -= np.round(diff / box_diag) * box_diag  # type: ignore[union-attr]
-        pep_rmsd = float(np.sqrt((diff**2).sum(axis=1).mean()))  # type: ignore[union-attr]
-
+        pep_rmsd = OpenMMRunner._peptide_ca_rmsd(simulation, ref_pep_ca, ref_pep_ca_idx, unit, np)
         ns_at_check = steps_done * config.timestep_fs / 1e6
         logger.info(
             "5 ns check: peptide Ca RMSD = %.1f A, abort threshold = %.1f A",
@@ -875,26 +900,17 @@ class OpenMMRunner:
 
         Returns True if the slope exceeds the threshold (0.05 A/ns).
         """
-        state = simulation.context.getState(getPositions=True)  # type: ignore[union-attr]
-        cur_pos = state.getPositions(asNumpy=True).value_in_unit(unit.angstroms)  # type: ignore[union-attr]
-        cur_pep_ca = cur_pos[ref_pep_ca_idx]
-
-        box_vecs = state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.angstroms)  # type: ignore[union-attr]
-        box_diag = np.array([box_vecs[0][0], box_vecs[1][1], box_vecs[2][2]])  # type: ignore[union-attr]
-
-        diff = cur_pep_ca - ref_pep_ca
-        diff -= np.round(diff / box_diag) * box_diag  # type: ignore[union-attr]
-        rmsd_10ns = float(np.sqrt((diff**2).sum(axis=1).mean()))  # type: ignore[union-attr]
-
+        rmsd_10ns = OpenMMRunner._peptide_ca_rmsd(simulation, ref_pep_ca, ref_pep_ca_idx, unit, np)
         slope = (rmsd_10ns - rmsd_5ns) / 5.0  # A/ns
         ns_at_check = steps_done * config.timestep_fs / 1e6
         logger.info(
-            "10 ns check: RMSD = %.1f A, slope = %.3f A/ns (threshold 0.05)",
+            "10 ns check: RMSD = %.1f A, slope = %.3f A/ns (threshold %.2f)",
             rmsd_10ns,
             slope,
+            _SLOPE_THRESHOLD_A_PER_NS,
         )
 
-        if slope > 0.05:
+        if slope > _SLOPE_THRESHOLD_A_PER_NS:
             logger.warning(
                 "EARLY ABORT (slope): %.3f A/ns > 0.05 at %.1f ns",
                 slope,
@@ -909,7 +925,7 @@ class OpenMMRunner:
                 "peptide_ca_rmsd_5ns_A": round(rmsd_5ns, 2),
                 "peptide_ca_rmsd_10ns_A": round(rmsd_10ns, 2),
                 "slope_A_per_ns": round(slope, 4),
-                "slope_threshold": 0.05,
+                "slope_threshold": _SLOPE_THRESHOLD_A_PER_NS,
                 "target": config.target,
                 "peptide_id": config.peptide_id,
             }

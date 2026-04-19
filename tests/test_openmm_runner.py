@@ -52,7 +52,7 @@ class TestOpenMMConfig:
         config = OpenMMConfig(
             receptor_pdb="rec.pdb",
             peptide_pdb="pep.pdb",
-            output_dir="/tmp/out",
+            output_dir="fake/out",
             target="demo",
             peptide_id="PEP001",
         )
@@ -160,7 +160,7 @@ class TestSimulationResult:
         config = OpenMMConfig(target="demo", peptide_id="PEP001")
         result = SimulationResult(
             config=config,
-            trajectory_path="/tmp/traj.dcd",
+            trajectory_path="fake/traj.dcd",
             total_ns=100.0,
             elapsed_seconds=36000.0,
             ns_per_day=240.0,
