@@ -30,7 +30,7 @@ class TestQualityGate:
     def test_clean_prediction_passes(self) -> None:
         result = PredictionResult(
             name="test",
-            structure_path="/tmp/test.pdb",
+            structure_path="fake/test.pdb",
             confidence=ConfidenceScores(iptm=0.85, ptm=0.80, plddt_mean=82.0, clash_count=0),
         )
         gated = apply_quality_gate(result)
@@ -51,7 +51,7 @@ class TestQualityGate:
     def test_severe_clashes_fail(self) -> None:
         result = PredictionResult(
             name="test",
-            structure_path="/tmp/test.pdb",
+            structure_path="fake/test.pdb",
             confidence=ConfidenceScores(iptm=0.85, plddt_mean=80.0, clash_severe_count=1),
         )
         gated = apply_quality_gate(result)
@@ -61,7 +61,7 @@ class TestQualityGate:
     def test_many_clashes_fail(self) -> None:
         result = PredictionResult(
             name="test",
-            structure_path="/tmp/test.pdb",
+            structure_path="fake/test.pdb",
             confidence=ConfidenceScores(iptm=0.85, plddt_mean=80.0, clash_count=5),
         )
         gated = apply_quality_gate(result)
@@ -70,7 +70,7 @@ class TestQualityGate:
     def test_mild_clashes_conditional(self) -> None:
         result = PredictionResult(
             name="test",
-            structure_path="/tmp/test.pdb",
+            structure_path="fake/test.pdb",
             confidence=ConfidenceScores(iptm=0.85, plddt_mean=80.0, clash_count=2),
         )
         gated = apply_quality_gate(result)
@@ -79,7 +79,7 @@ class TestQualityGate:
     def test_low_iptm_fails(self) -> None:
         result = PredictionResult(
             name="test",
-            structure_path="/tmp/test.pdb",
+            structure_path="fake/test.pdb",
             confidence=ConfidenceScores(iptm=0.3, plddt_mean=80.0),
         )
         gated = apply_quality_gate(result)
@@ -88,7 +88,7 @@ class TestQualityGate:
     def test_moderate_iptm_conditional(self) -> None:
         result = PredictionResult(
             name="test",
-            structure_path="/tmp/test.pdb",
+            structure_path="fake/test.pdb",
             confidence=ConfidenceScores(iptm=0.6, plddt_mean=80.0),
         )
         gated = apply_quality_gate(result)
@@ -97,7 +97,7 @@ class TestQualityGate:
     def test_low_plddt_fails(self) -> None:
         result = PredictionResult(
             name="test",
-            structure_path="/tmp/test.pdb",
+            structure_path="fake/test.pdb",
             confidence=ConfidenceScores(iptm=0.85, plddt_mean=40.0),
         )
         gated = apply_quality_gate(result)
@@ -106,7 +106,7 @@ class TestQualityGate:
     def test_moderate_plddt_conditional(self) -> None:
         result = PredictionResult(
             name="test",
-            structure_path="/tmp/test.pdb",
+            structure_path="fake/test.pdb",
             confidence=ConfidenceScores(iptm=0.85, plddt_mean=60.0),
         )
         gated = apply_quality_gate(result)
@@ -115,7 +115,7 @@ class TestQualityGate:
     def test_low_ranking_score_fails(self) -> None:
         result = PredictionResult(
             name="test",
-            structure_path="/tmp/test.pdb",
+            structure_path="fake/test.pdb",
             confidence=ConfidenceScores(iptm=0.85, plddt_mean=80.0, ranking_score=0.3),
         )
         gated = apply_quality_gate(result)
@@ -124,7 +124,7 @@ class TestQualityGate:
     def test_moderate_ranking_score_conditional(self) -> None:
         result = PredictionResult(
             name="test",
-            structure_path="/tmp/test.pdb",
+            structure_path="fake/test.pdb",
             confidence=ConfidenceScores(iptm=0.85, plddt_mean=80.0, ranking_score=0.6),
         )
         gated = apply_quality_gate(result)
@@ -134,7 +134,7 @@ class TestQualityGate:
         """ipTM=0 means not populated — should not trigger a gate."""
         result = PredictionResult(
             name="test",
-            structure_path="/tmp/test.pdb",
+            structure_path="fake/test.pdb",
             confidence=ConfidenceScores(iptm=0.0, plddt_mean=80.0),
         )
         gated = apply_quality_gate(result)
@@ -384,7 +384,7 @@ class TestSerialization:
             name="test",
             receptor_sequence="MVKL",
             peptide_sequence="RWK",
-            structure_path="/tmp/test.pdb",
+            structure_path="fake/test.pdb",
             quality_gate=QualityGate.PASS,
             runtime_seconds=123.456,
         )
