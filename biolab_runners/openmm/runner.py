@@ -787,15 +787,37 @@ class OpenMMRunner:
         return rec_ca, pep_ca
 
     @staticmethod
+    def _pbc_correct(diff: object, box_vecs: object, np: object) -> object:
+        """Apply minimum-image PBC correction to displacement vectors."""
+        box_diag = np.array([box_vecs[0][0], box_vecs[1][1], box_vecs[2][2]])  # type: ignore[union-attr,index]
+        diff -= np.round(diff / box_diag) * box_diag  # type: ignore[union-attr]
+        return diff
+
+    @staticmethod
+    def _peptide_ca_rmsd(
+        simulation: object,
+        ref_pep_ca: object,
+        ref_pep_ca_idx: list[int],
+        unit: object,
+        np: object,
+    ) -> float:
+        """Compute PBC-corrected peptide Ca RMSD vs reference positions."""
+        state = simulation.context.getState(getPositions=True)  # type: ignore[union-attr]
+        cur_pos = state.getPositions(asNumpy=True).value_in_unit(unit.angstroms)  # type: ignore[union-attr]
+        box_vecs = state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.angstroms)  # type: ignore[union-attr]
+        diff = cur_pos[ref_pep_ca_idx] - ref_pep_ca
+        diff = OpenMMRunner._pbc_correct(diff, box_vecs, np)
+        return float(np.sqrt((diff**2).sum(axis=1).mean()))  # type: ignore[union-attr]
+
+    @staticmethod
     def _min_pbc_distance(
         rec_ca: list[object], pep_ca: list[object], box_vecs: object, np: object
     ) -> float:
         """Compute min PBC-corrected distance between two sets of positions."""
         rec_arr = np.array(rec_ca)  # type: ignore[union-attr]
         pep_arr = np.array(pep_ca)  # type: ignore[union-attr]
-        box_diag = np.array([box_vecs[0][0], box_vecs[1][1], box_vecs[2][2]])  # type: ignore[union-attr,index]
         diffs = rec_arr[:, None, :] - pep_arr[None, :, :]
-        diffs -= np.round(diffs / box_diag) * box_diag  # type: ignore[union-attr]
+        diffs = OpenMMRunner._pbc_correct(diffs, box_vecs, np)
         dists = np.sqrt((np.square(diffs)).sum(axis=-1))  # type: ignore[union-attr]
         return float(dists.min())
 
@@ -817,18 +839,7 @@ class OpenMMRunner:
 
         Returns the peptide RMSD, or None if check could not be performed.
         """
-        state = simulation.context.getState(getPositions=True)  # type: ignore[union-attr]
-        cur_pos = state.getPositions(asNumpy=True).value_in_unit(unit.angstroms)  # type: ignore[union-attr]
-        cur_pep_ca = cur_pos[ref_pep_ca_idx]
-
-        # PBC correction
-        box_vecs = state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.angstroms)  # type: ignore[union-attr]
-        box_diag = np.array([box_vecs[0][0], box_vecs[1][1], box_vecs[2][2]])  # type: ignore[union-attr]
-
-        diff = cur_pep_ca - ref_pep_ca
-        diff -= np.round(diff / box_diag) * box_diag  # type: ignore[union-attr]
-        pep_rmsd = float(np.sqrt((diff**2).sum(axis=1).mean()))  # type: ignore[union-attr]
-
+        pep_rmsd = OpenMMRunner._peptide_ca_rmsd(simulation, ref_pep_ca, ref_pep_ca_idx, unit, np)
         ns_at_check = steps_done * config.timestep_fs / 1e6
         logger.info(
             "5 ns check: peptide Ca RMSD = %.1f A, abort threshold = %.1f A",
@@ -875,17 +886,7 @@ class OpenMMRunner:
 
         Returns True if the slope exceeds the threshold (0.05 A/ns).
         """
-        state = simulation.context.getState(getPositions=True)  # type: ignore[union-attr]
-        cur_pos = state.getPositions(asNumpy=True).value_in_unit(unit.angstroms)  # type: ignore[union-attr]
-        cur_pep_ca = cur_pos[ref_pep_ca_idx]
-
-        box_vecs = state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.angstroms)  # type: ignore[union-attr]
-        box_diag = np.array([box_vecs[0][0], box_vecs[1][1], box_vecs[2][2]])  # type: ignore[union-attr]
-
-        diff = cur_pep_ca - ref_pep_ca
-        diff -= np.round(diff / box_diag) * box_diag  # type: ignore[union-attr]
-        rmsd_10ns = float(np.sqrt((diff**2).sum(axis=1).mean()))  # type: ignore[union-attr]
-
+        rmsd_10ns = OpenMMRunner._peptide_ca_rmsd(simulation, ref_pep_ca, ref_pep_ca_idx, unit, np)
         slope = (rmsd_10ns - rmsd_5ns) / 5.0  # A/ns
         ns_at_check = steps_done * config.timestep_fs / 1e6
         logger.info(
