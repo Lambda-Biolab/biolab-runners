@@ -468,6 +468,10 @@ class _FakeSimulation:
     def __init__(self, positions: object, box: object) -> None:
         self.context = _FakeContext(positions, box)
 
+    def saveState(self, _path: str) -> None:  # noqa: N802
+        """No-op — abort path writes state.xml on real sims; tests don't need it."""
+        return None
+
 
 class _FakeContext:
     def __init__(self, positions: object, box: object) -> None:
@@ -684,3 +688,294 @@ class TestPbcCorrectTriclinic:
         assert out.shape == (3, 4, 3)
         # All pairs wrap to the same ~0.866 Å displacement (−0.5,−0.5,−0.5).
         assert np.allclose(np.linalg.norm(out, axis=-1), np.sqrt(0.75), atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# _check_slope_10ns — conjunctive slope gate (#167)
+#
+# The prior implementation fired on slope > 0.05 Å/ns alone, using the
+# endpoint-to-endpoint slope (RMSD_10ns − RMSD_5ns) / 5. Both choices were
+# wrong: (a) at 310 K a bound peptide's RMSD fluctuates at ~0.1-0.2 Å/ns
+# from thermal noise, so the threshold triggers on stably-bound peptides;
+# (b) point-to-point slope has huge variance from single-frame noise.
+# This session's VicK_g2_abc021a3_cstr validation was the load-bearing
+# example — online slope 0.111 Å/ns false-aborted a peptide with max 3.82 Å
+# RMSD over the full 10 ns trajectory (offline mdtraj ground truth).
+#
+# Fix: conjunctive gate — abort only when BOTH
+# (i) rmsd_10ns > abort_thresh (the same 2× iRMSD absolute bound the 5 ns
+#     gate uses), AND
+# (ii) regression slope over every sub-chunk sample in the 5→10 ns window
+#      > 0.05 Å/ns.
+# ---------------------------------------------------------------------------
+
+
+class TestRegressionSlope:
+    """``_regression_slope`` computes a least-squares fit, not endpoint-to-endpoint."""
+
+    def test_matches_polyfit_on_noisy_data(self) -> None:
+        """``_regression_slope`` delegates to ``np.polyfit``, bitwise-identical."""
+        import numpy as np
+
+        rng = np.random.default_rng(seed=0)
+        xs = np.linspace(5.0, 10.0, 17)
+        ys_clean = 3.0 + 0.1 * (xs - 5.0)  # true slope 0.1 Å/ns
+        ys = ys_clean + rng.normal(0.0, 0.3, size=xs.shape)
+        samples = list(zip(xs.tolist(), ys.tolist(), strict=True))
+        slope = OpenMMRunner._regression_slope(samples, np)  # noqa: SLF001
+        expected_slope, _ = np.polyfit(xs, ys, 1)
+        assert slope == pytest.approx(float(expected_slope), abs=1e-12)
+
+    def test_converges_to_true_slope_with_many_samples(self) -> None:
+        """Averaged across many noise seeds the regression tracks the true slope.
+
+        Endpoint-to-endpoint slope has expected value = true slope but variance
+        2σ²/window²; regression over N samples has variance 12σ²/(N window²),
+        so regression beats endpoint-to-endpoint by a factor of N/6. This test
+        verifies that convergence behaviour across 50 seeds — an individual
+        draw is not guaranteed to win, but the average absolutely does.
+        """
+        import numpy as np
+
+        errs_regression: list[float] = []
+        errs_endpoint: list[float] = []
+        for seed in range(50):
+            rng = np.random.default_rng(seed=seed)
+            xs = np.linspace(5.0, 10.0, 17)
+            ys = 3.0 + 0.1 * (xs - 5.0) + rng.normal(0.0, 0.3, size=xs.shape)
+            samples = list(zip(xs.tolist(), ys.tolist(), strict=True))
+            slope = OpenMMRunner._regression_slope(samples, np)  # noqa: SLF001
+            endpoint = (ys[-1] - ys[0]) / (xs[-1] - xs[0])
+            errs_regression.append(abs(slope - 0.1))
+            errs_endpoint.append(abs(endpoint - 0.1))
+        assert np.mean(errs_regression) < np.mean(errs_endpoint)
+
+    def test_two_samples_returns_endpoint_slope(self) -> None:
+        import numpy as np
+
+        samples = [(5.0, 3.1), (10.0, 3.7)]
+        slope = OpenMMRunner._regression_slope(samples, np)  # noqa: SLF001
+        assert slope == pytest.approx(0.12, abs=1e-10)
+
+
+class TestCheckSlope10nsConjunctiveGate:
+    """Regression tests pinning the #167 fix."""
+
+    @staticmethod
+    def _make_stationary_peptide_setup() -> tuple[object, list[int], object, list[int], object]:
+        """A frame where the peptide coincides with its reference (RMSD = 0)."""
+        import numpy as np
+
+        rec = np.array(
+            [[np.cos(i * 1.0), np.sin(i * 1.0), i * 1.5] for i in range(10)],
+            dtype=float,
+        )
+        pep = np.array([[3.0, 0.0, 2.0], [3.5, 0.5, 3.5], [3.0, 1.0, 5.0]], dtype=float)
+        positions = np.vstack([rec, pep])
+        rec_idx = list(range(10))
+        pep_idx = list(range(10, 13))
+        box = np.eye(3) * 100.0
+        sim = _FakeSimulation(positions, box)
+        return sim, rec_idx, rec, pep_idx, pep
+
+    def _make_config(self) -> OpenMMConfig:
+        # production_ns > 0 satisfies the config's internal assertions;
+        # the values themselves only feed into metadata fields.
+        return OpenMMConfig(
+            target="VicK",
+            peptide_id="VicK_g2_abc021a3_cstr",
+            production_ns=20.0,
+            timestep_fs=2.0,
+        )
+
+    def test_thermal_fluctuation_below_abs_thresh_does_not_abort(self, tmp_path: Path) -> None:
+        """The load-bearing #167 case — a bound peptide fluctuating at > 0.05 Å/ns.
+
+        Reference positions place the peptide exactly at pocket centre so
+        ``_peptide_ca_rmsd`` returns ~0 at 10 ns. Sampled history simulates
+        genuine thermal fluctuation between 5 and 10 ns (mean ~3.5 Å,
+        regression slope 0.11 Å/ns — the exact observed VicK signature).
+        With abort_thresh = 7 Å the conjunctive gate must NOT fire:
+        abs branch fails even though the slope branch would.
+        """
+        import numpy as np
+
+        sim, rec_idx, ref_rec, pep_idx, ref_pep = self._make_stationary_peptide_setup()
+        rng = np.random.default_rng(seed=0)
+        xs = np.linspace(5.0, 10.0, 17)
+        ys = 3.0 + 0.11 * (xs - 5.0) + rng.normal(0.0, 0.15, size=xs.shape)
+        rmsd_samples = list(zip(xs.tolist(), ys.tolist(), strict=True))[:-1]  # drop 10 ns
+
+        aborted = OpenMMRunner._check_slope_10ns(  # noqa: SLF001
+            sim,
+            ref_pep,
+            pep_idx,
+            ref_rec,
+            rec_idx,
+            rmsd_samples,
+            abort_thresh=7.0,
+            config=self._make_config(),
+            steps_done=5_000_000,
+            output_dir=tmp_path,
+            unit=_FakeUnit(),
+            np=np,
+        )
+        assert aborted is False
+        assert not (tmp_path / "early_abort.json").exists()
+
+    def test_true_dissociation_triggers_conjunctive_abort(self, tmp_path: Path) -> None:
+        """Peptide drifted out of pocket (RMSD >> 7 Å) AND slope positive → abort."""
+        import numpy as np
+
+        rec = np.array(
+            [[np.cos(i * 1.0), np.sin(i * 1.0), i * 1.5] for i in range(10)],
+            dtype=float,
+        )
+        ref_pep = np.array([[3.0, 0.0, 2.0], [3.5, 0.5, 3.5], [3.0, 1.0, 5.0]], dtype=float)
+        # Simulate peptide translated 9 Å out of pocket by 10 ns.
+        cur_pep = ref_pep + np.array([9.0, 0.0, 0.0])
+        positions = np.vstack([rec, cur_pep])
+        sim = _FakeSimulation(positions, np.eye(3) * 100.0)
+
+        xs = np.linspace(5.0, 10.0, 17)
+        ys = 3.0 + 1.2 * (xs - 5.0)  # clear drift: slope = 1.2 Å/ns
+        rmsd_samples = list(zip(xs.tolist(), ys.tolist(), strict=True))[:-1]
+
+        aborted = OpenMMRunner._check_slope_10ns(  # noqa: SLF001
+            sim,
+            ref_pep,
+            [10, 11, 12],
+            rec,
+            list(range(10)),
+            rmsd_samples,
+            abort_thresh=7.0,
+            config=self._make_config(),
+            steps_done=5_000_000,
+            output_dir=tmp_path,
+            unit=_FakeUnit(),
+            np=np,
+        )
+        assert aborted is True
+        meta = json.loads((tmp_path / "early_abort.json").read_text())
+        assert meta["aborted"] is True
+        assert meta["abort_reason"] == "rmsd_slope_drift"
+        assert meta["gate"] == "conjunctive"
+        assert meta["abs_threshold_A"] == 7.0
+        assert meta["slope_A_per_ns"] > 0.05
+        assert meta["peptide_ca_rmsd_10ns_A"] > 7.0
+
+    def test_high_slope_but_rmsd_below_abs_thresh_does_not_abort(self, tmp_path: Path) -> None:
+        """Slope > threshold but RMSD inside pocket → conjunctive gate holds."""
+        import numpy as np
+
+        sim, rec_idx, ref_rec, pep_idx, ref_pep = self._make_stationary_peptide_setup()
+        xs = np.linspace(5.0, 10.0, 17)
+        ys = 3.0 + 0.3 * (xs - 5.0)  # slope 0.3 Å/ns (would trip the old gate)
+        rmsd_samples = list(zip(xs.tolist(), ys.tolist(), strict=True))[:-1]
+
+        aborted = OpenMMRunner._check_slope_10ns(  # noqa: SLF001
+            sim,
+            ref_pep,
+            pep_idx,
+            ref_rec,
+            rec_idx,
+            rmsd_samples,
+            abort_thresh=7.0,
+            config=self._make_config(),
+            steps_done=5_000_000,
+            output_dir=tmp_path,
+            unit=_FakeUnit(),
+            np=np,
+        )
+        assert aborted is False
+
+    def test_high_rmsd_but_negative_slope_does_not_abort(self, tmp_path: Path) -> None:
+        """Peptide outside pocket at 10 ns but drifting back → slope branch holds."""
+        import numpy as np
+
+        rec = np.array(
+            [[np.cos(i * 1.0), np.sin(i * 1.0), i * 1.5] for i in range(10)],
+            dtype=float,
+        )
+        ref_pep = np.array([[3.0, 0.0, 2.0], [3.5, 0.5, 3.5], [3.0, 1.0, 5.0]], dtype=float)
+        cur_pep = ref_pep + np.array([9.0, 0.0, 0.0])  # at 9 Å at 10 ns
+        positions = np.vstack([rec, cur_pep])
+        sim = _FakeSimulation(positions, np.eye(3) * 100.0)
+
+        xs = np.linspace(5.0, 10.0, 17)
+        ys = 12.0 - 0.4 * (xs - 5.0)  # was higher at 5 ns, re-binding (negative slope)
+        rmsd_samples = list(zip(xs.tolist(), ys.tolist(), strict=True))[:-1]
+
+        aborted = OpenMMRunner._check_slope_10ns(  # noqa: SLF001
+            sim,
+            ref_pep,
+            [10, 11, 12],
+            rec,
+            list(range(10)),
+            rmsd_samples,
+            abort_thresh=7.0,
+            config=self._make_config(),
+            steps_done=5_000_000,
+            output_dir=tmp_path,
+            unit=_FakeUnit(),
+            np=np,
+        )
+        assert aborted is False
+
+    def test_window_too_short_skips_gate(self, tmp_path: Path) -> None:
+        """Fewer than ``_MIN_SLOPE_WINDOW_NS`` of samples → return False (no abort)."""
+        import numpy as np
+
+        sim, rec_idx, ref_rec, pep_idx, ref_pep = self._make_stationary_peptide_setup()
+        rmsd_samples = [(9.9, 3.0)]  # only one sample, < 2 ns window span
+
+        aborted = OpenMMRunner._check_slope_10ns(  # noqa: SLF001
+            sim,
+            ref_pep,
+            pep_idx,
+            ref_rec,
+            rec_idx,
+            rmsd_samples,
+            abort_thresh=7.0,
+            config=self._make_config(),
+            steps_done=5_000_000,
+            output_dir=tmp_path,
+            unit=_FakeUnit(),
+            np=np,
+        )
+        assert aborted is False
+
+    def test_vick_g2_abc021a3_ground_truth_would_pass(self, tmp_path: Path) -> None:
+        """The exact VicK signature from 2026-04-20 must not false-abort.
+
+        Observed online: rmsd_5ns=3.12 Å, rmsd_10ns=3.68 Å, endpoint slope
+        0.111 Å/ns → EARLY_FAIL under the old gate. Offline ground truth
+        (mdtraj full trajectory): max 3.82 Å, final 1.96 Å — genuinely bound.
+        With the conjunctive gate, abs_rmsd < 7 Å is enough to save the run.
+        """
+        import numpy as np
+
+        sim, rec_idx, ref_rec, pep_idx, ref_pep = self._make_stationary_peptide_setup()
+        # 17 samples between 5 and 10 ns, endpoint RMSDs match the observed run,
+        # interior points include thermal noise consistent with the online log.
+        rng = np.random.default_rng(seed=42)
+        xs = np.linspace(5.0, 10.0, 17)
+        ys_mean = 3.12 + (3.68 - 3.12) * (xs - 5.0) / 5.0
+        ys = ys_mean + rng.normal(0.0, 0.2, size=xs.shape)
+        rmsd_samples = list(zip(xs.tolist(), ys.tolist(), strict=True))[:-1]
+
+        aborted = OpenMMRunner._check_slope_10ns(  # noqa: SLF001
+            sim,
+            ref_pep,
+            pep_idx,
+            ref_rec,
+            rec_idx,
+            rmsd_samples,
+            abort_thresh=7.0,
+            config=self._make_config(),
+            steps_done=5_000_000,
+            output_dir=tmp_path,
+            unit=_FakeUnit(),
+            np=np,
+        )
+        assert aborted is False
