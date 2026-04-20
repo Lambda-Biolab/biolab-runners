@@ -476,8 +476,12 @@ class OpenMMRunner:
                     else:
                         ref_pep_ca_idx.append(atom.index)
 
+        # #174: enforcePeriodicBox=True matches DCDReporter output, so the
+        # gate's reference frame is comparable to offline-computed values.
         ref_positions = (
-            ctx.simulation.context.getState(getPositions=True)  # type: ignore[union-attr]
+            ctx.simulation.context.getState(  # type: ignore[union-attr]
+                getPositions=True, enforcePeriodicBox=True
+            )
             .getPositions(asNumpy=True)
             .value_in_unit(ctx.unit_mod.angstroms)  # type: ignore[union-attr]
         )
@@ -770,8 +774,12 @@ class OpenMMRunner:
         np: object,
     ) -> None:
         """Measure peptide-receptor Ca min distance after equilibration and write metadata."""
+        # #174: enforcePeriodicBox=True so equilibration-end coords match
+        # what the reference frame + gate sample at runtime.
         eq_positions = (
-            simulation.context.getState(getPositions=True)  # type: ignore[union-attr]
+            simulation.context.getState(  # type: ignore[union-attr]
+                getPositions=True, enforcePeriodicBox=True
+            )
             .getPositions(asNumpy=True)
             .value_in_unit(unit.angstroms)  # type: ignore[union-attr]
         )
@@ -873,24 +881,35 @@ class OpenMMRunner:
 
         Measures peptide displacement in the **receptor's reference frame**,
         so receptor diffusion and tumbling during production do not inflate
-        the RMSD. Per-atom PBC correction is applied first to unwrap atoms
-        that crossed a box edge, then a translation + rotation is fitted to
-        the receptor Cα positions and applied to the current peptide Cα.
+        the RMSD.
 
-        Using this function, a trajectory in which receptor + peptide move
-        as a rigid body returns RMSD ≈ 0. Lab-frame subtraction (the prior
+        OralBiome-AMP#174 fix: request ``enforcePeriodicBox=True`` on
+        ``getState`` so the online gate sees the same coordinate system
+        as ``DCDReporter`` writes (per-residue whole wrapping). The
+        previous default (``enforcePeriodicBox=False``) returned raw
+        unwrapped coordinates where atoms could diffuse many Å from
+        their starting image; per-atom ``_pbc_correct`` could not
+        recover because adjacent atoms near a box midplane would pick
+        different "closest image" wraps, fragmenting rigid structure
+        and inflating Kabsch residuals into the tens of Å — producing
+        phantom 10–13 Å RMSD values that did not exist in the offline
+        DCD. With enforcePeriodicBox=True, receptor and peptide remain
+        whole, so Kabsch fit on receptor handles the rigid-body PBC
+        shift naturally — no per-atom PBC unwrap needed.
+
+        A trajectory in which receptor + peptide move as a rigid body
+        returns RMSD ≈ 0. Lab-frame subtraction (the pre-#162
         implementation, superseded because it reported large RMSDs for
-        bound peptides that merely followed a rotating receptor) is not used.
+        bound peptides that merely followed a rotating receptor) is
+        not used.
         """
-        state = simulation.context.getState(getPositions=True)  # type: ignore[union-attr]
+        state = simulation.context.getState(  # type: ignore[union-attr]
+            getPositions=True, enforcePeriodicBox=True
+        )
         cur_pos = state.getPositions(asNumpy=True).value_in_unit(unit.angstroms)  # type: ignore[union-attr]
-        box_vecs = state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.angstroms)  # type: ignore[union-attr]
 
-        # Per-atom PBC unwrap: current_unwrapped = ref + pbc(current − ref)
-        rec_diff = OpenMMRunner._pbc_correct(cur_pos[ref_rec_ca_idx] - ref_rec_ca, box_vecs, np)
-        cur_rec = ref_rec_ca + rec_diff  # type: ignore[operator]
-        pep_diff = OpenMMRunner._pbc_correct(cur_pos[ref_pep_ca_idx] - ref_pep_ca, box_vecs, np)
-        cur_pep = ref_pep_ca + pep_diff  # type: ignore[operator]
+        cur_rec = cur_pos[ref_rec_ca_idx]
+        cur_pep = cur_pos[ref_pep_ca_idx]
 
         # Kabsch: fit rotation + translation of receptor Cα onto the reference.
         cur_centroid = cur_rec.mean(axis=0)  # type: ignore[union-attr]

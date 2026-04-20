@@ -477,7 +477,11 @@ class _FakeContext:
     def __init__(self, positions: object, box: object) -> None:
         self._state = _FakeState(positions, box)
 
-    def getState(self, getPositions: bool = False) -> _FakeState:  # noqa: ARG002, N802, N803, FBT001, FBT002
+    def getState(  # noqa: ARG002, N802, N803, FBT001, FBT002
+        self,
+        getPositions: bool = False,  # noqa: N803
+        enforcePeriodicBox: bool = False,  # noqa: N803
+    ) -> _FakeState:
         return self._state
 
 
