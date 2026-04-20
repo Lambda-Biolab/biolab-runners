@@ -43,11 +43,13 @@ def write_boltz_yaml(
     msa_paths: dict[str, str] | None = None,
     pocket_contacts: list[tuple[str, int]] | None = None,
     binder_chain: str = "B",
+    modifications: dict[str, list[dict[str, object]]] | None = None,
 ) -> Path:
     """Write a Boltz-2 v2 YAML input file.
 
     Boltz-2 v2 uses YAML as the primary input format, supporting multi-chain
-    complexes, pre-computed MSAs, and pocket constraints.
+    complexes, pre-computed MSAs, pocket constraints, and non-canonical
+    residue modifications via the PDB CCD dictionary.
 
     Args:
         sequences: Dict mapping chain_id to amino acid sequence.
@@ -57,11 +59,20 @@ def write_boltz_yaml(
         pocket_contacts: Optional list of (chain_id, residue_number) tuples
             specifying receptor residues the binder must contact.
         binder_chain: Chain ID of the binder/peptide (default "B").
+        modifications: Optional dict mapping chain_id to a list of residue
+            modifications. Each modification is a dict with keys
+            ``position`` (1-indexed residue number) and ``ccd`` (PDB CCD
+            three/four-letter code, e.g. ``"AIB"`` for α-aminoisobutyric
+            acid). Boltz-2 replaces the sequence token at ``position-1``
+            with the CCD residue during parsing, yielding the correct
+            non-canonical heavy-atom set in the output structure. See
+            ``boltz.data.parse.schema`` for the upstream contract.
 
     Returns:
         Path to the written YAML file.
     """
     msa_paths = msa_paths or {}
+    modifications = modifications or {}
     output_path.parent.mkdir(parents=True, exist_ok=True)
     lines = ["version: 1", "sequences:"]
     for chain_id, seq in sequences.items():
@@ -70,6 +81,12 @@ def write_boltz_yaml(
         lines.append(f"      sequence: {seq}")
         if chain_id in msa_paths:
             lines.append(f"      msa: {msa_paths[chain_id]}")
+        chain_mods = modifications.get(chain_id)
+        if chain_mods:
+            lines.append("      modifications:")
+            for mod in chain_mods:
+                lines.append(f"        - position: {mod['position']}")
+                lines.append(f"          ccd: {mod['ccd']}")
 
     if pocket_contacts:
         lines.append("constraints:")

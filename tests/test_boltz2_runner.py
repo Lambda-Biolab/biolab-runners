@@ -187,6 +187,68 @@ class TestWriteBoltzYaml:
         assert "[A, 123]" in content
         assert "[A, 456]" in content
 
+    def test_yaml_with_modifications(self, tmp_path: Path) -> None:
+        """Non-canonical residue modifications land under the right chain."""
+        yaml_path = tmp_path / "input.yaml"
+        write_boltz_yaml(
+            {"A": "MVKL", "B": "BKALBKKWBAWF"},
+            yaml_path,
+            modifications={
+                "B": [
+                    {"position": 1, "ccd": "AIB"},
+                    {"position": 5, "ccd": "AIB"},
+                    {"position": 9, "ccd": "AIB"},
+                ]
+            },
+        )
+        content = yaml_path.read_text()
+        assert "modifications:" in content
+        assert "- position: 1" in content
+        assert "ccd: AIB" in content
+        # 3 positions + 3 ccd entries
+        assert content.count("position:") == 3
+        assert content.count("ccd:") == 3
+
+        # Modifications block must nest under chain B only
+        b_block_start = content.index("id: B")
+        b_block = content[b_block_start:]
+        a_block = content[:b_block_start]
+        assert "modifications:" in b_block
+        assert "modifications:" not in a_block
+
+    def test_yaml_without_modifications_has_no_block(self, tmp_path: Path) -> None:
+        """Omitting modifications must not emit an empty 'modifications:' key."""
+        yaml_path = tmp_path / "input.yaml"
+        write_boltz_yaml({"A": "MVKL", "B": "RWKL"}, yaml_path)
+        assert "modifications:" not in yaml_path.read_text()
+
+    def test_yaml_modifications_empty_chain_list_skipped(self, tmp_path: Path) -> None:
+        """A chain with an empty mod list must not produce a header line."""
+        yaml_path = tmp_path / "input.yaml"
+        write_boltz_yaml(
+            {"A": "MVKL", "B": "RWKL"},
+            yaml_path,
+            modifications={"B": []},
+        )
+        assert "modifications:" not in yaml_path.read_text()
+
+    def test_yaml_modifications_coexist_with_msa_and_contacts(self, tmp_path: Path) -> None:
+        """All three optional blocks render together without interfering."""
+        yaml_path = tmp_path / "input.yaml"
+        write_boltz_yaml(
+            {"A": "MVKL", "B": "BKAL"},
+            yaml_path,
+            msa_paths={"A": "/data/msa.csv", "B": "empty"},
+            pocket_contacts=[("A", 42)],
+            modifications={"B": [{"position": 1, "ccd": "AIB"}]},
+        )
+        content = yaml_path.read_text()
+        assert "msa: /data/msa.csv" in content
+        assert "msa: empty" in content
+        assert "modifications:" in content
+        assert "constraints:" in content
+        assert "[A, 42]" in content
+
 
 # ---------------------------------------------------------------------------
 # Output validation tests
