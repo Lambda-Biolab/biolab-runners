@@ -70,6 +70,7 @@ _ABORT_MULTIPLIER = 2.0  # abort_thresh = irmsd_thresh * this
 _EARLY_ABORT_5NS_FS = 5_000_000  # 5 ns in femtoseconds
 _EARLY_ABORT_10NS_FS = 10_000_000  # 10 ns in femtoseconds
 _SLOPE_THRESHOLD_A_PER_NS = 0.05  # RMSD drift threshold (A/ns)
+_MIN_SLOPE_WINDOW_NS = 2.0  # regression needs at least this span for stability
 
 # Post-equilibration displacement
 _DISPLACEMENT_THRESHOLD_A = 8.0  # peptide-receptor Ca min distance (A)
@@ -970,58 +971,122 @@ class OpenMMRunner:
         return pep_rmsd
 
     @staticmethod
+    def _regression_slope(samples: list[tuple[float, float]], np: object) -> float:
+        """Least-squares slope of peptide-RMSD over the 5→10 ns sampling window.
+
+        ``samples`` is a list of ``(ns, rmsd_A)`` tuples captured every
+        sub-chunk between the 5 ns gate and the 10 ns gate. A regression
+        slope over ~17 samples is far less noisy than the endpoint-to-endpoint
+        estimate: a bound peptide at 310 K naturally fluctuates on the order
+        of 0.5-2 Å over nanosecond windows, so point-to-point slopes can swing
+        between 0.05 and 0.25 Å/ns from frame-to-frame noise, while the
+        least-squares line tracks the actual drift rate (OralBiome-AMP#167).
+        """
+        xs = np.asarray([s[0] for s in samples], dtype=float)  # type: ignore[union-attr]
+        ys = np.asarray([s[1] for s in samples], dtype=float)  # type: ignore[union-attr]
+        slope, _ = np.polyfit(xs, ys, 1)  # type: ignore[union-attr]
+        return float(slope)
+
+    @staticmethod
     def _check_slope_10ns(
         simulation: object,
         ref_pep_ca: object,
         ref_pep_ca_idx: list[int],
         ref_rec_ca: object,
         ref_rec_ca_idx: list[int],
-        rmsd_5ns: float,
+        rmsd_samples: list[tuple[float, float]],
+        abort_thresh: float,
         config: OpenMMConfig,
         steps_done: int,
         output_dir: Path,
         unit: object,
         np: object,
     ) -> bool:
-        """Check RMSD slope between 5 ns and 10 ns.
+        """Conjunctive early-abort gate at the 10 ns checkpoint.
 
-        Returns True if the slope exceeds the threshold (0.05 A/ns).
+        Fires only when BOTH conditions hold (OralBiome-AMP#167):
+
+        1. ``peptide_ca_rmsd_10ns > abort_thresh`` (the same absolute
+           2× iRMSD threshold the 5 ns gate uses).
+        2. Least-squares slope over the 5→10 ns window > 0.05 Å/ns.
+
+        The 5 ns endpoint alone is insufficient — published work
+        (Kokh/Wade τRAMD, residence-time MD) uses combined criteria because
+        slope-only gates trigger on thermal noise in bound states. A peptide
+        with RMSD well inside the pocket (< 2× iRMSD) that happens to be
+        fluctuating at > 0.05 Å/ns is bound-and-breathing, not dissociating.
+
+        Endpoint-to-endpoint slope is replaced by a linear regression over
+        every sub-chunk sample in the 5→10 ns window. The slope read from a
+        17-point fit is stable; the slope read from two single frames is
+        not. Returns True only on conjunctive abort.
         """
         rmsd_10ns = OpenMMRunner._peptide_ca_rmsd(
             simulation, ref_pep_ca, ref_pep_ca_idx, ref_rec_ca, ref_rec_ca_idx, unit, np
         )
-        slope = (rmsd_10ns - rmsd_5ns) / 5.0  # A/ns
         ns_at_check = steps_done * config.timestep_fs / 1e6
+        samples = [*rmsd_samples, (ns_at_check, rmsd_10ns)]
+
+        window_ns = samples[-1][0] - samples[0][0]
+        if len(samples) < 2 or window_ns < _MIN_SLOPE_WINDOW_NS:
+            logger.info(
+                "10 ns check: RMSD = %.1f A, only %d sample(s) over %.1f ns — "
+                "window too short for a meaningful regression, skipping slope gate",
+                rmsd_10ns,
+                len(samples),
+                window_ns,
+            )
+            return False
+
+        slope = OpenMMRunner._regression_slope(samples, np)
+        abs_above_thresh = rmsd_10ns > abort_thresh
+        slope_above_thresh = slope > _SLOPE_THRESHOLD_A_PER_NS
         logger.info(
-            "10 ns check: RMSD = %.1f A, slope = %.3f A/ns (threshold %.2f)",
+            "10 ns check: RMSD = %.2f A (abs threshold %.1f A), "
+            "regression slope = %.3f A/ns over %.1f ns (%d samples, threshold %.2f); "
+            "abs_above=%s slope_above=%s",
             rmsd_10ns,
+            abort_thresh,
             slope,
+            window_ns,
+            len(samples),
             _SLOPE_THRESHOLD_A_PER_NS,
+            abs_above_thresh,
+            slope_above_thresh,
         )
 
-        if slope > _SLOPE_THRESHOLD_A_PER_NS:
-            logger.warning(
-                "EARLY ABORT (slope): %.3f A/ns > 0.05 at %.1f ns",
-                slope,
-                ns_at_check,
-            )
-            simulation.saveState(str(output_dir / "state.xml"))  # type: ignore[union-attr]
-            abort_meta = {
-                "aborted": True,
-                "abort_reason": "rmsd_slope_drift",
-                "abort_step": steps_done,
-                "abort_ns": round(ns_at_check, 2),
-                "peptide_ca_rmsd_5ns_A": round(rmsd_5ns, 2),
-                "peptide_ca_rmsd_10ns_A": round(rmsd_10ns, 2),
-                "slope_A_per_ns": round(slope, 4),
-                "slope_threshold": _SLOPE_THRESHOLD_A_PER_NS,
-                "target": config.target,
-                "peptide_id": config.peptide_id,
-            }
-            (output_dir / "early_abort.json").write_text(json.dumps(abort_meta, indent=2))
-            return True
+        if not (abs_above_thresh and slope_above_thresh):
+            return False
 
-        return False
+        logger.warning(
+            "EARLY ABORT (conjunctive slope + abs): slope %.3f A/ns > %.2f AND "
+            "RMSD %.2f A > %.1f A at %.1f ns",
+            slope,
+            _SLOPE_THRESHOLD_A_PER_NS,
+            rmsd_10ns,
+            abort_thresh,
+            ns_at_check,
+        )
+        simulation.saveState(str(output_dir / "state.xml"))  # type: ignore[union-attr]
+        rmsd_5ns = rmsd_samples[0][1] if rmsd_samples else rmsd_10ns
+        abort_meta = {
+            "aborted": True,
+            "abort_reason": "rmsd_slope_drift",
+            "abort_step": steps_done,
+            "abort_ns": round(ns_at_check, 2),
+            "peptide_ca_rmsd_5ns_A": round(rmsd_5ns, 2),
+            "peptide_ca_rmsd_10ns_A": round(rmsd_10ns, 2),
+            "slope_A_per_ns": round(slope, 4),
+            "slope_threshold": _SLOPE_THRESHOLD_A_PER_NS,
+            "abs_threshold_A": round(abort_thresh, 2),
+            "window_ns": round(window_ns, 2),
+            "num_samples": len(samples),
+            "gate": "conjunctive",
+            "target": config.target,
+            "peptide_id": config.peptide_id,
+        }
+        (output_dir / "early_abort.json").write_text(json.dumps(abort_meta, indent=2))
+        return True
 
     def _run_production_loop(
         self,
@@ -1053,6 +1118,10 @@ class OpenMMRunner:
         early_abort_done = False
         slope_check_done = False
         rmsd_5ns: float | None = None
+        # Sampling buffer for the conjunctive slope gate (#167).
+        # Populated every sub-chunk between the 5 ns and 10 ns gates so the
+        # 10 ns regression runs over ~17 points instead of two.
+        rmsd_samples: list[tuple[float, float]] = []
         abort_reason = ""
         steps_box = [0]
         self._install_sigterm_handler(simulation, state_xml_path, steps_box, config)
@@ -1089,6 +1158,27 @@ class OpenMMRunner:
                 if aborted:
                     abort_reason = "early_dissociation"
                     break
+                if rmsd_5ns is not None:
+                    rmsd_samples.append((steps_done * config.timestep_fs / 1e6, rmsd_5ns))
+
+            in_slope_window = (
+                enable_early_abort
+                and not slope_check_done
+                and rmsd_5ns is not None
+                and ref_pep_ca is not None
+                and abort_step_5ns < steps_done < abort_step_10ns
+            )
+            if in_slope_window:
+                sample_rmsd = OpenMMRunner._peptide_ca_rmsd(
+                    simulation,
+                    ref_pep_ca,
+                    ref_pep_ca_idx,
+                    ref_rec_ca,
+                    ref_rec_ca_idx,
+                    unit,
+                    np,
+                )
+                rmsd_samples.append((steps_done * config.timestep_fs / 1e6, sample_rmsd))
 
             do_10ns = (
                 enable_early_abort
@@ -1105,7 +1195,8 @@ class OpenMMRunner:
                     ref_pep_ca_idx,
                     ref_rec_ca,
                     ref_rec_ca_idx,
-                    rmsd_5ns,  # type: ignore[arg-type]
+                    rmsd_samples,
+                    abort_thresh,
                     config,
                     steps_done,
                     output_dir,
