@@ -818,10 +818,27 @@ class OpenMMRunner:
 
     @staticmethod
     def _pbc_correct(diff: object, box_vecs: object, np: object) -> object:
-        """Apply minimum-image PBC correction to displacement vectors."""
-        box_diag = np.array([box_vecs[0][0], box_vecs[1][1], box_vecs[2][2]])  # type: ignore[union-attr,index]
-        diff -= np.round(diff / box_diag) * box_diag  # type: ignore[union-attr]
-        return diff
+        """Apply minimum-image PBC correction to displacement vectors.
+
+        Supports general triclinic cells (orthorhombic, dodecahedron,
+        truncated octahedron). The diagonal-only implementation used
+        previously was correct for rectangular boxes but produced spurious
+        large distances for GROMACS-style dodecahedron cells whenever an
+        atom crossed a non-orthogonal face, because the off-diagonal
+        lattice components were silently dropped. Converting ``diff`` to
+        fractional coordinates via the inverse lattice, snapping to the
+        nearest integer image, and converting back gives the correct
+        minimum image for any box shape and reduces exactly to the prior
+        diagonal operation when the lattice is rectangular.
+
+        Accepts any array whose last axis has length 3; the inverse
+        lattice multiplication broadcasts over leading axes.
+        """
+        box = np.asarray(box_vecs)  # type: ignore[union-attr]
+        inv = np.linalg.inv(box)  # type: ignore[union-attr]
+        frac = diff @ inv  # type: ignore[operator]
+        frac = frac - np.round(frac)  # type: ignore[union-attr]
+        return frac @ box  # type: ignore[operator]
 
     @staticmethod
     def _kabsch_rotation(

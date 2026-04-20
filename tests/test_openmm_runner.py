@@ -586,3 +586,101 @@ class TestPeptideCaRmsdReceptorAligned:
         )
         # Each of 3 peptide Cα moved 2 Å along z → RMSD = 2 Å regardless of rotation.
         assert rmsd == pytest.approx(2.0, abs=1e-8)
+
+
+# ---------------------------------------------------------------------------
+# _pbc_correct — triclinic / dodecahedron minimum-image regression tests
+#
+# OralBiome-AMP#163: the prior implementation used only the diagonal of the
+# lattice (box[0][0], box[1][1], box[2][2]). For GROMACS-style rhombic
+# dodecahedron cells the third lattice vector has off-diagonal components,
+# so atoms crossing a non-orthogonal face were not wrapped correctly —
+# minimum-image distances appeared tens of Å larger than reality.
+# Discovered when VicK_g2_abc021a3_cstr's online early-abort gate fired at
+# 10 ns while offline mdtraj analysis (which knows the full lattice) saw
+# max Cα-RMSD < 4 Å. Fix: convert to fractional coordinates via the inverse
+# lattice, snap to nearest image, convert back. Orthorhombic case reduces
+# exactly to the prior diagonal operation.
+# ---------------------------------------------------------------------------
+
+
+class TestPbcCorrectTriclinic:
+    """Regression tests pinning the #163 dodecahedron PBC fix."""
+
+    @staticmethod
+    def _dodecahedron_box(d: float = 60.0) -> object:
+        """GROMACS rhombic dodecahedron (xy-square) with edge length ``d``."""
+        import math
+
+        import numpy as np
+
+        return np.array(
+            [
+                [d, 0.0, 0.0],
+                [0.0, d, 0.0],
+                [0.5 * d, 0.5 * d, d / math.sqrt(2.0)],
+            ]
+        )
+
+    def test_orthorhombic_parity_with_diagonal_formula(self) -> None:
+        """For rectangular boxes the new formula must agree with the diagonal one."""
+        import numpy as np
+
+        box = np.diag([60.0, 45.0, 80.0]).astype(float)
+        rng = np.random.default_rng(seed=0)
+        diff = rng.uniform(-100.0, 100.0, size=(8, 3))
+        out = OpenMMRunner._pbc_correct(diff.copy(), box, np)  # noqa: SLF001
+        box_diag = np.array([box[0, 0], box[1, 1], box[2, 2]])
+        expected = diff - np.round(diff / box_diag) * box_diag
+        assert np.allclose(out, expected, atol=1e-10)
+
+    def test_dodecahedron_single_lattice_vector_wraps_to_zero(self) -> None:
+        """A displacement equal to lattice vector ``c`` must collapse to 0."""
+        import numpy as np
+
+        box = self._dodecahedron_box()
+        diff = box[2].reshape(1, 3).copy()  # one c-image
+        out = OpenMMRunner._pbc_correct(diff.copy(), box, np)  # noqa: SLF001
+        assert np.allclose(out, 0.0, atol=1e-10)
+
+        # Pre-fix diagonal-only formula left off-diagonal slop behind.
+        box_diag = np.array([box[0, 0], box[1, 1], box[2, 2]])
+        pre_fix = diff - np.round(diff / box_diag) * box_diag
+        assert np.linalg.norm(pre_fix) > 30.0  # ≈ d/√2 of stale xy components
+
+    def test_dodecahedron_face_crossing_minimum_image(self) -> None:
+        """Receptor-peptide displacement that crosses a diagonal face wraps correctly.
+
+        This is the production failure mode: in a bound complex with receptor
+        near the origin and peptide images diffusing across a non-orthogonal
+        face, the diagonal-only code reported min distances of 30–40 Å while
+        the true minimum-image distance was < 1 Å.
+        """
+        import numpy as np
+
+        box = self._dodecahedron_box(d=60.0)
+        # Peptide just past one ``c`` image from receptor.
+        rec = np.array([[0.0, 0.0, 0.0]])
+        pep = (box[2] + np.array([0.3, 0.3, 0.1])).reshape(1, 3)
+        diff = pep - rec
+        out = OpenMMRunner._pbc_correct(diff.copy(), box, np)  # noqa: SLF001
+        min_dist = float(np.linalg.norm(out, axis=-1).min())
+        assert min_dist < 1.0  # true distance ≈ 0.436 Å
+
+        # Pre-fix diagonal code returned ~36 Å here (huge false "dissociation").
+        box_diag = np.array([box[0, 0], box[1, 1], box[2, 2]])
+        pre_fix = diff - np.round(diff / box_diag) * box_diag
+        assert float(np.linalg.norm(pre_fix, axis=-1).min()) > 30.0
+
+    def test_pbc_correct_broadcasts_over_leading_axes(self) -> None:
+        """``_pbc_correct`` must accept (M, N, 3) arrays used by ``_min_pbc_distance``."""
+        import numpy as np
+
+        box = self._dodecahedron_box()
+        rec = np.zeros((3, 3))
+        pep = np.tile(box[2], (4, 1)) + 0.5  # 4 peptide atoms past one c-image
+        diffs = rec[:, None, :] - pep[None, :, :]  # shape (3, 4, 3)
+        out = OpenMMRunner._pbc_correct(diffs.copy(), box, np)  # noqa: SLF001
+        assert out.shape == (3, 4, 3)
+        # All pairs wrap to the same ~0.866 Å displacement (−0.5,−0.5,−0.5).
+        assert np.allclose(np.linalg.norm(out, axis=-1), np.sqrt(0.75), atol=1e-10)
