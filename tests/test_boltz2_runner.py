@@ -417,6 +417,33 @@ class TestBoltz2Runner:
         assert result.quality_gate == QualityGate.FAIL
         assert "CUDA OOM" in result.error
 
+    def test_modifications_flow_into_yaml(self, tmp_path: Path) -> None:
+        """modifications passed to predict_complex must land in the emitted YAML."""
+        with patch("biolab_runners.boltz2.runner.boltz_available", return_value=True):
+            with patch("subprocess.run") as mock_run:
+                # Non-zero exit so the runner stops after YAML + command — we only
+                # care that the YAML got written, not that the subprocess succeeds.
+                mock_run.return_value = MagicMock(returncode=1, stderr="no GPU")
+                runner = Boltz2Runner()
+                runner.predict_complex(
+                    receptor_sequence="MVKLTAEG",
+                    peptide_sequence="BKALBKKWBAWF",
+                    name="aib_mod_test",
+                    output_dir=tmp_path,
+                    modifications={
+                        "B": [
+                            {"position": 1, "ccd": "AIB"},
+                            {"position": 5, "ccd": "AIB"},
+                            {"position": 9, "ccd": "AIB"},
+                        ]
+                    },
+                )
+        yaml_path = tmp_path / "aib_mod_test" / "boltz2" / "input.yaml"
+        content = yaml_path.read_text()
+        assert "modifications:" in content
+        assert "ccd: AIB" in content
+        assert content.count("position:") == 3
+
 
 # ---------------------------------------------------------------------------
 # Config / result serialization tests

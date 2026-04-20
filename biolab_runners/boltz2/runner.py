@@ -314,6 +314,7 @@ class Boltz2Runner:
         pocket_contacts: list[tuple[str, int]] | None = None,
         seed: int | None = None,
         dry_run: bool = False,
+        modifications: dict[str, list[dict[str, object]]] | None = None,
     ) -> PredictionResult:
         """Predict a peptide-protein complex structure with Boltz-2.
 
@@ -329,6 +330,12 @@ class Boltz2Runner:
                 for spatially constrained prediction.
             seed: Random seed for reproducible predictions.
             dry_run: Validate inputs and log the command without executing.
+            modifications: Optional dict mapping chain_id to a list of
+                ``{"position": N, "ccd": "XXX"}`` entries. Forwarded to
+                ``write_boltz_yaml`` so non-canonical residues (e.g. Aib
+                as CCD ``AIB``) get the correct heavy-atom set in the
+                predicted structure. See ``write_boltz_yaml`` for the
+                schema.
 
         Returns:
             PredictionResult with quality gate applied.
@@ -385,6 +392,7 @@ class Boltz2Runner:
             yaml_path,
             msa_paths=msa_paths,
             pocket_contacts=pocket_contacts,
+            modifications=modifications,
         )
 
         cmd = self._build_command(
