@@ -41,6 +41,7 @@ dev = [
     "pytest>=8.0",
     "pytest-cov",
     "complexipy>=0.8",
+    "numpy>=1.26",  # required by the OpenMM runner Kabsch-aligned RMSD tests
 ]
 
 [build-system]

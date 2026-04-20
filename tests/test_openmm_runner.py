@@ -418,3 +418,171 @@ class TestIrmsdThreshold:
         path = config.save()
         loaded = OpenMMConfig.from_json(path)
         assert loaded.target_irmsd_threshold_a == 2.75
+
+
+# ---------------------------------------------------------------------------
+# _peptide_ca_rmsd — receptor-Cα-aligned RMSD regression tests
+#
+# The prior implementation subtracted peptide Cα in lab frame with only a
+# PBC box-wrap correction. This made receptor diffusion/tumbling look like
+# peptide dissociation: a bound peptide that moved together with a rotating
+# receptor was scored as "dissociated" with RMSDs of 20+ Å when the peptide
+# had never left the pocket. Confirmed in OralBiome-AMP#162 via offline
+# mdtraj re-analysis (2 of 3 spot-checks overturned; 5 of 17 batch results
+# overturned).
+#
+# These tests pin the fix: peptide RMSD must be measured in the receptor's
+# reference frame after Kabsch alignment.
+# ---------------------------------------------------------------------------
+
+
+class _FakeState:
+    """Minimal stand-in for OpenMM's State object returned by getState()."""
+
+    def __init__(self, positions: object, box: object) -> None:
+        import numpy as _np
+
+        self._positions = _np.asarray(positions, dtype=float)
+        self._box = _np.asarray(box, dtype=float)
+
+    def getPositions(self, asNumpy: bool = False) -> object:  # noqa: ARG002, N802, N803, FBT001, FBT002
+        return _QuantityStub(self._positions)
+
+    def getPeriodicBoxVectors(self, asNumpy: bool = False) -> object:  # noqa: ARG002, N802, N803, FBT001, FBT002
+        return _QuantityStub(self._box)
+
+
+class _QuantityStub:
+    """Return a plain numpy array from ``.value_in_unit(...)``."""
+
+    def __init__(self, arr: object) -> None:
+        self._arr = arr
+
+    def value_in_unit(self, _unit: object) -> object:
+        return self._arr
+
+
+class _FakeSimulation:
+    """Minimal stand-in for OpenMM's Simulation object."""
+
+    def __init__(self, positions: object, box: object) -> None:
+        self.context = _FakeContext(positions, box)
+
+
+class _FakeContext:
+    def __init__(self, positions: object, box: object) -> None:
+        self._state = _FakeState(positions, box)
+
+    def getState(self, getPositions: bool = False) -> _FakeState:  # noqa: ARG002, N802, N803, FBT001, FBT002
+        return self._state
+
+
+class _FakeUnit:
+    """Stand-in for ``openmm.unit`` — value_in_unit just ignores the argument."""
+
+    angstroms = "angstrom_unit_marker"
+
+
+class TestPeptideCaRmsdReceptorAligned:
+    """Regression tests for receptor-Cα-aligned peptide RMSD (OralBiome-AMP#162)."""
+
+    @staticmethod
+    def _make_reference() -> tuple[object, object, object, list[int], list[int]]:
+        """Build a simple receptor (α-helix-ish, 10 Cα) + peptide (3 Cα) frame."""
+        import numpy as np
+
+        # Receptor: 10 Cα atoms along a helix
+        rec = np.array(
+            [[np.cos(i * 1.0), np.sin(i * 1.0), i * 1.5] for i in range(10)],
+            dtype=float,
+        )
+        # Peptide: 3 Cα atoms in the receptor's "pocket" (offset fixed)
+        pep = np.array([[3.0, 0.0, 2.0], [3.5, 0.5, 3.5], [3.0, 1.0, 5.0]], dtype=float)
+        positions = np.vstack([rec, pep])
+        rec_idx = list(range(10))
+        pep_idx = list(range(10, 13))
+        return positions, rec, pep, rec_idx, pep_idx
+
+    def test_identical_frame_returns_zero(self) -> None:
+        """Identity: no motion → RMSD = 0."""
+        import numpy as np
+
+        positions, ref_rec, ref_pep, rec_idx, pep_idx = self._make_reference()
+        sim = _FakeSimulation(positions, np.eye(3) * 100.0)
+        rmsd = OpenMMRunner._peptide_ca_rmsd(  # noqa: SLF001
+            sim, ref_pep, pep_idx, ref_rec, rec_idx, _FakeUnit(), np
+        )
+        assert rmsd == pytest.approx(0.0, abs=1e-10)
+
+    def test_rigid_body_translation_returns_zero(self) -> None:
+        """Receptor + peptide translated by the same vector → RMSD = 0."""
+        import numpy as np
+
+        positions, ref_rec, ref_pep, rec_idx, pep_idx = self._make_reference()
+        shift = np.array([7.0, -3.0, 2.5])
+        sim = _FakeSimulation(positions + shift, np.eye(3) * 100.0)
+        rmsd = OpenMMRunner._peptide_ca_rmsd(  # noqa: SLF001
+            sim, ref_pep, pep_idx, ref_rec, rec_idx, _FakeUnit(), np
+        )
+        assert rmsd == pytest.approx(0.0, abs=1e-10)
+
+    def test_rigid_body_rotation_returns_zero(self) -> None:
+        """Receptor + peptide rotated together by 90° about Z → RMSD ≈ 0.
+
+        This is the load-bearing regression. The prior lab-frame implementation
+        returned a large non-zero RMSD here — the exact failure mode that caused
+        the 17/17 false-positive EARLY_FAIL rate on VicK + HmuY cohorts and the
+        1YCR positive control.
+        """
+        import numpy as np
+
+        positions, ref_rec, ref_pep, rec_idx, pep_idx = self._make_reference()
+        rot_z = np.array(
+            [
+                [np.cos(np.pi / 2), -np.sin(np.pi / 2), 0.0],
+                [np.sin(np.pi / 2), np.cos(np.pi / 2), 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+        rotated = positions @ rot_z.T
+        sim = _FakeSimulation(rotated, np.eye(3) * 100.0)
+        rmsd = OpenMMRunner._peptide_ca_rmsd(  # noqa: SLF001
+            sim, ref_pep, pep_idx, ref_rec, rec_idx, _FakeUnit(), np
+        )
+        assert rmsd == pytest.approx(0.0, abs=1e-8)
+
+    def test_genuine_peptide_displacement_detected(self) -> None:
+        """Peptide genuinely translated out of the pocket while receptor fixed → large RMSD."""
+        import numpy as np
+
+        positions, ref_rec, ref_pep, rec_idx, pep_idx = self._make_reference()
+        moved = positions.copy()
+        moved[10:13] += np.array([15.0, 0.0, 0.0])  # peptide drifts 15 Å
+        sim = _FakeSimulation(moved, np.eye(3) * 100.0)
+        rmsd = OpenMMRunner._peptide_ca_rmsd(  # noqa: SLF001
+            sim, ref_pep, pep_idx, ref_rec, rec_idx, _FakeUnit(), np
+        )
+        assert rmsd == pytest.approx(15.0, abs=1e-8)
+
+    def test_receptor_rotation_plus_peptide_drift(self) -> None:
+        """Receptor rotates + peptide drifts in receptor frame → only peptide drift counted."""
+        import numpy as np
+
+        positions, ref_rec, ref_pep, rec_idx, pep_idx = self._make_reference()
+        rot_z = np.array(
+            [
+                [np.cos(np.pi / 4), -np.sin(np.pi / 4), 0.0],
+                [np.sin(np.pi / 4), np.cos(np.pi / 4), 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+        # Drift peptide 2 Å along +z in the reference frame, then rotate whole system.
+        perturbed = positions.copy()
+        perturbed[10:13] += np.array([0.0, 0.0, 2.0])
+        perturbed = perturbed @ rot_z.T
+        sim = _FakeSimulation(perturbed, np.eye(3) * 100.0)
+        rmsd = OpenMMRunner._peptide_ca_rmsd(  # noqa: SLF001
+            sim, ref_pep, pep_idx, ref_rec, rec_idx, _FakeUnit(), np
+        )
+        # Each of 3 peptide Cα moved 2 Å along z → RMSD = 2 Å regardless of rotation.
+        assert rmsd == pytest.approx(2.0, abs=1e-8)

@@ -161,7 +161,7 @@ class OpenMMRunner:
         if ctx is None:
             return result
 
-        ref_pep_ca, ref_pep_ca_idx, ref_rec_ca_idx = self._compute_reference_ca(ctx)
+        ref_pep_ca, ref_pep_ca_idx, ref_rec_ca, ref_rec_ca_idx = self._compute_reference_ca(ctx)
 
         irmsd_thresh = config.target_irmsd_threshold_a
         abort_thresh = irmsd_thresh * _ABORT_MULTIPLIER
@@ -191,6 +191,7 @@ class OpenMMRunner:
             enable_early_abort=enable_early_abort,
             ref_pep_ca=ref_pep_ca,
             ref_pep_ca_idx=ref_pep_ca_idx,
+            ref_rec_ca=ref_rec_ca,
             ref_rec_ca_idx=ref_rec_ca_idx,
             abort_thresh=abort_thresh,
             irmsd_thresh=irmsd_thresh,
@@ -454,8 +455,16 @@ class OpenMMRunner:
         return restraint_force, ca_indices
 
     @staticmethod
-    def _compute_reference_ca(ctx: _MdContext) -> tuple[object, list[int], list[int]]:
-        """Compute receptor/peptide CA index lists and the reference peptide CA positions."""
+    def _compute_reference_ca(
+        ctx: _MdContext,
+    ) -> tuple[object, list[int], object, list[int]]:
+        """Compute receptor/peptide CA index lists + reference CA positions.
+
+        Returns ``(ref_pep_ca, ref_pep_ca_idx, ref_rec_ca, ref_rec_ca_idx)``.
+        The reference positions are captured once at the start of production
+        and reused by the early-abort gate for receptor-Cα-aligned peptide
+        RMSD measurement (see ``_peptide_ca_rmsd``).
+        """
         ref_pep_ca_idx: list[int] = []
         ref_rec_ca_idx: list[int] = []
         for chain_idx, chain in enumerate(ctx.chains):
@@ -472,7 +481,8 @@ class OpenMMRunner:
             .value_in_unit(ctx.unit_mod.angstroms)  # type: ignore[union-attr]
         )
         ref_pep_ca = ref_positions[ref_pep_ca_idx].copy() if ref_pep_ca_idx else None
-        return ref_pep_ca, ref_pep_ca_idx, ref_rec_ca_idx
+        ref_rec_ca = ref_positions[ref_rec_ca_idx].copy() if ref_rec_ca_idx else None
+        return ref_pep_ca, ref_pep_ca_idx, ref_rec_ca, ref_rec_ca_idx
 
     @staticmethod
     def _setup_reporters(
@@ -814,19 +824,68 @@ class OpenMMRunner:
         return diff
 
     @staticmethod
+    def _kabsch_rotation(
+        cur_centered: object,
+        ref_centered: object,
+        np: object,
+    ) -> object:
+        """Return the 3×3 rotation matrix that best aligns ``cur`` onto ``ref``.
+
+        Both inputs must be centroid-subtracted (N, 3) arrays. Uses the
+        standard SVD formulation with a reflection-guard determinant step so
+        the returned matrix is always a proper rotation (det = +1).
+        """
+        h = cur_centered.T @ ref_centered  # type: ignore[union-attr]
+        u, _s, vt = np.linalg.svd(h)  # type: ignore[union-attr]
+        d = np.sign(np.linalg.det(vt.T @ u.T))  # type: ignore[union-attr]
+        reflect = np.diag([1.0, 1.0, d])  # type: ignore[union-attr]
+        return vt.T @ reflect @ u.T  # type: ignore[union-attr]
+
+    @staticmethod
     def _peptide_ca_rmsd(
         simulation: object,
         ref_pep_ca: object,
         ref_pep_ca_idx: list[int],
+        ref_rec_ca: object,
+        ref_rec_ca_idx: list[int],
         unit: object,
         np: object,
     ) -> float:
-        """Compute PBC-corrected peptide Ca RMSD vs reference positions."""
+        """Peptide Cα RMSD after Kabsch alignment on receptor Cα.
+
+        Measures peptide displacement in the **receptor's reference frame**,
+        so receptor diffusion and tumbling during production do not inflate
+        the RMSD. Per-atom PBC correction is applied first to unwrap atoms
+        that crossed a box edge, then a translation + rotation is fitted to
+        the receptor Cα positions and applied to the current peptide Cα.
+
+        Using this function, a trajectory in which receptor + peptide move
+        as a rigid body returns RMSD ≈ 0. Lab-frame subtraction (the prior
+        implementation, superseded because it reported large RMSDs for
+        bound peptides that merely followed a rotating receptor) is not used.
+        """
         state = simulation.context.getState(getPositions=True)  # type: ignore[union-attr]
         cur_pos = state.getPositions(asNumpy=True).value_in_unit(unit.angstroms)  # type: ignore[union-attr]
         box_vecs = state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.angstroms)  # type: ignore[union-attr]
-        diff = cur_pos[ref_pep_ca_idx] - ref_pep_ca
-        diff = OpenMMRunner._pbc_correct(diff, box_vecs, np)
+
+        # Per-atom PBC unwrap: current_unwrapped = ref + pbc(current − ref)
+        rec_diff = OpenMMRunner._pbc_correct(cur_pos[ref_rec_ca_idx] - ref_rec_ca, box_vecs, np)
+        cur_rec = ref_rec_ca + rec_diff  # type: ignore[operator]
+        pep_diff = OpenMMRunner._pbc_correct(cur_pos[ref_pep_ca_idx] - ref_pep_ca, box_vecs, np)
+        cur_pep = ref_pep_ca + pep_diff  # type: ignore[operator]
+
+        # Kabsch: fit rotation + translation of receptor Cα onto the reference.
+        cur_centroid = cur_rec.mean(axis=0)  # type: ignore[union-attr]
+        ref_centroid = ref_rec_ca.mean(axis=0)  # type: ignore[union-attr]
+        rotation = OpenMMRunner._kabsch_rotation(
+            cur_rec - cur_centroid,
+            ref_rec_ca - ref_centroid,
+            np,  # type: ignore[operator]
+        )
+
+        # Apply the same transform to peptide Cα, then RMSD vs reference.
+        pep_aligned = (cur_pep - cur_centroid) @ rotation.T + ref_centroid  # type: ignore[union-attr]
+        diff = pep_aligned - ref_pep_ca
         return float(np.sqrt((diff**2).sum(axis=1).mean()))  # type: ignore[union-attr]
 
     @staticmethod
@@ -846,7 +905,8 @@ class OpenMMRunner:
         simulation: object,
         ref_pep_ca: object,
         ref_pep_ca_idx: list[int],
-        ref_rec_ca_idx: list[int],  # noqa: ARG004
+        ref_rec_ca: object,
+        ref_rec_ca_idx: list[int],
         abort_thresh: float,
         irmsd_thresh: float,
         config: OpenMMConfig,
@@ -859,7 +919,9 @@ class OpenMMRunner:
 
         Returns the peptide RMSD, or None if check could not be performed.
         """
-        pep_rmsd = OpenMMRunner._peptide_ca_rmsd(simulation, ref_pep_ca, ref_pep_ca_idx, unit, np)
+        pep_rmsd = OpenMMRunner._peptide_ca_rmsd(
+            simulation, ref_pep_ca, ref_pep_ca_idx, ref_rec_ca, ref_rec_ca_idx, unit, np
+        )
         ns_at_check = steps_done * config.timestep_fs / 1e6
         logger.info(
             "5 ns check: peptide Ca RMSD = %.1f A, abort threshold = %.1f A",
@@ -895,6 +957,8 @@ class OpenMMRunner:
         simulation: object,
         ref_pep_ca: object,
         ref_pep_ca_idx: list[int],
+        ref_rec_ca: object,
+        ref_rec_ca_idx: list[int],
         rmsd_5ns: float,
         config: OpenMMConfig,
         steps_done: int,
@@ -906,7 +970,9 @@ class OpenMMRunner:
 
         Returns True if the slope exceeds the threshold (0.05 A/ns).
         """
-        rmsd_10ns = OpenMMRunner._peptide_ca_rmsd(simulation, ref_pep_ca, ref_pep_ca_idx, unit, np)
+        rmsd_10ns = OpenMMRunner._peptide_ca_rmsd(
+            simulation, ref_pep_ca, ref_pep_ca_idx, ref_rec_ca, ref_rec_ca_idx, unit, np
+        )
         slope = (rmsd_10ns - rmsd_5ns) / 5.0  # A/ns
         ns_at_check = steps_done * config.timestep_fs / 1e6
         logger.info(
@@ -951,6 +1017,7 @@ class OpenMMRunner:
         enable_early_abort: bool,
         ref_pep_ca: object,
         ref_pep_ca_idx: list[int],
+        ref_rec_ca: object,
         ref_rec_ca_idx: list[int],
         abort_thresh: float,
         irmsd_thresh: float,
@@ -992,6 +1059,7 @@ class OpenMMRunner:
                     simulation,
                     ref_pep_ca,
                     ref_pep_ca_idx,
+                    ref_rec_ca,
                     ref_rec_ca_idx,
                     abort_thresh,
                     irmsd_thresh,
@@ -1018,6 +1086,8 @@ class OpenMMRunner:
                     simulation,
                     ref_pep_ca,
                     ref_pep_ca_idx,
+                    ref_rec_ca,
+                    ref_rec_ca_idx,
                     rmsd_5ns,  # type: ignore[arg-type]
                     config,
                     steps_done,
@@ -1070,6 +1140,7 @@ class OpenMMRunner:
         simulation: object,
         ref_pep_ca: object,
         ref_pep_ca_idx: list[int],
+        ref_rec_ca: object,
         ref_rec_ca_idx: list[int],
         abort_thresh: float,
         irmsd_thresh: float,
@@ -1084,6 +1155,7 @@ class OpenMMRunner:
             simulation,
             ref_pep_ca,
             ref_pep_ca_idx,
+            ref_rec_ca,
             ref_rec_ca_idx,
             abort_thresh,
             irmsd_thresh,
