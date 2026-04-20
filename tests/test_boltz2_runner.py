@@ -445,6 +445,83 @@ class TestBoltz2Runner:
         assert content.count("position:") == 3
 
 
+class TestForceOverride:
+    """``force=True`` must append ``--override`` to the boltz CLI command.
+
+    Without it the ``boltz predict`` binary silently no-ops when
+    ``--out_dir`` already contains predictions, so re-running a
+    ``predict_complex(force=True)`` after e.g. regenerating input YAML
+    appears to succeed but leaves the stale PDBs on disk.
+    """
+
+    def test_complex_force_false_no_override(self) -> None:
+        runner = Boltz2Runner()
+        cmd = runner._build_command(
+            yaml_path=Path("input.yaml"),
+            boltz_output=Path("output"),
+            num_seeds=1,
+            seed=None,
+            force=False,
+        )
+        assert "--override" not in cmd
+
+    def test_complex_force_true_appends_override(self) -> None:
+        runner = Boltz2Runner()
+        cmd = runner._build_command(
+            yaml_path=Path("input.yaml"),
+            boltz_output=Path("output"),
+            num_seeds=1,
+            seed=None,
+            force=True,
+        )
+        assert cmd.count("--override") == 1
+
+    def test_complex_force_default_is_false(self) -> None:
+        """Omitting the flag preserves backwards-compatible behaviour."""
+        runner = Boltz2Runner()
+        cmd = runner._build_command(
+            yaml_path=Path("input.yaml"),
+            boltz_output=Path("output"),
+            num_seeds=1,
+            seed=None,
+        )
+        assert "--override" not in cmd
+
+    def test_monomer_force_true_appends_override(self) -> None:
+        runner = Boltz2Runner()
+        cmd = runner._build_monomer_command(
+            yaml_path=Path("input.yaml"),
+            boltz_output=Path("output"),
+            force=True,
+        )
+        assert cmd.count("--override") == 1
+
+    def test_monomer_force_false_no_override(self) -> None:
+        runner = Boltz2Runner()
+        cmd = runner._build_monomer_command(
+            yaml_path=Path("input.yaml"),
+            boltz_output=Path("output"),
+            force=False,
+        )
+        assert "--override" not in cmd
+
+    def test_predict_complex_threads_force_through(self, tmp_path: Path) -> None:
+        """End-to-end: ``predict_complex(force=True)`` → command has ``--override``."""
+        with patch("biolab_runners.boltz2.runner.boltz_available", return_value=True):
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=1, stderr="stop")
+                runner = Boltz2Runner()
+                runner.predict_complex(
+                    receptor_sequence="MVKLTAEG",
+                    peptide_sequence="RWKLFKK",
+                    name="force_e2e",
+                    output_dir=tmp_path,
+                    force=True,
+                )
+                invoked_cmd = mock_run.call_args.args[0]
+        assert "--override" in invoked_cmd
+
+
 # ---------------------------------------------------------------------------
 # Config / result serialization tests
 # ---------------------------------------------------------------------------

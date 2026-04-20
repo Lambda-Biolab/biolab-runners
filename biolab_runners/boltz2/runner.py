@@ -358,6 +358,7 @@ class Boltz2Runner:
                 boltz_output=output_dir / name / "boltz2" / "output",
                 num_seeds=seeds,
                 seed=seed,
+                force=force,
             )
             logger.info(
                 "[DRY-RUN] Would run: %s (receptor=%d aa, peptide=%d aa)",
@@ -400,6 +401,7 @@ class Boltz2Runner:
             boltz_output=boltz_output,
             num_seeds=seeds,
             seed=seed,
+            force=force,
         )
         logger.info("Running Boltz-2: %s", " ".join(cmd))
 
@@ -424,8 +426,17 @@ class Boltz2Runner:
 
         return apply_quality_gate(result)
 
-    def _build_monomer_command(self, yaml_path: Path, boltz_output: Path) -> list[str]:
-        """Build the boltz predict CLI command for a monomer run."""
+    def _build_monomer_command(
+        self,
+        yaml_path: Path,
+        boltz_output: Path,
+        force: bool = False,
+    ) -> list[str]:
+        """Build the boltz predict CLI command for a monomer run.
+
+        ``force=True`` adds ``--override`` so Boltz re-runs even when
+        ``--out_dir`` already contains predictions. See ``_build_command``.
+        """
         cfg = self.config
         cmd = [
             cfg.boltz_binary,
@@ -446,6 +457,8 @@ class Boltz2Runner:
             cmd.append("--no_kernels")
         if cfg.use_potentials:
             cmd.append("--use_potentials")
+        if force:
+            cmd.append("--override")
         return cmd
 
     def predict_monomer(
@@ -499,7 +512,7 @@ class Boltz2Runner:
             return apply_quality_gate(result)
 
         yaml_path = write_boltz_yaml({"A": sequence}, run_dir / "input.yaml")
-        cmd = self._build_monomer_command(yaml_path, boltz_output)
+        cmd = self._build_monomer_command(yaml_path, boltz_output, force=force)
 
         if not self._run_boltz_subprocess(cmd, result, stderr_limit=300):
             return apply_quality_gate(result)
@@ -515,8 +528,16 @@ class Boltz2Runner:
         boltz_output: Path,
         num_seeds: int,
         seed: int | None,
+        force: bool = False,
     ) -> list[str]:
-        """Build the boltz predict CLI command."""
+        """Build the boltz predict CLI command.
+
+        ``force=True`` adds ``--override`` so the ``boltz predict`` binary
+        re-runs even when ``--out_dir`` already contains predictions.
+        Without it, Boltz silently exits in <5 s when the output dir is
+        populated — defeating ``predict_complex(force=True)`` after the
+        internal cache check is bypassed.
+        """
         cfg = self.config
         cmd = [
             cfg.boltz_binary,
@@ -545,4 +566,6 @@ class Boltz2Runner:
             cmd.append("--use_potentials")
         if seed is not None:
             cmd.extend(["--seed", str(seed)])
+        if force:
+            cmd.append("--override")
         return cmd
