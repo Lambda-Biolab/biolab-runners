@@ -1145,6 +1145,23 @@ class OpenMMRunner:
         steps_box = [0]
         self._install_sigterm_handler(simulation, state_xml_path, steps_box, config)
 
+        gates_active = enable_early_abort and ref_pep_ca is not None
+        gate_args = {
+            "simulation": simulation,
+            "ref_pep_ca": ref_pep_ca,
+            "ref_pep_ca_idx": ref_pep_ca_idx,
+            "ref_rec_ca": ref_rec_ca,
+            "ref_rec_ca_idx": ref_rec_ca_idx,
+            "abort_thresh": abort_thresh,
+            "irmsd_thresh": irmsd_thresh,
+            "abort_step_5ns": abort_step_5ns,
+            "abort_step_10ns": abort_step_10ns,
+            "config": config,
+            "output_dir": output_dir,
+            "unit": unit,
+            "np": np,
+        }
+
         while steps_box[0] < remaining_steps:
             steps_done = steps_box[0]
             chunk = min(SUB_CHUNK_STEPS, remaining_steps - steps_done)
@@ -1152,78 +1169,36 @@ class OpenMMRunner:
             steps_done += chunk
             steps_box[0] = steps_done
 
-            do_5ns = (
-                enable_early_abort
-                and not early_abort_done
-                and ref_pep_ca is not None
-                and steps_done >= abort_step_5ns
+            early_abort_done, rmsd_5ns, abort_reason = self._maybe_run_5ns_gate(
+                early_abort_done=early_abort_done,
+                rmsd_5ns=rmsd_5ns,
+                rmsd_samples=rmsd_samples,
+                gates_active=gates_active,
+                steps_done=steps_done,
+                **gate_args,
             )
-            if do_5ns:
-                early_abort_done = True
-                rmsd_5ns, aborted = self._do_5ns_check(
-                    simulation,
-                    ref_pep_ca,
-                    ref_pep_ca_idx,
-                    ref_rec_ca,
-                    ref_rec_ca_idx,
-                    abort_thresh,
-                    irmsd_thresh,
-                    config,
-                    steps_done,
-                    output_dir,
-                    unit,
-                    np,
-                )
-                if aborted:
-                    abort_reason = "early_dissociation"
-                    break
-                if rmsd_5ns is not None:
-                    rmsd_samples.append((steps_done * config.timestep_fs / 1e6, rmsd_5ns))
+            if abort_reason:
+                break
 
-            in_slope_window = (
-                enable_early_abort
-                and not slope_check_done
-                and rmsd_5ns is not None
-                and ref_pep_ca is not None
-                and abort_step_5ns < steps_done < abort_step_10ns
+            self._maybe_sample_slope(
+                rmsd_5ns=rmsd_5ns,
+                rmsd_samples=rmsd_samples,
+                slope_check_done=slope_check_done,
+                gates_active=gates_active,
+                steps_done=steps_done,
+                **gate_args,
             )
-            if in_slope_window:
-                sample_rmsd = OpenMMRunner._peptide_ca_rmsd(
-                    simulation,
-                    ref_pep_ca,
-                    ref_pep_ca_idx,
-                    ref_rec_ca,
-                    ref_rec_ca_idx,
-                    unit,
-                    np,
-                )
-                rmsd_samples.append((steps_done * config.timestep_fs / 1e6, sample_rmsd))
 
-            do_10ns = (
-                enable_early_abort
-                and not slope_check_done
-                and rmsd_5ns is not None
-                and ref_pep_ca is not None
-                and steps_done >= abort_step_10ns
+            slope_check_done, abort_reason = self._maybe_run_10ns_gate(
+                rmsd_5ns=rmsd_5ns,
+                rmsd_samples=rmsd_samples,
+                slope_check_done=slope_check_done,
+                gates_active=gates_active,
+                steps_done=steps_done,
+                **gate_args,
             )
-            if do_10ns:
-                slope_check_done = True
-                if self._check_slope_10ns(
-                    simulation,
-                    ref_pep_ca,
-                    ref_pep_ca_idx,
-                    ref_rec_ca,
-                    ref_rec_ca_idx,
-                    rmsd_samples,
-                    abort_thresh,
-                    config,
-                    steps_done,
-                    output_dir,
-                    unit,
-                    np,
-                ):
-                    abort_reason = "rmsd_slope_drift"
-                    break
+            if abort_reason:
+                break
 
             last_ckpt_step = self._maybe_checkpoint(
                 simulation,
@@ -1236,6 +1211,145 @@ class OpenMMRunner:
             )
 
         return steps_box[0], abort_reason
+
+    def _maybe_run_5ns_gate(
+        self,
+        *,
+        early_abort_done: bool,
+        rmsd_5ns: float | None,
+        rmsd_samples: list[tuple[float, float]],
+        gates_active: bool,
+        steps_done: int,
+        simulation: object,
+        ref_pep_ca: object,
+        ref_pep_ca_idx: list[int],
+        ref_rec_ca: object,
+        ref_rec_ca_idx: list[int],
+        abort_thresh: float,
+        irmsd_thresh: float,
+        abort_step_5ns: int,
+        abort_step_10ns: int,  # noqa: ARG002 — unified gate_args
+        config: OpenMMConfig,
+        output_dir: Path,
+        unit: object,
+        np: object,
+    ) -> tuple[bool, float | None, str]:
+        """Run the 5 ns gate if due.
+
+        Returns:
+            ``(early_abort_done, rmsd_5ns, abort_reason)`` — ``abort_reason``
+            is ``""`` unless dissociation was detected.
+        """
+        if not gates_active or early_abort_done or steps_done < abort_step_5ns:
+            return early_abort_done, rmsd_5ns, ""
+        new_rmsd, aborted = self._do_5ns_check(
+            simulation,
+            ref_pep_ca,
+            ref_pep_ca_idx,
+            ref_rec_ca,
+            ref_rec_ca_idx,
+            abort_thresh,
+            irmsd_thresh,
+            config,
+            steps_done,
+            output_dir,
+            unit,
+            np,
+        )
+        if aborted:
+            return True, new_rmsd, "early_dissociation"
+        if new_rmsd is not None:
+            rmsd_samples.append((steps_done * config.timestep_fs / 1e6, new_rmsd))
+        return True, new_rmsd, ""
+
+    @staticmethod
+    def _maybe_sample_slope(
+        *,
+        rmsd_5ns: float | None,
+        rmsd_samples: list[tuple[float, float]],
+        slope_check_done: bool,
+        gates_active: bool,
+        steps_done: int,
+        simulation: object,
+        ref_pep_ca: object,
+        ref_pep_ca_idx: list[int],
+        ref_rec_ca: object,
+        ref_rec_ca_idx: list[int],
+        abort_thresh: float,  # noqa: ARG004 — unified gate_args
+        irmsd_thresh: float,  # noqa: ARG004
+        abort_step_5ns: int,
+        abort_step_10ns: int,
+        config: OpenMMConfig,
+        output_dir: Path,  # noqa: ARG004
+        unit: object,
+        np: object,
+    ) -> None:
+        """Append a slope sample if steps_done is inside the 5–10 ns sampling window."""
+        in_window = (
+            gates_active
+            and rmsd_5ns is not None
+            and not slope_check_done
+            and abort_step_5ns < steps_done < abort_step_10ns
+        )
+        if not in_window:
+            return
+        sample_rmsd = OpenMMRunner._peptide_ca_rmsd(
+            simulation,
+            ref_pep_ca,
+            ref_pep_ca_idx,
+            ref_rec_ca,
+            ref_rec_ca_idx,
+            unit,
+            np,
+        )
+        rmsd_samples.append((steps_done * config.timestep_fs / 1e6, sample_rmsd))
+
+    def _maybe_run_10ns_gate(
+        self,
+        *,
+        rmsd_5ns: float | None,
+        rmsd_samples: list[tuple[float, float]],
+        slope_check_done: bool,
+        gates_active: bool,
+        steps_done: int,
+        simulation: object,
+        ref_pep_ca: object,
+        ref_pep_ca_idx: list[int],
+        ref_rec_ca: object,
+        ref_rec_ca_idx: list[int],
+        abort_thresh: float,
+        irmsd_thresh: float,  # noqa: ARG002 — unified gate_args
+        abort_step_5ns: int,  # noqa: ARG002
+        abort_step_10ns: int,
+        config: OpenMMConfig,
+        output_dir: Path,
+        unit: object,
+        np: object,
+    ) -> tuple[bool, str]:
+        """Run the 10 ns slope gate if due. Returns (slope_check_done, abort_reason)."""
+        due = (
+            gates_active
+            and rmsd_5ns is not None
+            and not slope_check_done
+            and steps_done >= abort_step_10ns
+        )
+        if not due:
+            return slope_check_done, ""
+        drifted = self._check_slope_10ns(
+            simulation,
+            ref_pep_ca,
+            ref_pep_ca_idx,
+            ref_rec_ca,
+            ref_rec_ca_idx,
+            rmsd_samples,
+            abort_thresh,
+            config,
+            steps_done,
+            output_dir,
+            unit,
+            np,
+        )
+        return True, ("rmsd_slope_drift" if drifted else "")
 
     @staticmethod
     def _install_sigterm_handler(
