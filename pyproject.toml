@@ -29,6 +29,11 @@ openmm = [
     "openmm>=8.5.0",
     "pdbfixer>=1.9",
     "numpy>=1.26",
+    # Offline MD early-abort gate (biolab_runners.openmm.offline_gate) —
+    # loads partial trajectory.dcd between production sub-chunks and
+    # evaluates peptide-Cα RMSD with triclinic-aware unwrap. Replaces
+    # the pre-task-#10 inside-OpenMM gate.
+    "mdtraj>=1.10",
 ]
 all = [
     "biolab-runners[boltz2,openmm]",
