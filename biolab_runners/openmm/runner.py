@@ -476,12 +476,18 @@ class OpenMMRunner:
                     else:
                         ref_pep_ca_idx.append(atom.index)
 
-        # #174: enforcePeriodicBox=True matches DCDReporter output, so the
-        # gate's reference frame is comparable to offline-computed values.
+        # OralBiome-AMP#175: use OpenMM's internal unwrapped coordinates
+        # (enforcePeriodicBox=False, the default). #174's enforcePeriodicBox=True
+        # convention per-molecule-wraps each chain's centroid independently into
+        # the primary unit cell, which flips receptor and peptide into different
+        # periodic images when centroids sit near box faces — breaking Kabsch.
+        # Unwrapped internal positions keep molecules continuous across frames
+        # and absorb global drift via Kabsch's centroid-subtraction step.
+        # The reference pose MUST be captured with the same convention as the
+        # current-frame gate input — mixing wrapped reference with unwrapped
+        # current frames reintroduces image mismatches at the reference itself.
         ref_positions = (
-            ctx.simulation.context.getState(  # type: ignore[union-attr]
-                getPositions=True, enforcePeriodicBox=True
-            )
+            ctx.simulation.context.getState(getPositions=True)  # type: ignore[union-attr]
             .getPositions(asNumpy=True)
             .value_in_unit(ctx.unit_mod.angstroms)  # type: ignore[union-attr]
         )
@@ -774,12 +780,13 @@ class OpenMMRunner:
         np: object,
     ) -> None:
         """Measure peptide-receptor Ca min distance after equilibration and write metadata."""
-        # #174: enforcePeriodicBox=True so equilibration-end coords match
-        # what the reference frame + gate sample at runtime.
+        # OralBiome-AMP#175: match the gate path — use OpenMM's internal
+        # unwrapped coordinates (enforcePeriodicBox=False, default). The
+        # downstream _min_pbc_distance does its own PBC-correct min-image
+        # math, so the input convention here only needs to stay consistent
+        # with what the gate sees; unwrapped is the correct choice.
         eq_positions = (
-            simulation.context.getState(  # type: ignore[union-attr]
-                getPositions=True, enforcePeriodicBox=True
-            )
+            simulation.context.getState(getPositions=True)  # type: ignore[union-attr]
             .getPositions(asNumpy=True)
             .value_in_unit(unit.angstroms)  # type: ignore[union-attr]
         )
@@ -883,29 +890,63 @@ class OpenMMRunner:
         so receptor diffusion and tumbling during production do not inflate
         the RMSD.
 
-        OralBiome-AMP#174 fix: request ``enforcePeriodicBox=True`` on
-        ``getState`` so the online gate sees the same coordinate system
-        as ``DCDReporter`` writes (per-residue whole wrapping). The
-        previous default (``enforcePeriodicBox=False``) returned raw
-        unwrapped coordinates where atoms could diffuse many Å from
-        their starting image; per-atom ``_pbc_correct`` could not
-        recover because adjacent atoms near a box midplane would pick
-        different "closest image" wraps, fragmenting rigid structure
-        and inflating Kabsch residuals into the tens of Å — producing
-        phantom 10–13 Å RMSD values that did not exist in the offline
-        DCD. With enforcePeriodicBox=True, receptor and peptide remain
-        whole, so Kabsch fit on receptor handles the rigid-body PBC
-        shift naturally — no per-atom PBC unwrap needed.
+        OralBiome-AMP#175 fix: request OpenMM's **internal unwrapped
+        coordinates** (``enforcePeriodicBox=False``, the default) instead
+        of the per-molecule-wrapped convention #174 introduced. Short
+        history of the gate-convention chain:
 
-        A trajectory in which receptor + peptide move as a rigid body
-        returns RMSD ≈ 0. Lab-frame subtraction (the pre-#162
-        implementation, superseded because it reported large RMSDs for
-        bound peptides that merely followed a rotating receptor) is
-        not used.
+        - Pre-#162: lab-frame RMSD (no Kabsch) — broke on receptor
+          tumbling.
+        - #162: Kabsch on receptor Cα. Used
+          ``enforcePeriodicBox=False`` + per-atom ``_pbc_correct``.
+          Broke when rigid receptors straddled a box face: per-atom
+          correction picked different "nearest image" for adjacent
+          atoms, fragmenting the receptor across primary-cell sides.
+        - #174: switched to ``enforcePeriodicBox=True`` and removed
+          per-atom correction. This per-molecule-wraps each chain's
+          centroid into the primary cell independently. When a
+          receptor's centroid sits near a box face (very common for
+          large receptors), thermal jitter flips the wrapping decision
+          across frames; receptor and peptide can end up in different
+          periodic images even though they're a physically bound
+          complex. Kabsch-on-receptor finds the correct rotation but
+          applies the translation using whichever image the current
+          receptor is in — placing the aligned peptide ~box/2 away
+          from reference. Produces phantom ~50 Å RMSD on bound
+          peptides. Root cause was reproduced on
+          ``VicK_g2_abc021a3_cstr_tier2_rep3`` (peptide stayed in
+          pocket at min-Cα 3.5–5.5 Å, online gate reported 51.52 Å).
+        - #175 (this fix): OpenMM's integrated internal positions are
+          the time-integral of velocities — genuinely continuous, no
+          per-frame wrapping decisions, no image flipping. Molecules
+          stay whole. Kabsch's centroid-subtraction step absorbs any
+          global translation; the peptide RMSD measures true drift in
+          the receptor's reference frame.
+
+        Caveats (document at call sites that touch these paths):
+
+        1. Checkpoint restart must use ``Simulation.saveState`` /
+           ``loadState`` (preserves unwrapped internals), NOT
+           ``saveCheckpoint`` (wraps on save and breaks continuity).
+        2. Long-trajectory center-of-mass drift of 1–5 nm over 100 ns
+           is normal under default CenterOfMassMotionRemover and is
+           absorbed by Kabsch. Unwrapped coords may be far from box
+           origin in absolute terms — that is fine.
+        3. Kabsch on the entire receptor-Cα assumes a rigid body. For
+           large flexible receptors undergoing hinge motion, monitor
+           the receptor self-Kabsch residual; if > 3 Å, align on a
+           stable subdomain instead.
+
+        The reference pose captured in ``_compute_reference_ca`` MUST
+        use the same ``enforcePeriodicBox=False`` convention. Mixing
+        wrapped reference with unwrapped current frames reintroduces
+        image mismatches at the reference frame itself.
+
+        Do not reintroduce per-atom ``_pbc_correct`` inside this
+        function — it was the original #162 failure mode and is
+        unnecessary with the internal-unwrapped-coords convention.
         """
-        state = simulation.context.getState(  # type: ignore[union-attr]
-            getPositions=True, enforcePeriodicBox=True
-        )
+        state = simulation.context.getState(getPositions=True)  # type: ignore[union-attr]
         cur_pos = state.getPositions(asNumpy=True).value_in_unit(unit.angstroms)  # type: ignore[union-attr]
 
         cur_rec = cur_pos[ref_rec_ca_idx]

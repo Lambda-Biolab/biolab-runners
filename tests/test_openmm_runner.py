@@ -986,41 +986,66 @@ class TestCheckSlope10nsConjunctiveGate:
 
 
 # ---------------------------------------------------------------------------
-# #174 regression: getState must use enforcePeriodicBox=True for the gate
+# #175 regression: getState in the gate path must NOT pass
+# enforcePeriodicBox=True.
 #
-# The bug: simulation.context.getState(getPositions=True) defaulted to
-# enforcePeriodicBox=False, returning raw unwrapped coordinates where atoms
-# could diffuse many Å from their starting image. Per-atom _pbc_correct
-# unwrap could not recover because atoms near a box midplane picked
-# different "closest image" wraps, fragmenting rigid structure and
-# inflating Kabsch residuals. DCDReporter writes enforcePeriodicBox=True
-# coords, so offline analysis was clean while the live gate saw phantoms.
+# History:
+#   #162 fix (receptor-Cα Kabsch) used enforcePeriodicBox=False + per-atom
+#   _pbc_correct. Broke when rigid receptors straddled a box face — adjacent
+#   atoms picked different "nearest images", fragmenting the receptor.
 #
-# Production reproducer: OralBiome-AMP MDM2/p53_TAD_cstr_rep2 rep2, which
-# aborted at 10.2 ns with online RMSD 13.02 Å while all three DCD-based
-# methods gave 2.70 Å on the same frames.
+#   #174 fix switched to enforcePeriodicBox=True (per-molecule centroid
+#   wrapping). Fixed fragmentation but introduced a new pathology: molecules
+#   whose centroids sit near box faces get their wrapping decisions flipped
+#   by thermal jitter, placing receptor and peptide in different periodic
+#   images even when they're a physically bound complex. Kabsch then mis-
+#   places the peptide by ~box/2, producing phantom ~50 Å RMSD on bound
+#   peptides.
+#
+#   #175 fix (current): use OpenMM's internal unwrapped coordinates
+#   (enforcePeriodicBox=False, the default). Integrated internal positions
+#   are continuous across frames — no per-frame wrapping, no image flipping.
+#   Molecules stay whole. Kabsch absorbs global drift via centroid
+#   subtraction. Do NOT reintroduce per-atom _pbc_correct — that was the
+#   original #162 failure mode and is unnecessary here.
+#
+# Production reproducer for #175: OralBiome-AMP
+# VicK_g2_abc021a3_cstr_tier2_rep3 aborted at 5.1 ns with online gate
+# reporting 51.52 Å while min-Cα PBC distance was 4.28 Å throughout
+# (peptide bound to same receptor residue across all 510 frames). Ground
+# truth via state.xml unwrapped Kabsch: 9.65 Å.
 # ---------------------------------------------------------------------------
 
 
-class TestEnforcePeriodicBoxRegression:
-    """Structural regression tests for OralBiome-AMP#174.
+class TestGateCoordConventionRegression:
+    """Structural regression tests for OralBiome-AMP#175.
 
-    Guards the two requirements of the fix:
-      1. ``getState(getPositions=True)`` calls in gate paths must pair
-         with ``enforcePeriodicBox=True``.
-      2. ``_peptide_ca_rmsd`` must not call ``_pbc_correct`` — the
-         per-atom PBC unwrap is incompatible with rigid bodies
-         straddling a box face, and ``enforcePeriodicBox=True`` makes
-         it unnecessary.
+    Guards the three requirements of the gate coord convention:
+      1. ``getState(getPositions=True)`` calls in gate paths must NOT
+         pass ``enforcePeriodicBox=True``.
+      2. ``_peptide_ca_rmsd`` must not call ``_pbc_correct``.
+      3. Math: Kabsch on receptor absorbs rigid-body translation (works
+         because the internal-unwrapped convention keeps everything
+         continuous).
 
-    The math-layer dual assertion (per-atom PBC fragments; whole-box Kabsch
-    absorbs rigid translation) is tested in the sibling OralBiome-AMP
-    ``tests/test_openmm_cloud_pbc.py::TestEnforcePeriodicBoxRegression``,
-    which guards the same invariant on the embedded cloud runner script.
+    The math-layer dual assertion lives in the sibling OralBiome-AMP
+    ``tests/test_openmm_cloud_pbc.py`` which guards the same invariant
+    on the embedded cloud runner script.
+
+    Note: this class REPLACES the older ``TestEnforcePeriodicBoxRegression``
+    from PR #25 which pinned the (now-wrong) ``enforcePeriodicBox=True``
+    mechanism. The history for those tests lives in git.
     """
 
-    def test_peptide_ca_rmsd_uses_enforce_periodic_box(self) -> None:
-        """The gate's getState call must pass enforcePeriodicBox=True."""
+    def test_peptide_ca_rmsd_does_not_force_periodic_box(self) -> None:
+        """The gate's getState call must NOT pass ``enforcePeriodicBox=True``.
+
+        Per #175: enforcePeriodicBox=True per-molecule-wraps centroids
+        independently; when centroids sit near box faces, wrapping
+        decisions flip and receptor + peptide can end up in different
+        periodic images, breaking Kabsch. Use the default (False) which
+        returns OpenMM's integrated internal unwrapped positions.
+        """
         import ast
         import inspect
         import textwrap
@@ -1029,30 +1054,31 @@ class TestEnforcePeriodicBoxRegression:
 
         src = textwrap.dedent(inspect.getsource(OpenMMRunner._peptide_ca_rmsd))
         tree = ast.parse(src)
-        found_kwarg = False
+        found_call = False
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             callee = ast.unparse(node.func)
             if "getState" not in callee:
                 continue
-            # Any getState call inside this method must pass enforcePeriodicBox=True
             kwargs = {kw.arg: ast.unparse(kw.value) for kw in node.keywords if kw.arg}
-            assert kwargs.get("enforcePeriodicBox") == "True", (
-                f"getState() in _peptide_ca_rmsd must pass enforcePeriodicBox=True "
-                f"(guards OralBiome-AMP#174). Got kwargs: {kwargs}"
+            assert kwargs.get("enforcePeriodicBox") != "True", (
+                f"getState() in _peptide_ca_rmsd must NOT pass "
+                f"enforcePeriodicBox=True (guards OralBiome-AMP#175). "
+                f"Got kwargs: {kwargs}. Use the default (False) which "
+                f"returns internal unwrapped coordinates."
             )
-            found_kwarg = True
-        assert found_kwarg, "expected at least one getState() call in _peptide_ca_rmsd body"
+            found_call = True
+        assert found_call, "expected at least one getState() call in _peptide_ca_rmsd body"
 
     def test_peptide_ca_rmsd_removed_per_atom_pbc(self) -> None:
         """``_peptide_ca_rmsd`` must not call ``_pbc_correct``.
 
-        The fix is two-sided: enforcePeriodicBox=True coords AND no
-        per-atom PBC unwrap. Per-atom wrap fragments rigid bodies across
-        box faces; whole-receptor Kabsch handles the rigid-body shift
-        naturally. Walks the AST and checks ``Call`` nodes only, so the
-        docstring is free to mention ``_pbc_correct`` by name.
+        Per-atom PBC unwrap was the original #162 failure mode (fragments
+        rigid bodies across box faces). Unnecessary under #175 because
+        OpenMM's internal unwrapped positions are already continuous.
+        Walks the AST and checks ``Call`` nodes only, so the docstring
+        is free to mention ``_pbc_correct`` by name.
         """
         import ast
         import inspect
@@ -1077,10 +1103,12 @@ class TestEnforcePeriodicBoxRegression:
                         if isinstance(sub, ast.Call):
                             callee = ast.unparse(sub.func)
                             assert "_pbc_correct" not in callee, (
-                                "_peptide_ca_rmsd must not call _pbc_correct after "
-                                "OralBiome-AMP#174 — enforcePeriodicBox=True + Kabsch "
-                                "on whole receptor is sufficient, and per-atom PBC "
-                                "fragments rigid structures across box faces."
+                                "_peptide_ca_rmsd must not call _pbc_correct "
+                                "(OralBiome-AMP#162 + #175). Per-atom PBC unwrap "
+                                "fragments rigid bodies across box faces; OpenMM's "
+                                "internal unwrapped coords (the default from "
+                                "getState) keep molecules continuous across frames "
+                                "without needing any explicit PBC math in the gate."
                             )
                 return
         pytest.fail("_peptide_ca_rmsd not found via inspect.getsource")
@@ -1088,13 +1116,17 @@ class TestEnforcePeriodicBoxRegression:
     def test_kabsch_absorbs_rigid_body_translation(self) -> None:
         """Math sanity: Kabsch on receptor gives RMSD≈0 under rigid-body translation.
 
-        Once inputs are in the same coordinate system (whole-molecule wrapped,
-        which is what enforcePeriodicBox=True guarantees) Kabsch fully absorbs
-        any rigid-body translation of the whole complex — peptide RMSD should
-        remain at ~0 regardless of how far the complex has drifted.
+        Once inputs are in the same coordinate system (which the
+        internal-unwrapped-coords convention per #175 guarantees) Kabsch
+        fully absorbs any rigid-body translation of the whole complex —
+        peptide RMSD should remain at ~0 regardless of how far the
+        complex has drifted. This is exactly why OpenMM's default
+        (enforcePeriodicBox=False) internal-coord convention is the
+        right input for the Kabsch gate: global drift is absorbed by the
+        centroid-subtraction step.
 
-        The live-integration check (gate output matches mdtraj.superpose on
-        a real OpenMM simulation) lives in the ``@pytest.mark.slow`` test.
+        The live-integration check (Flavor C) for catching per-molecule-
+        wrapping regressions is tracked in OralBiome-AMP#175.
         """
         import numpy as np
 
@@ -1121,209 +1153,31 @@ class TestEnforcePeriodicBoxRegression:
             )
 
 
-class TestOnlineGateMatchesOfflineOnLiveSimulation:
-    """Integration regression for #174: online gate output matches offline
-    mdtraj.superpose on the same DCD frames from a live OpenMM simulation.
-
-    This is the failure path Flavor-A structural tests cannot cover: a
-    future change that leaves the ``enforcePeriodicBox=True`` kwarg in
-    place but breaks the upstream-OpenMM semantics (e.g. new OpenMM
-    version changing coord-wrapping behavior, or DCDReporter reconfigured
-    to write a different coordinate convention) would still pass the
-    structural tests but fail here.
-
-    Marked ``@pytest.mark.slow``: runs a short live MD (~5 ps production
-    on a ~3 nm cubic TIP3P box). Expected runtime: ~20 s on CPU, faster
-    on GPU. Requires the ``openmm`` extra plus ``mdtraj`` (dev group).
-    """
-
-    @staticmethod
-    def _build_2chain_ala_modeller(app: object, unit: object, n_a: int, n_b: int, sep_y: float):
-        """Build a 2-chain extended-Ala complex as an OpenMM Modeller.
-
-        Heavy atoms only (N, CA, C, O, CB); ``Modeller.addHydrogens`` on the
-        caller adds missing hydrogens and caps N/C termini via the force
-        field's residue templates. Geometry is approximate — minimization
-        reshapes it. Positions are returned in nanometers.
-        """
-        from openmm.unit import Quantity
-
-        from openmm import Vec3  # local import — openmm is importorskip'd in the test
-
-        topology = app.Topology()  # type: ignore[attr-defined]
-        positions_bare: list[object] = []
-
-        # Heavy-atom offsets from residue origin (Å); chosen so adjacent
-        # residues stacked at Δx=3.5 Å give a plausible extended backbone
-        # that the CHARMM36 minimizer can relax without exploding.
-        ala_offsets = [
-            ("N", "N", (0.000, 0.000, 0.000)),
-            ("CA", "C", (1.458, 0.500, 0.000)),
-            ("C", "C", (2.478, 0.000, 1.100)),
-            ("O", "O", (2.478, -1.200, 1.100)),
-            ("CB", "C", (1.458, 1.500, -1.200)),
-        ]
-        # C-terminal requires OXT for the CHARMM36 C-term ALA template to match.
-        oxt_offset = ("OXT", "O", (3.478, 0.500, 1.400))
-
-        def _add_chain(chain_id: str, n_res: int, y_off: float) -> None:
-            chain = topology.addChain(chain_id)  # type: ignore[attr-defined]
-            prev_c = None
-            for i in range(n_res):
-                residue = topology.addResidue("ALA", chain)  # type: ignore[attr-defined]
-                atoms_in_res: dict[str, object] = {}
-                x_base = 3.5 * i
-                atom_defs = list(ala_offsets)
-                if i == n_res - 1:
-                    atom_defs.append(oxt_offset)
-                for name, elt_symbol, (dx, dy, dz) in atom_defs:
-                    atom = topology.addAtom(  # type: ignore[attr-defined]
-                        name,
-                        app.Element.getBySymbol(elt_symbol),  # type: ignore[attr-defined]
-                        residue,
-                    )
-                    atoms_in_res[name] = atom
-                    # Convert Å → nm for OpenMM positions (bare Vec3, wrapped
-                    # once as a single Quantity at the end — per-element Quantity
-                    # wrappers break Modeller.addHydrogens under OpenMM 8.5).
-                    positions_bare.append(
-                        Vec3(  # type: ignore[call-arg]
-                            (x_base + dx) * 0.1,
-                            (y_off + dy) * 0.1,
-                            dz * 0.1,
-                        )
-                    )
-                topology.addBond(atoms_in_res["N"], atoms_in_res["CA"])  # type: ignore[attr-defined]
-                topology.addBond(atoms_in_res["CA"], atoms_in_res["C"])  # type: ignore[attr-defined]
-                topology.addBond(atoms_in_res["CA"], atoms_in_res["CB"])  # type: ignore[attr-defined]
-                topology.addBond(atoms_in_res["C"], atoms_in_res["O"])  # type: ignore[attr-defined]
-                if "OXT" in atoms_in_res:
-                    topology.addBond(atoms_in_res["C"], atoms_in_res["OXT"])  # type: ignore[attr-defined]
-                if prev_c is not None:
-                    topology.addBond(prev_c, atoms_in_res["N"])  # type: ignore[attr-defined]
-                prev_c = atoms_in_res["C"]
-
-        _add_chain("A", n_a, y_off=0.0)
-        _add_chain("B", n_b, y_off=sep_y)
-        positions = Quantity(positions_bare, unit.nanometer)  # type: ignore[attr-defined]
-        return app.Modeller(topology, positions)  # type: ignore[attr-defined]
-
-    @pytest.mark.slow
-    def test_online_gate_rmsd_matches_mdtraj_within_half_angstrom(self, tmp_path) -> None:
-        """Live-OpenMM regression for OralBiome-AMP#174.
-
-        Runs a short live MD simulation and asserts that the online gate
-        RMSD (computed via ``OpenMMRunner._peptide_ca_rmsd`` using
-        ``getState(enforcePeriodicBox=True)``) agrees frame-by-frame with
-        an offline RMSD computed from the DCD trajectory (which also uses
-        ``enforcePeriodicBox=True`` internally).
-
-        Flavor A tests (``TestEnforcePeriodicBoxRegression``) pin the
-        **mechanism** — every gate-path ``getState`` passes
-        ``enforcePeriodicBox=True`` and ``_peptide_ca_rmsd`` no longer
-        calls ``_pbc_correct``. This Flavor B test additionally pins that
-        those choices actually produce coordinates matching what
-        ``DCDReporter`` writes under the current OpenMM version — the
-        failure surface Flavor A cannot cover because it never exercises
-        OpenMM itself.
-
-        Expected runtime: ~5–15 s GPU, ~60 s CPU. Gated behind
-        ``@pytest.mark.slow``; run with ``pytest -m slow``.
-        """
-        openmm = pytest.importorskip("openmm")
-        app = pytest.importorskip("openmm.app")
-        unit = pytest.importorskip("openmm.unit")
-        md = pytest.importorskip("mdtraj")
-        import numpy as _np
-
-        # Build a 2-chain Ala complex programmatically ----------------------
-        modeller = self._build_2chain_ala_modeller(app, unit, n_a=5, n_b=4, sep_y=9.0)
-
-        # Solvate in a small cubic box to force PBC exposure ----------------
-        ff = app.ForceField("charmm36.xml", "charmm36/water.xml")
-        modeller.addHydrogens(ff, pH=7.0)
-        modeller.addSolvent(
-            ff,
-            model="tip3p",
-            padding=0.8 * unit.nanometers,
-            boxShape="cube",
-            ionicStrength=0.15 * unit.molar,
-        )
-
-        system = ff.createSystem(
-            modeller.topology,
-            nonbondedMethod=app.PME,
-            nonbondedCutoff=1.0 * unit.nanometers,
-            constraints=app.HBonds,
-        )
-        integrator = openmm.LangevinMiddleIntegrator(
-            310.0 * unit.kelvin,
-            1.0 / unit.picosecond,
-            2.0 * unit.femtoseconds,
-        )
-        # CPU-safe platform — test must not require GPU.
-        platform = openmm.Platform.getPlatformByName("CPU")
-        sim = app.Simulation(modeller.topology, system, integrator, platform)
-        sim.context.setPositions(modeller.positions)
-
-        sim.minimizeEnergy(maxIterations=200)
-        sim.context.setVelocitiesToTemperature(310.0 * unit.kelvin)
-        sim.step(500)  # 1 ps equilibration
-
-        # Reference Cα arrays for online + offline ---------------------------
-        atoms = list(modeller.topology.atoms())
-        rec_ca_idx = [a.index for a in atoms if a.residue.chain.id == "A" and a.name == "CA"]
-        pep_ca_idx = [a.index for a in atoms if a.residue.chain.id == "B" and a.name == "CA"]
-        assert len(rec_ca_idx) >= 3, "Receptor Cα set must be non-degenerate for Kabsch fit"
-        assert len(pep_ca_idx) >= 2, "Peptide Cα set must have at least 2 atoms"
-
-        state0 = sim.context.getState(getPositions=True, enforcePeriodicBox=True)
-        pos0_ang = state0.getPositions(asNumpy=True).value_in_unit(unit.angstroms)
-        ref_rec_ca = _np.asarray(pos0_ang)[rec_ca_idx]
-        ref_pep_ca = _np.asarray(pos0_ang)[pep_ca_idx]
-
-        # Persist reference PDB for mdtraj topology
-        topo_path = tmp_path / "topo.pdb"
-        with open(str(topo_path), "w") as f:
-            app.PDBFile.writeFile(modeller.topology, state0.getPositions(), f)
-
-        # Production: step-by-step to capture online RMSD at each DCD write -
-        dcd_path = tmp_path / "prod.dcd"
-        steps_per_frame = 250  # 0.5 ps
-        n_frames = 10  # 5 ps total
-        sim.reporters.append(
-            app.DCDReporter(str(dcd_path), steps_per_frame, enforcePeriodicBox=True)
-        )
-
-        online_rmsd: list[float] = []
-        for _ in range(n_frames):
-            sim.step(steps_per_frame)
-            r = OpenMMRunner._peptide_ca_rmsd(  # noqa: SLF001
-                sim, ref_pep_ca, pep_ca_idx, ref_rec_ca, rec_ca_idx, unit, _np
-            )
-            online_rmsd.append(r)
-
-        # Release the DCD so mdtraj can read it
-        sim.reporters.clear()
-        del sim
-
-        # Offline RMSD via mdtraj --------------------------------------------
-        traj = md.load(str(dcd_path), top=str(topo_path))
-        ref_traj = md.load(str(topo_path))
-        rec_idx_arr = _np.asarray(rec_ca_idx, dtype=_np.int64)
-        pep_idx_arr = _np.asarray(pep_ca_idx, dtype=_np.int64)
-        traj.superpose(ref_traj, atom_indices=rec_idx_arr)
-        pep_diff_nm = traj.xyz[:, pep_idx_arr, :] - ref_traj.xyz[0, pep_idx_arr, :]
-        offline_rmsd = _np.sqrt((pep_diff_nm**2).sum(axis=-1).mean(axis=-1)) * 10.0
-
-        assert len(online_rmsd) == len(offline_rmsd), (
-            f"Frame count mismatch: online={len(online_rmsd)}, offline={len(offline_rmsd)}. "
-            "DCDReporter should produce exactly one frame per step-block."
-        )
-        for i, (on, off) in enumerate(zip(online_rmsd, offline_rmsd, strict=True)):
-            assert abs(on - off) < 0.5, (
-                f"Frame {i}: online RMSD = {on:.3f} Å, offline RMSD = {off:.3f} Å, "
-                f"|diff| = {abs(on - off):.3f} Å ≥ 0.5 Å. If this fails, the "
-                "online gate and DCD are reporting different coordinate systems "
-                "— likely an OpenMM API/semantics regression on enforcePeriodicBox=True."
-            )
+# ---------------------------------------------------------------------------
+# Flavor C live-integration regression (placeholder — see OralBiome-AMP#175)
+#
+# The previous Flavor B test (PR #26, now removed) asserted that the online
+# gate's output matched DCDReporter-based offline analysis. Post-#175 that
+# invariant no longer holds by design: the online gate uses
+# enforcePeriodicBox=False (internal unwrapped) while DCDReporter writes
+# enforcePeriodicBox=True (per-molecule wrapped). They intentionally use
+# different coordinate conventions.
+#
+# The replacement (Flavor C) should instead pin the failure mode that
+# motivated #175: a complex whose receptor centroid sits near a box face,
+# long enough production for thermal motion to push centroids across box
+# faces, asserting online gate RMSD ≈ ground-truth unwrapped-Kabsch RMSD
+# within 0.5 Å per frame — NOT DCD agreement.
+#
+# Implementation options per expert consultation 2026-04-21:
+#   (a) Deterministic analytical synthetic test (preferred): construct
+#       wrapped+unwrapped coordinate pairs manually (receptor at face+δ,
+#       peptide bound but in adjacent image) and assert gate math is
+#       correct. Fast, deterministic, runs in every CI pass.
+#   (b) Deterministic live-MD test: CustomExternalForce applies constant
+#       slow drift to receptor CoM, guaranteeing box-face crossing at a
+#       predictable step. Assert online RMSD < 7 Å while peptide is
+#       restrained in pocket. Slow, run nightly.
+#
+# Both tracked in OralBiome-AMP#175 task queue.
+# ---------------------------------------------------------------------------

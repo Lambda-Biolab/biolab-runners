@@ -42,7 +42,6 @@ dev = [
     "pytest-cov",
     "complexipy>=0.8",
     "numpy>=1.26",  # required by the OpenMM runner Kabsch-aligned RMSD tests
-    "mdtraj>=1.10",  # required by the Flavor B live-OpenMM `-m slow` regression test
 ]
 
 [build-system]
