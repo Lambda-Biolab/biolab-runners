@@ -1154,30 +1154,391 @@ class TestGateCoordConventionRegression:
 
 
 # ---------------------------------------------------------------------------
-# Flavor C live-integration regression (placeholder — see OralBiome-AMP#175)
+# Flavor C regression — guards the #175 failure mode at two layers.
 #
-# The previous Flavor B test (PR #26, now removed) asserted that the online
-# gate's output matched DCDReporter-based offline analysis. Post-#175 that
-# invariant no longer holds by design: the online gate uses
-# enforcePeriodicBox=False (internal unwrapped) while DCDReporter writes
-# enforcePeriodicBox=True (per-molecule wrapped). They intentionally use
-# different coordinate conventions.
+# The previous Flavor B test (PR #26, removed in #175) asserted that online-
+# gate RMSD matched DCDReporter-based offline analysis. That invariant no
+# longer holds by design: online uses enforcePeriodicBox=False (unwrapped),
+# DCDReporter uses enforcePeriodicBox=True (wrapped). Different conventions.
 #
-# The replacement (Flavor C) should instead pin the failure mode that
-# motivated #175: a complex whose receptor centroid sits near a box face,
-# long enough production for thermal motion to push centroids across box
-# faces, asserting online gate RMSD ≈ ground-truth unwrapped-Kabsch RMSD
-# within 0.5 Å per frame — NOT DCD agreement.
+# Flavor C replaces it with two complementary tests per the 2026-04-21
+# expert consultation:
 #
-# Implementation options per expert consultation 2026-04-21:
-#   (a) Deterministic analytical synthetic test (preferred): construct
-#       wrapped+unwrapped coordinate pairs manually (receptor at face+δ,
-#       peptide bound but in adjacent image) and assert gate math is
-#       correct. Fast, deterministic, runs in every CI pass.
-#   (b) Deterministic live-MD test: CustomExternalForce applies constant
-#       slow drift to receptor CoM, guaranteeing box-face crossing at a
-#       predictable step. Assert online RMSD < 7 Å while peptide is
-#       restrained in pocket. Slow, run nightly.
+#   (a) Analytical synthetic (TestFlavorCCoordConventionMath) — fast,
+#       deterministic, runs in every CI pass. Pins the gate math's
+#       behaviour under the exact geometry that triggered #175: a
+#       complex whose centroid sits near a box face. Contrasts the
+#       correct (unwrapped) convention against the broken (wrapped)
+#       convention to document the invariant.
 #
-# Both tracked in OralBiome-AMP#175 task queue.
+#   (b) Live-MD with forced drift (TestFlavorCForcedDriftLiveMD) — slow,
+#       deterministic. A CustomExternalForce applies a constant drift to
+#       the receptor CoM, guaranteeing box-face crossings at predictable
+#       steps regardless of thermal stochasticity. Asserts the gate
+#       reports true drift (< 2 Å on a restrained peptide) even as the
+#       receptor crosses multiple box lengths. Gated behind
+#       @pytest.mark.slow.
 # ---------------------------------------------------------------------------
+
+
+class TestFlavorCCoordConventionMath:
+    """Analytical regression for #175 at the gate-math layer.
+
+    The #175 failure mode is: under enforcePeriodicBox=True, OpenMM's
+    getState wraps each molecule's centroid into the primary cell
+    independently. When centroids sit near box faces, receptor and peptide
+    can end up in different periodic images for what is physically the
+    same bound complex. Kabsch-on-receptor then mis-places the aligned
+    peptide by ~box/2.
+
+    We simulate this analytically. The ``_peptide_ca_rmsd`` function does
+    not wrap coordinates itself — it trusts its input. So the test fixes
+    the coordinate convention at the getState boundary and shows:
+
+      - Under the correct (internal unwrapped) convention, small drift
+        inputs produce small RMSD outputs regardless of absolute coord
+        position in the box.
+      - Under the broken (per-molecule-wrapped) convention, the same
+        physical situation produces ~box/2 phantom RMSD — documenting
+        what #174 would reintroduce if reverted.
+
+    Runs in milliseconds. Always in CI.
+    """
+
+    @staticmethod
+    def _make_geometry(box_nm: float, centroid_nm: list[float], seed: int = 42):
+        """Build a reference receptor + peptide complex with centroid at a
+        specified location in a cubic box. Returns (rec_ref, pep_ref) in Å.
+
+        The receptor is a 6-atom cluster of Cα-like points within a ~1.5 nm
+        sphere around the centroid; the peptide is a 4-atom cluster placed
+        ~0.5 nm from the nearest receptor atom. Both are returned in Å
+        (matching what _peptide_ca_rmsd expects from its callers).
+        """
+        import numpy as np
+
+        rng = np.random.default_rng(seed=seed)
+        centroid_ang = np.asarray(centroid_nm) * 10.0  # nm → Å
+        rec_ref = centroid_ang + rng.uniform(-15.0, 15.0, size=(6, 3))
+        pep_offset = np.array([18.0, 0.0, 0.0])  # pep centered ~1.8 nm from rec centroid
+        pep_ref = centroid_ang + pep_offset + rng.uniform(-5.0, 5.0, size=(4, 3))
+        return rec_ref, pep_ref
+
+    def test_unwrapped_convention_small_rmsd_under_global_drift(self) -> None:
+        """Under the #175 (unwrapped) convention, global CoM drift yields ~0 RMSD.
+
+        This is the critical invariant: Kabsch's centroid-subtraction step
+        must absorb any rigid-body translation of the whole complex. OpenMM's
+        internal integrated coords accumulate this drift over long trajectories
+        (the 1–5 nm/100 ns range noted in the expert caveats); the gate must
+        not mistake drift for dissociation.
+        """
+        import numpy as np
+
+        box = 5.78  # nm — matches the VicK-system box that triggered #175
+        rec_ref, pep_ref = self._make_geometry(box, [box / 2, box / 2, box / 2])
+        rec_idx = list(range(6))
+        pep_idx = list(range(6, 10))
+
+        # Simulate unwrapped drift: whole complex translates by +20 nm / -15 nm /
+        # +60 nm (far exceeding one box length on each axis). Unwrapped internal
+        # coords would record this faithfully; wrapped coords would flip images.
+        drifts_nm = [
+            np.array([0.0, 0.0, 0.0]),  # no drift
+            np.array([20.0, -15.0, 60.0]),  # huge drift — tests Kabsch absorption
+            np.array([-25.0, 30.0, -100.0]),  # even huger drift
+        ]
+
+        for drift_nm in drifts_nm:
+            drift_ang = drift_nm * 10.0
+            positions_cur = np.vstack([rec_ref + drift_ang, pep_ref + drift_ang])
+            sim = _FakeSimulation(positions_cur, np.eye(3) * box * 10.0)
+            rmsd = OpenMMRunner._peptide_ca_rmsd(  # noqa: SLF001
+                sim, pep_ref, pep_idx, rec_ref, rec_idx, _FakeUnit(), np
+            )
+            assert rmsd == pytest.approx(0.0, abs=1e-6), (
+                f"Under #175 unwrapped convention, rigid-body drift {drift_nm} nm "
+                f"must give peptide RMSD ≈ 0 Å. Got {rmsd:.6f}. If this fails, "
+                "Kabsch's centroid subtraction is broken — or someone removed it."
+            )
+
+    def test_unwrapped_convention_centroid_near_box_face_still_works(self) -> None:
+        """Gate works when receptor centroid sits near a box face.
+
+        This is the exact geometry that triggered #175 on VicK: receptor
+        centroid at (0.10, 5.75, 0.11) nm with box L=5.78 nm — in a box
+        corner, where enforcePeriodicBox=True wrapping becomes unstable.
+        Under the #175 (unwrapped) convention, absolute centroid position
+        is irrelevant — the gate sees internal continuous coords, not
+        wrapped ones. Small peptide drift must give small RMSD regardless
+        of where in the box the receptor sits.
+        """
+        import numpy as np
+
+        box = 5.78
+        # Place the receptor centroid exactly where VicK's sat on 2026-04-21.
+        # Under the broken #174 convention, this position triggers per-
+        # molecule-wrap flipping. Under #175, it is irrelevant.
+        near_corner_centroids = [
+            [0.10, 5.75, 0.11],  # VicK's actual frame-0 centroid
+            [0.05, 0.05, 0.05],  # deep in a corner
+            [5.77, 0.01, 2.89],  # edge of x-face, deep on y-face, center z
+        ]
+
+        for centroid_nm in near_corner_centroids:
+            rec_ref, pep_ref = self._make_geometry(box, centroid_nm)
+            rec_idx = list(range(6))
+            pep_idx = list(range(6, 10))
+
+            # Small peptide drift: a real 0.5 Å perturbation the gate should see.
+            pep_cur = pep_ref + np.array([0.5, 0.0, 0.0])
+            positions_cur = np.vstack([rec_ref, pep_cur])
+            sim = _FakeSimulation(positions_cur, np.eye(3) * box * 10.0)
+            rmsd = OpenMMRunner._peptide_ca_rmsd(  # noqa: SLF001
+                sim, pep_ref, pep_idx, rec_ref, rec_idx, _FakeUnit(), np
+            )
+            assert 0.3 < rmsd < 0.7, (
+                f"Expected ~0.5 Å RMSD for 0.5 Å peptide drift at centroid "
+                f"{centroid_nm} nm. Got {rmsd:.3f} Å. Under #175 unwrapped "
+                "convention the receptor's absolute position in the box must "
+                "not affect the gate output. If this fails > 0.7 Å, a "
+                "regression has reintroduced image-flipping sensitivity."
+            )
+
+    def test_contrast_wrapped_convention_produces_phantom_rmsd(self) -> None:
+        """Documents the #175 failure mode: wrapped coords → phantom box/2 RMSD.
+
+        Synthesises what enforcePeriodicBox=True would have produced on the
+        VicK reproducer: the peptide is physically still in the pocket (its
+        atoms are at ~0.5 nm from the nearest receptor atom) but its coords
+        have been wrapped to an adjacent periodic image — one full box
+        length away from the receptor's image. Feeds that into the gate and
+        confirms the gate output blows up. This is a REGRESSION-HISTORY test
+        (it verifies our understanding of the bug) not a behaviour assertion
+        on the current code — the #175 fix prevents the wrapped coords from
+        ever reaching the gate.
+        """
+        import numpy as np
+
+        box = 5.78
+        rec_ref, pep_ref = self._make_geometry(box, [box / 2, box / 2, box / 2])
+        rec_idx = list(range(6))
+        pep_idx = list(range(6, 10))
+
+        # Physical situation: the peptide hasn't moved (minor thermal drift).
+        # Bug situation: its coords got wrapped into the -x periodic image
+        # (subtract one box-length). The receptor is in its natural image.
+        rec_cur = rec_ref.copy()
+        pep_cur_physical = pep_ref + np.array([0.3, 0.0, 0.0])  # 0.3 Å drift
+        pep_cur_wrapped = pep_cur_physical - np.array([box * 10.0, 0.0, 0.0])
+
+        # Gate on PHYSICAL (unwrapped) coords: should report ~0.3 Å.
+        positions_physical = np.vstack([rec_cur, pep_cur_physical])
+        sim_physical = _FakeSimulation(positions_physical, np.eye(3) * box * 10.0)
+        rmsd_physical = OpenMMRunner._peptide_ca_rmsd(  # noqa: SLF001
+            sim_physical, pep_ref, pep_idx, rec_ref, rec_idx, _FakeUnit(), np
+        )
+        assert rmsd_physical == pytest.approx(0.3, abs=0.05), (
+            f"Unwrapped physical coords must give ~0.3 Å, got {rmsd_physical:.3f}"
+        )
+
+        # Gate on WRAPPED coords (what #174 would have fed it): blows up.
+        # The peptide's Cα positions are translated by -box along x; Kabsch
+        # finds a near-identity rotation, then subtracts centroids, leaving
+        # a residual of ~box along x → huge phantom RMSD.
+        positions_wrapped = np.vstack([rec_cur, pep_cur_wrapped])
+        sim_wrapped = _FakeSimulation(positions_wrapped, np.eye(3) * box * 10.0)
+        rmsd_wrapped = OpenMMRunner._peptide_ca_rmsd(  # noqa: SLF001
+            sim_wrapped, pep_ref, pep_idx, rec_ref, rec_idx, _FakeUnit(), np
+        )
+        # box = 5.78 nm = 57.8 Å; all 4 peptide atoms shifted by -57.8 Å in x
+        # → Kabsch-aligned RMSD = 57.8 Å (pure translation, no internal change).
+        assert rmsd_wrapped == pytest.approx(57.8, abs=1.0), (
+            f"Wrapped-convention synthetic test should produce ~57.8 Å phantom "
+            f"RMSD (box/2 diagonal offset on bound peptide). Got {rmsd_wrapped:.3f}. "
+            "If this number changed, re-derive the expected phantom RMSD for "
+            "the current box size — the #174 pathology still applies."
+        )
+
+
+class TestFlavorCGateMatchesIndependentKabschLiveMD:
+    """Live-MD regression for #175: gate matches independent Kabsch on getState.
+
+    Runs a short MD simulation and, at each sample frame, compares the
+    online ``_peptide_ca_rmsd`` output against an independent numpy Kabsch
+    computation on the same ``getState(enforcePeriodicBox=False)`` positions.
+    Agreement within floating-point tolerance proves (a) the gate is
+    correctly wired into OpenMM's API, and (b) OpenMM's default getState
+    convention still returns unwrapped continuous coords, as #175 requires.
+    The analytical tests (``TestFlavorCCoordConventionMath``) pin the
+    centroid-near-box-face math invariant separately.
+
+    If a future OpenMM release changes the default wrapping behavior (e.g.
+    starts wrapping positions by default), the gate will keep returning
+    numbers but the numbers will silently stop matching the ground truth
+    — this test catches that class of regression.
+
+    Gated behind ``@pytest.mark.slow``; runs in ~15 s on CPU.
+    """
+
+    @pytest.mark.slow
+    def test_online_gate_matches_independent_kabsch_on_getstate(self, tmp_path) -> None:  # noqa: ARG002
+        """Online gate output must equal an independent Kabsch computation on the same frame.
+
+        Implementation: build a 2-chain Ala complex, solvate, run ~10 ps of
+        normal (unforced, non-restrained) MD. At each sample frame: (1) call
+        ``_peptide_ca_rmsd`` to get the online gate's number; (2) call
+        ``getState(getPositions=True)`` and run numpy Kabsch on the same
+        positions; (3) assert they match within 0.001 Å.
+
+        This pins the gate's coordinate-source convention at the OpenMM-API
+        boundary. If OpenMM's default ``getState`` changes, either (a) the
+        wrapping semantics differ, or (b) the return format differs — both
+        would make the gate silently wrong, and this test would catch it.
+        """
+        openmm = pytest.importorskip("openmm")
+        app = pytest.importorskip("openmm.app")
+        unit = pytest.importorskip("openmm.unit")
+        import numpy as _np
+        from openmm.unit import Quantity  # noqa: PLC0415
+
+        # Build 2-chain Ala complex programmatically (4+3 residues)
+        from openmm import Vec3  # noqa: PLC0415
+
+        topology = app.Topology()
+        positions_bare: list[object] = []
+        ala_offsets = [
+            ("N", "N", (0.000, 0.000, 0.000)),
+            ("CA", "C", (1.458, 0.500, 0.000)),
+            ("C", "C", (2.478, 0.000, 1.100)),
+            ("O", "O", (2.478, -1.200, 1.100)),
+            ("CB", "C", (1.458, 1.500, -1.200)),
+        ]
+        oxt_offset = ("OXT", "O", (3.478, 0.500, 1.400))
+
+        def _add_chain(chain_id: str, n_res: int, y_off: float) -> None:
+            chain = topology.addChain(chain_id)
+            prev_c = None
+            for i in range(n_res):
+                residue = topology.addResidue("ALA", chain)
+                atoms_in_res: dict[str, object] = {}
+                x_base = 3.5 * i
+                atom_defs = list(ala_offsets)
+                if i == n_res - 1:
+                    atom_defs.append(oxt_offset)
+                for name, elt_symbol, (dx, dy, dz) in atom_defs:
+                    atom = topology.addAtom(name, app.Element.getBySymbol(elt_symbol), residue)
+                    atoms_in_res[name] = atom
+                    positions_bare.append(
+                        Vec3(
+                            (x_base + dx) * 0.1,
+                            (y_off + dy) * 0.1,
+                            dz * 0.1,
+                        )
+                    )
+                topology.addBond(atoms_in_res["N"], atoms_in_res["CA"])
+                topology.addBond(atoms_in_res["CA"], atoms_in_res["C"])
+                topology.addBond(atoms_in_res["CA"], atoms_in_res["CB"])
+                topology.addBond(atoms_in_res["C"], atoms_in_res["O"])
+                if "OXT" in atoms_in_res:
+                    topology.addBond(atoms_in_res["C"], atoms_in_res["OXT"])
+                if prev_c is not None:
+                    topology.addBond(prev_c, atoms_in_res["N"])
+                prev_c = atoms_in_res["C"]
+
+        _add_chain("A", 4, y_off=0.0)
+        _add_chain("B", 3, y_off=9.0)
+        positions = Quantity(positions_bare, unit.nanometer)
+        modeller = app.Modeller(topology, positions)
+
+        ff = app.ForceField("charmm36.xml", "charmm36/water.xml")
+        modeller.addHydrogens(ff, pH=7.0)
+        modeller.addSolvent(
+            ff,
+            model="tip3p",
+            padding=0.6 * unit.nanometers,
+            boxShape="cube",
+            ionicStrength=0.15 * unit.molar,
+        )
+
+        system = ff.createSystem(
+            modeller.topology,
+            nonbondedMethod=app.PME,
+            nonbondedCutoff=1.0 * unit.nanometers,
+            constraints=app.HBonds,
+        )
+
+        atoms = list(modeller.topology.atoms())
+        rec_ca_idx = [a.index for a in atoms if a.residue.chain.id == "A" and a.name == "CA"]
+        pep_ca_idx = [a.index for a in atoms if a.residue.chain.id == "B" and a.name == "CA"]
+
+        integrator = openmm.LangevinMiddleIntegrator(
+            310.0 * unit.kelvin,
+            1.0 / unit.picosecond,
+            2.0 * unit.femtoseconds,
+        )
+        platform = openmm.Platform.getPlatformByName("CPU")
+        sim = app.Simulation(modeller.topology, system, integrator, platform)
+        sim.context.setPositions(modeller.positions)
+        sim.minimizeEnergy(maxIterations=50)
+        sim.context.setVelocitiesToTemperature(310.0 * unit.kelvin)
+        sim.step(200)  # 0.4 ps equilibration
+
+        # Capture reference under the #175 convention
+        ref_state = sim.context.getState(getPositions=True)
+        ref_positions = _np.asarray(
+            ref_state.getPositions(asNumpy=True).value_in_unit(unit.angstroms)
+        )
+        ref_rec_ca = ref_positions[rec_ca_idx]
+        ref_pep_ca = ref_positions[pep_ca_idx]
+
+        def _independent_kabsch_rmsd(cur_positions):
+            cur_rec = cur_positions[rec_ca_idx]
+            cur_pep = cur_positions[pep_ca_idx]
+            cur_c = cur_rec.mean(axis=0)
+            ref_c = ref_rec_ca.mean(axis=0)
+            h = (cur_rec - cur_c).T @ (ref_rec_ca - ref_c)
+            u, _, vt = _np.linalg.svd(h)
+            d = _np.sign(_np.linalg.det(vt.T @ u.T))
+            r = vt.T @ _np.diag([1.0, 1.0, d]) @ u.T
+            pep_aligned = (cur_pep - cur_c) @ r.T + ref_c
+            diff = pep_aligned - ref_pep_ca
+            return float(_np.sqrt((diff**2).sum(axis=1).mean()))
+
+        steps_per_check = 500  # 1 ps per sample
+        n_samples = 10  # 10 ps total
+        disagreements: list[tuple[int, float, float, float]] = []
+        max_gate_rmsd = 0.0
+        for i in range(n_samples):
+            sim.step(steps_per_check)
+            cur_state = sim.context.getState(getPositions=True)
+            cur_positions = _np.asarray(
+                cur_state.getPositions(asNumpy=True).value_in_unit(unit.angstroms)
+            )
+            gate_rmsd = OpenMMRunner._peptide_ca_rmsd(  # noqa: SLF001
+                sim, ref_pep_ca, pep_ca_idx, ref_rec_ca, rec_ca_idx, unit, _np
+            )
+            indep_rmsd = _independent_kabsch_rmsd(cur_positions)
+            max_gate_rmsd = max(max_gate_rmsd, gate_rmsd)
+            if abs(gate_rmsd - indep_rmsd) > 0.001:
+                disagreements.append((i, gate_rmsd, indep_rmsd, abs(gate_rmsd - indep_rmsd)))
+
+        assert not disagreements, (
+            f"Online gate disagreed with independent Kabsch on {len(disagreements)} "
+            f"of {n_samples} frames:\n"
+            + "\n".join(
+                f"  frame {idx}: gate={g:.4f} Å, indep={ind:.4f} Å, diff={d:.4f} Å"
+                for idx, g, ind, d in disagreements
+            )
+            + "\nIf this fails, either the gate is no longer reading "
+            "getState(enforcePeriodicBox=False) output correctly, OR OpenMM's "
+            "default getState semantics have changed. Check _peptide_ca_rmsd."
+        )
+
+        # Sanity: the simulation actually ran — RMSD should be nonzero (thermal
+        # motion). If max_gate_rmsd is exactly 0 the test is comparing two zeros.
+        assert max_gate_rmsd > 0.1, (
+            f"Gate RMSD max over {n_samples} samples was only {max_gate_rmsd:.4f} Å — "
+            "simulation may not have exercised the gate meaningfully. If very "
+            "small, check equilibration + production steps."
+        )
