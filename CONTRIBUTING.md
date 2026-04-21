@@ -4,19 +4,11 @@ This is a private repository. All contributions must be authorized.
 
 ## Commit Format
 
-Use [Conventional Commits](https://www.conventionalcommits.org/):
+Use [Conventional Commits](https://www.conventionalcommits.org/). See [`.gitmessage`](.gitmessage) for the template.
 
+```bash
+git config commit.template .gitmessage
 ```
-<type>(<scope>): <subject>
-
-<body>
-
-<footer>
-```
-
-**Types:** `feat`, `fix`, `docs`, `style`, `refactor`, `test`, `chore`, `ci`, `perf`
-
-**Scopes:** `boltz2`, `openmm`, `config`, `ci`
 
 ## Pre-commit Checklist
 
