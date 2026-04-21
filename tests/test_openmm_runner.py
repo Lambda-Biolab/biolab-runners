@@ -206,6 +206,42 @@ class TestBuildForcefield:
         ff = OpenMMRunner._build_forcefield(config, _FakeApp())
         assert ff.paths[-2:] == tuple(extras)
 
+    def test_water_ff_xml_overrides_water_model_path(self) -> None:
+        """When set, water_ff_xml replaces {water_model}.xml as the water XML.
+
+        Use case: Aib peptides at physiological ionic strength need AMBER
+        ion templates (Na/Cl/K/Ca). Bare ``tip3p.xml`` is water-only, so
+        ``addSolvent`` fails with "No template found for residue N (NA)".
+        ``water_ff_xml="amber14/tip3p.xml"`` loads the ion-inclusive bundle
+        into ForceField while addSolvent still sees the short model key.
+        """
+        config = OpenMMConfig(
+            protein_ff="amber14/protein.ff14SB",
+            water_model="tip3p",
+            water_ff_xml="amber14/tip3p.xml",
+        )
+        ff = OpenMMRunner._build_forcefield(config, _FakeApp())
+        assert ff.paths == ("amber14/protein.ff14SB.xml", "amber14/tip3p.xml")
+
+    def test_water_ff_xml_empty_falls_back_to_water_model(self) -> None:
+        """When water_ff_xml is empty, preserve the pre-change behavior."""
+        config = OpenMMConfig(
+            protein_ff="amber14/protein.ff14SB",
+            water_model="tip3p",
+            water_ff_xml="",
+        )
+        ff = OpenMMRunner._build_forcefield(config, _FakeApp())
+        assert ff.paths == ("amber14/protein.ff14SB.xml", "tip3p.xml")
+
+    def test_water_ff_xml_ignored_for_charmm(self) -> None:
+        """CHARMM branch hardcodes charmm36 XMLs regardless of water_ff_xml."""
+        config = OpenMMConfig(
+            protein_ff="charmm36m",
+            water_ff_xml="amber14/tip3p.xml",  # ignored — CHARMM branch
+        )
+        ff = OpenMMRunner._build_forcefield(config, _FakeApp())
+        assert ff.paths == ("charmm36.xml", "charmm36/water.xml")
+
 
 class TestEquilibrationStage:
     """Tests for EquilibrationStage dataclass."""

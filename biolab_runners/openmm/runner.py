@@ -340,6 +340,16 @@ class OpenMMRunner:
     def _build_forcefield(config: OpenMMConfig, app: object) -> object:
         """Construct the OpenMM ForceField for the configured protein FF + water.
 
+        Uses ``config.water_ff_xml`` when provided, else falls back to
+        ``{water_model}.xml``. The distinction matters: ``Modeller.addSolvent``
+        takes a SHORT model key (``"tip3p"``), whereas ``app.ForceField`` needs
+        an XML filename. Bare ``tip3p.xml`` ships water parameters only, so
+        ionic-strength solvation raises "No template found for residue N (NA)"
+        unless the XML loaded into ForceField carries ion templates. Point
+        ``water_ff_xml`` at e.g. ``"amber14/tip3p.xml"`` for an AMBER water+ions
+        bundle. For CHARMM36m, the built-in ``charmm36/water.xml`` already
+        includes ion templates so this override is unnecessary.
+
         ``config.extra_forcefields`` is appended after the protein and water
         XMLs so later entries take precedence for overlapping atom types.
         """
@@ -347,7 +357,8 @@ class OpenMMRunner:
         if "charmm" in ff_name.lower():
             base = ["charmm36.xml", "charmm36/water.xml"]
         else:
-            base = [f"{ff_name}.xml", f"{config.water_model}.xml"]
+            water_xml = config.water_ff_xml or f"{config.water_model}.xml"
+            base = [f"{ff_name}.xml", water_xml]
         return app.ForceField(*base, *config.extra_forcefields)  # type: ignore[union-attr]
 
     def _build_or_load_modeller(
