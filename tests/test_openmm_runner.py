@@ -983,3 +983,189 @@ class TestCheckSlope10nsConjunctiveGate:
             np=np,
         )
         assert aborted is False
+
+
+# ---------------------------------------------------------------------------
+# #174 regression: getState must use enforcePeriodicBox=True for the gate
+#
+# The bug: simulation.context.getState(getPositions=True) defaulted to
+# enforcePeriodicBox=False, returning raw unwrapped coordinates where atoms
+# could diffuse many Å from their starting image. Per-atom _pbc_correct
+# unwrap could not recover because atoms near a box midplane picked
+# different "closest image" wraps, fragmenting rigid structure and
+# inflating Kabsch residuals. DCDReporter writes enforcePeriodicBox=True
+# coords, so offline analysis was clean while the live gate saw phantoms.
+#
+# Production reproducer: OralBiome-AMP MDM2/p53_TAD_cstr_rep2 rep2, which
+# aborted at 10.2 ns with online RMSD 13.02 Å while all three DCD-based
+# methods gave 2.70 Å on the same frames.
+# ---------------------------------------------------------------------------
+
+
+class TestEnforcePeriodicBoxRegression:
+    """Structural regression tests for OralBiome-AMP#174.
+
+    Guards the two requirements of the fix:
+      1. ``getState(getPositions=True)`` calls in gate paths must pair
+         with ``enforcePeriodicBox=True``.
+      2. ``_peptide_ca_rmsd`` must not call ``_pbc_correct`` — the
+         per-atom PBC unwrap is incompatible with rigid bodies
+         straddling a box face, and ``enforcePeriodicBox=True`` makes
+         it unnecessary.
+
+    The math-layer dual assertion (per-atom PBC fragments; whole-box Kabsch
+    absorbs rigid translation) is tested in the sibling OralBiome-AMP
+    ``tests/test_openmm_cloud_pbc.py::TestEnforcePeriodicBoxRegression``,
+    which guards the same invariant on the embedded cloud runner script.
+    """
+
+    def test_peptide_ca_rmsd_uses_enforce_periodic_box(self) -> None:
+        """The gate's getState call must pass enforcePeriodicBox=True."""
+        import ast
+        import inspect
+        import textwrap
+
+        from biolab_runners.openmm.runner import OpenMMRunner
+
+        src = textwrap.dedent(inspect.getsource(OpenMMRunner._peptide_ca_rmsd))
+        tree = ast.parse(src)
+        found_kwarg = False
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            callee = ast.unparse(node.func)
+            if "getState" not in callee:
+                continue
+            # Any getState call inside this method must pass enforcePeriodicBox=True
+            kwargs = {kw.arg: ast.unparse(kw.value) for kw in node.keywords if kw.arg}
+            assert kwargs.get("enforcePeriodicBox") == "True", (
+                f"getState() in _peptide_ca_rmsd must pass enforcePeriodicBox=True "
+                f"(guards OralBiome-AMP#174). Got kwargs: {kwargs}"
+            )
+            found_kwarg = True
+        assert found_kwarg, "expected at least one getState() call in _peptide_ca_rmsd body"
+
+    def test_peptide_ca_rmsd_removed_per_atom_pbc(self) -> None:
+        """``_peptide_ca_rmsd`` must not call ``_pbc_correct``.
+
+        The fix is two-sided: enforcePeriodicBox=True coords AND no
+        per-atom PBC unwrap. Per-atom wrap fragments rigid bodies across
+        box faces; whole-receptor Kabsch handles the rigid-body shift
+        naturally. Walks the AST and checks ``Call`` nodes only, so the
+        docstring is free to mention ``_pbc_correct`` by name.
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        from biolab_runners.openmm.runner import OpenMMRunner
+
+        src = textwrap.dedent(inspect.getsource(OpenMMRunner._peptide_ca_rmsd))
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_peptide_ca_rmsd":
+                body = node.body
+                if (
+                    body
+                    and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)
+                ):
+                    body = body[1:]
+                for stmt in body:
+                    for sub in ast.walk(stmt):
+                        if isinstance(sub, ast.Call):
+                            callee = ast.unparse(sub.func)
+                            assert "_pbc_correct" not in callee, (
+                                "_peptide_ca_rmsd must not call _pbc_correct after "
+                                "OralBiome-AMP#174 — enforcePeriodicBox=True + Kabsch "
+                                "on whole receptor is sufficient, and per-atom PBC "
+                                "fragments rigid structures across box faces."
+                            )
+                return
+        pytest.fail("_peptide_ca_rmsd not found via inspect.getsource")
+
+    def test_kabsch_absorbs_rigid_body_translation(self) -> None:
+        """Math sanity: Kabsch on receptor gives RMSD≈0 under rigid-body translation.
+
+        Once inputs are in the same coordinate system (whole-molecule wrapped,
+        which is what enforcePeriodicBox=True guarantees) Kabsch fully absorbs
+        any rigid-body translation of the whole complex — peptide RMSD should
+        remain at ~0 regardless of how far the complex has drifted.
+
+        The live-integration check (gate output matches mdtraj.superpose on
+        a real OpenMM simulation) lives in the ``@pytest.mark.slow`` test.
+        """
+        import numpy as np
+
+        rng = np.random.default_rng(seed=123)
+        ref_rec = rng.uniform(-10.0, 10.0, size=(8, 3))
+        ref_pep = rng.uniform(-5.0, 5.0, size=(5, 3))
+        positions_ref = np.vstack([ref_rec, ref_pep])
+        rec_idx = list(range(8))
+        pep_idx = list(range(8, 13))
+
+        for shift in (
+            np.array([5.0, 0.0, 0.0]),
+            np.array([12.0, 8.0, -6.0]),
+            np.array([20.0, 0.0, 15.0]),
+        ):
+            positions_cur = positions_ref + shift
+            sim = _FakeSimulation(positions_cur, np.eye(3) * 100.0)
+            rmsd = OpenMMRunner._peptide_ca_rmsd(  # noqa: SLF001
+                sim, ref_pep, pep_idx, ref_rec, rec_idx, _FakeUnit(), np
+            )
+            assert rmsd == pytest.approx(0.0, abs=1e-6), (
+                f"Kabsch on receptor must absorb rigid-body translation shift={shift}. "
+                f"Got RMSD={rmsd:.6f} Å — if this fails, Kabsch math is broken."
+            )
+
+
+class TestOnlineGateMatchesOfflineOnLiveSimulation:
+    """Integration regression for #174: online gate output matches offline
+    mdtraj.superpose on the same DCD frames from a live OpenMM simulation.
+
+    This is the failure path Flavor-A structural tests cannot cover: a
+    future change that leaves the ``enforcePeriodicBox=True`` kwarg in
+    place but breaks the upstream-OpenMM semantics (e.g. new OpenMM
+    version changing coord-wrapping behavior, or DCDReporter reconfigured
+    to write a different coordinate convention) would still pass the
+    structural tests but fail here.
+
+    Marked ``@pytest.mark.slow`` because it runs ~100 ps of real MD.
+    Expected runtime: ~5 s on a local GPU (CPU: ~30 s).
+    """
+
+    @pytest.mark.slow
+    @pytest.mark.skip(reason="Flavor B placeholder — implement with a 2-chain PDB fixture")
+    def test_online_gate_rmsd_matches_mdtraj_within_half_angstrom(self, tmp_path) -> None:  # noqa: ARG002
+        """Live-OpenMM regression for OralBiome-AMP#174 (Flavor B placeholder).
+
+        Structural Flavor A tests (``TestEnforcePeriodicBoxRegression``)
+        pin the mechanism — every ``getState`` in gate paths must use
+        ``enforcePeriodicBox=True`` and ``_peptide_ca_rmsd`` must not call
+        ``_pbc_correct``. This test additionally pins that those choices
+        actually produce coordinates matching what ``DCDReporter`` writes
+        under the current OpenMM version — the failure surface Flavor A
+        cannot cover because it never calls OpenMM.
+
+        Implementation outline for the follow-up:
+          1. Build a 2-chain complex (two 6–8 residue polyalanine helices
+             placed 8 Å apart) via PDBFixer, OR load a checked-in fixture
+             from ``tests/data/pbc_regression.pdb``.
+          2. Solvate in a small TIP3P cubic box (~3–4 nm) via Modeller.
+          3. Minimize, briefly equilibrate with Cα restraints, run ~50 ps
+             production with DCDReporter on CPU platform (frame every 5 ps).
+          4. During production, at each DCD write, call
+             ``OpenMMRunner._peptide_ca_rmsd`` and record online RMSD.
+          5. After production, load DCD with mdtraj, slice to solute,
+             ``traj.superpose(traj, frame=0, atom_indices=rec_ca)``,
+             compute peptide RMSD per frame.
+          6. Assert ``abs(online[f] - offline[f]) < 0.5`` Å for every
+             recorded frame f.
+
+        Expected runtime: ~5 s GPU, ~30 s CPU. ``@pytest.mark.slow`` gates
+        it out of fast CI; run in nightly or pre-release.
+
+        Follow-up tracked in OralBiome-AMP#174.
+        """

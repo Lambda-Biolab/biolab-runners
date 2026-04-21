@@ -109,3 +109,6 @@ reportAttributeAccessIssue = "warning"
 # --- Pytest ---
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "slow: long-running integration tests (e.g., live OpenMM simulations). Skipped by default; run with `pytest -m slow`.",
+]

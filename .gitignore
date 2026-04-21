@@ -41,3 +41,5 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.log
+smoke_test/
+uv.lock
