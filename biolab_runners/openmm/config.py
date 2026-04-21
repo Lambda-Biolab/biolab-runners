@@ -146,6 +146,19 @@ class OpenMMConfig:
     # Force fields
     protein_ff: str = PROTEIN_FF
     water_model: str = WATER_MODEL
+    # Water + ions XML path for ``app.ForceField``. Separate from
+    # ``water_model`` because ``Modeller.addSolvent(model=…)`` takes a
+    # SHORT key like ``"tip3p"`` / ``"tip4pew"`` whereas ``ForceField``
+    # needs an XML filename. Bare ``tip3p.xml`` ships water-only
+    # parameters and ``addSolvent`` raises "No template found for
+    # residue N (NA)" once Na+/Cl-/K+/Ca2+ ions are inserted at the
+    # configured ionic strength. Point this at e.g.
+    # ``"amber14/tip3p.xml"`` for a water+ions bundle, or leave empty
+    # and biolab-runners will fall back to ``{water_model}.xml``
+    # (appropriate for CHARMM where the ion templates ship with the
+    # protein XML). OralBiome-AMP's Aib preprocessing sets this via
+    # ``force_fields.water_ff_xml`` — see ``augment_system_config_for_aib``.
+    water_ff_xml: str = ""
     ligand_ff: str = LIGAND_FF
     extra_forcefields: list[str] = field(default_factory=list)
 
@@ -221,6 +234,7 @@ class OpenMMConfig:
             "force_fields": {
                 "protein": self.protein_ff,
                 "water": self.water_model,
+                "water_ff_xml": self.water_ff_xml,
                 "ligand": self.ligand_ff,
                 "extra": list(self.extra_forcefields),
             },
@@ -277,6 +291,7 @@ class OpenMMConfig:
             checkpoint_interval_hours=sim.get("checkpoint_interval_hours", 2.0),
             protein_ff=ff.get("protein", PROTEIN_FF),
             water_model=ff.get("water", WATER_MODEL),
+            water_ff_xml=ff.get("water_ff_xml", ""),
             ligand_ff=ff.get("ligand", LIGAND_FF),
             extra_forcefields=list(ff.get("extra", []) or []),
             protonation_ph=data.get("protonation_ph", DEFAULT_PH),
