@@ -1132,40 +1132,198 @@ class TestOnlineGateMatchesOfflineOnLiveSimulation:
     to write a different coordinate convention) would still pass the
     structural tests but fail here.
 
-    Marked ``@pytest.mark.slow`` because it runs ~100 ps of real MD.
-    Expected runtime: ~5 s on a local GPU (CPU: ~30 s).
+    Marked ``@pytest.mark.slow``: runs a short live MD (~5 ps production
+    on a ~3 nm cubic TIP3P box). Expected runtime: ~20 s on CPU, faster
+    on GPU. Requires the ``openmm`` extra plus ``mdtraj`` (dev group).
     """
 
-    @pytest.mark.slow
-    @pytest.mark.skip(reason="Flavor B placeholder — implement with a 2-chain PDB fixture")
-    def test_online_gate_rmsd_matches_mdtraj_within_half_angstrom(self, tmp_path) -> None:  # noqa: ARG002
-        """Live-OpenMM regression for OralBiome-AMP#174 (Flavor B placeholder).
+    @staticmethod
+    def _build_2chain_ala_modeller(app: object, unit: object, n_a: int, n_b: int, sep_y: float):
+        """Build a 2-chain extended-Ala complex as an OpenMM Modeller.
 
-        Structural Flavor A tests (``TestEnforcePeriodicBoxRegression``)
-        pin the mechanism — every ``getState`` in gate paths must use
-        ``enforcePeriodicBox=True`` and ``_peptide_ca_rmsd`` must not call
-        ``_pbc_correct``. This test additionally pins that those choices
-        actually produce coordinates matching what ``DCDReporter`` writes
-        under the current OpenMM version — the failure surface Flavor A
-        cannot cover because it never calls OpenMM.
-
-        Implementation outline for the follow-up:
-          1. Build a 2-chain complex (two 6–8 residue polyalanine helices
-             placed 8 Å apart) via PDBFixer, OR load a checked-in fixture
-             from ``tests/data/pbc_regression.pdb``.
-          2. Solvate in a small TIP3P cubic box (~3–4 nm) via Modeller.
-          3. Minimize, briefly equilibrate with Cα restraints, run ~50 ps
-             production with DCDReporter on CPU platform (frame every 5 ps).
-          4. During production, at each DCD write, call
-             ``OpenMMRunner._peptide_ca_rmsd`` and record online RMSD.
-          5. After production, load DCD with mdtraj, slice to solute,
-             ``traj.superpose(traj, frame=0, atom_indices=rec_ca)``,
-             compute peptide RMSD per frame.
-          6. Assert ``abs(online[f] - offline[f]) < 0.5`` Å for every
-             recorded frame f.
-
-        Expected runtime: ~5 s GPU, ~30 s CPU. ``@pytest.mark.slow`` gates
-        it out of fast CI; run in nightly or pre-release.
-
-        Follow-up tracked in OralBiome-AMP#174.
+        Heavy atoms only (N, CA, C, O, CB); ``Modeller.addHydrogens`` on the
+        caller adds missing hydrogens and caps N/C termini via the force
+        field's residue templates. Geometry is approximate — minimization
+        reshapes it. Positions are returned in nanometers.
         """
+        from openmm.unit import Quantity
+
+        from openmm import Vec3  # local import — openmm is importorskip'd in the test
+
+        topology = app.Topology()  # type: ignore[attr-defined]
+        positions_bare: list[object] = []
+
+        # Heavy-atom offsets from residue origin (Å); chosen so adjacent
+        # residues stacked at Δx=3.5 Å give a plausible extended backbone
+        # that the CHARMM36 minimizer can relax without exploding.
+        ala_offsets = [
+            ("N", "N", (0.000, 0.000, 0.000)),
+            ("CA", "C", (1.458, 0.500, 0.000)),
+            ("C", "C", (2.478, 0.000, 1.100)),
+            ("O", "O", (2.478, -1.200, 1.100)),
+            ("CB", "C", (1.458, 1.500, -1.200)),
+        ]
+        # C-terminal requires OXT for the CHARMM36 C-term ALA template to match.
+        oxt_offset = ("OXT", "O", (3.478, 0.500, 1.400))
+
+        def _add_chain(chain_id: str, n_res: int, y_off: float) -> None:
+            chain = topology.addChain(chain_id)  # type: ignore[attr-defined]
+            prev_c = None
+            for i in range(n_res):
+                residue = topology.addResidue("ALA", chain)  # type: ignore[attr-defined]
+                atoms_in_res: dict[str, object] = {}
+                x_base = 3.5 * i
+                atom_defs = list(ala_offsets)
+                if i == n_res - 1:
+                    atom_defs.append(oxt_offset)
+                for name, elt_symbol, (dx, dy, dz) in atom_defs:
+                    atom = topology.addAtom(  # type: ignore[attr-defined]
+                        name,
+                        app.Element.getBySymbol(elt_symbol),  # type: ignore[attr-defined]
+                        residue,
+                    )
+                    atoms_in_res[name] = atom
+                    # Convert Å → nm for OpenMM positions (bare Vec3, wrapped
+                    # once as a single Quantity at the end — per-element Quantity
+                    # wrappers break Modeller.addHydrogens under OpenMM 8.5).
+                    positions_bare.append(
+                        Vec3(  # type: ignore[call-arg]
+                            (x_base + dx) * 0.1,
+                            (y_off + dy) * 0.1,
+                            dz * 0.1,
+                        )
+                    )
+                topology.addBond(atoms_in_res["N"], atoms_in_res["CA"])  # type: ignore[attr-defined]
+                topology.addBond(atoms_in_res["CA"], atoms_in_res["C"])  # type: ignore[attr-defined]
+                topology.addBond(atoms_in_res["CA"], atoms_in_res["CB"])  # type: ignore[attr-defined]
+                topology.addBond(atoms_in_res["C"], atoms_in_res["O"])  # type: ignore[attr-defined]
+                if "OXT" in atoms_in_res:
+                    topology.addBond(atoms_in_res["C"], atoms_in_res["OXT"])  # type: ignore[attr-defined]
+                if prev_c is not None:
+                    topology.addBond(prev_c, atoms_in_res["N"])  # type: ignore[attr-defined]
+                prev_c = atoms_in_res["C"]
+
+        _add_chain("A", n_a, y_off=0.0)
+        _add_chain("B", n_b, y_off=sep_y)
+        positions = Quantity(positions_bare, unit.nanometer)  # type: ignore[attr-defined]
+        return app.Modeller(topology, positions)  # type: ignore[attr-defined]
+
+    @pytest.mark.slow
+    def test_online_gate_rmsd_matches_mdtraj_within_half_angstrom(self, tmp_path) -> None:
+        """Live-OpenMM regression for OralBiome-AMP#174.
+
+        Runs a short live MD simulation and asserts that the online gate
+        RMSD (computed via ``OpenMMRunner._peptide_ca_rmsd`` using
+        ``getState(enforcePeriodicBox=True)``) agrees frame-by-frame with
+        an offline RMSD computed from the DCD trajectory (which also uses
+        ``enforcePeriodicBox=True`` internally).
+
+        Flavor A tests (``TestEnforcePeriodicBoxRegression``) pin the
+        **mechanism** — every gate-path ``getState`` passes
+        ``enforcePeriodicBox=True`` and ``_peptide_ca_rmsd`` no longer
+        calls ``_pbc_correct``. This Flavor B test additionally pins that
+        those choices actually produce coordinates matching what
+        ``DCDReporter`` writes under the current OpenMM version — the
+        failure surface Flavor A cannot cover because it never exercises
+        OpenMM itself.
+
+        Expected runtime: ~5–15 s GPU, ~60 s CPU. Gated behind
+        ``@pytest.mark.slow``; run with ``pytest -m slow``.
+        """
+        openmm = pytest.importorskip("openmm")
+        app = pytest.importorskip("openmm.app")
+        unit = pytest.importorskip("openmm.unit")
+        md = pytest.importorskip("mdtraj")
+        import numpy as _np
+
+        # Build a 2-chain Ala complex programmatically ----------------------
+        modeller = self._build_2chain_ala_modeller(app, unit, n_a=5, n_b=4, sep_y=9.0)
+
+        # Solvate in a small cubic box to force PBC exposure ----------------
+        ff = app.ForceField("charmm36.xml", "charmm36/water.xml")
+        modeller.addHydrogens(ff, pH=7.0)
+        modeller.addSolvent(
+            ff,
+            model="tip3p",
+            padding=0.8 * unit.nanometers,
+            boxShape="cube",
+            ionicStrength=0.15 * unit.molar,
+        )
+
+        system = ff.createSystem(
+            modeller.topology,
+            nonbondedMethod=app.PME,
+            nonbondedCutoff=1.0 * unit.nanometers,
+            constraints=app.HBonds,
+        )
+        integrator = openmm.LangevinMiddleIntegrator(
+            310.0 * unit.kelvin,
+            1.0 / unit.picosecond,
+            2.0 * unit.femtoseconds,
+        )
+        # CPU-safe platform — test must not require GPU.
+        platform = openmm.Platform.getPlatformByName("CPU")
+        sim = app.Simulation(modeller.topology, system, integrator, platform)
+        sim.context.setPositions(modeller.positions)
+
+        sim.minimizeEnergy(maxIterations=200)
+        sim.context.setVelocitiesToTemperature(310.0 * unit.kelvin)
+        sim.step(500)  # 1 ps equilibration
+
+        # Reference Cα arrays for online + offline ---------------------------
+        atoms = list(modeller.topology.atoms())
+        rec_ca_idx = [a.index for a in atoms if a.residue.chain.id == "A" and a.name == "CA"]
+        pep_ca_idx = [a.index for a in atoms if a.residue.chain.id == "B" and a.name == "CA"]
+        assert len(rec_ca_idx) >= 3, "Receptor Cα set must be non-degenerate for Kabsch fit"
+        assert len(pep_ca_idx) >= 2, "Peptide Cα set must have at least 2 atoms"
+
+        state0 = sim.context.getState(getPositions=True, enforcePeriodicBox=True)
+        pos0_ang = state0.getPositions(asNumpy=True).value_in_unit(unit.angstroms)
+        ref_rec_ca = _np.asarray(pos0_ang)[rec_ca_idx]
+        ref_pep_ca = _np.asarray(pos0_ang)[pep_ca_idx]
+
+        # Persist reference PDB for mdtraj topology
+        topo_path = tmp_path / "topo.pdb"
+        with open(str(topo_path), "w") as f:
+            app.PDBFile.writeFile(modeller.topology, state0.getPositions(), f)
+
+        # Production: step-by-step to capture online RMSD at each DCD write -
+        dcd_path = tmp_path / "prod.dcd"
+        steps_per_frame = 250  # 0.5 ps
+        n_frames = 10  # 5 ps total
+        sim.reporters.append(
+            app.DCDReporter(str(dcd_path), steps_per_frame, enforcePeriodicBox=True)
+        )
+
+        online_rmsd: list[float] = []
+        for _ in range(n_frames):
+            sim.step(steps_per_frame)
+            r = OpenMMRunner._peptide_ca_rmsd(  # noqa: SLF001
+                sim, ref_pep_ca, pep_ca_idx, ref_rec_ca, rec_ca_idx, unit, _np
+            )
+            online_rmsd.append(r)
+
+        # Release the DCD so mdtraj can read it
+        sim.reporters.clear()
+        del sim
+
+        # Offline RMSD via mdtraj --------------------------------------------
+        traj = md.load(str(dcd_path), top=str(topo_path))
+        ref_traj = md.load(str(topo_path))
+        rec_idx_arr = _np.asarray(rec_ca_idx, dtype=_np.int64)
+        pep_idx_arr = _np.asarray(pep_ca_idx, dtype=_np.int64)
+        traj.superpose(ref_traj, atom_indices=rec_idx_arr)
+        pep_diff_nm = traj.xyz[:, pep_idx_arr, :] - ref_traj.xyz[0, pep_idx_arr, :]
+        offline_rmsd = _np.sqrt((pep_diff_nm**2).sum(axis=-1).mean(axis=-1)) * 10.0
+
+        assert len(online_rmsd) == len(offline_rmsd), (
+            f"Frame count mismatch: online={len(online_rmsd)}, offline={len(offline_rmsd)}. "
+            "DCDReporter should produce exactly one frame per step-block."
+        )
+        for i, (on, off) in enumerate(zip(online_rmsd, offline_rmsd, strict=True)):
+            assert abs(on - off) < 0.5, (
+                f"Frame {i}: online RMSD = {on:.3f} Å, offline RMSD = {off:.3f} Å, "
+                f"|diff| = {abs(on - off):.3f} Å ≥ 0.5 Å. If this fails, the "
+                "online gate and DCD are reporting different coordinate systems "
+                "— likely an OpenMM API/semantics regression on enforcePeriodicBox=True."
+            )
