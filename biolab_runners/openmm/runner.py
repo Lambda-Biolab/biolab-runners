@@ -258,7 +258,8 @@ class OpenMMRunner:
                     start_step * config.timestep_fs / 1e6,
                 )
 
-        remaining_steps = max(0, config.total_steps - start_step)
+        production_steps_done = max(0, start_step - config.total_equil_steps)
+        remaining_steps = max(0, config.total_steps - production_steps_done)
         if remaining_steps == 0:
             logger.info("No remaining steps — simulation already complete")
             result.trajectory_path = str(output_dir / "trajectory.dcd")

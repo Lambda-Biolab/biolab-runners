@@ -44,6 +44,11 @@ class TestOpenMMConfig:
         assert config.save_every_steps == 5000  # 10ps * 500 steps/ps
         assert config.checkpoint_every_steps == 3_600_000  # 2hr * 3600s/hr * 500steps/s
 
+    def test_equil_steps_computation(self) -> None:
+        config = OpenMMConfig(timestep_fs=2.0)
+        # Default: 100ps + 100ps + 200ps = 400ps at 500 steps/ps = 200_000
+        assert config.total_equil_steps == 200_000
+
     def test_custom_production_ns(self) -> None:
         config = OpenMMConfig(production_ns=20.0, timestep_fs=2.0)
         assert config.total_steps == 10_000_000
@@ -383,6 +388,48 @@ class TestOpenMMRunner:
 # ---------------------------------------------------------------------------
 # iRMSD threshold tests
 # ---------------------------------------------------------------------------
+
+
+class TestResumeAccounting:
+    """Regression tests for issue #4: resume must not conflate equilibration + production."""
+
+    def test_resume_subtracts_equil_steps(self, tmp_path: Path) -> None:
+        """Remaining steps must discount equilibration from the checkpoint step counter."""
+        out = tmp_path / "output"
+        out.mkdir()
+
+        config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
+        # Simulate checkpoint after full equil (200k steps) + 1 ns production (500k steps)
+        checkpoint_step = config.total_equil_steps + 500_000
+        (out / "energy.csv").write_text(f"#step,time\n{checkpoint_step},{checkpoint_step}\n")
+        (out / "state.xml").write_text("<State/>")
+
+        runner = OpenMMRunner(config)
+        resume = runner._resolve_skip_or_resume(
+            force=False, output_dir=out, config=config, result=SimulationResult(config=config)
+        )
+        assert resume is not None
+        _start_step, remaining_steps, _resume_xml = resume
+        # Should be total_steps minus production-only steps done (500k), not minus absolute (700k)
+        assert remaining_steps == config.total_steps - 500_000
+
+    def test_resume_right_after_equil(self, tmp_path: Path) -> None:
+        """Checkpoint at end of equilibration should leave all production steps remaining."""
+        out = tmp_path / "output"
+        out.mkdir()
+
+        config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
+        checkpoint_step = config.total_equil_steps  # just finished equilibration
+        (out / "energy.csv").write_text(f"#step,time\n{checkpoint_step},{checkpoint_step}\n")
+        (out / "state.xml").write_text("<State/>")
+
+        runner = OpenMMRunner(config)
+        resume = runner._resolve_skip_or_resume(
+            force=False, output_dir=out, config=config, result=SimulationResult(config=config)
+        )
+        assert resume is not None
+        _, remaining_steps, _ = resume
+        assert remaining_steps == config.total_steps
 
 
 class TestIrmsdThreshold:

@@ -170,6 +170,7 @@ class OpenMMConfig:
 
     # Computed fields
     total_steps: int = 0
+    total_equil_steps: int = 0
     save_every_steps: int = 0
     checkpoint_every_steps: int = 0
 
@@ -180,6 +181,12 @@ class OpenMMConfig:
         """Compute derived step counts."""
         steps_per_ps = 1000.0 / self.timestep_fs
         self.total_steps = int(self.production_ns * 1000.0 * steps_per_ps)
+        equil_ps = 0.0
+        for stage in self.equilibration:
+            dur = stage.get("duration_ps")
+            if isinstance(dur, (int, float)):
+                equil_ps += dur
+        self.total_equil_steps = int(equil_ps * steps_per_ps)
         self.save_every_steps = int(self.save_interval_ps * steps_per_ps)
         self.checkpoint_every_steps = int(
             self.checkpoint_interval_hours * 3600.0 * 1000.0 / self.timestep_fs
