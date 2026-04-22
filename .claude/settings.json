@@ -33,7 +33,9 @@
     "makefile-core@qte77-claude-code-utils": true,
     "cc-meta@qte77-claude-code-utils": true,
     "workspace-setup@qte77-claude-code-utils": true,
-    "security-audit@qte77-claude-code-utils": true
+    "security-audit@qte77-claude-code-utils": true,
+    "gha-dev@qte77-claude-code-utils": true,
+    "planning@qte77-claude-code-utils": true
   },
   "extraKnownMarketplaces": {
     "qte77-claude-code-utils": {
