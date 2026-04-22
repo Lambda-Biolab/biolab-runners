@@ -95,7 +95,7 @@ class TestOpenMMConfig:
         """Default list must be per-instance (no mutable default aliasing)."""
         a = OpenMMConfig()
         b = OpenMMConfig()
-        a.extra_forcefields.append("/tmp/a.xml")
+        a.extra_forcefields.append("custom/a.xml")
         assert b.extra_forcefields == []
 
     def test_extra_forcefields_roundtrip(self, tmp_path: Path) -> None:

@@ -82,7 +82,6 @@ ignore = [
     "D104",  # missing public package docstring
     "D107",  # missing docstring in __init__
     "S101",  # assert used (needed for tests)
-    "S108",  # hardcoded temp paths (/tmp)
     "S603",  # subprocess call — pipeline shells out to boltz CLI
     "S607",  # partial path for subprocess — boltz binary is on PATH
     "S602",  # subprocess shell — not used
