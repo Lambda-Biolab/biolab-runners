@@ -298,9 +298,7 @@ def evaluate_trajectory(
     traj_path = rep_dir / "trajectory.dcd"
     top_path = rep_dir / "topology.pdb"
     if not traj_path.exists() or not top_path.exists():
-        raise FileNotFoundError(
-            f"missing trajectory.dcd or topology.pdb in {rep_dir}"
-        )
+        raise FileNotFoundError(f"missing trajectory.dcd or topology.pdb in {rep_dir}")
 
     traj = md.load(str(traj_path), top=str(top_path))
     if traj.n_frames == 0:
@@ -321,9 +319,7 @@ def evaluate_trajectory(
     rec_ca_idx = traj.topology.select("chainid 0 and name CA")
     pep_ca_idx = traj.topology.select("chainid 1 and name CA")
     if rec_ca_idx.size == 0 or pep_ca_idx.size == 0:
-        raise ValueError(
-            f"topology at {top_path} missing receptor or peptide Cα atoms"
-        )
+        raise ValueError(f"topology at {top_path} missing receptor or peptide Cα atoms")
 
     rmsd_ang, rec_fit_ang = _compute_per_frame_rmsd(traj, rec_ca_idx, pep_ca_idx)
     frame_interval_ns = _frame_interval_ns(rep_dir)
