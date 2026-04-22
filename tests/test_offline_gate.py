@@ -290,24 +290,33 @@ class TestDecide:
 
     def test_all_none_no_abort(self) -> None:
         abort, reason = _decide(
-            rmsd_5ns=None, rmsd_10ns=None, slope=None,
-            threshold_a=self.THRESHOLD, slope_threshold=self.SLOPE,
+            rmsd_5ns=None,
+            rmsd_10ns=None,
+            slope=None,
+            threshold_a=self.THRESHOLD,
+            slope_threshold=self.SLOPE,
         )
         assert abort is False
         assert reason == ""
 
     def test_5ns_dissociation_fires(self) -> None:
         abort, reason = _decide(
-            rmsd_5ns=8.0, rmsd_10ns=None, slope=None,
-            threshold_a=self.THRESHOLD, slope_threshold=self.SLOPE,
+            rmsd_5ns=8.0,
+            rmsd_10ns=None,
+            slope=None,
+            threshold_a=self.THRESHOLD,
+            slope_threshold=self.SLOPE,
         )
         assert abort is True
         assert reason == "early_dissociation"
 
     def test_5ns_below_threshold_no_abort(self) -> None:
         abort, reason = _decide(
-            rmsd_5ns=5.0, rmsd_10ns=None, slope=None,
-            threshold_a=self.THRESHOLD, slope_threshold=self.SLOPE,
+            rmsd_5ns=5.0,
+            rmsd_10ns=None,
+            slope=None,
+            threshold_a=self.THRESHOLD,
+            slope_threshold=self.SLOPE,
         )
         assert abort is False
         assert reason == ""
@@ -316,22 +325,31 @@ class TestDecide:
         """OralBiome-AMP#167: abort ONLY when both abs > threshold AND slope > 0.05."""
         # RMSD > threshold but slope tame → no abort (thermal fluctuation).
         abort, _ = _decide(
-            rmsd_5ns=6.0, rmsd_10ns=7.5, slope=0.01,
-            threshold_a=self.THRESHOLD, slope_threshold=self.SLOPE,
+            rmsd_5ns=6.0,
+            rmsd_10ns=7.5,
+            slope=0.01,
+            threshold_a=self.THRESHOLD,
+            slope_threshold=self.SLOPE,
         )
         assert abort is False
 
         # RMSD below threshold but slope > 0.05 → no abort (bound-and-breathing).
         abort, _ = _decide(
-            rmsd_5ns=6.0, rmsd_10ns=5.0, slope=0.1,
-            threshold_a=self.THRESHOLD, slope_threshold=self.SLOPE,
+            rmsd_5ns=6.0,
+            rmsd_10ns=5.0,
+            slope=0.1,
+            threshold_a=self.THRESHOLD,
+            slope_threshold=self.SLOPE,
         )
         assert abort is False
 
         # Both exceed → abort with the slope-drift reason.
         abort, reason = _decide(
-            rmsd_5ns=6.0, rmsd_10ns=8.0, slope=0.1,
-            threshold_a=self.THRESHOLD, slope_threshold=self.SLOPE,
+            rmsd_5ns=6.0,
+            rmsd_10ns=8.0,
+            slope=0.1,
+            threshold_a=self.THRESHOLD,
+            slope_threshold=self.SLOPE,
         )
         assert abort is True
         assert reason == "rmsd_slope_drift"
@@ -343,8 +361,11 @@ class TestDecide:
         """
         # Approximate the observed trace: 5ns=3.0, 10ns=3.5, slope=0.1
         abort, _ = _decide(
-            rmsd_5ns=3.0, rmsd_10ns=3.5, slope=0.1,
-            threshold_a=self.THRESHOLD, slope_threshold=self.SLOPE,
+            rmsd_5ns=3.0,
+            rmsd_10ns=3.5,
+            slope=0.1,
+            threshold_a=self.THRESHOLD,
+            slope_threshold=self.SLOPE,
         )
         assert abort is False
 
