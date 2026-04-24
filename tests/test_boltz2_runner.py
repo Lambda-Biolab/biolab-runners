@@ -574,3 +574,64 @@ class TestSerialization:
         assert config.use_potentials is True
         assert config.timeout_seconds == 1800
         assert config.boltz_binary == "boltz"
+
+
+class TestFindStructureFilePrefersCanonical:
+    """Regression: ``_find_structure_file`` must prefer ``*_model_0.pdb`` over
+    sibling files like ``*_model_0.no_caps_backup.pdb`` or
+    ``*_model_0_preminimize.pdb`` that sort alphabetically earlier.
+
+    Before the fix, a downstream MD stage that re-predicts with corrected
+    caps (e.g. after a cap-gap bugfix landed the canonical ``_model_0.pdb``
+    file) would silently ingest the stale backup and run MD on the wrong
+    molecule. Observed 2026-04-24 on the VicK gen-3 cyclic cohort.
+    """
+
+    def test_prefers_canonical_over_no_caps_backup(self, tmp_path: Path) -> None:
+        from biolab_runners.boltz2.utils import _find_structure_file
+
+        canonical = tmp_path / "vick_lin_01_model_0.pdb"
+        backup = tmp_path / "vick_lin_01_model_0.no_caps_backup.pdb"
+        canonical.write_text("ATOM  CANONICAL\nEND\n")
+        backup.write_text("ATOM  BACKUP\nEND\n")
+        # Alphabetical order puts backup first; the fix must override that.
+        assert _find_structure_file(tmp_path) == str(canonical)
+
+    def test_prefers_canonical_over_preminimize(self, tmp_path: Path) -> None:
+        from biolab_runners.boltz2.utils import _find_structure_file
+
+        canonical = tmp_path / "vick_lac_07_model_0.pdb"
+        preminimize = tmp_path / "vick_lac_07_model_0_preminimize.pdb"
+        canonical.write_text("ATOM  CANONICAL\nEND\n")
+        preminimize.write_text("ATOM  PREMINIMIZE\nEND\n")
+        assert _find_structure_file(tmp_path) == str(canonical)
+
+    def test_nested_predictions_layout_still_resolves(self, tmp_path: Path) -> None:
+        """The older ``boltz_results_*/predictions/*/`` layout still works."""
+        from biolab_runners.boltz2.utils import _find_structure_file
+
+        nested = tmp_path / "boltz_results_input" / "predictions" / "input"
+        nested.mkdir(parents=True)
+        canonical = nested / "input_model_0.pdb"
+        canonical.write_text("ATOM  NESTED\nEND\n")
+        assert _find_structure_file(tmp_path) == str(canonical)
+
+    def test_falls_back_when_no_canonical(self, tmp_path: Path) -> None:
+        """If the canonical suffix is absent, the broad glob still matches."""
+        from biolab_runners.boltz2.utils import _find_structure_file
+
+        other = tmp_path / "vick_lin_01_refined.pdb"
+        other.write_text("ATOM  OTHER\nEND\n")
+        assert _find_structure_file(tmp_path) == str(other)
+
+    def test_falls_back_to_cif_when_only_mmcif_present(self, tmp_path: Path) -> None:
+        from biolab_runners.boltz2.utils import _find_structure_file
+
+        cif = tmp_path / "vick_lin_01_model_0.cif"
+        cif.write_text("_atom_site\n")
+        assert _find_structure_file(tmp_path) == str(cif)
+
+    def test_empty_dir_returns_empty_string(self, tmp_path: Path) -> None:
+        from biolab_runners.boltz2.utils import _find_structure_file
+
+        assert _find_structure_file(tmp_path) == ""
