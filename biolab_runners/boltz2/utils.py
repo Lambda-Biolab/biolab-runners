@@ -121,8 +121,36 @@ def is_boltz_output_complete(output_dir: Path) -> bool:
 
 
 def _find_structure_file(output_dir: Path) -> str:
-    """Return the first structure file under output_dir, or ""."""
-    for pattern in ["**/predictions/**/*.pdb", "**/*.pdb", "**/*.cif"]:
+    """Return the first structure file under output_dir, or "".
+
+    Prefers the canonical ``*_model_0.pdb`` suffix exactly. Broad
+    fallback globs (``**/*.pdb``) are consulted only when no canonical
+    file is found, so downstream consumers never silently ingest a
+    sibling file like ``*_model_0.no_caps_backup.pdb`` or
+    ``*_model_0_preminimize.pdb``. Those sibling files sort before the
+    canonical ``_model_0.pdb`` in a naive alphabetical glob
+    (``n`` < ``p`` in ASCII), which previously caused OralBiome-AMP's
+    MD stage to re-extract the peptide chain from a pre-cap backup
+    after the cohort had been re-predicted with the correct caps —
+    producing silently-wrong-molecule Stage-2 verdicts.
+
+    Search order:
+
+    1. ``**/*_model_0.pdb`` — Boltz-2's canonical output, two layouts:
+       flat ``{name}_model_0.pdb`` and the older
+       ``boltz_results_<name>/predictions/<name>/<name>_model_0.pdb``.
+    2. ``**/predictions/**/*.pdb`` — any PDB inside a ``predictions/``
+       subtree; used for non-standard dumps that still follow the
+       Boltz directory convention.
+    3. ``**/*.pdb`` — permissive fallback.
+    4. ``**/*.cif`` — when Boltz-2 ran with ``--output_format mmcif``.
+    """
+    for pattern in [
+        "**/*_model_0.pdb",
+        "**/predictions/**/*.pdb",
+        "**/*.pdb",
+        "**/*.cif",
+    ]:
         matches = sorted(output_dir.glob(pattern))
         if matches:
             return str(matches[0])
