@@ -21,9 +21,12 @@ biolab_runners/
 │   ├── runner.py     # Boltz2Runner class + apply_quality_gate()
 │   └── utils.py      # YAML writer, output parser, availability check
 └── openmm/
-    ├── config.py     # OpenMMConfig, SimulationResult, EquilibrationStage
-    ├── runner.py     # OpenMMRunner class (build, equilibrate, produce)
-    └── utils.py      # Output verification, checkpoint loading, availability check
+    ├── config.py         # OpenMMConfig, SimulationResult, EquilibrationStage
+    ├── runner.py         # OpenMMRunner class (orchestrate pipeline, run production)
+    ├── system_builder.py # ForceField, Modeller, System, Integrator, Cα restraint
+    ├── geometry.py       # Pure-numpy PBC math (pbc_correct, min_pbc_distance)
+    ├── offline_gate.py   # Offline mdtraj gate + verdict I/O
+    └── utils.py          # Output verification, checkpoint loading, availability check
 ```
 
 ## Domain Rules
@@ -42,7 +45,11 @@ biolab_runners/
 - **Input:** `OpenMMConfig` with receptor/peptide PDB paths, simulation parameters
 - **Output:** `SimulationResult` with trajectory DCD, energy CSV, state XML
 - **Force fields:** CHARMM36m protein, TIP3P water, dodecahedral solvent box
-- **Buffer environment:** Configurable via `OpenMMConfig` fields or the `physiological` / `saliva` / `gastric` / `intestinal` preset classmethods. Field defaults are physiological PBS-like (150 mM NaCl, pH 7.4, 310 K)
+- **Buffer environment:** Configurable via `OpenMMConfig` fields or the
+  `physiological` / `saliva` / `gastric` / `intestinal` preset classmethods
+  (see `biolab_runners.openmm.config.OpenMMConfig` docstrings for the
+  ionic concentrations, pH, and temperature of each preset). Field
+  defaults are physiological PBS-like (150 mM NaCl, pH 7.4, 310 K).
 - **Early abort:** 5 ns / 10 ns checkpoint — if peptide dissociates (PBC-corrected Cα RMSD > 2 × `config.target_irmsd_threshold_a`), abort. Threshold is per-system and defaults to 3.5 Å — override for tighter/looser gating
 - **Resume safety:** Always load original topology.pdb — re-solvating produces different water counts
 - **Restraint force on resume:** Must add restraint force (k=0) to system even on resume, or loadState() fails
@@ -79,9 +86,10 @@ make check_docs     # Lint markdown files
 ```
 Package:     biolab_runners (hatchling build)
 Python:      >=3.11 (3.11, 3.12 tested)
-Lint:        ruff (line-length=100, Google docstrings, C90 ≤10)
-Types:       pyright basic
+Lint:        ruff (line-length=100, Google docstrings, C90 ≤10, RUF/ANN/PT enabled)
+Types:       pyright standard
 Complexity:  complexipy cognitive ≤15
 Tests:       pytest with mocks (no GPU/CLI needed)
-CI:          .github/workflows/ci.yml (lint → type → test, Python 3.11+3.12)
+CI:          .github/workflows/ci.yml (lint → type → complexity → test, Python 3.11+3.12)
+Coverage:    55% floor (ratcheting to 80%)
 ```
