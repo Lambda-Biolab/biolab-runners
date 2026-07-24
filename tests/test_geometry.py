@@ -14,25 +14,11 @@ from biolab_runners.openmm.geometry import (
     pbc_correct,
 )
 
+from tests._helpers import FakeAtom, FakeChain, dodecahedron_box
+
 # ---------------------------------------------------------------------------
 # collect_chain_ca_positions
 # ---------------------------------------------------------------------------
-
-
-class _FakeAtom:
-    """Minimal stand-in for an OpenMM Topology Atom (just .name + .index)."""
-
-    def __init__(self, name: str, index: int) -> None:
-        self.name = name
-        self.index = index
-
-
-class _FakeChain:
-    def __init__(self, atoms: list[_FakeAtom]) -> None:
-        self._atoms = atoms
-
-    def atoms(self) -> list[_FakeAtom]:
-        return self._atoms
 
 
 class TestCollectChainCaPositions:
@@ -42,8 +28,8 @@ class TestCollectChainCaPositions:
         positions = np.array(
             [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0], [3.0, 0.0, 0.0], [4.0, 0.0, 0.0]]
         )
-        chain0 = _FakeChain([_FakeAtom("CA", 0), _FakeAtom("N", 1), _FakeAtom("CA", 2)])
-        chain1 = _FakeChain([_FakeAtom("CA", 3), _FakeAtom("CA", 4)])
+        chain0 = FakeChain([FakeAtom("CA", 0), FakeAtom("N", 1), FakeAtom("CA", 2)])
+        chain1 = FakeChain([FakeAtom("CA", 3), FakeAtom("CA", 4)])
         rec, pep = collect_chain_ca_positions([chain0, chain1], positions)
         assert len(rec) == 2
         assert len(pep) == 2
@@ -54,12 +40,12 @@ class TestCollectChainCaPositions:
 
     def test_ignores_non_ca_atoms(self) -> None:
         positions = np.array([[0.0], [1.0], [2.0]])
-        chain = _FakeChain(
+        chain = FakeChain(
             [
-                _FakeAtom("N", 0),
-                _FakeAtom("CA", 1),
-                _FakeAtom("C", 2),
-                _FakeAtom("O", 0),
+                FakeAtom("N", 0),
+                FakeAtom("CA", 1),
+                FakeAtom("C", 2),
+                FakeAtom("O", 0),
             ]
         )
         rec, pep = collect_chain_ca_positions([chain], positions)
@@ -69,9 +55,9 @@ class TestCollectChainCaPositions:
     def test_three_chains_all_peptide_after_first(self) -> None:
         """Chains after index 0 all go into the peptide list (multi-chain peptide)."""
         positions = np.array([[i, 0.0, 0.0] for i in range(6)])
-        chain0 = _FakeChain([_FakeAtom("CA", 0), _FakeAtom("CA", 1)])
-        chain1 = _FakeChain([_FakeAtom("CA", 2), _FakeAtom("CA", 3)])
-        chain2 = _FakeChain([_FakeAtom("CA", 4), _FakeAtom("CA", 5)])
+        chain0 = FakeChain([FakeAtom("CA", 0), FakeAtom("CA", 1)])
+        chain1 = FakeChain([FakeAtom("CA", 2), FakeAtom("CA", 3)])
+        chain2 = FakeChain([FakeAtom("CA", 4), FakeAtom("CA", 5)])
         rec, pep = collect_chain_ca_positions([chain0, chain1, chain2], positions)
         assert len(rec) == 2
         assert len(pep) == 4
@@ -120,14 +106,7 @@ class TestPbcCorrectDeterministic:
 
     def test_dodecahedron_diagonal_face_zero(self) -> None:
         """Displacement of a full lattice vector collapses to zero."""
-        d = 60.0
-        box = np.array(
-            [
-                [d, 0.0, 0.0],
-                [0.0, d, 0.0],
-                [0.5 * d, 0.5 * d, d / np.sqrt(2.0)],
-            ]
-        )
+        box = dodecahedron_box(60.0)
         diff = box[2].reshape(1, 3).copy()
         out = pbc_correct(diff, box, np)
         np.testing.assert_allclose(out, 0.0, atol=1e-10)

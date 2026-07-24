@@ -19,6 +19,15 @@ from biolab_runners.openmm.system_builder import (
     write_topology,
 )
 
+from tests._helpers import (
+    FakeApp,
+    FakeAtom,
+    FakeChain,
+    FakePos,
+    FakeSystem,
+    FakeUnit,
+)
+
 # ---------------------------------------------------------------------------
 # _resolve_pdb — pure filesystem
 # ---------------------------------------------------------------------------
@@ -67,37 +76,13 @@ class TestResolvePdb:
 # ---------------------------------------------------------------------------
 
 
-class _FakeAtom:
-    def __init__(self, name: str, index: int) -> None:
-        self.name = name
-        self.index = index
-
-
-class _FakePos:
-    def __init__(self, x: float, y: float, z: float) -> None:
-        self.x = x
-        self.y = y
-        self.z = z
-
-
-class _FakeChain:
-    def __init__(self, atoms: list[_FakeAtom]) -> None:
-        self._atoms = atoms
-
-    def atoms(self) -> list[_FakeAtom]:
-        return self._atoms
-
-
-class _FakeSystem:
-    def __init__(self) -> None:
-        self.forces: list[MagicMock] = []
-
-    def addForce(self, force: MagicMock) -> None:
-        self.forces.append(force)
-
-
 class _FakeOpenMM:
-    """Minimal stand-in for the openmm module — only CustomExternalForce."""
+    """Minimal stand-in for the openmm module — only CustomExternalForce.
+
+    This is system_builder-specific (the shared tests._helpers module does
+    not include it because the system_builder test exercises the
+    CustomExternalForce call directly).
+    """
 
     def __init__(self) -> None:
         self.last_force: MagicMock | None = None
@@ -115,25 +100,25 @@ class TestAddCaRestraint:
     def test_collects_only_ca_indices(self) -> None:
         """Only Cα atoms are added to the restraint."""
         chains = [
-            _FakeChain(
+            FakeChain(
                 [
-                    _FakeAtom("N", 0),
-                    _FakeAtom("CA", 1),
-                    _FakeAtom("C", 2),
-                    _FakeAtom("CA", 3),
-                    _FakeAtom("O", 4),
+                    FakeAtom("N", 0),
+                    FakeAtom("CA", 1),
+                    FakeAtom("C", 2),
+                    FakeAtom("CA", 3),
+                    FakeAtom("O", 4),
                 ]
             ),
         ]
         modeller = MagicMock()
         modeller.positions = [
-            _FakePos(0.0, 0.0, 0.0),
-            _FakePos(1.0, 0.0, 0.0),
-            _FakePos(2.0, 0.0, 0.0),
-            _FakePos(3.0, 0.0, 0.0),
-            _FakePos(4.0, 0.0, 0.0),
+            FakePos(0.0, 0.0, 0.0),
+            FakePos(1.0, 0.0, 0.0),
+            FakePos(2.0, 0.0, 0.0),
+            FakePos(3.0, 0.0, 0.0),
+            FakePos(4.0, 0.0, 0.0),
         ]
-        system = _FakeSystem()
+        system = FakeSystem()
         openmm = _FakeOpenMM()
 
         _force, ca_indices = add_ca_restraint(system, modeller, chains, openmm)  # type: ignore[arg-type]
@@ -141,10 +126,10 @@ class TestAddCaRestraint:
         assert ca_indices == [1, 3]
 
     def test_force_added_to_system(self) -> None:
-        chains = [_FakeChain([_FakeAtom("CA", 0)])]
+        chains = [FakeChain([FakeAtom("CA", 0)])]
         modeller = MagicMock()
-        modeller.positions = [_FakePos(0.0, 0.0, 0.0)]
-        system = _FakeSystem()
+        modeller.positions = [FakePos(0.0, 0.0, 0.0)]
+        system = FakeSystem()
         openmm = _FakeOpenMM()
 
         _force, _ca = add_ca_restraint(system, modeller, chains, openmm)  # type: ignore[arg-type]
@@ -156,10 +141,10 @@ class TestAddCaRestraint:
         """The expression must be 'k*periodicdistance(...)^2' for the
         restraint to actually constrain when k > 0 (used in equilibration
         stages 1-3)."""
-        chains = [_FakeChain([_FakeAtom("CA", 0)])]
+        chains = [FakeChain([FakeAtom("CA", 0)])]
         modeller = MagicMock()
-        modeller.positions = [_FakePos(0.0, 0.0, 0.0)]
-        system = _FakeSystem()
+        modeller.positions = [FakePos(0.0, 0.0, 0.0)]
+        system = FakeSystem()
         openmm = _FakeOpenMM()
 
         _force, _ca = add_ca_restraint(system, modeller, chains, openmm)  # type: ignore[arg-type]
@@ -170,10 +155,10 @@ class TestAddCaRestraint:
     def test_initial_k_is_zero(self) -> None:
         """k=0 means the force has no effect; restraint is engaged later
         by simulation.context.setParameter('k', ...)."""
-        chains = [_FakeChain([_FakeAtom("CA", 0)])]
+        chains = [FakeChain([FakeAtom("CA", 0)])]
         modeller = MagicMock()
-        modeller.positions = [_FakePos(0.0, 0.0, 0.0)]
-        system = _FakeSystem()
+        modeller.positions = [FakePos(0.0, 0.0, 0.0)]
+        system = FakeSystem()
         openmm = _FakeOpenMM()
 
         _force, _ca = add_ca_restraint(system, modeller, chains, openmm)  # type: ignore[arg-type]
@@ -183,14 +168,14 @@ class TestAddCaRestraint:
 
     def test_particles_added_with_position(self) -> None:
         """Each Cα particle is added with its (x0, y0, z0) reference position."""
-        chains = [_FakeChain([_FakeAtom("CA", 0), _FakeAtom("CA", 2)])]
+        chains = [FakeChain([FakeAtom("CA", 0), FakeAtom("CA", 2)])]
         modeller = MagicMock()
         modeller.positions = [
-            _FakePos(1.0, 2.0, 3.0),
-            _FakePos(0.0, 0.0, 0.0),  # not a CA
-            _FakePos(4.0, 5.0, 6.0),
+            FakePos(1.0, 2.0, 3.0),
+            FakePos(0.0, 0.0, 0.0),  # not a CA
+            FakePos(4.0, 5.0, 6.0),
         ]
-        system = _FakeSystem()
+        system = FakeSystem()
         openmm = _FakeOpenMM()
 
         _force, _ca = add_ca_restraint(system, modeller, chains, openmm)  # type: ignore[arg-type]
@@ -205,10 +190,10 @@ class TestAddCaRestraint:
 
     def test_no_ca_atoms(self) -> None:
         """Edge case: a chain with no Cα atoms → empty ca_indices, no particles added."""
-        chains = [_FakeChain([_FakeAtom("N", 0), _FakeAtom("C", 1)])]
+        chains = [FakeChain([FakeAtom("N", 0), FakeAtom("C", 1)])]
         modeller = MagicMock()
-        modeller.positions = [_FakePos(0.0, 0.0, 0.0), _FakePos(1.0, 0.0, 0.0)]
-        system = _FakeSystem()
+        modeller.positions = [FakePos(0.0, 0.0, 0.0), FakePos(1.0, 0.0, 0.0)]
+        system = FakeSystem()
         openmm = _FakeOpenMM()
 
         _force, ca_indices = add_ca_restraint(system, modeller, chains, openmm)  # type: ignore[arg-type]
@@ -239,6 +224,8 @@ class _FakeOpenMMForAssemble:
 
 
 class _FakeForceField:
+    """Stand-in for openmm.app.ForceField — captures createSystem args + addForce."""
+
     def __init__(self) -> None:
         self.system = MagicMock()
         self.system.addForce = MagicMock()
@@ -247,52 +234,6 @@ class _FakeForceField:
         self._topology = topology
         self._kwargs = kwargs
         return self.system
-
-
-class _RecordingForceField:
-    """Captures the XML paths passed to app.ForceField(...)."""
-
-    def __init__(self, *paths: str) -> None:
-        self.paths = paths
-
-
-class _FakeApp:
-    """Stand-in for openmm.app — exposes only the symbols system_builder touches."""
-
-    def __init__(self) -> None:
-        self.PME = "PME"
-        self.HBonds = "HBonds"
-        self.ForceField = _RecordingForceField
-        self.PDBFile: MagicMock = MagicMock()
-
-
-class _FakeQuantity:
-    """A quantity that supports ``float * quantity`` and ``float / quantity``."""
-
-    def __init__(self, label: str) -> None:
-        self.label = label
-
-    def __rmul__(self, other: float) -> _FakeQuantity:
-        return _FakeQuantity(f"{other} {self.label}")
-
-    def __rtruediv__(self, other: float) -> _FakeQuantity:
-        return _FakeQuantity(f"{other}/{self.label}")
-
-    def __str__(self) -> str:
-        return self.label
-
-    __repr__ = __str__
-
-
-class _FakeUnit:
-    """Stand-in for openmm.unit — quantities stringify for assertions."""
-
-    def __init__(self) -> None:
-        self.nanometers = _FakeQuantity("nm")
-        self.atmospheres = _FakeQuantity("atm")
-        self.kelvin = _FakeQuantity("K")
-        self.picoseconds = _FakeQuantity("ps")
-        self.femtoseconds = _FakeQuantity("fs")
 
 
 class TestAssembleSystem:
@@ -308,8 +249,8 @@ class TestAssembleSystem:
             temperature_k=310.0,
         )
         openmm = _FakeOpenMMForAssemble()
-        app = _FakeApp()
-        unit = _FakeUnit()
+        app = FakeApp()
+        unit = FakeUnit()
 
         system, integrator = assemble_system(
             ff,
@@ -335,8 +276,8 @@ class TestAssembleSystem:
             temperature_k=300.0,
         )
         openmm = _FakeOpenMMForAssemble()
-        app = _FakeApp()
-        unit = _FakeUnit()
+        app = FakeApp()
+        unit = FakeUnit()
 
         _system, _integrator = assemble_system(
             ff,
@@ -362,8 +303,8 @@ class TestAssembleSystem:
             timestep_fs=2.0,
         )
         openmm = _FakeOpenMMForAssemble()
-        app = _FakeApp()
-        unit = _FakeUnit()
+        app = FakeApp()
+        unit = FakeUnit()
 
         _system, _integrator = assemble_system(
             ff,
@@ -385,8 +326,8 @@ class TestAssembleSystem:
         ff = _FakeForceField()
         config = OpenMMConfig(protein_ff="amber14/protein.ff14SB")
         openmm = _FakeOpenMMForAssemble()
-        app = _FakeApp()
-        unit = _FakeUnit()
+        app = FakeApp()
+        unit = FakeUnit()
 
         _system, _integrator = assemble_system(
             ff,
@@ -405,25 +346,21 @@ class TestAssembleSystem:
 # ---------------------------------------------------------------------------
 
 
-class _FakePDBFile:
-    """Stand-in for openmm.app.PDBFile — exposes ``writeFile`` as a static-ish call."""
-
-    writeFile = MagicMock()
-
-
-class _FakeAppForWrite(_FakeApp):
-    """_FakeApp subclass that wires PDBFile.writeFile for inspection."""
+class FakeAppForWrite(FakeApp):
+    """FakeApp subclass that wires PDBFile.writeFile for inspection."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.PDBFile = _FakePDBFile()
+        # Replace the default FakePDBFile (which is a no-op) with a
+        # MagicMock so tests can assert it was called.
+        self.PDBFile = MagicMock()
 
 
 class TestWriteTopology:
     """Persist the solvated topology PDB and populate result metadata."""
 
     def test_writes_pdb_to_output_dir(self, tmp_path: Path) -> None:
-        app = _FakeAppForWrite()
+        app = FakeAppForWrite()
         modeller = MagicMock()
         modeller.topology.getNumAtoms.return_value = 12345
         result = MagicMock()
@@ -440,7 +377,7 @@ class TestWriteTopology:
 
     def test_topology_path_set_even_if_file_already_exists(self, tmp_path: Path) -> None:
         """Result is updated regardless of pre-existing file."""
-        app = _FakeAppForWrite()
+        app = FakeAppForWrite()
         modeller = MagicMock()
         modeller.topology.getNumAtoms.return_value = 100
         result = MagicMock()
@@ -458,23 +395,9 @@ class TestWriteTopology:
 
 
 class TestBuildForcefieldReExported:
-    """build_forcefield from system_builder is the same function that
-    was on OpenMMRunner._build_forcefield; the existing TestBuildForcefield
-    in test_openmm_runner.py covers it. This test guards against future
-    regression: the function must remain importable from system_builder."""
+    """Guards against regression: ``build_forcefield`` must remain
+    importable from ``system_builder``. The functional tests live in
+    test_openmm_runner.py::TestBuildForcefield (same function)."""
 
     def test_importable_from_system_builder(self) -> None:
         assert callable(build_forcefield)
-
-    def test_charmm_uses_hardcoded_xmls(self) -> None:
-        config = OpenMMConfig(protein_ff="charmm36m")
-        ff = build_forcefield(config, _FakeApp())  # type: ignore[arg-type]
-        assert ff.paths == ("charmm36.xml", "charmm36/water.xml")
-
-    def test_amber_uses_water_model_or_overrides(self) -> None:
-        config = OpenMMConfig(
-            protein_ff="amber14/protein.ff14SB",
-            water_model="tip3p",
-        )
-        ff = build_forcefield(config, _FakeApp())  # type: ignore[arg-type]
-        assert ff.paths == ("amber14/protein.ff14SB.xml", "tip3p.xml")

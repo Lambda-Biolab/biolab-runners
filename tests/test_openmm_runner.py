@@ -20,6 +20,8 @@ from biolab_runners.openmm.utils import (
     verify_production_outputs,
 )
 
+from tests._helpers import FakeApp, dodecahedron_box
+
 # ---------------------------------------------------------------------------
 # OpenMMConfig tests
 # ---------------------------------------------------------------------------
@@ -157,25 +159,12 @@ class TestOpenMMConfig:
         assert config.nacl_mol == 0.150  # preset value preserved
 
 
-class _RecordingForceField:
-    """Fake ``app.ForceField`` that records the XML paths it was constructed with."""
-
-    def __init__(self, *paths: str) -> None:
-        self.paths: tuple[str, ...] = paths
-
-
-class _FakeApp:
-    """Minimal stand-in for ``openmm.app`` used by ``_build_forcefield``."""
-
-    ForceField = _RecordingForceField
-
-
 class TestBuildForcefield:
     """Tests for ``build_forcefield`` extra_forcefields pass-through."""
 
     def test_amber_no_extras(self) -> None:
         config = OpenMMConfig(protein_ff="amber14/protein.ff14SB", water_model="tip3p")
-        ff = build_forcefield(config, _FakeApp())
+        ff = build_forcefield(config, FakeApp())
         assert ff.paths == ("amber14/protein.ff14SB.xml", "tip3p.xml")
 
     def test_amber_with_extras(self, tmp_path: Path) -> None:
@@ -185,20 +174,20 @@ class TestBuildForcefield:
             water_model="tip3p",
             extra_forcefields=[extra],
         )
-        ff = build_forcefield(config, _FakeApp())
+        ff = build_forcefield(config, FakeApp())
         assert ff.paths == ("amber14/protein.ff14SB.xml", "tip3p.xml", extra)
 
     def test_charmm_with_extras(self, tmp_path: Path) -> None:
         """CHARMM branch must still honour extra_forcefields."""
         extra = str(tmp_path / "custom.xml")
         config = OpenMMConfig(protein_ff="charmm36m", extra_forcefields=[extra])
-        ff = build_forcefield(config, _FakeApp())
+        ff = build_forcefield(config, FakeApp())
         assert ff.paths == ("charmm36.xml", "charmm36/water.xml", extra)
 
     def test_extras_preserve_order(self, tmp_path: Path) -> None:
         extras = [str(tmp_path / "a.xml"), str(tmp_path / "b.xml")]
         config = OpenMMConfig(protein_ff="amber14/protein.ff14SB", extra_forcefields=extras)
-        ff = build_forcefield(config, _FakeApp())
+        ff = build_forcefield(config, FakeApp())
         assert ff.paths[-2:] == tuple(extras)
 
     def test_water_ff_xml_overrides_water_model_path(self) -> None:
@@ -215,7 +204,7 @@ class TestBuildForcefield:
             water_model="tip3p",
             water_ff_xml="amber14/tip3p.xml",
         )
-        ff = build_forcefield(config, _FakeApp())
+        ff = build_forcefield(config, FakeApp())
         assert ff.paths == ("amber14/protein.ff14SB.xml", "amber14/tip3p.xml")
 
     def test_water_ff_xml_empty_falls_back_to_water_model(self) -> None:
@@ -225,7 +214,7 @@ class TestBuildForcefield:
             water_model="tip3p",
             water_ff_xml="",
         )
-        ff = build_forcefield(config, _FakeApp())
+        ff = build_forcefield(config, FakeApp())
         assert ff.paths == ("amber14/protein.ff14SB.xml", "tip3p.xml")
 
     def test_water_ff_xml_ignored_for_charmm(self) -> None:
@@ -234,7 +223,7 @@ class TestBuildForcefield:
             protein_ff="charmm36m",
             water_ff_xml="amber14/tip3p.xml",  # ignored — CHARMM branch
         )
-        ff = build_forcefield(config, _FakeApp())
+        ff = build_forcefield(config, FakeApp())
         assert ff.paths == ("charmm36.xml", "charmm36/water.xml")
 
 
@@ -490,21 +479,6 @@ class TestIrmsdThreshold:
 class TestPbcCorrectTriclinic:
     """Regression tests pinning the #163 dodecahedron PBC fix."""
 
-    @staticmethod
-    def _dodecahedron_box(d: float = 60.0) -> object:
-        """GROMACS rhombic dodecahedron (xy-square) with edge length ``d``."""
-        import math
-
-        import numpy as np
-
-        return np.array(
-            [
-                [d, 0.0, 0.0],
-                [0.0, d, 0.0],
-                [0.5 * d, 0.5 * d, d / math.sqrt(2.0)],
-            ]
-        )
-
     def test_orthorhombic_parity_with_diagonal_formula(self) -> None:
         """For rectangular boxes the new formula must agree with the diagonal one."""
         import numpy as np
@@ -521,7 +495,7 @@ class TestPbcCorrectTriclinic:
         """A displacement equal to lattice vector ``c`` must collapse to 0."""
         import numpy as np
 
-        box = self._dodecahedron_box()
+        box = dodecahedron_box()
         diff = box[2].reshape(1, 3).copy()  # one c-image
         out = pbc_correct(diff.copy(), box, np)
         assert np.allclose(out, 0.0, atol=1e-10)
@@ -541,7 +515,7 @@ class TestPbcCorrectTriclinic:
         """
         import numpy as np
 
-        box = self._dodecahedron_box(d=60.0)
+        box = dodecahedron_box(d=60.0)
         # Peptide just past one ``c`` image from receptor.
         rec = np.array([[0.0, 0.0, 0.0]])
         pep = (box[2] + np.array([0.3, 0.3, 0.1])).reshape(1, 3)
@@ -559,7 +533,7 @@ class TestPbcCorrectTriclinic:
         """``pbc_correct`` must accept (M, N, 3) arrays used by ``min_pbc_distance``."""
         import numpy as np
 
-        box = self._dodecahedron_box()
+        box = dodecahedron_box()
         rec = np.zeros((3, 3))
         pep = np.tile(box[2], (4, 1)) + 0.5  # 4 peptide atoms past one c-image
         diffs = rec[:, None, :] - pep[None, :, :]  # shape (3, 4, 3)
@@ -695,7 +669,7 @@ class TestMaybeCheckpoint:
             last_ckpt_step=0,
             remaining_steps=10_000_000,
             config=config,
-            t0=time.time(),
+            t0=1000.0,  # fixed past time — avoids wall-clock dependency
         )
         assert result == 1500
         sim.saveState.assert_called_once_with("/tmp/state.xml")
@@ -715,20 +689,23 @@ class TestMaybeCheckpoint:
             last_ckpt_step=9_500,
             remaining_steps=10_000,
             config=config,
-            t0=time.time(),
+            t0=1000.0,  # fixed past time — avoids wall-clock dependency
         )
         assert result == 10_000
         sim.saveState.assert_called_once()
 
     def test_ns_per_day_handles_zero_elapsed(self) -> None:
-        """If t0 == time.time() (zero elapsed), don't divide by zero."""
+        """If t0 == time.time() (zero elapsed), don't divide by zero.
+
+        We use a t0 in the near-future so elapsed = t0 - now is negative
+        (function guards via ``if elapsed > 0``). A negative elapsed is
+        the realistic case the guard must cover.
+        """
         sim = MagicMock()
         config = OpenMMConfig(
             timestep_fs=2.0,
             checkpoint_interval_hours=500.0 / 3600.0 / 1000.0,  # 500 steps
         )
-        import time as _time
-
         result = OpenMMRunner._maybe_checkpoint(
             simulation=sim,
             state_xml_path="/tmp/state.xml",
@@ -736,7 +713,7 @@ class TestMaybeCheckpoint:
             last_ckpt_step=0,
             remaining_steps=10_000_000,
             config=config,
-            t0=_time.time(),  # exactly now → elapsed ≈ 0
+            t0=time.time() + 1e9,  # far future → elapsed < 0 → guard fires
         )
         # Should not raise; ns_per_day is 0 since elapsed is 0
         assert result == 2000
