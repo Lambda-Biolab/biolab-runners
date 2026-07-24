@@ -1,0 +1,17 @@
+# Pre-commit hooks for biolab-runners.
+# Install: `uv run pre-commit install` (one-time, after `uv sync`).
+# Run on all files: `uv run pre-commit run --all-files`.
+# Bypass (use sparingly): `git commit --no-verify`.
+#
+# This config is intentionally minimal: lint + format only. Pyright
+# and pytest are too slow for pre-commit's pre-push lifecycle and
+# are gated by CI (`.github/workflows/ci.yml`).
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.6
+    hooks:
+      - id: ruff-format
+        types_or: [python, pyi]
+      - id: ruff-check
+        types_or: [python, pyi]
+        args: [--fix]

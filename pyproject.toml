@@ -46,6 +46,7 @@ dev = [
     "pytest>=8.0",
     "pytest-cov",
     "complexipy>=0.8",
+    "pre-commit>=3.5",
     "numpy>=1.26",  # required by the OpenMM runner Kabsch-aligned RMSD tests
 ]
 
@@ -137,9 +138,11 @@ addopts = [
     "--cov-report=term-missing",
 ]
 markers = [
-    "slow: long-running integration tests (e.g., live OpenMM simulations). Skipped by default; run with `pytest -m slow`.",
-    "hardware: tests requiring real GPU/hardware (e.g., live OpenMM, real boltz CLI). Skipped by default.",
-    "network: tests requiring network access. Skipped by default.",
+    # The current pytest suite runs entirely with mocks + numpy + the
+    # optional `mdtraj` extra. No tests require real GPU hardware,
+    # the live boltz CLI, or network access — so no markers are
+    # defined. Add markers here when such tests are introduced and
+    # gate them via `--strict-markers` + `pytest -m <marker>` in CI.
 ]
 
 # --- Coverage ---

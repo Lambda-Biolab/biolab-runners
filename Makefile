@@ -1,11 +1,21 @@
 .DEFAULT_GOAL := help
-.PHONY: help setup_dev ruff lint_fix check_types check_complexity test validate quick_validate check_links check_docs
+.PHONY: help setup_dev ruff lint_fix check_types check_complexity test smoke_test validate quick_validate check_links check_docs
 
 # ──────────────────────────────────────────────────────────────────────────────
 # MARK: Setup
 # ──────────────────────────────────────────────────────────────────────────────
 setup_dev: ## Install all dependencies (dev + all extras)
 	uv sync --all-extras
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MARK: Smoke / integration tests (require real OpenMM + GPU)
+# ──────────────────────────────────────────────────────────────────────────────
+smoke_test: ## Run a 50-ps OpenMM MD simulation (requires real OpenMM + GPU)
+	@if ! uv run python -c "import openmm" 2>/dev/null; then \
+		echo "OpenMM not installed — run \`make setup_dev\` first."; \
+		exit 1; \
+	fi
+	uv run python smoke_test/run_smoke.py smoke_test/out_smoke
 
 # ──────────────────────────────────────────────────────────────────────────────
 # MARK: Validation (read-only — CI-safe)
