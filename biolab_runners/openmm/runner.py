@@ -33,7 +33,6 @@ import logging
 import signal
 import sys
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 
 from biolab_runners.openmm.config import OpenMMConfig, SimulationResult
@@ -46,28 +45,14 @@ from biolab_runners.openmm.offline_gate import (
     evaluate_trajectory,
     write_verdict_file,
 )
+from biolab_runners.openmm.system_builder import (
+    SimulationContext,
+    prepare_simulation,
+)
 from biolab_runners.openmm.utils import (
     load_checkpoint_step,
     verify_production_outputs,
 )
-
-
-@dataclass
-class _MdContext:
-    """Mutable carrier for simulation state passed between run() helpers."""
-
-    simulation: object = None
-    modeller: object = None
-    restraint_force: object = None
-    ca_indices: list[int] = field(default_factory=list)
-    chains: list[object] = field(default_factory=list)
-    openmm_mod: object = None
-    app_mod: object = None
-    unit_mod: object = None
-    np_mod: object = None
-    platform: object = None
-    is_resuming: bool = False
-
 
 logger = logging.getLogger(__name__)
 
@@ -269,201 +254,24 @@ class OpenMMRunner:
         output_dir: Path,
         resume_xml: str,
         result: SimulationResult,
-    ) -> _MdContext | None:
-        """Import OpenMM, build system, create simulation, equilibrate or resume.
+    ) -> SimulationContext | None:
+        """Build the OpenMM simulation, then equilibrate unless resuming.
 
-        Populates result.error on failure. Returns the simulation context or None.
+        Delegates system/forcefield/topology/integrator assembly to
+        :func:`biolab_runners.openmm.system_builder.prepare_simulation`,
+        then runs the equilibration protocol if the run is not a
+        checkpoint resume.
         """
-        try:
-            import numpy as np  # noqa: I001
-            import openmm
-            import openmm.app as app
-            import openmm.unit as unit
-        except ImportError as exc:
-            result.error = f"OpenMM not installed: {exc}"
-            logger.error(result.error)
+        ctx = prepare_simulation(config, output_dir, resume_xml, result)
+        if ctx is None:
             return None
-
-        try:
-            platform = openmm.Platform.getPlatformByName(config.openmm_platform)
-            if config.openmm_platform == "OpenCL":
-                platform.setPropertyDefaultValue("Precision", "mixed")
-            logger.info("Using platform: %s", platform.getName())
-        except Exception as exc:
-            result.error = f"Platform {config.openmm_platform} not available: {exc}"
-            logger.error(result.error)
-            return None
-
-        forcefield = self._build_forcefield(config, app)
-        is_resuming = bool(resume_xml and Path(resume_xml).exists())
-
-        modeller = self._build_or_load_modeller(
-            config, output_dir, app, forcefield, is_resuming, result
-        )
-        if modeller is None:
-            return None
-
-        self._write_topology(modeller, output_dir, app, result)
-
-        system, integrator = self._assemble_system(forcefield, modeller, config, openmm, app, unit)
-        chains = list(modeller.topology.chains())  # type: ignore[union-attr]
-        restraint_force, ca_indices = self._add_ca_restraint(system, modeller, chains, openmm)
-
-        simulation = app.Simulation(modeller.topology, system, integrator, platform)  # type: ignore[union-attr]
-        simulation.context.setPositions(modeller.positions)  # type: ignore[union-attr]
-
-        if is_resuming:
-            logger.info("Resuming from checkpoint: %s", resume_xml)
-            simulation.loadState(resume_xml)
-        else:
-            self._run_equilibration(
-                simulation,
-                restraint_force,
-                ca_indices,
-                config,
-                unit,
-                output_dir,
-                chains,
-                np,
-            )
-
-        return _MdContext(
-            simulation=simulation,
-            modeller=modeller,
-            restraint_force=restraint_force,
-            ca_indices=ca_indices,
-            chains=chains,
-            openmm_mod=openmm,
-            app_mod=app,
-            unit_mod=unit,
-            np_mod=np,
-            platform=platform,
-            is_resuming=is_resuming,
-        )
-
-    @staticmethod
-    def _build_forcefield(config: OpenMMConfig, app: object) -> object:
-        """Construct the OpenMM ForceField for the configured protein FF + water.
-
-        Uses ``config.water_ff_xml`` when provided, else falls back to
-        ``{water_model}.xml``. The distinction matters: ``Modeller.addSolvent``
-        takes a SHORT model key (``"tip3p"``), whereas ``app.ForceField`` needs
-        an XML filename. Bare ``tip3p.xml`` ships water parameters only, so
-        ionic-strength solvation raises "No template found for residue N (NA)"
-        unless the XML loaded into ForceField carries ion templates. Point
-        ``water_ff_xml`` at e.g. ``"amber14/tip3p.xml"`` for an AMBER water+ions
-        bundle. For CHARMM36m, the built-in ``charmm36/water.xml`` already
-        includes ion templates so this override is unnecessary.
-
-        ``config.extra_forcefields`` is appended after the protein and water
-        XMLs so later entries take precedence for overlapping atom types.
-        """
-        ff_name = config.protein_ff
-        if "charmm" in ff_name.lower():
-            base = ["charmm36.xml", "charmm36/water.xml"]
-        else:
-            water_xml = config.water_ff_xml or f"{config.water_model}.xml"
-            base = [f"{ff_name}.xml", water_xml]
-        return app.ForceField(*base, *config.extra_forcefields)  # type: ignore[union-attr]
-
-    def _build_or_load_modeller(
-        self,
-        config: OpenMMConfig,
-        output_dir: Path,
-        app: object,
-        forcefield: object,
-        is_resuming: bool,
-        result: SimulationResult,
-    ) -> object | None:
-        """Build a fresh solvated modeller or load one from a prior run."""
-        topo_path = output_dir / "topology.pdb"
-        existing_topo = (
-            topo_path if topo_path.exists() and topo_path.stat().st_size > 100_000 else None
-        )
-
-        if is_resuming and existing_topo:
-            logger.info("Resuming: loading solvated topology from %s", existing_topo)
-            topo_pdb = app.PDBFile(str(existing_topo))  # type: ignore[union-attr]
-            modeller = app.Modeller(topo_pdb.topology, topo_pdb.positions)  # type: ignore[union-attr]
-            logger.info("Loaded solvated system: %d atoms", modeller.topology.getNumAtoms())
-            return modeller
-
-        receptor_pdb = self._resolve_pdb(config.receptor_pdb, "receptor.pdb")
-        peptide_pdb = self._resolve_pdb(config.peptide_pdb, "peptide.pdb")
-        modeller = self._build_system(receptor_pdb, peptide_pdb, config, app, forcefield)
-        if modeller is None:
-            result.error = "Failed to build system — no valid PDB files"
-        return modeller
-
-    @staticmethod
-    def _write_topology(
-        modeller: object, output_dir: Path, app: object, result: SimulationResult
-    ) -> None:
-        """Persist the solvated topology PDB and populate result metadata."""
-        topo_path = output_dir / "topology.pdb"
-        with open(str(topo_path), "w") as f:
-            app.PDBFile.writeFile(modeller.topology, modeller.positions, f)  # type: ignore[union-attr]
-        result.num_atoms = modeller.topology.getNumAtoms()  # type: ignore[union-attr]
-        result.topology_path = str(topo_path)
-        logger.info("Topology: %d atoms", result.num_atoms)
-
-    @staticmethod
-    def _assemble_system(
-        forcefield: object,
-        modeller: object,
-        config: OpenMMConfig,
-        openmm: object,
-        app: object,
-        unit: object,
-    ) -> tuple[object, object]:
-        """Create the OpenMM System (with barostat) and integrator."""
-        system = forcefield.createSystem(  # type: ignore[union-attr]
-            modeller.topology,  # type: ignore[union-attr]
-            nonbondedMethod=app.PME,  # type: ignore[union-attr]
-            nonbondedCutoff=1.0 * unit.nanometers,  # type: ignore[union-attr]
-            constraints=app.HBonds,  # type: ignore[union-attr]
-        )
-        system.addForce(
-            openmm.MonteCarloBarostat(  # type: ignore[union-attr]
-                config.pressure_atm * unit.atmospheres,  # type: ignore[union-attr]
-                config.temperature_k * unit.kelvin,  # type: ignore[union-attr]
-                25,
-            )
-        )
-        integrator = openmm.LangevinMiddleIntegrator(  # type: ignore[union-attr]
-            config.temperature_k * unit.kelvin,  # type: ignore[union-attr]
-            1.0 / unit.picoseconds,  # type: ignore[union-attr]
-            config.timestep_fs * unit.femtoseconds,  # type: ignore[union-attr]
-        )
-        return system, integrator
-
-    @staticmethod
-    def _add_ca_restraint(
-        system: object, modeller: object, chains: list[object], openmm: object
-    ) -> tuple[object, list[int]]:
-        """Add the C-alpha CustomExternalForce restraint (k=0) to the system."""
-        ca_indices: list[int] = []
-        for chain in chains:
-            for atom in chain.atoms():  # type: ignore[union-attr]
-                if atom.name == "CA":
-                    ca_indices.append(atom.index)
-
-        restraint_force = openmm.CustomExternalForce(  # type: ignore[union-attr]
-            "k*periodicdistance(x,y,z,x0,y0,z0)^2"
-        )
-        restraint_force.addGlobalParameter("k", 0.0)
-        restraint_force.addPerParticleParameter("x0")
-        restraint_force.addPerParticleParameter("y0")
-        restraint_force.addPerParticleParameter("z0")
-        for idx in ca_indices:
-            pos = modeller.positions[idx]  # type: ignore[union-attr]
-            restraint_force.addParticle(idx, [pos.x, pos.y, pos.z])
-        system.addForce(restraint_force)  # type: ignore[union-attr]
-        return restraint_force, ca_indices
+        if not ctx.is_resuming:
+            self._run_equilibration(ctx, config, output_dir)
+        return ctx
 
     @staticmethod
     def _setup_reporters(
-        ctx: _MdContext,
+        ctx: SimulationContext,
         config: OpenMMConfig,
         traj_path: str,
         energy_path: str,
@@ -519,7 +327,7 @@ class OpenMMRunner:
     @staticmethod
     def _finalize_result(
         *,
-        ctx: _MdContext,
+        ctx: SimulationContext,
         result: SimulationResult,
         energy_fh: object,
         traj_path: str,
@@ -607,93 +415,21 @@ class OpenMMRunner:
 
         return result
 
-    def _resolve_pdb(self, config_path: str, fallback_name: str) -> str:
-        """Resolve a PDB path with fallback to output_dir."""
-        if config_path and Path(config_path).exists():
-            return config_path
-        output_dir = Path(self.config.output_dir)
-        for search_dir in [output_dir.parent, output_dir, Path(".")]:
-            fallback = search_dir / fallback_name
-            if fallback.exists():
-                return str(fallback)
-        return ""
-
     @staticmethod
-    def _build_system(
-        receptor_pdb: str,
-        peptide_pdb: str,
-        config: OpenMMConfig,
-        app: object,  # openmm.app module
-        forcefield: object,
-    ) -> object | None:
-        """Build the solvated peptide-protein complex.
-
-        Returns an openmm.app.Modeller or None if no PDB files are available.
-        """
-        from pdbfixer import PDBFixer
-
-        if receptor_pdb and peptide_pdb:
-            fixer = PDBFixer(filename=receptor_pdb)
-            fixer.findMissingResidues()
-            fixer.findMissingAtoms()
-            fixer.addMissingAtoms()
-            fixer.addMissingHydrogens(config.protonation_ph)
-
-            pep_fixer = PDBFixer(filename=peptide_pdb)
-            pep_fixer.findMissingResidues()
-            pep_fixer.findMissingAtoms()
-            pep_fixer.addMissingAtoms()
-            pep_fixer.addMissingHydrogens(config.protonation_ph)
-
-            modeller = app.Modeller(fixer.topology, fixer.positions)  # type: ignore[union-attr]
-            modeller.add(pep_fixer.topology, pep_fixer.positions)
-        elif receptor_pdb:
-            fixer = PDBFixer(filename=receptor_pdb)
-            fixer.findMissingResidues()
-            fixer.findMissingAtoms()
-            fixer.addMissingAtoms()
-            fixer.addMissingHydrogens(config.protonation_ph)
-            modeller = app.Modeller(fixer.topology, fixer.positions)  # type: ignore[union-attr]
-        else:
-            return None
-
-        import openmm.unit as unit
-
-        logger.info(
-            "Complex: %d atoms, %d residues, %d chains",
-            modeller.topology.getNumAtoms(),
-            modeller.topology.getNumResidues(),
-            modeller.topology.getNumChains(),
-        )
-
-        modeller.addSolvent(  # pyright: ignore[reportOperatorIssue, reportAttributeAccessIssue]
-            forcefield,
-            model=config.water_model,
-            padding=config.box_padding_nm * unit.nanometers,  # pyright: ignore[reportAttributeAccessIssue, reportOperatorIssue]
-            boxShape=config.box_shape,
-            ionicStrength=config.nacl_mol * unit.molar,  # pyright: ignore[reportOperatorIssue]
-        )
-        logger.info("Solvated: %d atoms", modeller.topology.getNumAtoms())
-
-        return modeller
-
-    @staticmethod
-    def _run_equilibration(
-        simulation: object,
-        restraint_force: object,
-        ca_indices: list[int],
-        config: OpenMMConfig,
-        unit: object,
-        output_dir: Path,
-        chains: list[object],
-        np: object,
-    ) -> None:
+    def _run_equilibration(ctx: SimulationContext, config: OpenMMConfig, output_dir: Path) -> None:
         """Run 3-stage equilibration protocol.
 
         Stage 1: NVT 100ps with strong restraints (k=1000 kJ/mol/nm^2)
         Stage 2: NPT 100ps with reduced restraints (k=100)
         Stage 3: NPT 200ps with gradual restraint ramp (100->0) + unrestrained
         """
+        simulation = ctx.simulation
+        restraint_force = ctx.restraint_force
+        ca_indices = ctx.ca_indices
+        unit = ctx.unit_mod
+        chains = ctx.chains
+        np = ctx.np_mod
+
         logger.info("Minimizing energy...")
         simulation.minimizeEnergy(maxIterations=_MAX_MINIMIZATION_ITERS)  # type: ignore[union-attr]
 

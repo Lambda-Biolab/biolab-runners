@@ -15,6 +15,7 @@ from biolab_runners.openmm.config import (
 )
 from biolab_runners.openmm.geometry import pbc_correct
 from biolab_runners.openmm.runner import OpenMMRunner
+from biolab_runners.openmm.system_builder import build_forcefield
 from biolab_runners.openmm.utils import (
     load_checkpoint_step,
     verify_production_outputs,
@@ -182,11 +183,11 @@ class _FakeApp:
 
 
 class TestBuildForcefield:
-    """Tests for ``OpenMMRunner._build_forcefield`` extra_forcefields pass-through."""
+    """Tests for ``build_forcefield`` extra_forcefields pass-through."""
 
     def test_amber_no_extras(self) -> None:
         config = OpenMMConfig(protein_ff="amber14/protein.ff14SB", water_model="tip3p")
-        ff = OpenMMRunner._build_forcefield(config, _FakeApp())
+        ff = build_forcefield(config, _FakeApp())
         assert ff.paths == ("amber14/protein.ff14SB.xml", "tip3p.xml")
 
     def test_amber_with_extras(self, tmp_path: Path) -> None:
@@ -196,20 +197,20 @@ class TestBuildForcefield:
             water_model="tip3p",
             extra_forcefields=[extra],
         )
-        ff = OpenMMRunner._build_forcefield(config, _FakeApp())
+        ff = build_forcefield(config, _FakeApp())
         assert ff.paths == ("amber14/protein.ff14SB.xml", "tip3p.xml", extra)
 
     def test_charmm_with_extras(self, tmp_path: Path) -> None:
         """CHARMM branch must still honour extra_forcefields."""
         extra = str(tmp_path / "custom.xml")
         config = OpenMMConfig(protein_ff="charmm36m", extra_forcefields=[extra])
-        ff = OpenMMRunner._build_forcefield(config, _FakeApp())
+        ff = build_forcefield(config, _FakeApp())
         assert ff.paths == ("charmm36.xml", "charmm36/water.xml", extra)
 
     def test_extras_preserve_order(self, tmp_path: Path) -> None:
         extras = [str(tmp_path / "a.xml"), str(tmp_path / "b.xml")]
         config = OpenMMConfig(protein_ff="amber14/protein.ff14SB", extra_forcefields=extras)
-        ff = OpenMMRunner._build_forcefield(config, _FakeApp())
+        ff = build_forcefield(config, _FakeApp())
         assert ff.paths[-2:] == tuple(extras)
 
     def test_water_ff_xml_overrides_water_model_path(self) -> None:
@@ -226,7 +227,7 @@ class TestBuildForcefield:
             water_model="tip3p",
             water_ff_xml="amber14/tip3p.xml",
         )
-        ff = OpenMMRunner._build_forcefield(config, _FakeApp())
+        ff = build_forcefield(config, _FakeApp())
         assert ff.paths == ("amber14/protein.ff14SB.xml", "amber14/tip3p.xml")
 
     def test_water_ff_xml_empty_falls_back_to_water_model(self) -> None:
@@ -236,7 +237,7 @@ class TestBuildForcefield:
             water_model="tip3p",
             water_ff_xml="",
         )
-        ff = OpenMMRunner._build_forcefield(config, _FakeApp())
+        ff = build_forcefield(config, _FakeApp())
         assert ff.paths == ("amber14/protein.ff14SB.xml", "tip3p.xml")
 
     def test_water_ff_xml_ignored_for_charmm(self) -> None:
@@ -245,7 +246,7 @@ class TestBuildForcefield:
             protein_ff="charmm36m",
             water_ff_xml="amber14/tip3p.xml",  # ignored — CHARMM branch
         )
-        ff = OpenMMRunner._build_forcefield(config, _FakeApp())
+        ff = build_forcefield(config, _FakeApp())
         assert ff.paths == ("charmm36.xml", "charmm36/water.xml")
 
 
