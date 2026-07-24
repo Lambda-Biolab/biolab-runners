@@ -27,7 +27,11 @@ jobs:
           cache-dependency-glob: "uv.lock"
 
       - name: Install dependencies
-        run: uv sync --frozen --all-extras
+        # --extra openmm brings openmm + pdbfixer + numpy + mdtraj.
+        # Without --all-extras we skip boltz2 (requires the boltz
+        # binary on PATH and a GPU, not needed for the unit-test
+        # suite, which mocks the CLI). Saves ~30 s per CI run.
+        run: uv sync --frozen --extra openmm --group dev
 
       - name: Lint with ruff
         run: |
@@ -60,6 +64,8 @@ jobs:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
       - name: Install dependencies
-        run: uv sync --frozen --all-extras
+        # Smoke test needs the boltz2 extra too (the boltz CLI is
+        # referenced indirectly through biolab_runners imports).
+        run: uv sync --frozen --all-extras --group dev
       - name: Run smoke test
         run: make smoke_test
