@@ -7,15 +7,17 @@ smoke_test/run_smoke.py driver (requires real OpenMM + GPU).
 
 from __future__ import annotations
 
+import sys
+import types
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from biolab_runners.openmm.config import OpenMMConfig
+import pytest  # noqa: TC002  # used in helper annotations only
+from biolab_runners.openmm.config import OpenMMConfig, SimulationResult
 from biolab_runners.openmm.system_builder import (
     SimulationContext,
     add_ca_restraint,
     assemble_system,
-    build_forcefield,
     resolve_pdb,
     write_topology,
 )
@@ -425,15 +427,174 @@ class TestSimulationContextFields:
         assert ctx_b.chains == []
 
 
-# ---------------------------------------------------------------------------
-# build_forcefield — re-exported test (already in test_openmm_runner.py)
-# ---------------------------------------------------------------------------
+class TestPrepareSimulationPopulatesContext:
+    """Drive ``prepare_simulation`` end-to-end with mocks and assert the
+    returned ``SimulationContext`` carries the chains list.
+
+    The Phase 8 cleanup accidentally removed ``chains`` from
+    ``SimulationContext`` based on a "derivable" recommendation,
+    but the runner actually consumes ``ctx.chains`` during
+    equilibration. The unit suite never reached that path so the
+    regression slipped through. This test makes the production
+    contract a unit-test invariant: any future removal of the
+    ``chains=chains`` constructor argument in ``prepare_simulation``
+    would fail this test.
+    """
+
+    def test_fresh_run_populates_chains_from_modeller(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Fresh (non-resume) prepare_simulation must populate ctx.chains
+        from the modeller topology. A missing ``chains=chains`` constructor
+        argument would silently leave ctx.chains == [], which downstream
+        _run_equilibration would then fail to walk.
+        """
+        import biolab_runners.openmm.system_builder as sb
+
+        sentinel_chains = [object(), object(), object()]
+        fake_modeller = _make_fake_modeller(sentinel_chains, num_atoms=42)
+        _stub_openmm(monkeypatch)
+        _stub_system_builder(monkeypatch, sb, fake_modeller)
+
+        config = OpenMMConfig(
+            receptor_pdb="receptor.pdb",
+            peptide_pdb="peptide.pdb",
+            output_dir=str(tmp_path),
+            openmm_platform="CPU",
+        )
+        result = SimulationResult(config=config)
+        ctx = sb.prepare_simulation(config, tmp_path, "", result)
+
+        assert ctx is not None, f"prepare_simulation failed: {result.error}"
+        # The contract: ctx.chains must contain the modeller topology's
+        # chain list (list() in prepare_simulation produces a new list,
+        # so we compare by element identity, not the list itself).
+        assert ctx.chains == sentinel_chains
+        for sentinel, populated in zip(sentinel_chains, ctx.chains, strict=True):
+            assert sentinel is populated
+        # Also verify the metadata fields the BLOCKER #2 fix addressed.
+        assert result.num_atoms == 42
+        assert result.topology_path == str(tmp_path / "topology.pdb")
 
 
-class TestBuildForcefieldReExported:
-    """Guards against regression: ``build_forcefield`` must remain
-    importable from ``system_builder``. The functional tests live in
-    test_openmm_runner.py::TestBuildForcefield (same function)."""
+def _make_fake_modeller(chains: list[object], num_atoms: int) -> object:
+    """Build a minimal OpenMM Modeller stand-in for the prepare_simulation test."""
 
-    def test_importable_from_system_builder(self) -> None:
-        assert callable(build_forcefield)
+    class _FakeTopology:
+        def chains(self) -> list[object]:
+            return chains
+
+        def getNumAtoms(self) -> int:
+            return num_atoms
+
+    class _FakeModeller:
+        topology = _FakeTopology()
+        positions: tuple[object, ...] = ()
+
+    return _FakeModeller()
+
+
+def _stub_openmm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Populate ``sys.modules`` with fake openmm / openmm.app / openmm.unit.
+
+    ``prepare_simulation`` does lazy ``import openmm`` /
+    ``import openmm.app as app`` / ``import openmm.unit as unit`` inside
+    its body, plus ``import numpy as np``. Pre-populating ``sys.modules``
+    with ``types.ModuleType`` instances (which carry a ``__path__``) lets
+    the ``from X import Y`` form resolve.
+    """
+    fake_modules = {
+        "openmm": _make_fake_openmm_module(),
+        "openmm.app": _make_fake_app_module(),
+        "openmm.unit": _make_fake_unit_module(),
+    }
+    for name, module in fake_modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+
+def _make_fake_openmm_module() -> types.ModuleType:
+    """Stand-in for the ``openmm`` package — Platform, CustomExternalForce, etc."""
+
+    class _FakePlatform:
+        @staticmethod
+        def getPlatformByName(name: str) -> _FakePlatform:
+            p = _FakePlatform()
+            p._name = name
+            return p
+
+        def getName(self) -> str:
+            return self._name  # type: ignore[attr-defined]
+
+        def setPropertyDefaultValue(self, key: str, value: str) -> None:
+            pass
+
+    class _CustomExternalForce:
+        def __init__(self, expr: str) -> None:
+            pass
+
+        def addGlobalParameter(self, *a: object, **kw: object) -> None:
+            pass
+
+        def addPerParticleParameter(self, *a: object, **kw: object) -> None:
+            pass
+
+        def addParticle(self, *a: object, **kw: object) -> None:
+            pass
+
+    class _MonteCarloBarostat:
+        def __init__(self, *a: object, **kw: object) -> None:
+            pass
+
+    class _LangevinMiddleIntegrator:
+        def __init__(self, *a: object, **kw: object) -> None:
+            pass
+
+    class _FakeOpenMMModule(types.ModuleType):
+        Platform = _FakePlatform
+        CustomExternalForce = _CustomExternalForce
+        MonteCarloBarostat = _MonteCarloBarostat
+        LangevinMiddleIntegrator = _LangevinMiddleIntegrator
+
+    return _FakeOpenMMModule("openmm")
+
+
+def _make_fake_app_module() -> types.ModuleType:
+    """Stand-in for the ``openmm.app`` module — PDBFile, Simulation, etc."""
+
+    class _FakeForceField:
+        def __init__(self, *paths: str, **kwargs: object) -> None:
+            self.paths = paths
+
+    class _FakePDBFile:
+        @staticmethod
+        def writeFile(*args: object, **kwargs: object) -> None:
+            pass
+
+    class _FakeSimulation:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self.context = type("_Ctx", (), {"setPositions": lambda self, p: None})()
+
+    class _FakeAppModule(types.ModuleType):
+        PME = "PME"
+        HBonds = "HBonds"
+        ForceField = _FakeForceField
+        PDBFile = _FakePDBFile
+        Simulation = _FakeSimulation
+
+    return _FakeAppModule("openmm.app")
+
+
+def _make_fake_unit_module() -> types.ModuleType:
+    """Stand-in for ``openmm.unit`` — no symbols used by prepare_simulation."""
+    return types.ModuleType("openmm.unit")
+
+
+def _stub_system_builder(
+    monkeypatch: pytest.MonkeyPatch, sb: object, fake_modeller: object
+) -> None:
+    """Stub the heavy collaborators of ``prepare_simulation`` so the
+    test doesn't need real OpenMM or pdbfixer."""
+    monkeypatch.setattr(sb, "build_forcefield", lambda config, app: object())
+    monkeypatch.setattr(sb, "build_or_load_modeller", lambda *args, **kw: fake_modeller)
+    monkeypatch.setattr(sb, "assemble_system", lambda *a, **kw: (MagicMock(), MagicMock()))
+    monkeypatch.setattr(sb, "add_ca_restraint", lambda *a, **kw: (MagicMock(), []))

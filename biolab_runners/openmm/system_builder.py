@@ -192,14 +192,33 @@ def build_or_load_modeller(
 
 
 def write_topology(
-    modeller: object, output_dir: Path, app: object, result: SimulationResult
+    modeller: object,
+    output_dir: Path,
+    app: object,
+    result: SimulationResult,
+    *,
+    write_file: bool = True,
 ) -> None:
-    """Persist the solvated topology PDB and populate result metadata."""
+    """Populate ``result`` with topology metadata, and (optionally) write the PDB.
+
+    Args:
+        modeller: OpenMM Modeller whose topology + positions to record.
+        output_dir: Where ``topology.pdb`` would be written.
+        app: openmm.app module (only needed when ``write_file=True``).
+        result: SimulationResult whose ``num_atoms`` and ``topology_path``
+            are populated.
+        write_file: If True (default), persist the topology to disk.
+            If False, skip the PDB write — used during resume where the
+            existing topology.pdb was just loaded by
+            ``build_or_load_modeller`` and re-writing would be wasted I/O.
+            The metadata assignments still run.
+    """
     topo_path = output_dir / FileNames.TOPOLOGY
-    with open(str(topo_path), "w") as f:
-        app.PDBFile.writeFile(modeller.topology, modeller.positions, f)  # type: ignore[union-attr]
     result.num_atoms = modeller.topology.getNumAtoms()  # type: ignore[union-attr]
     result.topology_path = str(topo_path)
+    if write_file:
+        with open(str(topo_path), "w") as f:
+            app.PDBFile.writeFile(modeller.topology, modeller.positions, f)  # type: ignore[union-attr]
     logger.info("Topology: %d atoms", result.num_atoms)
 
 
@@ -302,20 +321,12 @@ def prepare_simulation(
     if modeller is None:
         return None
 
-    # write_topology performs two things: the file write and the
-    # metadata assignments (result.num_atoms, result.topology_path).
-    # On resume the existing topology.pdb was just read by
-    # build_or_load_modeller, so re-writing it is wasted I/O. The
-    # metadata assignments are still required so callers see a
-    # populated SimulationResult. Split: always set metadata; only
-    # do the file write on a fresh run.
-    topo_path = output_dir / FileNames.TOPOLOGY
-    result.topology_path = str(topo_path)
-    result.num_atoms = modeller.topology.getNumAtoms()  # type: ignore[union-attr]
-    if not is_resuming:
-        with open(str(topo_path), "w") as f:
-            app.PDBFile.writeFile(modeller.topology, modeller.positions, f)  # type: ignore[union-attr]
-    logger.info("Topology: %d atoms", result.num_atoms)
+    # write_topology handles both the file write AND the metadata
+    # assignments. On resume the existing topology.pdb was just read
+    # by build_or_load_modeller, so re-writing it is wasted I/O. The
+    # metadata assignments still run via ``write_file=False`` so
+    # callers see a populated SimulationResult.
+    write_topology(modeller, output_dir, app, result, write_file=not is_resuming)
 
     system, integrator = assemble_system(forcefield, modeller, config, openmm, app, unit)
     chains = list(modeller.topology.chains())  # type: ignore[union-attr]

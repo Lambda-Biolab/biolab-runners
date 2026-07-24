@@ -488,23 +488,13 @@ class TestIrmsdThreshold:
 # ``tests/test_offline_gate.py``, which exercises the same coord-convention,
 # Kabsch, triclinic-unwrap, and conjunctive-slope-gate properties on the
 # new file-based gate function. Git history preserves the old tests.
+#
+# PBC math tests (orthorhombic parity, dodecahedron wrap, face crossing,
+# broadcasting) moved to tests/test_geometry.py during the god-module
+# split (2026-07). That file owns the ``pbc_correct`` /
+# ``min_pbc_distance`` / ``collect_chain_ca_positions`` public surface
+# and includes the pre-fix regression assertions for #163.
 # ---------------------------------------------------------------------------
-
-
-class TestPbcCorrectMoved:
-    """PBC tests live in test_geometry.py after the geometry extraction.
-
-    Re-exported here as a single no-op marker so reviewers searching
-    for ``TestPbcCorrect`` in test_openmm_runner.py find a pointer
-    to the canonical location.
-    """
-
-    def test_see_test_geometry(self) -> None:
-        """All PBC parity / dodecahedron / broadcast tests moved to test_geometry.py."""
-        # The 4 regression tests for #163 (orthorhombic parity,
-        # dodecahedron wrap, dodecahedron face crossing, broadcasting)
-        # are now in tests/test_geometry.py::TestPbcCorrectDeterministic.
-        assert True
 
 
 # ---------------------------------------------------------------------------
