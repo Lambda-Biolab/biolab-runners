@@ -30,10 +30,12 @@ This executes: `ruff` (format + lint check) → `pyright` (type check) → `comp
 
 ## Code Style
 
-- Google-style docstrings (enforced by ruff)
-- Type annotations on all public functions (enforced by pyright basic)
-- Max cyclomatic complexity: 10
-- Max cognitive complexity: 15
+- Google-style docstrings (enforced by ruff `D` rules)
+- Type annotations on all public functions (enforced by pyright `standard`)
+- Two complexity gates, by different tools, on different metrics:
+  - **Cyclomatic complexity ≤ 10** (ruff `C90` / mccabe) — counts linearly-independent paths through a function
+  - **Cognitive complexity ≤ 15** (complexipy) — weights nested control flow (loops/conditionals add mental load)
+  - Both are checked by `make validate` and in CI
 
 ## Adding a New Runner
 

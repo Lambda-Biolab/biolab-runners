@@ -42,3 +42,24 @@ jobs:
 
       - name: Run tests
         run: uv run pytest tests/ -v --tb=short
+
+  # Smoke test job — requires a self-hosted runner with a CUDA-capable
+  # GPU and OpenMM built with CUDA support (not available on GitHub-hosted
+  # runners). Trigger manually with `workflow_dispatch` after the lint
+  # gate is green. Run on tagged releases for an end-to-end check.
+  smoke-test:
+    runs-on: [self-hosted, gpu]
+    needs: lint-and-test
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Install dependencies
+        run: uv sync --frozen --all-extras
+      - name: Run smoke test
+        run: make smoke_test
