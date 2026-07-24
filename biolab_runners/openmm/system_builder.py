@@ -39,7 +39,6 @@ class SimulationContext:
     modeller: object = None
     restraint_force: object = None
     ca_indices: list[int] = field(default_factory=list)
-    chains: list[object] = field(default_factory=list)
     openmm_mod: object = None
     app_mod: object = None
     unit_mod: object = None
@@ -65,7 +64,10 @@ def build_forcefield(config: OpenMMConfig, app: object) -> object:
     XMLs so later entries take precedence for overlapping atom types.
     """
     ff_name = config.protein_ff
-    if "charmm" in ff_name.lower():
+    # Match CHARMM by prefix to avoid false positives like
+    # "non-charmm-test". The list is open to the same prefixes the
+    # OpenMM CHARMM force fields actually ship under.
+    if ff_name.lower().startswith("charmm"):
         base = ["charmm36.xml", "charmm36/water.xml"]
     else:
         water_xml = config.water_ff_xml or f"{config.water_model}.xml"
@@ -90,6 +92,7 @@ def build_solvated_complex(
     config: OpenMMConfig,
     app: object,  # openmm.app module
     forcefield: object,
+    unit: object | None = None,  # openmm.unit module; optional, imported if None
 ) -> object | None:
     """Build the solvated peptide-protein complex.
 
@@ -122,7 +125,8 @@ def build_solvated_complex(
     else:
         return None
 
-    import openmm.unit as unit
+    if unit is None:
+        import openmm.unit as unit
 
     logger.info(
         "Complex: %d atoms, %d residues, %d chains",
@@ -150,6 +154,7 @@ def build_or_load_modeller(
     forcefield: object,
     is_resuming: bool,
     result: SimulationResult,
+    unit: object | None = None,  # openmm.unit module; forwarded to build_solvated_complex
 ) -> object | None:
     """Build a fresh solvated modeller or load one from a prior run."""
     topo_path = output_dir / "topology.pdb"
@@ -164,7 +169,7 @@ def build_or_load_modeller(
 
     receptor_pdb = _resolve_pdb(config.receptor_pdb, "receptor.pdb", output_dir)
     peptide_pdb = _resolve_pdb(config.peptide_pdb, "peptide.pdb", output_dir)
-    modeller = build_solvated_complex(receptor_pdb, peptide_pdb, config, app, forcefield)
+    modeller = build_solvated_complex(receptor_pdb, peptide_pdb, config, app, forcefield, unit)
     if modeller is None:
         result.error = "Failed to build system — no valid PDB files"
     return modeller
@@ -275,11 +280,18 @@ def prepare_simulation(
     forcefield = build_forcefield(config, app)
     is_resuming = bool(resume_xml and Path(resume_xml).exists())
 
-    modeller = build_or_load_modeller(config, output_dir, app, forcefield, is_resuming, result)
+    modeller = build_or_load_modeller(
+        config, output_dir, app, forcefield, is_resuming, result, unit
+    )
     if modeller is None:
         return None
 
-    write_topology(modeller, output_dir, app, result)
+    # Skip the topology write-back on resume: the existing topology.pdb
+    # was just read by build_or_load_modeller, so re-writing it would
+    # only burn I/O. write_topology still updates result.num_atoms /
+    # result.topology_path, so the skip is narrowly the file write.
+    if not is_resuming:
+        write_topology(modeller, output_dir, app, result)
 
     system, integrator = assemble_system(forcefield, modeller, config, openmm, app, unit)
     chains = list(modeller.topology.chains())  # type: ignore[union-attr]
@@ -297,7 +309,6 @@ def prepare_simulation(
         modeller=modeller,
         restraint_force=restraint_force,
         ca_indices=ca_indices,
-        chains=chains,
         openmm_mod=openmm,
         app_mod=app,
         unit_mod=unit,

@@ -42,6 +42,7 @@ from biolab_runners.openmm.geometry import (
 )
 from biolab_runners.openmm.offline_gate import (
     DEFAULT_GATE_10NS,
+    GateVerdict,
     evaluate_trajectory,
     write_verdict_file,
 )
@@ -149,7 +150,7 @@ class OpenMMRunner:
         resume_state = self._resolve_skip_or_resume(force, output_dir, config, result)
         if resume_state is None:
             return result
-        start_step, remaining_steps, resume_xml = resume_state
+        _, remaining_steps, resume_xml = resume_state
 
         ctx = self._prepare_simulation(config, output_dir, resume_xml, result)
         if ctx is None:
@@ -196,7 +197,6 @@ class OpenMMRunner:
             t0=t0,
             output_dir=output_dir,
         )
-        _ = start_step  # consumed via remaining_steps
         return result
 
     def _resolve_skip_or_resume(
@@ -285,8 +285,9 @@ class OpenMMRunner:
         simulation = ctx.simulation
         is_resuming = ctx.is_resuming
 
-        dcd_append = is_resuming and Path(traj_path).exists()
-        if not is_resuming and Path(traj_path).exists():
+        traj_exists = Path(traj_path).exists()
+        dcd_append = is_resuming and traj_exists
+        if not is_resuming and traj_exists:
             stale = Path(traj_path).with_suffix(".dcd.stale")
             Path(traj_path).rename(stale)
 
@@ -659,7 +660,7 @@ class OpenMMRunner:
 
     @staticmethod
     def _write_abort_metadata(
-        verdict: object,
+        verdict: GateVerdict,
         output_dir: Path,
         abort_thresh: float,
         config: OpenMMConfig,
@@ -670,32 +671,30 @@ class OpenMMRunner:
         # Schema matches the pre-task-#10 inside-OpenMM abort contract
         # consumed by ``oral_amp.cloud.openmm_cloud``.
         primary_rmsd = (
-            verdict.rmsd_5ns  # type: ignore[union-attr]
-            if verdict.reason == "early_dissociation" and verdict.rmsd_5ns is not None  # type: ignore[union-attr]
-            else verdict.rmsd_10ns  # type: ignore[union-attr]
-            if verdict.rmsd_10ns is not None  # type: ignore[union-attr]
-            else verdict.max_rmsd  # type: ignore[union-attr]
+            verdict.rmsd_5ns
+            if verdict.reason == "early_dissociation" and verdict.rmsd_5ns is not None
+            else verdict.rmsd_10ns
+            if verdict.rmsd_10ns is not None
+            else verdict.max_rmsd
         )
         abort_meta = {
             "aborted": True,
-            "abort_reason": verdict.reason,  # type: ignore[union-attr]
+            "abort_reason": verdict.reason,
             "abort_step": steps_done,
             "abort_ns": round(ns_at_check, 2),
             "peptide_ca_rmsd_A": round(primary_rmsd, 2),
             "peptide_ca_rmsd_5ns_A": (
-                round(verdict.rmsd_5ns, 2) if verdict.rmsd_5ns is not None else None  # type: ignore[union-attr]
+                round(verdict.rmsd_5ns, 2) if verdict.rmsd_5ns is not None else None
             ),
             "peptide_ca_rmsd_10ns_A": (
-                round(verdict.rmsd_10ns, 2) if verdict.rmsd_10ns is not None else None  # type: ignore[union-attr]
+                round(verdict.rmsd_10ns, 2) if verdict.rmsd_10ns is not None else None
             ),
             "slope_A_per_ns": (
-                round(verdict.slope_a_per_ns, 4)  # type: ignore[union-attr]
-                if verdict.slope_a_per_ns is not None  # type: ignore[union-attr]
-                else None
+                round(verdict.slope_a_per_ns, 4) if verdict.slope_a_per_ns is not None else None
             ),
-            "max_rmsd_A": round(verdict.max_rmsd, 2),  # type: ignore[union-attr]
+            "max_rmsd_A": round(verdict.max_rmsd, 2),
             "abort_threshold_A": round(abort_thresh, 2),
-            "receptor_fit_residual_A": round(verdict.receptor_fit_residual, 2),  # type: ignore[union-attr]
+            "receptor_fit_residual_A": round(verdict.receptor_fit_residual, 2),
             "gate": "offline_mdtraj",
             "target": config.target,
             "peptide_id": config.peptide_id,
@@ -703,10 +702,10 @@ class OpenMMRunner:
         (output_dir / "early_abort.json").write_text(json.dumps(abort_meta, indent=2))
         logger.warning(
             "EARLY ABORT (%s): RMSD 5ns=%s 10ns=%s max=%.2f Å @ %.1f ns",
-            verdict.reason,  # type: ignore[union-attr]
-            f"{verdict.rmsd_5ns:.2f}" if verdict.rmsd_5ns is not None else "n/a",  # type: ignore[union-attr]
-            f"{verdict.rmsd_10ns:.2f}" if verdict.rmsd_10ns is not None else "n/a",  # type: ignore[union-attr]
-            verdict.max_rmsd,  # type: ignore[union-attr]
+            verdict.reason,
+            f"{verdict.rmsd_5ns:.2f}" if verdict.rmsd_5ns is not None else "n/a",
+            f"{verdict.rmsd_10ns:.2f}" if verdict.rmsd_10ns is not None else "n/a",
+            verdict.max_rmsd,
             ns_at_check,
         )
 
