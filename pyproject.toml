@@ -81,12 +81,14 @@ select = [
     "TCH", # flake8-type-checking
     "ARG", # flake8-unused-arguments
     "C90", # mccabe cyclomatic complexity
+    "RUF", # ruff-specific rules
+    "ANN", # flake8-annotations
+    "PT",  # flake8-pytest-style
 ]
 ignore = [
     "D100",  # missing module docstring (allow for __init__.py)
     "D104",  # missing public package docstring
     "D107",  # missing docstring in __init__
-    "S101",  # assert used (needed for tests)
     "S603",  # subprocess call — pipeline shells out to boltz CLI
     "S607",  # partial path for subprocess — boltz binary is on PATH
     "S602",  # subprocess shell — not used
@@ -99,20 +101,64 @@ max-complexity = 10
 convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["D", "S", "ARG", "TC003", "SIM117"]
+"tests/**" = [
+    "D",     # docstring rules (tests are self-documenting via test names)
+    "S",     # security (asserts, subprocess mocks are safe in tests)
+    "ARG",   # unused arguments (fixtures may pass extras)
+    "TC003", # type-checking block (tests import broadly)
+    "SIM117", # combine multiple with statements (test readability)
+    "ANN",   # annotations (tests use pytest fixtures; full annotations noisy)
+    "PT",    # pytest-style (existing tests use class grouping, not function-style)
+]
 
 # --- Pyright ---
 [tool.pyright]
-include = ["biolab_runners"]
+include = ["biolab_runners", "tests"]
 pythonVersion = "3.11"
-typeCheckingMode = "basic"
-reportMissingImports = false
-reportMissingModuleSource = false
+typeCheckingMode = "standard"
+# `mdtraj` is an optional dep under the `openmm` extra; imported lazily
+# inside `biolab_runners/openmm/offline_gate.py`. Pyright can't see the
+# dep unless the extra is installed, so silence the missing-import
+# diagnostic specifically.
+reportMissingImports = "warning"
 reportAttributeAccessIssue = "warning"
 
 # --- Pytest ---
 [tool.pytest.ini_options]
+minversion = "8.0"
 testpaths = ["tests"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--tb=short",
+    "--cov=biolab_runners",
+    "--cov-branch",
+    "--cov-report=term-missing",
+]
 markers = [
     "slow: long-running integration tests (e.g., live OpenMM simulations). Skipped by default; run with `pytest -m slow`.",
+    "hardware: tests requiring real GPU/hardware (e.g., live OpenMM, real boltz CLI). Skipped by default.",
+    "network: tests requiring network access. Skipped by default.",
+]
+
+# --- Coverage ---
+[tool.coverage.run]
+branch = true
+source = ["biolab_runners"]
+omit = [
+    "biolab_runners/__init__.py",
+]
+
+[tool.coverage.report]
+# Threshold is enforced via `make validate` → pytest → --cov-fail-under below.
+# Currently set as a soft floor; ratchet up in a follow-up.
+fail_under = 55
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
 ]

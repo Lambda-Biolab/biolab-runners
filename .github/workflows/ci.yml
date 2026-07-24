@@ -17,26 +17,28 @@ jobs:
         python-version: ["3.11", "3.12"]
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
         with:
           python-version: ${{ matrix.python-version }}
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[all]" || pip install -e .
-          pip install ruff pyright pytest pytest-cov
+        run: uv sync --frozen --all-extras
 
       - name: Lint with ruff
         run: |
-          ruff check biolab_runners/ tests/
-          ruff format --check biolab_runners/ tests/
+          uv run ruff check biolab_runners/ tests/
+          uv run ruff format --check biolab_runners/ tests/
 
       - name: Type check with pyright
-        run: pyright biolab_runners/
+        run: uv run pyright biolab_runners/ tests/
+
+      - name: Check complexity
+        run: uv run complexipy biolab_runners/ --max-complexity-allowed 15
 
       - name: Run tests
-        run: pytest tests/ -v --tb=short
+        run: uv run pytest tests/ -v --tb=short
