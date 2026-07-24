@@ -46,6 +46,7 @@ from biolab_runners.openmm.offline_gate import (
     evaluate_trajectory,
     write_verdict_file,
 )
+from biolab_runners.openmm.paths import FileNames
 from biolab_runners.openmm.system_builder import (
     SimulationContext,
     prepare_simulation,
@@ -158,9 +159,9 @@ class OpenMMRunner:
 
         abort_thresh = config.target_irmsd_threshold_a * _ABORT_MULTIPLIER
 
-        traj_path = str(output_dir / "trajectory.dcd")
-        energy_path = str(output_dir / "energy.csv")
-        state_xml_path = str(output_dir / "state.xml")
+        traj_path = str(output_dir / FileNames.TRAJECTORY)
+        energy_path = str(output_dir / FileNames.ENERGY)
+        state_xml_path = str(output_dir / FileNames.STATE_XML)
 
         energy_fh = self._setup_reporters(ctx, config, traj_path, energy_path, remaining_steps)
 
@@ -216,17 +217,17 @@ class OpenMMRunner:
             if verification["complete"]:
                 logger.info(
                     "Skipping MD — trajectory already complete at %s. Use force=True to re-run.",
-                    output_dir / "trajectory.dcd",
+                    output_dir / FileNames.TRAJECTORY,
                 )
-                result.trajectory_path = str(output_dir / "trajectory.dcd")
-                result.energy_path = str(output_dir / "energy.csv")
-                result.state_xml_path = str(output_dir / "state.xml")
-                result.topology_path = str(output_dir / "topology.pdb")
+                result.trajectory_path = str(output_dir / FileNames.TRAJECTORY)
+                result.energy_path = str(output_dir / FileNames.ENERGY)
+                result.state_xml_path = str(output_dir / FileNames.STATE_XML)
+                result.topology_path = str(output_dir / FileNames.TOPOLOGY)
                 return None
 
         start_step = 0
         resume_xml = ""
-        state_xml = output_dir / "state.xml"
+        state_xml = output_dir / FileNames.STATE_XML
         if not force and state_xml.exists() and state_xml.stat().st_size > 0:
             start_step = load_checkpoint_step(output_dir)
             if start_step > 0:
@@ -241,8 +242,8 @@ class OpenMMRunner:
         remaining_steps = max(0, config.total_steps - production_steps_done)
         if remaining_steps == 0:
             logger.info("No remaining steps — simulation already complete")
-            result.trajectory_path = str(output_dir / "trajectory.dcd")
-            result.energy_path = str(output_dir / "energy.csv")
+            result.trajectory_path = str(output_dir / FileNames.TRAJECTORY)
+            result.energy_path = str(output_dir / FileNames.ENERGY)
             result.state_xml_path = str(state_xml)
             return None
 
@@ -366,7 +367,7 @@ class OpenMMRunner:
             "early_abort": result.early_abort,
             "abort_reason": result.abort_reason,
         }
-        (output_dir / "md_summary.json").write_text(json.dumps(summary, indent=2))
+        (output_dir / FileNames.MD_SUMMARY_JSON).write_text(json.dumps(summary, indent=2))
 
         logger.info(
             "Done: %.1f ns in %.1f hours (%.0f ns/day)",
@@ -518,7 +519,9 @@ class OpenMMRunner:
             "displaced": min_dist > _DISPLACEMENT_THRESHOLD_A,
             "threshold_A": _DISPLACEMENT_THRESHOLD_A,
         }
-        (output_dir / "equilibration_metadata.json").write_text(json.dumps(eq_meta, indent=2))
+        (output_dir / FileNames.EQUILIBRATION_METADATA_JSON).write_text(
+            json.dumps(eq_meta, indent=2)
+        )
 
     def _run_production_loop(
         self,
@@ -699,7 +702,7 @@ class OpenMMRunner:
             "target": config.target,
             "peptide_id": config.peptide_id,
         }
-        (output_dir / "early_abort.json").write_text(json.dumps(abort_meta, indent=2))
+        (output_dir / FileNames.EARLY_ABORT_JSON).write_text(json.dumps(abort_meta, indent=2))
         logger.warning(
             "EARLY ABORT (%s): RMSD 5ns=%s 10ns=%s max=%.2f Å @ %.1f ns",
             verdict.reason,

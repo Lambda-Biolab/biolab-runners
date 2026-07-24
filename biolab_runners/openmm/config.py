@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from biolab_runners.openmm.paths import FileNames
+
 logger = logging.getLogger(__name__)
 
 # Default ionic conditions (physiological PBS-like; override via presets or explicit args)
@@ -201,7 +203,7 @@ class OpenMMConfig:
             Path to saved file.
         """
         if path is None:
-            path = Path(self.output_dir) / "system_config.json"
+            path = Path(self.output_dir) / FileNames.SYSTEM_CONFIG_JSON
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(self.to_dict(), indent=2))
         logger.info("System config saved to %s", path)

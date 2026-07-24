@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from biolab_runners.openmm.paths import FileNames
+
 if TYPE_CHECKING:
     from biolab_runners.openmm.config import OpenMMConfig, SimulationResult
 
@@ -157,7 +159,7 @@ def build_or_load_modeller(
     unit: object | None = None,  # openmm.unit module; forwarded to build_solvated_complex
 ) -> object | None:
     """Build a fresh solvated modeller or load one from a prior run."""
-    topo_path = output_dir / "topology.pdb"
+    topo_path = output_dir / FileNames.TOPOLOGY
     existing_topo = topo_path if topo_path.exists() and topo_path.stat().st_size > 100_000 else None
 
     if is_resuming and existing_topo:
@@ -167,8 +169,8 @@ def build_or_load_modeller(
         logger.info("Loaded solvated system: %d atoms", modeller.topology.getNumAtoms())
         return modeller
 
-    receptor_pdb = _resolve_pdb(config.receptor_pdb, "receptor.pdb", output_dir)
-    peptide_pdb = _resolve_pdb(config.peptide_pdb, "peptide.pdb", output_dir)
+    receptor_pdb = _resolve_pdb(config.receptor_pdb, FileNames.RECEPTOR_PDB, output_dir)
+    peptide_pdb = _resolve_pdb(config.peptide_pdb, FileNames.PEPTIDE_PDB, output_dir)
     modeller = build_solvated_complex(receptor_pdb, peptide_pdb, config, app, forcefield, unit)
     if modeller is None:
         result.error = "Failed to build system — no valid PDB files"
@@ -179,7 +181,7 @@ def write_topology(
     modeller: object, output_dir: Path, app: object, result: SimulationResult
 ) -> None:
     """Persist the solvated topology PDB and populate result metadata."""
-    topo_path = output_dir / "topology.pdb"
+    topo_path = output_dir / FileNames.TOPOLOGY
     with open(str(topo_path), "w") as f:
         app.PDBFile.writeFile(modeller.topology, modeller.positions, f)  # type: ignore[union-attr]
     result.num_atoms = modeller.topology.getNumAtoms()  # type: ignore[union-attr]

@@ -10,6 +10,8 @@ import typing
 if typing.TYPE_CHECKING:
     from pathlib import Path
 
+from biolab_runners.openmm.paths import FileNames
+
 logger = logging.getLogger(__name__)
 
 
@@ -74,19 +76,13 @@ def verify_production_outputs(output_dir: Path) -> dict[str, object]:
     Returns:
         Verification report dict with "complete" boolean and file details.
     """
-    expected = [
-        "trajectory.dcd",
-        "energy.csv",
-        "state.xml",
-    ]
-
     report: dict[str, object] = {
         "output_dir": str(output_dir),
         "complete": True,
         "files": {},
     }
 
-    for filename in expected:
+    for filename in FileNames.PRODUCTION_OUTPUT_FILES:
         path = output_dir / filename
         exists = path.exists()
         size = path.stat().st_size if exists else 0
@@ -96,14 +92,14 @@ def verify_production_outputs(output_dir: Path) -> dict[str, object]:
             "size_bytes": size,
         }
 
-        if filename == "energy.csv" and exists:
+        if filename == FileNames.ENERGY and exists:
             lines = len(path.read_text().strip().splitlines())
             file_info["rows"] = lines
             if lines < 10:
                 file_info["warning"] = "Very few energy rows — run may be incomplete"
                 report["complete"] = False
 
-        if filename == "trajectory.dcd" and exists and size < 10_000_000:
+        if filename == FileNames.TRAJECTORY and exists and size < 10_000_000:
             file_info["warning"] = "Trajectory < 10 MB — likely incomplete"
             report["complete"] = False
 
@@ -125,7 +121,7 @@ def load_checkpoint_step(output_dir: Path) -> int:
         Step number of the last checkpoint, or 0 if no checkpoint exists.
     """
     # Try checkpoint.json first
-    ckpt_json = output_dir / "checkpoint.json"
+    ckpt_json = output_dir / FileNames.CHECKPOINT_JSON
     if ckpt_json.exists():
         try:
             data = json.loads(ckpt_json.read_text())
@@ -136,7 +132,7 @@ def load_checkpoint_step(output_dir: Path) -> int:
             pass
 
     # Fallback: parse last line of energy.csv
-    energy_csv = output_dir / "energy.csv"
+    energy_csv = output_dir / FileNames.ENERGY
     if energy_csv.exists() and energy_csv.stat().st_size > 0:
         try:
             last_line = energy_csv.read_text().strip().rsplit("\n", 1)[-1]

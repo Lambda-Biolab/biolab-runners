@@ -60,6 +60,8 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from biolab_runners.openmm.paths import FileNames
+
 if TYPE_CHECKING:
     import mdtraj as md
 
@@ -225,7 +227,7 @@ def _frame_interval_ns(rep_dir: Path, default_ns: float = 0.010) -> float:
     ``simulation.save_interval_ps`` (preferred) or falls back to
     ``save_every_steps * timestep_fs`` for legacy configs.
     """
-    cfg_path = rep_dir / "system_config.json"
+    cfg_path = rep_dir / FileNames.SYSTEM_CONFIG_JSON
     if not cfg_path.exists():
         return default_ns
     try:
@@ -295,8 +297,8 @@ def evaluate_trajectory(
     import mdtraj as md
 
     rep_dir = Path(rep_dir)
-    traj_path = rep_dir / "trajectory.dcd"
-    top_path = rep_dir / "topology.pdb"
+    traj_path = rep_dir / FileNames.TRAJECTORY
+    top_path = rep_dir / FileNames.TOPOLOGY
     if not traj_path.exists() or not top_path.exists():
         raise FileNotFoundError(f"missing trajectory.dcd or topology.pdb in {rep_dir}")
 
@@ -433,7 +435,9 @@ def write_verdict_file(verdict: GateVerdict, rep_dir: Path | str) -> Path:
     """
     rep_dir = Path(rep_dir)
     rep_dir.mkdir(parents=True, exist_ok=True)
-    path = rep_dir / f"gate_verdict_{verdict.current_ns:.1f}ns.json"
+    path = rep_dir / (
+        f"{FileNames.GATE_VERDICT_PREFIX}{verdict.current_ns:.1f}{FileNames.GATE_VERDICT_SUFFIX}"
+    )
     path.write_text(json.dumps(asdict(verdict), indent=2))
     return path
 
@@ -442,7 +446,7 @@ def latest_verdict_file(rep_dir: Path | str) -> Path | None:
     """Return the most recent ``gate_verdict_*.json`` in ``rep_dir``, or None."""
     rep_dir = Path(rep_dir)
     candidates = sorted(
-        rep_dir.glob("gate_verdict_*ns.json"),
+        rep_dir.glob(FileNames.GATE_VERDICT_GLOB),
         key=lambda p: p.stat().st_mtime,
     )
     return candidates[-1] if candidates else None
