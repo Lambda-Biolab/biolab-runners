@@ -10,10 +10,8 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Default ionic conditions (physiological PBS-like; override with presets or explicit args)
+# Default ionic conditions (physiological PBS-like; override via presets or explicit args)
 DEFAULT_NACL_M = 0.150
-DEFAULT_CACL2_M = 0.0
-DEFAULT_KH2PO4_M = 0.0
 DEFAULT_PH = 7.4
 
 # Default early-abort iRMSD threshold (Å). Override per-system via
@@ -31,49 +29,18 @@ BOX_SHAPE = "dodecahedron"  # ~29% less solvent than cubic
 # Force fields
 PROTEIN_FF = "charmm36m"
 WATER_MODEL = "tip3p"
-LIGAND_FF = "cgenff"
 
 # GPU platform — pip OpenMM has OpenCL (not CUDA); conda OpenMM has both
 OPENMM_PLATFORM = "OpenCL"
 
-# Default equilibration protocol
-DEFAULT_EQUIL_STAGES = [
-    {"name": "NVT", "ensemble": "NVT", "duration_ps": 100, "restraint_k": 1000.0},
-    {
-        "name": "NPT_restrained",
-        "ensemble": "NPT",
-        "duration_ps": 100,
-        "restraint_k": 100.0,
-    },
-    {"name": "NPT_free", "ensemble": "NPT", "duration_ps": 200, "restraint_k": 0.0},
-]
-
-
-@dataclass(frozen=True)
-class EquilibrationStage:
-    """One stage of the equilibration protocol.
-
-    Attributes:
-        name: Human-readable name (e.g. "NVT", "NPT_restrained").
-        ensemble: Thermodynamic ensemble ("NVT" or "NPT").
-        duration_ps: Duration in picoseconds.
-        restraint_k: Backbone restraint force constant (kJ/mol/nm^2).
-            0 means no restraints.
-    """
-
-    name: str
-    ensemble: str
-    duration_ps: float
-    restraint_k: float
-
-    def to_dict(self) -> dict[str, object]:
-        """Convert to dictionary."""
-        return {
-            "name": self.name,
-            "ensemble": self.ensemble,
-            "duration_ps": self.duration_ps,
-            "restraint_k": self.restraint_k,
-        }
+# Equilibration protocol (3 stages, 100 + 100 + 200 = 400 ps total).
+# The runner hardcodes the k-values for each stage; only the durations
+# (in ps) are exposed as constants so the total-equil-steps calculation
+# in __post_init__ stays in sync with the runner's behavior.
+EQUIL_NVT_PS = 100.0
+EQUIL_NPT_RESTRAINED_PS = 100.0
+EQUIL_NPT_FREE_PS = 200.0
+EQUIL_TOTAL_PS = EQUIL_NVT_PS + EQUIL_NPT_RESTRAINED_PS + EQUIL_NPT_FREE_PS
 
 
 @dataclass
@@ -95,9 +62,10 @@ class OpenMMConfig:
             by the early-abort logic. Runner aborts at 5 ns if peptide Cα
             RMSD > 2× this value. Override per-system for tighter/looser
             gating.
-        nacl_mol: NaCl concentration in mol/L.
-        cacl2_mol: CaCl2 concentration in mol/L.
-        kh2po4_mol: KH2PO4 concentration in mol/L.
+        nacl_mol: NaCl concentration in mol/L. This is the only ionic
+            concentration the runner actually passes to OpenMM (the
+            ``addSolvent(ionicStrength=…)`` call takes a single value).
+            Other ion species (Ca2+, K+, etc.) are not yet modeled.
         temperature_k: Temperature in Kelvin.
         pressure_atm: Pressure in atmospheres.
         timestep_fs: Integration timestep in femtoseconds.
@@ -105,7 +73,6 @@ class OpenMMConfig:
         box_shape: Solvent box shape ("dodecahedron" or "cubic").
         protein_ff: Protein force field name.
         water_model: Water model name.
-        ligand_ff: Ligand force field name.
         extra_forcefields: Additional OpenMM force-field XML files to load
             alongside ``protein_ff`` and ``water_model``. Each entry is the
             path (str) to an XML file accepted by ``openmm.app.ForceField``.
@@ -114,15 +81,15 @@ class OpenMMConfig:
             take precedence for overlapping atom types. Defaults to the empty
             list.
         openmm_platform: OpenMM platform ("OpenCL", "CUDA", "CPU").
-        equilibration: List of equilibration stage dicts.
         production_ns: Production simulation length in nanoseconds.
         save_interval_ps: Trajectory save interval in picoseconds.
         checkpoint_interval_hours: Checkpoint save interval in hours.
         protonation_ph: pH for hydrogen addition.
         total_steps: Computed total production steps.
+        total_equil_steps: Computed total equilibration steps (constant
+            derived from the 3-stage protocol, 400 ps).
         save_every_steps: Computed trajectory save step interval.
         checkpoint_every_steps: Computed checkpoint step interval.
-        solvated_atoms: Number of atoms in solvated system (0 = unknown).
     """
 
     receptor_pdb: str = ""
@@ -131,10 +98,8 @@ class OpenMMConfig:
     target: str = ""
     peptide_id: str = ""
 
-    # Ionic conditions
+    # Ionic conditions (NaCl only — see class docstring)
     nacl_mol: float = DEFAULT_NACL_M
-    cacl2_mol: float = DEFAULT_CACL2_M
-    kh2po4_mol: float = DEFAULT_KH2PO4_M
 
     # Simulation parameters
     temperature_k: float = TEMPERATURE_K
@@ -151,7 +116,7 @@ class OpenMMConfig:
     # SHORT key like ``"tip3p"`` / ``"tip4pew"`` whereas ``ForceField``
     # needs an XML filename. Bare ``tip3p.xml`` ships water-only
     # parameters and ``addSolvent`` raises "No template found for
-    # residue N (NA)" once Na+/Cl-/K+/Ca2+ ions are inserted at the
+    # residue N (NA)" once Na+/Cl- ions are inserted at the
     # configured ionic strength. Point this at e.g.
     # ``"amber14/tip3p.xml"`` for a water+ions bundle, or leave empty
     # and biolab-runners will fall back to ``{water_model}.xml``
@@ -159,16 +124,10 @@ class OpenMMConfig:
     # protein XML). OralBiome-AMP's Aib preprocessing sets this via
     # ``force_fields.water_ff_xml`` — see ``augment_system_config_for_aib``.
     water_ff_xml: str = ""
-    ligand_ff: str = LIGAND_FF
     extra_forcefields: list[str] = field(default_factory=list)
 
     # GPU platform
     openmm_platform: str = OPENMM_PLATFORM
-
-    # Equilibration
-    equilibration: list[dict[str, object]] = field(
-        default_factory=lambda: list(DEFAULT_EQUIL_STAGES)
-    )
 
     # Production
     production_ns: float = 100.0
@@ -187,19 +146,11 @@ class OpenMMConfig:
     save_every_steps: int = 0
     checkpoint_every_steps: int = 0
 
-    # Solvated system size (set after topology building, 0 = unknown)
-    solvated_atoms: int = 0
-
     def __post_init__(self) -> None:
         """Compute derived step counts."""
         steps_per_ps = 1000.0 / self.timestep_fs
         self.total_steps = int(self.production_ns * 1000.0 * steps_per_ps)
-        equil_ps = 0.0
-        for stage in self.equilibration:
-            dur = stage.get("duration_ps")
-            if isinstance(dur, (int, float)):
-                equil_ps += dur
-        self.total_equil_steps = int(equil_ps * steps_per_ps)
+        self.total_equil_steps = int(EQUIL_TOTAL_PS * steps_per_ps)
         self.save_every_steps = int(self.save_interval_ps * steps_per_ps)
         self.checkpoint_every_steps = int(
             self.checkpoint_interval_hours * 3600.0 * 1000.0 / self.timestep_fs
@@ -215,8 +166,6 @@ class OpenMMConfig:
             "peptide_id": self.peptide_id,
             "ionic_conditions": {
                 "NaCl_M": self.nacl_mol,
-                "CaCl2_M": self.cacl2_mol,
-                "KH2PO4_M": self.kh2po4_mol,
             },
             "simulation": {
                 "temperature_K": self.temperature_k,
@@ -235,14 +184,11 @@ class OpenMMConfig:
                 "protein": self.protein_ff,
                 "water": self.water_model,
                 "water_ff_xml": self.water_ff_xml,
-                "ligand": self.ligand_ff,
                 "extra": list(self.extra_forcefields),
             },
             "openmm_platform": self.openmm_platform,
             "protonation_ph": self.protonation_ph,
             "target_irmsd_threshold_a": self.target_irmsd_threshold_a,
-            "equilibration": self.equilibration,
-            "solvated_atoms": self.solvated_atoms,
         }
 
     def save(self, path: Path | None = None) -> Path:
@@ -283,8 +229,6 @@ class OpenMMConfig:
             target=data.get("target", ""),
             peptide_id=data.get("peptide_id", ""),
             nacl_mol=ions.get("NaCl_M", DEFAULT_NACL_M),
-            cacl2_mol=ions.get("CaCl2_M", DEFAULT_CACL2_M),
-            kh2po4_mol=ions.get("KH2PO4_M", DEFAULT_KH2PO4_M),
             temperature_k=sim.get("temperature_K", TEMPERATURE_K),
             production_ns=sim.get("production_ns", 100.0),
             save_interval_ps=sim.get("save_interval_ps", 10.0),
@@ -292,26 +236,26 @@ class OpenMMConfig:
             protein_ff=ff.get("protein", PROTEIN_FF),
             water_model=ff.get("water", WATER_MODEL),
             water_ff_xml=ff.get("water_ff_xml", ""),
-            ligand_ff=ff.get("ligand", LIGAND_FF),
             extra_forcefields=list(ff.get("extra", []) or []),
             protonation_ph=data.get("protonation_ph", DEFAULT_PH),
             target_irmsd_threshold_a=float(
                 data.get("target_irmsd_threshold_a", DEFAULT_IRMSD_THRESHOLD_A)
             ),
-            solvated_atoms=int(data.get("solvated_atoms", 0)),
         )
 
     @classmethod
     def saliva(cls, **overrides: Any) -> OpenMMConfig:  # noqa: ANN401
-        """Saliva-like buffer: 140 mM NaCl + 1.4 mM CaCl2 + 0.5 mM KH2PO4, pH 6.2, 310 K.
+        """Saliva-like buffer: 140 mM NaCl, pH 6.2, 310 K.
 
-        Literature reference values for unstimulated whole saliva.
+        Literature reference values for unstimulated whole saliva. The
+        runner currently models only NaCl ionic strength — Ca2+ and
+        KH2PO4 from the original saliva composition are documented in
+        AGENT_LEARNINGS.md as future work; for now only NaCl is
+        applied to ``addSolvent(ionicStrength=…)``.
         """
         return cls(
             **_preset(
                 nacl_mol=0.140,
-                cacl2_mol=0.0014,
-                kh2po4_mol=0.0005,
                 temperature_k=310.0,
                 protonation_ph=6.2,
                 overrides=overrides,
@@ -324,8 +268,6 @@ class OpenMMConfig:
         return cls(
             **_preset(
                 nacl_mol=0.150,
-                cacl2_mol=0.0,
-                kh2po4_mol=0.0,
                 temperature_k=310.0,
                 protonation_ph=7.4,
                 overrides=overrides,
@@ -342,8 +284,6 @@ class OpenMMConfig:
         return cls(
             **_preset(
                 nacl_mol=0.150,
-                cacl2_mol=0.0,
-                kh2po4_mol=0.0,
                 temperature_k=310.0,
                 protonation_ph=2.0,
                 overrides=overrides,
@@ -356,8 +296,6 @@ class OpenMMConfig:
         return cls(
             **_preset(
                 nacl_mol=0.150,
-                cacl2_mol=0.0,
-                kh2po4_mol=0.0,
                 temperature_k=310.0,
                 protonation_ph=6.8,
                 overrides=overrides,
@@ -368,8 +306,6 @@ class OpenMMConfig:
 def _preset(
     *,
     nacl_mol: float,
-    cacl2_mol: float,
-    kh2po4_mol: float,
     temperature_k: float,
     protonation_ph: float,
     overrides: dict[str, Any],
@@ -377,8 +313,6 @@ def _preset(
     """Merge preset values with caller overrides. Caller overrides win."""
     values: dict[str, Any] = {
         "nacl_mol": nacl_mol,
-        "cacl2_mol": cacl2_mol,
-        "kh2po4_mol": kh2po4_mol,
         "temperature_k": temperature_k,
         "protonation_ph": protonation_ph,
     }

@@ -7,10 +7,8 @@ import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
 from biolab_runners.openmm.config import (
     DEFAULT_IRMSD_THRESHOLD_A,
-    EquilibrationStage,
     OpenMMConfig,
     SimulationResult,
 )
@@ -88,13 +86,6 @@ class TestOpenMMConfig:
         assert loaded.nacl_mol == 0.150
         assert loaded.protein_ff == "charmm36m"
 
-    def test_equilibration_stages_default(self) -> None:
-        config = OpenMMConfig()
-        assert len(config.equilibration) == 3
-        assert config.equilibration[0]["name"] == "NVT"
-        assert config.equilibration[0]["restraint_k"] == 1000.0
-        assert config.equilibration[2]["restraint_k"] == 0.0
-
     def test_extra_forcefields_default_empty(self) -> None:
         config = OpenMMConfig()
         assert config.extra_forcefields == []
@@ -134,16 +125,12 @@ class TestOpenMMConfig:
     def test_preset_saliva(self) -> None:
         config = OpenMMConfig.saliva()
         assert config.nacl_mol == 0.140
-        assert config.cacl2_mol == 0.0014
-        assert config.kh2po4_mol == 0.0005
         assert config.protonation_ph == 6.2
         assert config.temperature_k == 310.0
 
     def test_preset_physiological(self) -> None:
         config = OpenMMConfig.physiological()
         assert config.nacl_mol == 0.150
-        assert config.cacl2_mol == 0.0
-        assert config.kh2po4_mol == 0.0
         assert config.protonation_ph == 7.4
         assert config.temperature_k == 310.0
 
@@ -249,28 +236,6 @@ class TestBuildForcefield:
         )
         ff = build_forcefield(config, _FakeApp())
         assert ff.paths == ("charmm36.xml", "charmm36/water.xml")
-
-
-class TestEquilibrationStage:
-    """Tests for EquilibrationStage dataclass."""
-
-    def test_creation(self) -> None:
-        stage = EquilibrationStage(name="NVT", ensemble="NVT", duration_ps=100, restraint_k=1000.0)
-        assert stage.name == "NVT"
-        assert stage.ensemble == "NVT"
-
-    def test_to_dict(self) -> None:
-        stage = EquilibrationStage(
-            name="NPT_free", ensemble="NPT", duration_ps=200, restraint_k=0.0
-        )
-        d = stage.to_dict()
-        assert d["name"] == "NPT_free"
-        assert d["restraint_k"] == 0.0
-
-    def test_frozen(self) -> None:
-        stage = EquilibrationStage(name="NVT", ensemble="NVT", duration_ps=100, restraint_k=1000.0)
-        with pytest.raises(AttributeError):
-            stage.name = "changed"  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------
