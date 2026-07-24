@@ -140,10 +140,10 @@ print(f"Early abort: {result.early_abort} ({result.abort_reason})")
 
 ### OpenMM Buffer Presets
 
-`OpenMMConfig` ships with preset classmethods for common biological environments. Presets set ionic concentrations, pH, and temperature; all other fields can still be passed as keyword overrides.
+`OpenMMConfig` ships with preset classmethods for common biological environments. Presets set ionic concentration (NaCl only — see caveat below), pH, and temperature; all other fields can still be passed as keyword overrides.
 
 ```python
-# Saliva-like (140 mM NaCl + 1.4 mM CaCl2 + 0.5 mM KH2PO4, pH 6.2, 310 K)
+# Saliva-like (140 mM NaCl, pH 6.2, 310 K)
 config = OpenMMConfig.saliva(
     receptor_pdb="receptor.pdb",
     peptide_pdb="peptide.pdb",
@@ -173,7 +173,9 @@ config = OpenMMConfig.physiological(
 )
 ```
 
-For environments not covered by a preset, instantiate `OpenMMConfig` directly and set `nacl_mol`, `cacl2_mol`, `kh2po4_mol`, `protonation_ph`, and `temperature_k` explicitly.
+For environments not covered by a preset, instantiate `OpenMMConfig` directly and set `nacl_mol`, `protonation_ph`, and `temperature_k` explicitly.
+
+**Ionic strength:** the runner currently models only NaCl ionic strength (the `addSolvent(ionicStrength=…)` call takes a single value). The saliva preset's Ca²⁺ and KH₂PO₄ contributions from the original literature composition are documented in the docstring as unmodelled context — they don't reach the OpenMM call. Multi-ion modeling is future work.
 
 Note: very low pH (e.g. gastric) affects protonation of His/Asp/Glu/N-termini. Verify that the selected protein force field handles the target regime.
 

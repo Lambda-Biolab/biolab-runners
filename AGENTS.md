@@ -21,11 +21,12 @@ biolab_runners/
 │   ├── runner.py     # Boltz2Runner class + apply_quality_gate()
 │   └── utils.py      # YAML writer, output parser, availability check
 └── openmm/
-    ├── config.py         # OpenMMConfig, SimulationResult, EquilibrationStage
+    ├── config.py         # OpenMMConfig, SimulationResult
     ├── runner.py         # OpenMMRunner class (orchestrate pipeline, run production)
-    ├── system_builder.py # ForceField, Modeller, System, Integrator, Cα restraint
+    ├── system_builder.py # ForceField, Modeller, System, Integrator, Cα restraint, prepare_simulation
     ├── geometry.py       # Pure-numpy PBC math (pbc_correct, min_pbc_distance)
     ├── offline_gate.py   # Offline mdtraj gate + verdict I/O
+    ├── paths.py          # Centralized filenames (FileNames)
     └── utils.py          # Output verification, checkpoint loading, availability check
 ```
 
@@ -91,5 +92,5 @@ Types:       pyright standard
 Complexity:  complexipy cognitive ≤15
 Tests:       pytest with mocks (no GPU/CLI needed)
 CI:          .github/workflows/ci.yml (lint → type → complexity → test, Python 3.11+3.12)
-Coverage:    55% floor (ratcheting to 80%)
+Coverage:    70% floor (ratcheting to 80%)
 ```

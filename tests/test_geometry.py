@@ -111,6 +111,55 @@ class TestPbcCorrectDeterministic:
         out = pbc_correct(diff, box, np)
         np.testing.assert_allclose(out, 0.0, atol=1e-10)
 
+        # Regression #163: the pre-fix diagonal-only formula left
+        # off-diagonal slop behind. With d = 60 Å, the stale xy
+        # displacement is ≈ d/√2 ≈ 42 Å.
+        box_diag = np.array([box[0, 0], box[1, 1], box[2, 2]])
+        pre_fix = diff - np.round(diff / box_diag) * box_diag
+        assert np.linalg.norm(pre_fix) > 30.0
+
+    def test_dodecahedron_face_crossing_minimum_image(self) -> None:
+        """Regression #163: displacement across a diagonal face wraps to ~0.5 Å.
+
+        In a bound complex with the receptor near the origin and the
+        peptide images diffusing across a non-orthogonal face, the
+        diagonal-only code reported min distances of 30–40 Å while
+        the true minimum-image distance is < 1 Å.
+        """
+        box = dodecahedron_box(d=60.0)
+        rec = np.array([[0.0, 0.0, 0.0]])
+        pep = (box[2] + np.array([0.3, 0.3, 0.1])).reshape(1, 3)
+        diff = pep - rec
+        out = pbc_correct(diff.copy(), box, np)
+        min_dist = float(np.linalg.norm(out, axis=-1).min())
+        assert min_dist < 1.0  # true distance ≈ 0.436 Å
+
+        # Pre-fix diagonal code returned ~36 Å here (huge false "dissociation").
+        box_diag = np.array([box[0, 0], box[1, 1], box[2, 2]])
+        pre_fix = diff - np.round(diff / box_diag) * box_diag
+        assert float(np.linalg.norm(pre_fix, axis=-1).min()) > 30.0
+
+    def test_broadcasts_over_leading_axes(self) -> None:
+        """``pbc_correct`` must accept (M, N, 3) arrays used by ``min_pbc_distance``."""
+        box = dodecahedron_box()
+        rec = np.zeros((3, 3))
+        pep = np.tile(box[2], (4, 1)) + 0.5  # 4 peptide atoms past one c-image
+        diffs = rec[:, None, :] - pep[None, :, :]  # shape (3, 4, 3)
+        out = pbc_correct(diffs.copy(), box, np)
+        assert out.shape == (3, 4, 3)
+        # All pairs wrap to the same ~0.866 Å displacement.
+        assert np.allclose(np.linalg.norm(out, axis=-1), np.sqrt(0.75), atol=1e-10)
+
+    def test_orthorhombic_parity_with_diagonal_formula(self) -> None:
+        """For rectangular boxes the new formula must agree with the diagonal one."""
+        box = np.diag([60.0, 45.0, 80.0]).astype(float)
+        rng = np.random.default_rng(seed=0)
+        diff = rng.uniform(-100.0, 100.0, size=(8, 3))
+        out = pbc_correct(diff.copy(), box, np)
+        box_diag = np.array([box[0, 0], box[1, 1], box[2, 2]])
+        expected = diff - np.round(diff / box_diag) * box_diag
+        assert np.allclose(out, expected, atol=1e-10)
+
 
 # ---------------------------------------------------------------------------
 # pbc_correct (property-based)

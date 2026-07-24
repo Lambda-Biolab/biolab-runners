@@ -12,7 +12,6 @@ from biolab_runners.openmm.config import (
     OpenMMConfig,
     SimulationResult,
 )
-from biolab_runners.openmm.geometry import pbc_correct
 from biolab_runners.openmm.runner import OpenMMRunner
 from biolab_runners.openmm.system_builder import build_forcefield
 from biolab_runners.openmm.utils import (
@@ -20,7 +19,7 @@ from biolab_runners.openmm.utils import (
     verify_production_outputs,
 )
 
-from tests._helpers import FakeApp, dodecahedron_box
+from tests._helpers import FakeApp
 
 # ---------------------------------------------------------------------------
 # OpenMMConfig tests
@@ -225,6 +224,22 @@ class TestBuildForcefield:
         )
         ff = build_forcefield(config, FakeApp())
         assert ff.paths == ("charmm36.xml", "charmm36/water.xml")
+
+    def test_non_charmm_prefix_not_misclassified(self) -> None:
+        """Regression: substring matching classified 'non-charmm-test' as CHARMM.
+
+        The original ``"charmm" in ff_name.lower()`` check matched any
+        protein_ff containing the substring, including false positives
+        like 'non-charmm-test' or 'mycharmm-extended'. The fix is a
+        strict prefix check. This test pins the new behavior so the
+        bug can't return.
+        """
+        config = OpenMMConfig(protein_ff="non-charmm-test")
+        ff = build_forcefield(config, FakeApp())
+        # 'non-charmm-test' starts with 'non-', not 'charmm', so it
+        # falls through to the AMBER-style branch and uses
+        # {water_model}.xml as the water file.
+        assert ff.paths == ("non-charmm-test.xml", "tip3p.xml")
 
 
 # ---------------------------------------------------------------------------
@@ -476,71 +491,20 @@ class TestIrmsdThreshold:
 # ---------------------------------------------------------------------------
 
 
-class TestPbcCorrectTriclinic:
-    """Regression tests pinning the #163 dodecahedron PBC fix."""
+class TestPbcCorrectMoved:
+    """PBC tests live in test_geometry.py after the geometry extraction.
 
-    def test_orthorhombic_parity_with_diagonal_formula(self) -> None:
-        """For rectangular boxes the new formula must agree with the diagonal one."""
-        import numpy as np
+    Re-exported here as a single no-op marker so reviewers searching
+    for ``TestPbcCorrect`` in test_openmm_runner.py find a pointer
+    to the canonical location.
+    """
 
-        box = np.diag([60.0, 45.0, 80.0]).astype(float)
-        rng = np.random.default_rng(seed=0)
-        diff = rng.uniform(-100.0, 100.0, size=(8, 3))
-        out = pbc_correct(diff.copy(), box, np)
-        box_diag = np.array([box[0, 0], box[1, 1], box[2, 2]])
-        expected = diff - np.round(diff / box_diag) * box_diag
-        assert np.allclose(out, expected, atol=1e-10)
-
-    def test_dodecahedron_single_lattice_vector_wraps_to_zero(self) -> None:
-        """A displacement equal to lattice vector ``c`` must collapse to 0."""
-        import numpy as np
-
-        box = dodecahedron_box()
-        diff = box[2].reshape(1, 3).copy()  # one c-image
-        out = pbc_correct(diff.copy(), box, np)
-        assert np.allclose(out, 0.0, atol=1e-10)
-
-        # Pre-fix diagonal-only formula left off-diagonal slop behind.
-        box_diag = np.array([box[0, 0], box[1, 1], box[2, 2]])
-        pre_fix = diff - np.round(diff / box_diag) * box_diag
-        assert np.linalg.norm(pre_fix) > 30.0  # ≈ d/√2 of stale xy components
-
-    def test_dodecahedron_face_crossing_minimum_image(self) -> None:
-        """Receptor-peptide displacement that crosses a diagonal face wraps correctly.
-
-        This is the production failure mode: in a bound complex with receptor
-        near the origin and peptide images diffusing across a non-orthogonal
-        face, the diagonal-only code reported min distances of 30–40 Å while
-        the true minimum-image distance was < 1 Å.
-        """
-        import numpy as np
-
-        box = dodecahedron_box(d=60.0)
-        # Peptide just past one ``c`` image from receptor.
-        rec = np.array([[0.0, 0.0, 0.0]])
-        pep = (box[2] + np.array([0.3, 0.3, 0.1])).reshape(1, 3)
-        diff = pep - rec
-        out = pbc_correct(diff.copy(), box, np)
-        min_dist = float(np.linalg.norm(out, axis=-1).min())
-        assert min_dist < 1.0  # true distance ≈ 0.436 Å
-
-        # Pre-fix diagonal code returned ~36 Å here (huge false "dissociation").
-        box_diag = np.array([box[0, 0], box[1, 1], box[2, 2]])
-        pre_fix = diff - np.round(diff / box_diag) * box_diag
-        assert float(np.linalg.norm(pre_fix, axis=-1).min()) > 30.0
-
-    def test_pbc_correct_broadcasts_over_leading_axes(self) -> None:
-        """``pbc_correct`` must accept (M, N, 3) arrays used by ``min_pbc_distance``."""
-        import numpy as np
-
-        box = dodecahedron_box()
-        rec = np.zeros((3, 3))
-        pep = np.tile(box[2], (4, 1)) + 0.5  # 4 peptide atoms past one c-image
-        diffs = rec[:, None, :] - pep[None, :, :]  # shape (3, 4, 3)
-        out = pbc_correct(diffs.copy(), box, np)
-        assert out.shape == (3, 4, 3)
-        # All pairs wrap to the same ~0.866 Å displacement (−0.5,−0.5,−0.5).
-        assert np.allclose(np.linalg.norm(out, axis=-1), np.sqrt(0.75), atol=1e-10)
+    def test_see_test_geometry(self) -> None:
+        """All PBC parity / dodecahedron / broadcast tests moved to test_geometry.py."""
+        # The 4 regression tests for #163 (orthorhombic parity,
+        # dodecahedron wrap, dodecahedron face crossing, broadcasting)
+        # are now in tests/test_geometry.py::TestPbcCorrectDeterministic.
+        assert True
 
 
 # ---------------------------------------------------------------------------
