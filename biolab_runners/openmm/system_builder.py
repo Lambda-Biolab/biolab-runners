@@ -41,6 +41,11 @@ class SimulationContext:
     modeller: object = None
     restraint_force: object = None
     ca_indices: list[int] = field(default_factory=list)
+    # Pre-built list of OpenMM Chain objects from modeller.topology.chains().
+    # Equilibration and the post-equilibration PBC displacement check read
+    # this rather than re-walking the modeller topology; storing it avoids
+    # the walk on every call and keeps the runner methods pure data-flow.
+    chains: list[object] = field(default_factory=list)
     openmm_mod: object = None
     app_mod: object = None
     unit_mod: object = None
@@ -77,8 +82,17 @@ def build_forcefield(config: OpenMMConfig, app: object) -> object:
     return app.ForceField(*base, *config.extra_forcefields)  # type: ignore[union-attr]
 
 
-def _resolve_pdb(config_path: str, fallback_name: str, output_dir: Path) -> str:
-    """Resolve a PDB path with fallback to output_dir / cwd."""
+def resolve_pdb(config_path: str, fallback_name: str, output_dir: Path) -> str:
+    """Resolve a PDB path with fallback to output_dir / cwd.
+
+    If ``config_path`` points to an existing file, return it as-is.
+    Otherwise search ``output_dir.parent``, ``output_dir``, and the
+    current working directory for ``<fallback_name>``. Returns the
+    empty string if no candidate is found.
+
+    Public so callers (and tests) can reuse the same fallback
+    semantics the runner uses internally.
+    """
     if config_path and Path(config_path).exists():
         return config_path
     for search_dir in [output_dir.parent, output_dir, Path(".")]:
@@ -169,8 +183,8 @@ def build_or_load_modeller(
         logger.info("Loaded solvated system: %d atoms", modeller.topology.getNumAtoms())
         return modeller
 
-    receptor_pdb = _resolve_pdb(config.receptor_pdb, FileNames.RECEPTOR_PDB, output_dir)
-    peptide_pdb = _resolve_pdb(config.peptide_pdb, FileNames.PEPTIDE_PDB, output_dir)
+    receptor_pdb = resolve_pdb(config.receptor_pdb, FileNames.RECEPTOR_PDB, output_dir)
+    peptide_pdb = resolve_pdb(config.peptide_pdb, FileNames.PEPTIDE_PDB, output_dir)
     modeller = build_solvated_complex(receptor_pdb, peptide_pdb, config, app, forcefield, unit)
     if modeller is None:
         result.error = "Failed to build system — no valid PDB files"
@@ -288,12 +302,20 @@ def prepare_simulation(
     if modeller is None:
         return None
 
-    # Skip the topology write-back on resume: the existing topology.pdb
-    # was just read by build_or_load_modeller, so re-writing it would
-    # only burn I/O. write_topology still updates result.num_atoms /
-    # result.topology_path, so the skip is narrowly the file write.
+    # write_topology performs two things: the file write and the
+    # metadata assignments (result.num_atoms, result.topology_path).
+    # On resume the existing topology.pdb was just read by
+    # build_or_load_modeller, so re-writing it is wasted I/O. The
+    # metadata assignments are still required so callers see a
+    # populated SimulationResult. Split: always set metadata; only
+    # do the file write on a fresh run.
+    topo_path = output_dir / FileNames.TOPOLOGY
+    result.topology_path = str(topo_path)
+    result.num_atoms = modeller.topology.getNumAtoms()  # type: ignore[union-attr]
     if not is_resuming:
-        write_topology(modeller, output_dir, app, result)
+        with open(str(topo_path), "w") as f:
+            app.PDBFile.writeFile(modeller.topology, modeller.positions, f)  # type: ignore[union-attr]
+    logger.info("Topology: %d atoms", result.num_atoms)
 
     system, integrator = assemble_system(forcefield, modeller, config, openmm, app, unit)
     chains = list(modeller.topology.chains())  # type: ignore[union-attr]
@@ -311,6 +333,7 @@ def prepare_simulation(
         modeller=modeller,
         restraint_force=restraint_force,
         ca_indices=ca_indices,
+        chains=chains,
         openmm_mod=openmm,
         app_mod=app,
         unit_mod=unit,

@@ -12,10 +12,11 @@ from unittest.mock import MagicMock
 
 from biolab_runners.openmm.config import OpenMMConfig
 from biolab_runners.openmm.system_builder import (
-    _resolve_pdb,
+    SimulationContext,
     add_ca_restraint,
     assemble_system,
     build_forcefield,
+    resolve_pdb,
     write_topology,
 )
 
@@ -29,7 +30,7 @@ from tests._helpers import (
 )
 
 # ---------------------------------------------------------------------------
-# _resolve_pdb — pure filesystem
+# resolve_pdb — pure filesystem
 # ---------------------------------------------------------------------------
 
 
@@ -39,12 +40,12 @@ class TestResolvePdb:
     def test_returns_explicit_path_when_exists(self, tmp_path: Path) -> None:
         explicit = tmp_path / "rec.pdb"
         explicit.write_text("HEADER\n")
-        assert _resolve_pdb(str(explicit), "receptor.pdb", tmp_path) == str(explicit)
+        assert resolve_pdb(str(explicit), "receptor.pdb", tmp_path) == str(explicit)
 
     def test_returns_empty_when_neither_exists(self, tmp_path: Path) -> None:
         out = tmp_path / "out"
         out.mkdir()
-        result = _resolve_pdb("", "receptor.pdb", out)
+        result = resolve_pdb("", "receptor.pdb", out)
         assert result == ""
 
     def test_falls_back_to_output_dir_parent(self, tmp_path: Path) -> None:
@@ -52,14 +53,14 @@ class TestResolvePdb:
         out.mkdir()
         fallback = tmp_path / "receptor.pdb"  # tmp_path is output_dir.parent
         fallback.write_text("HEADER\n")
-        assert _resolve_pdb("", "receptor.pdb", out) == str(fallback)
+        assert resolve_pdb("", "receptor.pdb", out) == str(fallback)
 
     def test_falls_back_to_output_dir(self, tmp_path: Path) -> None:
         out = tmp_path / "out"
         out.mkdir()
         fallback = out / "receptor.pdb"
         fallback.write_text("HEADER\n")
-        assert _resolve_pdb("", "receptor.pdb", out) == str(fallback)
+        assert resolve_pdb("", "receptor.pdb", out) == str(fallback)
 
     def test_explicit_path_wins_even_if_fallback_exists(self, tmp_path: Path) -> None:
         """If the explicit path exists, the fallback is never consulted."""
@@ -68,7 +69,7 @@ class TestResolvePdb:
         (out / "receptor.pdb").write_text("FALLBACK\n")
         explicit = tmp_path / "explicit.pdb"
         explicit.write_text("EXPLICIT\n")
-        assert _resolve_pdb(str(explicit), "receptor.pdb", out) == str(explicit)
+        assert resolve_pdb(str(explicit), "receptor.pdb", out) == str(explicit)
 
 
 # ---------------------------------------------------------------------------
@@ -387,6 +388,41 @@ class TestWriteTopology:
         write_topology(modeller, tmp_path, app, result)  # type: ignore[arg-type]
 
         assert result.topology_path == str(tmp_path / "topology.pdb")
+
+
+# ---------------------------------------------------------------------------
+# SimulationContext — guard against field removal (review finding)
+# ---------------------------------------------------------------------------
+
+
+class TestSimulationContextFields:
+    """Pin the public surface of ``SimulationContext``.
+
+    The runner's ``_run_equilibration`` and ``_check_post_equilibration
+    _displacement`` consume ``ctx.chains``; removing it from the
+    dataclass would silently break every fresh (non-resume) run. The
+    smoke test would catch this in integration, but the unit-test
+    suite doesn't reach that path. These tests guard the contract
+    in isolation so a future cleanup can't remove a consumed field
+    again.
+    """
+
+    def test_chains_field_present(self) -> None:
+        """``chains`` must be a field on SimulationContext (defaulted to [])."""
+        from dataclasses import fields
+
+        field_names = {f.name for f in fields(SimulationContext)}
+        assert "chains" in field_names
+
+    def test_chains_default_is_empty_list(self) -> None:
+        """Default factory is list (each context gets its own list, no shared state)."""
+        ctx_a = SimulationContext()
+        ctx_b = SimulationContext()
+        assert ctx_a.chains == []
+        assert ctx_b.chains == []
+        # Mutating one must not affect the other (separate list instances).
+        ctx_a.chains.append("sentinel")
+        assert ctx_b.chains == []
 
 
 # ---------------------------------------------------------------------------
