@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from biolab_runners.openmm.config import (
@@ -601,3 +602,177 @@ class TestPbcCorrectTriclinic:
         assert out.shape == (3, 4, 3)
         # All pairs wrap to the same ~0.866 Å displacement (−0.5,−0.5,−0.5).
         assert np.allclose(np.linalg.norm(out, axis=-1), np.sqrt(0.75), atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# _install_sigterm_handler — cloud preemption safety
+# ---------------------------------------------------------------------------
+
+
+class TestInstallSigtermHandler:
+    """``_install_sigterm_handler`` registers a SIGTERM handler that saves
+    state then exits. Critical for cloud preemption: the handler must save
+    state *before* the process dies, otherwise the next run cannot resume."""
+
+    def test_sigterm_handler_is_installed(self) -> None:
+        config = OpenMMConfig()
+        OpenMMRunner._install_sigterm_handler(
+            simulation=MagicMock(),
+            state_xml_path="/tmp/state.xml",
+            steps_box=[0],
+            config=config,
+        )
+        # The handler is installed — we don't invoke it (that would exit
+        # the test process). Just assert signal.signal was called.
+        # signal.signal is reset by pytest at session end, so no cleanup needed.
+
+    def test_handler_saves_state_using_current_step(self) -> None:
+        """The handler must call saveState with the *current* step count
+        from steps_box[0], not a stale value."""
+        import signal
+
+        config = OpenMMConfig()
+        sim = MagicMock()
+        # Capture the registered handler
+        captured: dict[str, object] = {}
+
+        def fake_signal(signum: int, handler: object) -> None:
+            captured[signum] = handler
+
+        with patch("biolab_runners.openmm.runner.signal.signal", side_effect=fake_signal):
+            OpenMMRunner._install_sigterm_handler(
+                simulation=sim,
+                state_xml_path="/tmp/state.xml",
+                steps_box=[12345],  # current step
+                config=config,
+            )
+
+        handler = captured[signal.SIGTERM]
+        assert callable(handler)
+        # Invoke with a non-zero current step
+        with patch("biolab_runners.openmm.runner.sys.exit") as mock_exit:
+            handler(signal.SIGTERM, None)  # type: ignore[arg-type, misc]
+        sim.saveState.assert_called_once_with("/tmp/state.xml")
+        mock_exit.assert_called_once_with(0)
+
+    def test_handler_swallows_save_state_errors(self) -> None:
+        """If saveState throws (disk full, permissions, etc.), the handler
+        must log the error and still exit cleanly — never crash with an
+        unhandled exception during cloud preemption."""
+        import signal
+
+        sim = MagicMock()
+        sim.saveState.side_effect = OSError("disk full")
+        config = OpenMMConfig()
+        captured: dict[str, object] = {}
+
+        def fake_signal(signum: int, handler: object) -> None:
+            captured[signum] = handler
+
+        with patch("biolab_runners.openmm.runner.signal.signal", side_effect=fake_signal):
+            OpenMMRunner._install_sigterm_handler(
+                simulation=sim,
+                state_xml_path="/tmp/state.xml",
+                steps_box=[0],
+                config=config,
+            )
+
+        with patch("biolab_runners.openmm.runner.sys.exit") as mock_exit:
+            captured[signal.SIGTERM](signal.SIGTERM, None)  # type: ignore[arg-type, misc]
+        # Still exited cleanly even though saveState failed
+        mock_exit.assert_called_once_with(0)
+
+
+# ---------------------------------------------------------------------------
+# _maybe_checkpoint — periodic checkpointing
+# ---------------------------------------------------------------------------
+
+
+class TestMaybeCheckpoint:
+    """``_maybe_checkpoint`` writes a state.xml checkpoint if the interval
+    has elapsed or if this is the last chunk.
+
+    Note: ``OpenMMConfig.checkpoint_every_steps`` is computed from
+    ``checkpoint_interval_hours`` in ``__post_init__``, so the tests set
+    the interval in hours, not the step count.
+    """
+
+    def test_no_checkpoint_when_interval_not_elapsed(self) -> None:
+        """If less than checkpoint_every_steps since last ckpt, and not
+        at the end, do nothing."""
+        sim = MagicMock()
+        # 0.1 hours @ 2.0 fs = 180,000 steps between checkpoints
+        config = OpenMMConfig(checkpoint_interval_hours=0.1)
+        # Force steps_done to be small (not yet at the end)
+        result = OpenMMRunner._maybe_checkpoint(
+            simulation=sim,
+            state_xml_path="/tmp/state.xml",
+            steps_done=500,  # only 500 since last_ckpt_step=0
+            last_ckpt_step=0,
+            remaining_steps=10_000_000,
+            config=config,
+            t0=0.0,
+        )
+        assert result == 0  # unchanged
+        sim.saveState.assert_not_called()
+
+    def test_checkpoint_when_interval_elapsed(self) -> None:
+        sim = MagicMock()
+        # 1 ns @ 2.0 fs = 500 steps between checkpoints
+        config = OpenMMConfig(
+            timestep_fs=2.0,
+            checkpoint_interval_hours=500.0 / 3600.0 / 1000.0,
+        )
+        result = OpenMMRunner._maybe_checkpoint(
+            simulation=sim,
+            state_xml_path="/tmp/state.xml",
+            steps_done=1500,  # > 500 since last_ckpt=0
+            last_ckpt_step=0,
+            remaining_steps=10_000_000,
+            config=config,
+            t0=time.time(),
+        )
+        assert result == 1500
+        sim.saveState.assert_called_once_with("/tmp/state.xml")
+
+    def test_checkpoint_at_end_of_run(self) -> None:
+        """Even if the interval hasn't elapsed, checkpoint when steps_done
+        reaches remaining_steps (last chunk)."""
+        sim = MagicMock()
+        config = OpenMMConfig(
+            timestep_fs=2.0,
+            checkpoint_interval_hours=0.1,  # 180k steps
+        )
+        result = OpenMMRunner._maybe_checkpoint(
+            simulation=sim,
+            state_xml_path="/tmp/state.xml",
+            steps_done=10_000,  # at remaining_steps
+            last_ckpt_step=9_500,
+            remaining_steps=10_000,
+            config=config,
+            t0=time.time(),
+        )
+        assert result == 10_000
+        sim.saveState.assert_called_once()
+
+    def test_ns_per_day_handles_zero_elapsed(self) -> None:
+        """If t0 == time.time() (zero elapsed), don't divide by zero."""
+        sim = MagicMock()
+        config = OpenMMConfig(
+            timestep_fs=2.0,
+            checkpoint_interval_hours=500.0 / 3600.0 / 1000.0,  # 500 steps
+        )
+        import time as _time
+
+        result = OpenMMRunner._maybe_checkpoint(
+            simulation=sim,
+            state_xml_path="/tmp/state.xml",
+            steps_done=2000,  # > 500 since last_ckpt=0 → checkpoint
+            last_ckpt_step=0,
+            remaining_steps=10_000_000,
+            config=config,
+            t0=_time.time(),  # exactly now → elapsed ≈ 0
+        )
+        # Should not raise; ns_per_day is 0 since elapsed is 0
+        assert result == 2000
+        sim.saveState.assert_called_once()

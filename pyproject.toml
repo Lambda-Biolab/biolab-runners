@@ -47,6 +47,7 @@ dev = [
     "pytest-cov",
     "complexipy>=0.8",
     "pre-commit>=3.5",
+    "hypothesis>=6.0",
     "numpy>=1.26",  # required by the OpenMM runner Kabsch-aligned RMSD tests
 ]
 
@@ -118,6 +119,8 @@ convention = "google"
     "SIM117", # combine multiple with statements (test readability)
     "ANN",   # annotations (tests use pytest fixtures; full annotations noisy)
     "PT",    # pytest-style (existing tests use class grouping, not function-style)
+    "N802",  # camelCase function names (test mocks mirror OpenMM's camelCase API)
+    "N815",  # mixedCase in class scope (test mocks mirror OpenMM's mixedCase attrs)
 ]
 
 # --- Pyright ---
@@ -162,9 +165,10 @@ omit = [
 ]
 
 [tool.coverage.report]
-# Threshold is enforced via `make validate` → pytest → --cov-fail-under below.
-# Currently set as a soft floor; ratchet up in a follow-up.
-fail_under = 55
+# Threshold enforced via `make validate` → pytest → --cov-fail-under below.
+# Current floor: 70%. Aspirational target: 80% (needs integration tests
+# for runner.py/system_builder.py OpenMM-coupled paths).
+fail_under = 70
 show_missing = true
 skip_covered = false
 exclude_lines = [
