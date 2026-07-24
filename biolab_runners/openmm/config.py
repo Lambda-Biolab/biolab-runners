@@ -302,7 +302,7 @@ class OpenMMConfig:
         )
 
     @classmethod
-    def saliva(cls, **overrides: Any) -> OpenMMConfig:
+    def saliva(cls, **overrides: Any) -> OpenMMConfig:  # noqa: ANN401
         """Saliva-like buffer: 140 mM NaCl + 1.4 mM CaCl2 + 0.5 mM KH2PO4, pH 6.2, 310 K.
 
         Literature reference values for unstimulated whole saliva.
@@ -319,7 +319,7 @@ class OpenMMConfig:
         )
 
     @classmethod
-    def physiological(cls, **overrides: Any) -> OpenMMConfig:
+    def physiological(cls, **overrides: Any) -> OpenMMConfig:  # noqa: ANN401
         """Physiological buffer (PBS / plasma-like): 150 mM NaCl, pH 7.4, 310 K."""
         return cls(
             **_preset(
@@ -333,7 +333,7 @@ class OpenMMConfig:
         )
 
     @classmethod
-    def gastric(cls, **overrides: Any) -> OpenMMConfig:
+    def gastric(cls, **overrides: Any) -> OpenMMConfig:  # noqa: ANN401
         """Gastric fluid: 150 mM NaCl, pH 2.0, 310 K.
 
         Note: very low pH affects protonation of His/Asp/Glu/N-termini. Verify
@@ -351,7 +351,7 @@ class OpenMMConfig:
         )
 
     @classmethod
-    def intestinal(cls, **overrides: Any) -> OpenMMConfig:
+    def intestinal(cls, **overrides: Any) -> OpenMMConfig:  # noqa: ANN401
         """Small-intestinal fluid: 150 mM NaCl, pH 6.8, 310 K."""
         return cls(
             **_preset(

@@ -95,7 +95,7 @@ def build_solvated_complex(
 
     Returns an openmm.app.Modeller or None if no PDB files are available.
     """
-    from pdbfixer import PDBFixer  # noqa: PLC0415 — optional runtime dep
+    from pdbfixer import PDBFixer
 
     if receptor_pdb and peptide_pdb:
         fixer = PDBFixer(filename=receptor_pdb)
@@ -122,7 +122,7 @@ def build_solvated_complex(
     else:
         return None
 
-    import openmm.unit as unit  # noqa: PLC0415 — optional runtime dep
+    import openmm.unit as unit
 
     logger.info(
         "Complex: %d atoms, %d residues, %d chains",
@@ -253,10 +253,10 @@ def prepare_simulation(
     the runner so system_builder stays free of equilibration policy.
     """
     try:
-        import numpy as np  # noqa: I001, PLC0415
-        import openmm  # noqa: PLC0415
-        import openmm.app as app  # noqa: PLC0415
-        import openmm.unit as unit  # noqa: PLC0415
+        import numpy as np  # noqa: I001
+        import openmm
+        import openmm.app as app
+        import openmm.unit as unit
     except ImportError as exc:
         result.error = f"OpenMM not installed: {exc}"
         logger.error(result.error)
