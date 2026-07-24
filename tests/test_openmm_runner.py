@@ -13,6 +13,7 @@ from biolab_runners.openmm.config import (
     OpenMMConfig,
     SimulationResult,
 )
+from biolab_runners.openmm.geometry import pbc_correct
 from biolab_runners.openmm.runner import OpenMMRunner
 from biolab_runners.openmm.utils import (
     load_checkpoint_step,
@@ -544,7 +545,7 @@ class TestPbcCorrectTriclinic:
         box = np.diag([60.0, 45.0, 80.0]).astype(float)
         rng = np.random.default_rng(seed=0)
         diff = rng.uniform(-100.0, 100.0, size=(8, 3))
-        out = OpenMMRunner._pbc_correct(diff.copy(), box, np)  # noqa: SLF001
+        out = pbc_correct(diff.copy(), box, np)
         box_diag = np.array([box[0, 0], box[1, 1], box[2, 2]])
         expected = diff - np.round(diff / box_diag) * box_diag
         assert np.allclose(out, expected, atol=1e-10)
@@ -555,7 +556,7 @@ class TestPbcCorrectTriclinic:
 
         box = self._dodecahedron_box()
         diff = box[2].reshape(1, 3).copy()  # one c-image
-        out = OpenMMRunner._pbc_correct(diff.copy(), box, np)  # noqa: SLF001
+        out = pbc_correct(diff.copy(), box, np)
         assert np.allclose(out, 0.0, atol=1e-10)
 
         # Pre-fix diagonal-only formula left off-diagonal slop behind.
@@ -578,7 +579,7 @@ class TestPbcCorrectTriclinic:
         rec = np.array([[0.0, 0.0, 0.0]])
         pep = (box[2] + np.array([0.3, 0.3, 0.1])).reshape(1, 3)
         diff = pep - rec
-        out = OpenMMRunner._pbc_correct(diff.copy(), box, np)  # noqa: SLF001
+        out = pbc_correct(diff.copy(), box, np)
         min_dist = float(np.linalg.norm(out, axis=-1).min())
         assert min_dist < 1.0  # true distance ≈ 0.436 Å
 
@@ -588,14 +589,14 @@ class TestPbcCorrectTriclinic:
         assert float(np.linalg.norm(pre_fix, axis=-1).min()) > 30.0
 
     def test_pbc_correct_broadcasts_over_leading_axes(self) -> None:
-        """``_pbc_correct`` must accept (M, N, 3) arrays used by ``_min_pbc_distance``."""
+        """``pbc_correct`` must accept (M, N, 3) arrays used by ``min_pbc_distance``."""
         import numpy as np
 
         box = self._dodecahedron_box()
         rec = np.zeros((3, 3))
         pep = np.tile(box[2], (4, 1)) + 0.5  # 4 peptide atoms past one c-image
         diffs = rec[:, None, :] - pep[None, :, :]  # shape (3, 4, 3)
-        out = OpenMMRunner._pbc_correct(diffs.copy(), box, np)  # noqa: SLF001
+        out = pbc_correct(diffs.copy(), box, np)
         assert out.shape == (3, 4, 3)
         # All pairs wrap to the same ~0.866 Å displacement (−0.5,−0.5,−0.5).
         assert np.allclose(np.linalg.norm(out, axis=-1), np.sqrt(0.75), atol=1e-10)

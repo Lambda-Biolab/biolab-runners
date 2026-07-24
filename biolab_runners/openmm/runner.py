@@ -37,6 +37,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from biolab_runners.openmm.config import OpenMMConfig, SimulationResult
+from biolab_runners.openmm.geometry import (
+    collect_chain_ca_positions,
+    min_pbc_distance,
+)
 from biolab_runners.openmm.offline_gate import (
     DEFAULT_GATE_10NS,
     evaluate_trajectory,
@@ -744,7 +748,7 @@ class OpenMMRunner:
         """Measure peptide-receptor Ca min distance after equilibration and write metadata."""
         # OralBiome-AMP#175: match the gate path — use OpenMM's internal
         # unwrapped coordinates (enforcePeriodicBox=False, default). The
-        # downstream _min_pbc_distance does its own PBC-correct min-image
+        # downstream min_pbc_distance does its own PBC-correct min-image
         # math, so the input convention here only needs to stay consistent
         # with what the gate sees; unwrapped is the correct choice.
         eq_positions = (
@@ -752,7 +756,7 @@ class OpenMMRunner:
             .getPositions(asNumpy=True)
             .value_in_unit(unit.angstroms)  # type: ignore[union-attr]
         )
-        rec_ca, pep_ca = OpenMMRunner._collect_chain_ca_positions(chains, eq_positions)
+        rec_ca, pep_ca = collect_chain_ca_positions(chains, eq_positions)
         if not (rec_ca and pep_ca):
             return
 
@@ -761,7 +765,7 @@ class OpenMMRunner:
             .getPeriodicBoxVectors(asNumpy=True)
             .value_in_unit(unit.angstroms)  # type: ignore[union-attr]
         )
-        min_dist = OpenMMRunner._min_pbc_distance(rec_ca, pep_ca, box_vecs, np)
+        min_dist = min_pbc_distance(rec_ca, pep_ca, box_vecs, np)
         logger.info(
             "Post-equilibration peptide-receptor Ca min distance: %.1f A",
             min_dist,
@@ -778,57 +782,6 @@ class OpenMMRunner:
             "threshold_A": _DISPLACEMENT_THRESHOLD_A,
         }
         (output_dir / "equilibration_metadata.json").write_text(json.dumps(eq_meta, indent=2))
-
-    @staticmethod
-    def _collect_chain_ca_positions(
-        chains: list[object], positions: object
-    ) -> tuple[list[object], list[object]]:
-        """Return (receptor_ca_positions, peptide_ca_positions) lists from chain 0 / chain >0."""
-        rec_ca: list[object] = []
-        pep_ca: list[object] = []
-        for chain_idx, chain in enumerate(chains):
-            for atom in chain.atoms():  # type: ignore[union-attr]
-                if atom.name != "CA":
-                    continue
-                target = rec_ca if chain_idx == 0 else pep_ca
-                target.append(positions[atom.index])  # type: ignore[index]
-        return rec_ca, pep_ca
-
-    @staticmethod
-    def _pbc_correct(diff: object, box_vecs: object, np: object) -> object:
-        """Apply minimum-image PBC correction to displacement vectors.
-
-        Supports general triclinic cells (orthorhombic, dodecahedron,
-        truncated octahedron). The diagonal-only implementation used
-        previously was correct for rectangular boxes but produced spurious
-        large distances for GROMACS-style dodecahedron cells whenever an
-        atom crossed a non-orthogonal face, because the off-diagonal
-        lattice components were silently dropped. Converting ``diff`` to
-        fractional coordinates via the inverse lattice, snapping to the
-        nearest integer image, and converting back gives the correct
-        minimum image for any box shape and reduces exactly to the prior
-        diagonal operation when the lattice is rectangular.
-
-        Accepts any array whose last axis has length 3; the inverse
-        lattice multiplication broadcasts over leading axes.
-        """
-        box = np.asarray(box_vecs)  # type: ignore[union-attr]
-        inv = np.linalg.inv(box)  # type: ignore[union-attr]
-        frac = diff @ inv  # type: ignore[operator]
-        frac = frac - np.round(frac)  # type: ignore[union-attr]
-        return frac @ box  # type: ignore[operator]
-
-    @staticmethod
-    def _min_pbc_distance(
-        rec_ca: list[object], pep_ca: list[object], box_vecs: object, np: object
-    ) -> float:
-        """Compute min PBC-corrected distance between two sets of positions."""
-        rec_arr = np.array(rec_ca)  # type: ignore[union-attr]
-        pep_arr = np.array(pep_ca)  # type: ignore[union-attr]
-        diffs = rec_arr[:, None, :] - pep_arr[None, :, :]
-        diffs = OpenMMRunner._pbc_correct(diffs, box_vecs, np)
-        dists = np.sqrt((np.square(diffs)).sum(axis=-1))  # type: ignore[union-attr]
-        return float(dists.min())
 
     def _run_production_loop(
         self,
