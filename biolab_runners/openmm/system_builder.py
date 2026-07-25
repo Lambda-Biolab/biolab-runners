@@ -156,7 +156,7 @@ def build_solvated_complex(
         model=config.water_model,
         padding=config.box_padding_nm * unit.nanometers,  # pyright: ignore[reportAttributeAccessIssue, reportOperatorIssue]
         boxShape=config.box_shape,
-        ionicStrength=config.nacl_mol * unit.molar,  # pyright: ignore[reportOperatorIssue]
+        ionicStrength=config.nacl_mol * unit.molar,  # pyright: ignore[reportAttributeAccessIssue, reportOperatorIssue]
     )
     logger.info("Solvated: %d atoms", modeller.topology.getNumAtoms())
 

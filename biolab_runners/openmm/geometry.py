@@ -16,7 +16,7 @@ numpy array of shape ``(N, 3)`` in angstroms (e.g. the value returned by
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
@@ -42,7 +42,7 @@ def collect_chain_ca_positions(
     return rec_ca, pep_ca
 
 
-def pbc_correct(diff: object, box_vecs: object, np: object) -> object:
+def pbc_correct(diff: object, box_vecs: object, np: object) -> Any:  # noqa: ANN401
     """Apply minimum-image PBC correction to displacement vectors.
 
     Supports general triclinic cells (orthorhombic, dodecahedron,
@@ -58,6 +58,13 @@ def pbc_correct(diff: object, box_vecs: object, np: object) -> object:
 
     Accepts any array whose last axis has length 3; the inverse
     lattice multiplication broadcasts over leading axes.
+
+    Returns:
+        The minimum-image displacement as a numpy ndarray of the same
+        shape as ``diff`` (last axis length 3). Typed as ``Any`` because
+        the ``np`` parameter accepts a numpy-like module (for unit-test
+        mockability) and the result type therefore resolves to the
+        module's array type, which pyright cannot infer statically.
     """
     box = np.asarray(box_vecs)  # type: ignore[union-attr]
     inv = np.linalg.inv(box)  # type: ignore[union-attr]
