@@ -330,21 +330,39 @@ def prepare_simulation(
         return None
 
     forcefield = build_forcefield(config, app)
-    is_resuming = bool(resume_xml and Path(resume_xml).exists())
-
+    is_resuming_known = bool(resume_xml and Path(resume_xml).exists())
     modeller, loaded_existing_topology = build_or_load_modeller(
-        config, output_dir, app, forcefield, is_resuming, result, unit
+        config, output_dir, app, forcefield, is_resuming_known, result, unit
     )
     if modeller is None:
         return None
 
-    # Persist the modeller to topology.pdb only when we *constructed*
-    # one (not when we loaded an existing one from disk). Note the
-    # decision is NOT keyed on ``is_resuming``: a state.xml may
-    # exist without an intact topology.pdb, in which case
-    # build_or_load_modeller just built a fresh modeller and we
-    # MUST persist it before any loadState() call.
+    # Fail fast when a checkpoint exists but the original topology is
+    # missing or truncated. The saved state.xml was produced with a
+    # System whose particle count, mass, and force parameters are
+    # encoded at save time — a freshly-built System (different water
+    # count, different atom order from re-solvation) cannot safely
+    # accept that state via simulation.loadState(). The original
+    # AGENTS.md "Resume safety" rule is the source of this
+    # constraint. To discard the corrupted checkpoint, the user
+    # must invoke runner.run(force=True).
+    if is_resuming_known and not loaded_existing_topology:
+        result.error = (
+            f"Checkpoint {resume_xml} exists but the original "
+            f"{FileNames.TOPOLOGY} is missing or truncated — the "
+            f"saved state is incompatible with a freshly-built System. "
+            f"Re-run with force=True to discard the checkpoint."
+        )
+        logger.error(result.error)
+        return None
+
+    # When the original topology was loaded from disk, persist the
+    # metadata but skip the PDB write (the file is already in sync).
+    # The fresh-build path doesn't reach here (the fail-fast branch
+    # above handles it).
     write_topology(modeller, output_dir, app, result, write_file=not loaded_existing_topology)
+
+    is_resuming = is_resuming_known and loaded_existing_topology
 
     system, integrator = assemble_system(forcefield, modeller, config, openmm, app, unit)
     chains = list(modeller.topology.chains())  # type: ignore[union-attr]

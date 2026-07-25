@@ -125,7 +125,12 @@ convention = "google"
 
 # --- Pyright ---
 [tool.pyright]
-include = ["biolab_runners", "tests"]
+# Production-only type checking. Tests are excluded because the mock
+# infrastructure (types.ModuleType, MagicMock, "object"-typed stubs)
+# generates reports that the test code intentionally accepts. CI and
+# `make check_types` both run `pyright biolab_runners/` which respects
+# this include.
+include = ["biolab_runners"]
 pythonVersion = "3.11"
 typeCheckingMode = "standard"
 # `mdtraj` is an optional dep under the `openmm` extra; imported lazily

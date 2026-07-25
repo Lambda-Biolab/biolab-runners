@@ -28,7 +28,7 @@ lint_fix: ## Auto-fix formatting + linting
 	uv run ruff format biolab_runners/ tests/
 	uv run ruff check --fix biolab_runners/ tests/
 
-check_types: ## Static type checking (pyright basic)
+check_types: ## Static type checking (pyright standard, production-only)
 	uv run pyright biolab_runners/
 
 check_complexity: ## Check cognitive complexity (max 15/function)

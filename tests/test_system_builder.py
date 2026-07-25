@@ -478,40 +478,46 @@ class TestPrepareSimulationPopulatesContext:
 
 
 class TestPrepareSimulationResumeTopologyGuard:
-    """Regression #1 (BLOCKER): on resume the saved state.xml must be
-    paired with the exact topology it came from. A prior optimisation
-    keyed ``write_file`` on ``is_resuming`` (state.xml exists), but
-    ``build_or_load_modeller`` independently decides whether to load
-    an existing topology or build a fresh one. When state.xml exists
-    but topology.pdb is missing or undersized, the modeller is
-    freshly built — and skipping the write would then leave
-    ``result.topology_path`` pointing to a missing file. The
-    downstream ``loadState`` would pair an unrelated modeller with
-    a state.xml that describes a different topology.
+    """Resume-safety regression: the saved state.xml must be paired
+    with the exact topology it was serialized from. Re-solvation
+    produces different water counts and atom ordering, so a freshly
+    built System cannot accept a state.xml produced from a different
+    System.
 
-    The fix: ``build_or_load_modeller`` returns whether it loaded an
-    existing topology. ``prepare_simulation`` uses that flag (not
-    ``is_resuming``) to decide whether to write the topology file.
+    Behaviour:
+      - state.xml absent: fresh run (build + solvate + write topology.pdb).
+      - state.xml present + topology.pdb intact: resume (load original
+        modeller + loadState).
+      - state.xml present + topology.pdb missing/truncated: FAIL FAST
+        (set result.error, return None). The user must re-run with
+        force=True to discard the checkpoint.
+
+    The previous BLOCKER fix wrote the fresh modeller to topology.pdb
+    in the corruption case — that hides the incompatibility rather
+    than surfacing it. This class pins the fail-fast path and asserts
+    ``loadState`` is never called on a freshly-built modeller.
     """
 
-    def test_state_xml_without_topology_pdb_writes_fresh_topology(
+    def test_state_xml_without_topology_pdb_fails_fast(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """state.xml exists, but topology.pdb is missing.
 
         ``build_or_load_modeller`` falls back to building a new
-        modeller. ``prepare_simulation`` must persist that modeller
-        to topology.pdb so a subsequent ``loadState`` sees the
-        matching topology.
+        modeller. ``prepare_simulation`` must refuse to proceed —
+        the saved state.xml is incompatible with a freshly-built
+        System. ``simulation.loadState`` must not run.
         """
         import biolab_runners.openmm.system_builder as sb
 
-        # state.xml exists, but topology.pdb does NOT.
         (tmp_path / "state.xml").write_text("<State/>")
+        # topology.pdb is intentionally absent.
 
         sentinel_chains = [object(), object()]
         fake_modeller = _make_fake_modeller(sentinel_chains, num_atoms=12)
         _stub_openmm(monkeypatch)
+        # loaded_existing_topology=False: the on-disk topology was
+        # missing, so build_or_load_modeller returns a fresh modeller.
         _stub_system_builder(monkeypatch, sb, fake_modeller, loaded_existing_topology=False)
 
         config = OpenMMConfig(
@@ -522,25 +528,21 @@ class TestPrepareSimulationResumeTopologyGuard:
         )
         result = SimulationResult(config=config)
         state_xml = str(tmp_path / "state.xml")
+
         ctx = sb.prepare_simulation(config, tmp_path, state_xml, result)
 
-        assert ctx is not None, f"prepare_simulation failed: {result.error}"
-        # The freshly-built modeller must be persisted to topology.pdb.
-        # (Stub writeFile writes a byte stream so the on-disk file
-        # exists; if writeFile is not called, the BLOCKER regression
-        # returns — the topology.pdb is missing and loadState would
-        # pair against an invalid file.)
-        assert (tmp_path / "topology.pdb").exists()
-        assert result.topology_path == str(tmp_path / "topology.pdb")
+        # The function must refuse to proceed.
+        assert ctx is None, "prepare_simulation must return None on corrupt checkpoint"
+        assert "topology" in result.error.lower() or "checkpoint" in result.error.lower()
 
-    def test_state_xml_with_undersized_topology_pdb_writes_fresh_topology(
+    def test_state_xml_with_undersized_topology_pdb_fails_fast(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """state.xml exists, but topology.pdb is < 100 KB (truncated).
 
-        ``build_or_load_modeller`` checks ``stat().st_size > 100_000``
-        — truncated topology.pdb falls through to the fresh-build
-        path. ``prepare_simulation`` must persist the fresh modeller.
+        Same as the missing case — the modeller is freshly built, the
+        saved state.xml is incompatible, ``simulation.loadState``
+        must not run.
         """
         import biolab_runners.openmm.system_builder as sb
 
@@ -560,29 +562,20 @@ class TestPrepareSimulationResumeTopologyGuard:
         )
         result = SimulationResult(config=config)
         state_xml = str(tmp_path / "state.xml")
+
         ctx = sb.prepare_simulation(config, tmp_path, state_xml, result)
 
-        assert ctx is not None
-        # The undersized topology.pdb must have been replaced by the
-        # fresh modeller's output (so loadState pairs correctly).
-        assert (tmp_path / "topology.pdb").stat().st_size > 100_000 or True
-        # The above is permissive; the real check is the simulation
-        # call: write_topology was invoked with write_file=False ONLY
-        # when the modeller was loaded from disk. The stub returns
-        # loaded_existing_topology=False, so write_file=True and the
-        # file must be overwritten. We can't easily measure "file
-        # was overwritten" without a real OpenMM, but the assert on
-        # result.topology_path catches a missing-file regression.
-        assert result.topology_path == str(tmp_path / "topology.pdb")
+        assert ctx is None
+        assert "topology" in result.error.lower() or "checkpoint" in result.error.lower()
 
-    def test_state_xml_with_intact_topology_pdb_skips_rewrite(
+    def test_state_xml_with_intact_topology_pdb_resumes(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """state.xml exists AND topology.pdb is intact (> 100 KB).
 
-        The optimize path: skip the topology rewrite since the file
-        on disk is the same as the loaded modeller. This is the
-        legitimate I/O optimization the previous fix was targeting.
+        Resume path: load the original modeller and call
+        ``simulation.loadState``. The on-disk topology.pdb is not
+        rewritten (it is already the loaded modeller).
         """
         import biolab_runners.openmm.system_builder as sb
 
@@ -612,7 +605,7 @@ class TestPrepareSimulationResumeTopologyGuard:
         state_xml = str(tmp_path / "state.xml")
         ctx = sb.prepare_simulation(config, tmp_path, state_xml, result)
 
-        assert ctx is not None
+        assert ctx is not None, f"prepare_simulation failed: {result.error}"
         # metadata still populated
         assert result.num_atoms == 99
         assert result.topology_path == str(tmp_path / "topology.pdb")
@@ -633,8 +626,9 @@ def _make_fake_modeller(chains: list[object], num_atoms: int) -> object:
             return num_atoms
 
     class _FakeModeller:
-        topology = _FakeTopology()
-        positions: tuple[object, ...] = ()
+        def __init__(self) -> None:
+            self.topology = _FakeTopology()
+            self.positions: tuple[object, ...] = ()
 
     return _FakeModeller()
 
@@ -710,7 +704,19 @@ def _make_fake_app_module() -> types.ModuleType:
         def __init__(self, *paths: str, **kwargs: object) -> None:
             self.paths = paths
 
+    class _FakePDBTopology:
+        def __init__(self) -> None:
+            self.chains = [object()]
+
     class _FakePDBFile:
+        """Stand-in for openmm.app.PDBFile — exposes ``writeFile`` and
+        ``topology``/``positions`` attributes consumed by app.Modeller()."""
+
+        def __init__(self, path: str) -> None:
+            self.path = path
+            self.topology = _FakePDBTopology()
+            self.positions = object()
+
         @staticmethod
         def writeFile(topology: object, positions: object, file_handle: object) -> None:
             # Write a real byte stream so the test can assert the
@@ -721,10 +727,26 @@ def _make_fake_app_module() -> types.ModuleType:
             file_handle.write("FAKE PDB\n")
             file_handle.flush()
 
+    class _FakeModeller:
+        """Stand-in for openmm.app.Modeller — built when the existing
+        topology.pdb is missing/truncated and a fresh modeller is
+        constructed."""
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self.topology = _FakePDBTopology()
+            self.positions = object()
+
     class _FakeSimulation:
+        last_instance: _FakeSimulation | None = None
+
         def __init__(self, *args: object, **kwargs: object) -> None:
             self.context = type("_Ctx", (), {"setPositions": lambda self, p: None})()
             self.loaded_state: str | None = None
+            # Track the most recently constructed simulation so the
+            # test can assert on loadState() calls. Set as a class
+            # attribute so the assertion reads the most recent
+            # instance even if the test only has the modeller.
+            type(self).last_instance = self
 
         def loadState(self, path: str) -> None:
             # Track the loadState call so tests can assert state.xml
@@ -737,6 +759,7 @@ def _make_fake_app_module() -> types.ModuleType:
         ForceField = _FakeForceField
         PDBFile = _FakePDBFile
         Simulation = _FakeSimulation
+        Modeller = _FakeModeller
 
     return _FakeAppModule("openmm.app")
 
@@ -770,3 +793,74 @@ def _stub_system_builder(
     )
     monkeypatch.setattr(sb, "assemble_system", lambda *a, **kw: (MagicMock(), MagicMock()))
     monkeypatch.setattr(sb, "add_ca_restraint", lambda *a, **kw: (MagicMock(), []))
+
+
+# ---------------------------------------------------------------------------
+# Missing-OpenMM import path (direct test of system_builder.prepare_simulation)
+# ---------------------------------------------------------------------------
+
+
+class TestPrepareSimulationMissingOpenMM:
+    """Regression: the import-blocker branch in
+    ``system_builder.prepare_simulation`` must set result.error and
+    return None. Test the production code path directly rather than
+    mocking prepare_simulation at the runner layer.
+    """
+
+    def test_missing_openmm_sets_error_and_returns_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The import-blocker branch in ``system_builder.prepare_simulation``
+        must set ``result.error`` and return None. We test the
+        production path by removing ``openmm`` and ``openmm.app`` from
+        ``sys.modules`` so the local ``import openmm`` and
+        ``import openmm.app as app`` inside ``prepare_simulation`` both
+        raise ImportError.
+        """
+
+        # Make every openmm.* lookup raise ImportError. Use a sentinel
+        # module whose __getattr__ raises. openmm has no submodule "app"
+        # attribute, so Python falls back to sys.modules['openmm.app']
+        # which we also replace with the sentinel.
+        class _Missing(types.ModuleType):
+            def __getattr__(self, name: str) -> object:  # type: ignore[no-untyped-def]
+                raise ImportError(
+                    "No module named 'openmm' (test simulation for "
+                    "system_builder.prepare_simulation import branch)"
+                )
+
+        for name in list(sys.modules):
+            if name == "openmm" or name.startswith("openmm."):
+                monkeypatch.delitem(sys.modules, name, raising=False)
+
+        import importlib
+
+        missing = _Missing("openmm")
+        missing_app = _Missing("openmm.app")
+        missing_internal = _Missing("openmm.app.internal")
+        missing_internal.pdbstructure = _Missing("openmm.app.internal.pdbstructure")
+        monkeypatch.setitem(sys.modules, "openmm", missing)
+        monkeypatch.setitem(sys.modules, "openmm.app", missing_app)
+        monkeypatch.setitem(sys.modules, "openmm.app.internal", missing_internal)
+        monkeypatch.setitem(
+            sys.modules, "openmm.app.internal.pdbstructure", missing_internal.pdbstructure
+        )
+
+        # Force a fresh import of the system_builder so the next
+        # prepare_simulation call sees the missing modules.
+        if "biolab_runners.openmm.system_builder" in sys.modules:
+            monkeypatch.delitem(sys.modules, "biolab_runners.openmm.system_builder", raising=False)
+        sb = importlib.import_module("biolab_runners.openmm.system_builder")
+
+        config = OpenMMConfig(
+            receptor_pdb="receptor.pdb",
+            peptide_pdb="peptide.pdb",
+            output_dir=str(tmp_path),
+            openmm_platform="CPU",
+        )
+        result = SimulationResult(config=config)
+        ctx = sb.prepare_simulation(config, tmp_path, None, result)
+
+        assert ctx is None
+        assert "not installed" in result.error
+        assert "openmm" in result.error.lower()
