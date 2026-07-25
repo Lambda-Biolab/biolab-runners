@@ -721,11 +721,11 @@ class TestRunPlanTypeContract:
         plan = ResumePlan(
             start_step=10_000,
             remaining_steps=49_990_000,
-            resume_xml="/tmp/state.10000_1_1.xml",
+            resume_xml="build/state.10000_1_1.xml",
             manifest_step=10_000,
             state_file_basename="state.10000_1_1.xml",
         )
-        assert plan.resume_xml == "/tmp/state.10000_1_1.xml"
+        assert plan.resume_xml == "build/state.10000_1_1.xml"
         assert not hasattr(plan, "error")
 
     def test_skip_plan_carries_all_result_fields(self) -> None:
@@ -734,10 +734,10 @@ class TestRunPlanTypeContract:
             completion_reason="manifest_terminal_early_abort_step_5000000",
             manifest_step=5_000_000,
             state_file_basename="state.5000000_1_1.xml",
-            trajectory_path="/tmp/trajectory.dcd",
-            energy_path="/tmp/energy.csv",
-            topology_path="/tmp/topology.pdb",
-            state_xml_path="/tmp/state.5000000_1_1.xml",
+            trajectory_path="build/trajectory.dcd",
+            energy_path="build/energy.csv",
+            topology_path="build/topology.pdb",
+            state_xml_path="build/state.5000000_1_1.xml",
             total_ns=5.0,
             early_abort=True,
             abort_reason="5ns gate tripped",
