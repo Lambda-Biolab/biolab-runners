@@ -54,7 +54,7 @@ from biolab_runners.openmm.system_builder import (
     quarantine_stale_checkpoint,
 )
 from biolab_runners.openmm.utils import (
-    load_checkpoint_step,
+    load_checkpoint,
     verify_production_outputs,
 )
 
@@ -153,7 +153,14 @@ class OpenMMRunner:
         resume_state = self._resolve_skip_or_resume(force, output_dir, config, result)
         if resume_state is None:
             return result
-        _, remaining_steps, resume_xml = resume_state
+        # ``start_step`` is the ABSOLUTE step the simulation will be at
+        # when the production loop starts. For a fresh run, equil runs
+        # inside _prepare_simulation, so the simulation is at
+        # total_equil_steps when the loop starts. For a resumed run,
+        # loadState sets the simulation to the saved step. The
+        # production loop computes its absolute step as
+        # ``start_step + steps_done`` (local).
+        start_step, remaining_steps, resume_xml = resume_state
 
         ctx = self._prepare_simulation(config, output_dir, resume_xml, result)
         if ctx is None:
@@ -163,7 +170,6 @@ class OpenMMRunner:
 
         traj_path = str(output_dir / FileNames.TRAJECTORY)
         energy_path = str(output_dir / FileNames.ENERGY)
-        state_xml_path = str(output_dir / FileNames.STATE_XML)
 
         energy_fh = self._setup_reporters(ctx, config, traj_path, energy_path, remaining_steps)
 
@@ -175,11 +181,11 @@ class OpenMMRunner:
         )
 
         t0 = time.time()
-        _, abort_reason = self._run_production_loop(
+        steps_done, abort_reason = self._run_production_loop(
             simulation=ctx.simulation,
             config=config,
+            start_step=start_step,
             remaining_steps=remaining_steps,
-            state_xml_path=state_xml_path,
             output_dir=output_dir,
             enable_early_abort=enable_early_abort,
             abort_thresh=abort_thresh,
@@ -195,8 +201,8 @@ class OpenMMRunner:
             energy_fh=energy_fh,
             traj_path=traj_path,
             energy_path=energy_path,
-            state_xml_path=state_xml_path,
-            remaining_steps=remaining_steps,
+            start_step=start_step,
+            steps_done=steps_done,
             t0=t0,
             output_dir=output_dir,
         )
@@ -212,25 +218,34 @@ class OpenMMRunner:
         """Handle idempotency + checkpoint resolution.
 
         When ``force=True`` and a prior checkpoint exists, the
-        resumable files (``state.xml`` + ``checkpoint.json`` +
-        ``energy.csv``) are moved into a timestamped
-        ``output_dir/.stale/<UTC>/`` directory BEFORE this method
-        returns. This guarantees the next non-forced invocation cannot
-        pair a stale ``state.xml`` with a freshly-built topology, even
-        if the forced run is interrupted before producing a new
-        ``state.xml`` of its own.
+        resumable files (the manifest, the energy log, and any
+        state file under ``state*.xml``) are moved into a
+        timestamped ``output_dir/.stale/<UTC>/`` directory BEFORE
+        this method returns. This guarantees the next non-forced
+        invocation cannot pair a stale state file with a
+        freshly-built topology, even if the forced run is interrupted
+        before producing a new manifest of its own.
 
-        When a non-forced invocation finds ``state.xml`` but no valid
-        manifest (``checkpoint.json``), the saved state's step is
-        unknown — falling back to a fresh build would overwrite the
-        topology and re-introduce the incompatibility class the
-        "Resume safety" / "Atomic checkpoint" rules exist to avoid.
-        We fail fast instead, and require the user to invoke
+        When a non-forced invocation finds a state file (legacy
+        ``state.xml`` or v7 ``state.<gen>.xml``) but no valid
+        manifest, the saved state's step is unknown — falling back
+        to a fresh build would overwrite the topology and re-introduce
+        the incompatibility class the "Resume safety" /
+        "Atomic checkpoint" rules exist to avoid. We fail fast
+        instead, and require the user to invoke
         ``runner.run(force=True)`` to discard the orphaned state.
 
         Returns None if the simulation is already complete (result populated)
         or the checkpoint is orphaned (result.error set),
         otherwise (start_step, remaining_steps, resume_xml).
+
+        ``start_step`` is the ABSOLUTE step the simulation will be at
+        when the production loop starts:
+        - Fresh run: ``config.total_equil_steps`` (equil runs inside
+          ``_prepare_simulation`` before the loop).
+        - Resumed run: the absolute step from the manifest (the
+          ``loadState`` in ``prepare_simulation`` sets the simulator
+          to this step).
         """
         if force:
             moved = quarantine_stale_checkpoint(output_dir)
@@ -249,47 +264,50 @@ class OpenMMRunner:
                 )
                 result.trajectory_path = str(output_dir / FileNames.TRAJECTORY)
                 result.energy_path = str(output_dir / FileNames.ENERGY)
-                result.state_xml_path = str(output_dir / FileNames.STATE_XML)
                 result.topology_path = str(output_dir / FileNames.TOPOLOGY)
                 return None
 
-        start_step = 0
+        manifest_step = 0
+        state_file = ""
         resume_xml = ""
-        state_xml = output_dir / FileNames.STATE_XML
-        # After a force=True quarantine, state_xml no longer exists on
-        # disk (it was moved to .stale/) — the resume branch is naturally
-        # skipped, and the fresh build proceeds without a stale state
-        # to pair against.
-        if not force and state_xml.exists() and state_xml.stat().st_size > 0:
-            # load_checkpoint_step reads ONLY the atomic-save manifest
-            # (see biolab_runners.openmm.utils). It does NOT fall back
-            # to energy.csv — the cadences differ and a stale step
-            # there would silently shorten the run on resume.
-            start_step = load_checkpoint_step(output_dir)
-            if start_step > 0:
-                resume_xml = str(state_xml)
+        if not force:
+            # load_checkpoint reads ONLY the atomic-save manifest.
+            # It returns (step, file) — the file is the basename of
+            # the state file referenced by the manifest.
+            manifest_step, state_file = load_checkpoint(output_dir)
+            if manifest_step > 0:
+                resume_xml = str(output_dir / state_file)
                 logger.info(
                     "Resuming from checkpoint at step %d (%.2f ns)",
-                    start_step,
-                    start_step * config.timestep_fs / 1e6,
+                    manifest_step,
+                    manifest_step * config.timestep_fs / 1e6,
                 )
             else:
-                # Orphaned state: state.xml exists but the manifest
-                # (checkpoint.json) is missing or invalid. We cannot
-                # determine what step the saved state corresponds to,
-                # so we cannot safely loadState it. Returning None
-                # with a clear error forces the user to discard via
-                # runner.run(force=True), which quarantines the state.
-                result.error = (
-                    f"state.xml exists at {state_xml} but the manifest "
-                    f"{FileNames.CHECKPOINT_JSON} is missing or empty — "
-                    f"the saved state's step is unknown. Pairing it with "
-                    f"a freshly-built System would re-introduce the "
-                    f"incompatibility this rule exists to avoid. Re-run "
-                    f"with force=True to discard the orphaned checkpoint."
-                )
-                logger.error(result.error)
-                return None
+                # No valid manifest. If a state file exists from a
+                # v6 run (legacy state.xml) or from a v7 interrupted
+                # save that landed before the manifest rename, it is
+                # orphaned — fail fast.
+                leftover_states = list(output_dir.glob("state*.xml"))
+                if leftover_states:
+                    result.error = (
+                        f"State file(s) exist at {leftover_states} but "
+                        f"the manifest {FileNames.CHECKPOINT_JSON} is "
+                        f"missing or invalid — the saved state's step is "
+                        f"unknown. Pairing it with a freshly-built System "
+                        f"would re-introduce the incompatibility this rule "
+                        f"exists to avoid. Re-run with force=True to "
+                        f"discard the orphaned checkpoint."
+                    )
+                    logger.error(result.error)
+                    return None
+
+        # Compute ``start_step`` (the absolute step the simulator is at
+        # when the production loop starts) and ``remaining_steps``
+        # (production steps to run). For a fresh run, equil will run
+        # inside _prepare_simulation, so start_step = total_equil_steps.
+        # For a resumed run, loadState sets the simulator to
+        # ``manifest_step``, so start_step = manifest_step.
+        start_step = manifest_step if manifest_step > 0 else config.total_equil_steps
 
         production_steps_done = max(0, start_step - config.total_equil_steps)
         remaining_steps = max(0, config.total_steps - production_steps_done)
@@ -297,7 +315,6 @@ class OpenMMRunner:
             logger.info("No remaining steps — simulation already complete")
             result.trajectory_path = str(output_dir / FileNames.TRAJECTORY)
             result.energy_path = str(output_dir / FileNames.ENERGY)
-            result.state_xml_path = str(state_xml)
             return None
 
         return start_step, remaining_steps, resume_xml
@@ -387,29 +404,38 @@ class OpenMMRunner:
         energy_fh: object,
         traj_path: str,
         energy_path: str,
-        state_xml_path: str,
-        remaining_steps: int,
+        start_step: int,
+        steps_done: int,
         t0: float,
         output_dir: Path,
     ) -> None:
-        """Save final state, close reporters, populate result, write md_summary.json."""
+        """Save final state atomically, close reporters, populate result.
+
+        The final state save goes through ``_atomic_save_checkpoint``
+        so the manifest is updated together with the state file. The
+        ``absolute_step`` written to the manifest is ``start_step +
+        steps_done`` — the ABSOLUTE OpenMM step the simulation is at
+        when the production loop ends. The v6 design wrote the
+        invocation-local ``steps_done`` instead, which silently
+        broke accounting on resumes.
+        """
         config = result.config
         elapsed = time.time() - t0
-        total_ns = remaining_steps * config.timestep_fs / 1e6
+        total_ns = steps_done * config.timestep_fs / 1e6
         ns_per_day = (total_ns / elapsed) * 86400 if elapsed > 0 else 0
 
-        ctx.simulation.saveState(state_xml_path)  # type: ignore[union-attr]
+        absolute_step = start_step + steps_done
+        _atomic_save_checkpoint(ctx.simulation, output_dir, absolute_step)
         energy_fh.close()  # type: ignore[union-attr]
 
         result.trajectory_path = traj_path
         result.energy_path = energy_path
-        result.state_xml_path = state_xml_path
         result.total_ns = round(total_ns, 2)
         result.elapsed_seconds = round(elapsed, 1)
         result.ns_per_day = round(ns_per_day, 1)
 
         summary = {
-            "total_steps": remaining_steps,
+            "total_steps": steps_done,
             "total_ns": result.total_ns,
             "elapsed_seconds": result.elapsed_seconds,
             "ns_per_day": result.ns_per_day,
@@ -419,6 +445,7 @@ class OpenMMRunner:
             "energy": energy_path,
             "early_abort": result.early_abort,
             "abort_reason": result.abort_reason,
+            "final_absolute_step": absolute_step,
         }
         (output_dir / FileNames.MD_SUMMARY_JSON).write_text(json.dumps(summary, indent=2))
 
@@ -581,8 +608,8 @@ class OpenMMRunner:
         *,
         simulation: object,
         config: OpenMMConfig,
+        start_step: int,
         remaining_steps: int,
-        state_xml_path: str,
         output_dir: Path,
         enable_early_abort: bool,
         abort_thresh: float,
@@ -590,13 +617,22 @@ class OpenMMRunner:
     ) -> tuple[int, str]:
         """Run the production MD loop with early-abort checks and checkpointing.
 
+        ``start_step`` is the ABSOLUTE step the simulation is at when
+        the loop starts (``total_equil_steps`` for fresh runs, the
+        saved step for resumed runs). The atomic save helper writes
+        ``start_step + steps_done`` to the manifest, so the v6
+        silent-shortening bug cannot recur.
+
         Returns:
-            (steps_done, abort_reason) — abort_reason is "" if no early abort.
+            (steps_done, abort_reason) — ``steps_done`` is the
+            INVOCATION-LOCAL count (not absolute). The caller adds
+            ``start_step`` to get the absolute step. ``abort_reason``
+            is ``""`` if no early abort.
         """
         last_ckpt_step = 0
         abort_reason = ""
         steps_box = [0]
-        self._install_sigterm_handler(simulation, state_xml_path, output_dir, steps_box, config)
+        self._install_sigterm_handler(simulation, output_dir, start_step, steps_box, config)
 
         # OralBiome-AMP task #10: the early-abort gate is an offline mdtraj
         # evaluation of the partial trajectory.dcd, not an inside-OpenMM
@@ -621,8 +657,8 @@ class OpenMMRunner:
             if gates_active and not gate_polling_done:
                 gate_polling_done, abort_reason = self._poll_offline_gate(
                     simulation=simulation,
-                    state_xml_path=state_xml_path,
                     output_dir=output_dir,
+                    start_step=start_step,
                     abort_thresh=abort_thresh,
                     config=config,
                     steps_done=steps_done,
@@ -632,8 +668,8 @@ class OpenMMRunner:
 
             last_ckpt_step = self._maybe_checkpoint(
                 simulation,
-                state_xml_path,
                 output_dir,
+                start_step,
                 steps_done,
                 last_ckpt_step,
                 remaining_steps,
@@ -647,8 +683,8 @@ class OpenMMRunner:
     def _poll_offline_gate(
         *,
         simulation: object,
-        state_xml_path: str,
         output_dir: Path,
+        start_step: int,
         abort_thresh: float,
         config: OpenMMConfig,
         steps_done: int,
@@ -662,10 +698,9 @@ class OpenMMRunner:
         ``gate_verdict_{current_ns}ns.json`` file next to the trajectory
         so orchestrators + SIGTERM teardown can see the latest state.
 
-        On ``abort=True``, saves ``state.xml`` (via ``saveState``, per
-        expert caveat #1 in ``project_md_gate_architecture.md`` — NOT
-        ``saveCheckpoint``) and writes an ``early_abort.json`` with the
-        reason.
+        On ``abort=True``, atomically saves the state + manifest with
+        the absolute step (``start_step + steps_done``) so the next
+        non-forced invocation can resume from a consistent step.
 
         Returns:
             ``(polling_done, abort_reason)``. ``polling_done`` is True
@@ -704,10 +739,11 @@ class OpenMMRunner:
         )
 
         if verdict.abort:
-            # Atomic save: state.xml + checkpoint.json committed together
-            # so the next non-forced invocation can resume from a
-            # consistent step (or fail fast if the manifest is missing).
-            _atomic_save_checkpoint(simulation, state_xml_path, output_dir, steps_done)
+            # Atomic save: state file + manifest committed together.
+            # The manifest's step is the absolute OpenMM step
+            # (``start_step + steps_done``), not the local counter.
+            absolute_step = start_step + steps_done
+            _atomic_save_checkpoint(simulation, output_dir, absolute_step)
             OpenMMRunner._write_abort_metadata(
                 verdict, output_dir, abort_thresh, config, steps_done, ns_at_check
             )
@@ -772,36 +808,34 @@ class OpenMMRunner:
     @staticmethod
     def _install_sigterm_handler(
         simulation: object,
-        state_xml_path: str,
         output_dir: Path,
+        start_step: int,
         steps_box: list[int],
         config: OpenMMConfig,
     ) -> None:
         """Install a SIGTERM handler that atomically saves state + manifest.
 
-        The atomic save (state.xml + checkpoint.json committed together)
-        ensures that a SIGTERM mid-save cannot leave a stale state
-        paired with the wrong manifest step. If the save itself fails
-        (e.g. disk full), the canonical files are unchanged and the
-        runner sees no checkpoint on the next invocation — fresh
-        build proceeds, no incompatibility risk.
+        Writes the absolute step (``start_step + steps_box[0]``) to
+        the manifest so the next invocation can resume from the
+        correct step. The atomic save (single ``os.replace`` on
+        ``checkpoint.json``) ensures that a SIGTERM mid-save cannot
+        leave a stale state paired with the wrong manifest step. If
+        the save itself fails (e.g. disk full), the canonical
+        manifest is unchanged and the runner sees the previous
+        (coherent) checkpoint on the next invocation.
         """
 
         def handle_sigterm(signum: int, frame: object) -> None:  # noqa: ARG001
             steps_done = steps_box[0]
-            ns_done = steps_done * config.timestep_fs / 1e6
+            absolute_step = start_step + steps_done
+            ns_done = absolute_step * config.timestep_fs / 1e6
             logger.warning(
-                "SIGTERM received at step %d (%.2f ns) — saving state",
-                steps_done,
+                "SIGTERM received at absolute step %d (%.2f ns) — saving state",
+                absolute_step,
                 ns_done,
             )
             try:
-                _atomic_save_checkpoint(
-                    simulation,
-                    state_xml_path,
-                    output_dir,
-                    steps_done,
-                )
+                _atomic_save_checkpoint(simulation, output_dir, absolute_step)
             except Exception as exc:
                 logger.error("Failed to save state on SIGTERM: %s", exc)
             sys.exit(0)
@@ -811,8 +845,8 @@ class OpenMMRunner:
     @staticmethod
     def _maybe_checkpoint(
         simulation: object,
-        state_xml_path: str,
         output_dir: Path,
+        start_step: int,
         steps_done: int,
         last_ckpt_step: int,
         remaining_steps: int,
@@ -821,17 +855,21 @@ class OpenMMRunner:
     ) -> int:
         """Write a checkpoint if interval elapsed. Returns the (possibly updated) last_ckpt_step.
 
-        The save is atomic (state.xml + checkpoint.json committed
-        together via :func:`_atomic_save_checkpoint`) so that a crash
+        The save is atomic (the manifest rename is the single commit
+        point via :func:`_atomic_save_checkpoint`) so that a crash
         mid-save cannot leave a stale state whose step does not match
-        the manifest. See AGENTS.md "Atomic checkpoint" rule.
+        the manifest. The manifest records the absolute step
+        (``start_step + steps_done``), not the invocation-local
+        counter — the v6 protocol wrote the local counter and
+        silently shortened resumed runs.
         """
         since_ckpt = steps_done - last_ckpt_step
         if since_ckpt < config.checkpoint_every_steps and steps_done < remaining_steps:
             return last_ckpt_step
-        _atomic_save_checkpoint(simulation, state_xml_path, output_dir, steps_done)
+        absolute_step = start_step + steps_done
+        _atomic_save_checkpoint(simulation, output_dir, absolute_step)
         elapsed = time.time() - t0
-        ns_done = steps_done * config.timestep_fs / 1e6
+        ns_done = absolute_step * config.timestep_fs / 1e6
         ns_per_day = (ns_done / elapsed) * 86400 if elapsed > 0 else 0
         logger.info(
             "Checkpoint: %d/%d steps (%.2f ns, %.0f ns/day)",

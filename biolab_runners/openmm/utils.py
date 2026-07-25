@@ -68,7 +68,11 @@ def verify_production_outputs(output_dir: Path) -> dict[str, object]:
     """Verify that production MD outputs are complete.
 
     Checks for expected files and validates basic integrity (file sizes,
-    energy row counts).
+    energy row counts). The "state presence" check is now against
+    the atomic-save manifest (``checkpoint.json``) — the v7 save
+    format uses generation-versioned state files
+    (``state.<gen>.xml``) referenced by the manifest, not a canonical
+    ``state.xml``.
 
     Args:
         output_dir: Directory containing MD outputs.
@@ -108,45 +112,73 @@ def verify_production_outputs(output_dir: Path) -> dict[str, object]:
 
         report["files"][filename] = file_info  # type: ignore[index]
 
+    # The manifest always exists if the run is complete — it is the
+    # last thing the atomic save commits. Insert its info into the
+    # report for completeness.
+    manifest_path = output_dir / FileNames.CHECKPOINT_JSON
+    if manifest_path.exists():
+        report["files"][FileNames.CHECKPOINT_JSON] = {  # type: ignore[index]
+            "exists": True,
+            "size_bytes": manifest_path.stat().st_size,
+        }
+
     return report
 
 
-def load_checkpoint_step(output_dir: Path) -> int:
-    """Load the last checkpoint step from the atomic-save manifest.
+def load_checkpoint(output_dir: Path) -> tuple[int, str]:
+    """Load the saved step AND state file from the atomic-save manifest.
 
     The manifest (``checkpoint.json``) is the ONLY authoritative
-    source for the saved state's step. The previous implementation
-    fell back to the last row of ``energy.csv`` when the manifest
-    was missing, but that was unsafe: ``energy.csv`` is written every
-    ``save_every_steps`` (~10 ps) by the reporter, while
-    ``state.xml`` is saved every ``checkpoint_every_steps`` (~2 hr)
-    via :func:`biolab_runners.openmm.system_builder._atomic_save_checkpoint`.
-    The two cadences differ by orders of magnitude — after a crash,
-    the energy row can be hundreds of thousands of steps ahead of
-    the saved state, and resuming from the energy step while
-    loading the older state would silently shorten the run.
+    source for the saved state's step and the file to load. It
+    references a state file by basename (e.g.
+    ``state.700000_12345_1700000000000000000.xml``). The resume
+    flow reads both the step and the file from the manifest, then
+    loads the state file via ``simulation.loadState``.
 
-    The runner's resume flow (see ``runner._resolve_skip_or_resume``)
-    treats a return value of 0 as "no resume" and fails fast if
-    ``state.xml`` exists without a matching manifest — see the
-    "Atomic checkpoint" rule in AGENTS.md.
+    The previous design saved only ``state.xml`` and inferred the
+    saved step from the last row of ``energy.csv`` — unsafe because
+    the two cadences differ by orders of magnitude (energy.csv at
+    ~10 ps, state.xml at ~2 hr). The v7 fix commits the state file
+    and the manifest as a single atomic transaction: the manifest
+    rename is the only atomic commit point; the state file's
+    filename uniquely identifies it, so any state file not
+    referenced by the manifest is an orphan that can be safely
+    garbage-collected.
 
     Args:
         output_dir: MD output directory.
 
     Returns:
-        Step number recorded in the manifest, or 0 if the manifest
-        is missing or invalid (the runner treats 0 as "no resumable
-        checkpoint").
+        ``(absolute_step, state_file_basename)`` on success — both
+        non-empty. ``(0, "")`` if no manifest exists or the manifest
+        is invalid. The runner treats (0, "") as "no resumable
+        checkpoint" and fails fast on any orphaned state file.
     """
-    ckpt_json = output_dir / FileNames.CHECKPOINT_JSON
-    if not ckpt_json.exists():
-        return 0
+    manifest_path = output_dir / FileNames.CHECKPOINT_JSON
+    if not manifest_path.exists():
+        return 0, ""
     try:
-        data = json.loads(ckpt_json.read_text())
+        data = json.loads(manifest_path.read_text())
         records = data.get("records", [])
-        if records:
-            return int(records[-1].get("step", 0))
-    except (json.JSONDecodeError, KeyError, IndexError, OSError):
+        if not records:
+            return 0, ""
+        last = records[-1]
+        step = int(last.get("step", 0))
+        file = str(last.get("file", ""))
+        if step > 0 and file:
+            return step, file
+    except (json.JSONDecodeError, KeyError, IndexError, OSError, ValueError):
         pass
-    return 0
+    return 0, ""
+
+
+def load_checkpoint_step(output_dir: Path) -> int:
+    """Backwards-compatible step-only wrapper around :func:`load_checkpoint`.
+
+    Returns the absolute step from the manifest, or 0 if no manifest
+    exists. Kept for callers that only need the step (e.g. logs);
+    new code should call :func:`load_checkpoint` directly to also
+    get the file the manifest references.
+    """
+    step, _ = load_checkpoint(output_dir)
+    return step

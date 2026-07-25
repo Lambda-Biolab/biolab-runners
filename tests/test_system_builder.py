@@ -727,81 +727,116 @@ class TestPrepareSimulationResumeTopologyGuard:
 
 
 class TestAtomicSaveCheckpoint:
-    """Regression tests for the v6 BLOCKER: ``_atomic_save_checkpoint``
-    must commit ``state.xml`` and the step manifest together, so
-    that a crash mid-save cannot leave a stale state whose step
-    does not match the manifest.
+    """Regression tests for the v7 BLOCKER: ``_atomic_save_checkpoint``
+    must commit the state file and the manifest as one transaction
+    such that the manifest's ``os.replace`` is the single atomic
+    commit point.
 
-    The previous protocol saved only ``state.xml`` and derived the
-    saved step from the last row of ``energy.csv``. That was unsafe:
-    the two files advance at very different cadences.
+    The v6 design used two ``os.replace`` calls (one for the state
+    file, one for the manifest) — those are individually atomic but
+    the pair is not. The v7 design uses generation-versioned state
+    files (``state.<step>_<pid>_<nanos>.xml``) so the state file
+    has a unique identity and only the manifest needs to be
+    atomically renamed.
     """
 
-    def test_writes_state_and_manifest_atomically(self, tmp_path: Path) -> None:
-        """Both files are present after the call, and the manifest's
-        step matches the value passed in."""
+    def test_writes_state_file_and_manifest(self, tmp_path: Path) -> None:
+        """After the call, the state file exists at its versioned name
+        and the manifest references it."""
         from biolab_runners.openmm.system_builder import _atomic_save_checkpoint
 
         sim = MagicMock()
         sim.saveState = MagicMock(side_effect=lambda path: Path(path).write_text("<State/>"))
 
-        state_path = tmp_path / "state.xml"
-        _atomic_save_checkpoint(sim, str(state_path), tmp_path, step=42_000)
+        state_basename = _atomic_save_checkpoint(sim, tmp_path, absolute_step=42_000)
 
+        # State file is at the versioned name (NOT canonical state.xml).
+        assert state_basename.startswith("state.42000_")
+        assert state_basename.endswith(".xml")
+        state_path = tmp_path / state_basename
         assert state_path.exists()
+        # legacy state.xml is NOT created.
+        assert not (tmp_path / "state.xml").exists()
+        # Manifest exists and references the state file.
         manifest_path = tmp_path / "checkpoint.json"
         assert manifest_path.exists()
         manifest = json.loads(manifest_path.read_text())
-        assert manifest["records"][-1]["step"] == 42_000
+        last_record = manifest["records"][-1]
+        assert last_record["step"] == 42_000
+        assert last_record["file"] == state_basename
 
-    def test_interrupted_save_leaves_no_inconsistent_pair(self, tmp_path: Path) -> None:
-        """If simulation.saveState raises mid-save, neither canonical
-        file is touched. The runner sees no checkpoint on the next
-        invocation and proceeds fresh — no possibility of pairing
-        a stale state with the wrong manifest step."""
+    def test_interrupted_save_state_leaves_previous_checkpoint_active(self, tmp_path: Path) -> None:
+        """If ``saveState`` raises, the manifest is unchanged.
+        The previous (coherent) checkpoint remains active."""
         from biolab_runners.openmm.system_builder import _atomic_save_checkpoint
 
         def exploding_save_state(path: str) -> None:
-            # Simulate a crash mid-save: leave the temp file but raise
-            # before the atomic rename. The canonical files must
-            # remain untouched.
-            Path(path).write_text("<State/>")
             raise RuntimeError("simulated disk-full interrupt")
 
         sim = MagicMock()
         sim.saveState = MagicMock(side_effect=exploding_save_state)
 
-        state_path = tmp_path / "state.xml"
-        manifest_path = tmp_path / "checkpoint.json"
-        # Pre-create stale canonical files to prove the interrupt
-        # did NOT clobber them.
-        state_path.write_text("<OLD_STATE/>")
-        manifest_path.write_text(json.dumps({"records": [{"step": 1}]}))
+        # Pre-create a previous coherent checkpoint.
+        previous_state = tmp_path / "state.1_1_1.xml"
+        previous_state.write_text("<OLD_STATE/>")
+        previous_manifest = {"records": [{"step": 1, "file": "state.1_1_1.xml"}]}
+        (tmp_path / "checkpoint.json").write_text(json.dumps(previous_manifest))
 
         with pytest.raises(RuntimeError, match="simulated"):
-            _atomic_save_checkpoint(sim, str(state_path), tmp_path, step=99_999)
+            _atomic_save_checkpoint(sim, tmp_path, absolute_step=99_999)
 
-        # Canonical files are untouched — the old state and manifest
-        # are still there. The runner would see a valid (old) pair
-        # and resume from it, or fail-fast if the manifest doesn't
-        # match, but never a fresh state with no manifest.
-        assert state_path.read_text() == "<OLD_STATE/>"
-        assert json.loads(manifest_path.read_text())["records"][-1]["step"] == 1
+        # Previous manifest is unchanged. The previous state file is
+        # still there (the new save never wrote anything).
+        manifest = json.loads((tmp_path / "checkpoint.json").read_text())
+        assert manifest["records"][-1]["step"] == 1
+        assert manifest["records"][-1]["file"] == "state.1_1_1.xml"
+        assert previous_state.exists()
 
-    def test_overwrites_previous_checkpoint(self, tmp_path: Path) -> None:
-        """A second atomic save replaces the canonical files. The
-        manifest's step matches the latest call."""
+    def test_garbage_collects_orphan_state_files(self, tmp_path: Path) -> None:
+        """After a save, any state.*.xml not referenced by the manifest
+        is removed."""
         from biolab_runners.openmm.system_builder import _atomic_save_checkpoint
 
         sim = MagicMock()
         sim.saveState = MagicMock(side_effect=lambda path: Path(path).write_text("<State/>"))
 
-        state_path = tmp_path / "state.xml"
-        _atomic_save_checkpoint(sim, str(state_path), tmp_path, step=10_000)
-        _atomic_save_checkpoint(sim, str(state_path), tmp_path, step=20_000)
+        # Pre-create an orphan state file (simulating a v6 leftover
+        # or an interrupted save).
+        orphan = tmp_path / "state.99999_12345_170000000.xml"
+        orphan.write_text("<ORPHAN/>")
 
+        # Run a fresh save.
+        state_basename = _atomic_save_checkpoint(sim, tmp_path, absolute_step=42_000)
+
+        # Orphan is gone.
+        assert not orphan.exists()
+        # The active state file is present.
+        assert (tmp_path / state_basename).exists()
+
+    def test_two_saves_produce_distinct_state_files(self, tmp_path: Path) -> None:
+        """Two consecutive saves produce distinct state files. The
+        manifest references the latest one; the previous is GC'd."""
+        from biolab_runners.openmm.system_builder import _atomic_save_checkpoint
+
+        sim = MagicMock()
+        sim.saveState = MagicMock(side_effect=lambda path: Path(path).write_text("<State/>"))
+
+        # First save.
+        first_basename = _atomic_save_checkpoint(sim, tmp_path, absolute_step=10_000)
+        # Second save (different absolute step).
+        second_basename = _atomic_save_checkpoint(sim, tmp_path, absolute_step=20_000)
+
+        # Distinct state files (the unique filename includes nanos).
+        assert first_basename != second_basename
+        # Manifest references the SECOND one.
         manifest = json.loads((tmp_path / "checkpoint.json").read_text())
+        assert manifest["records"][-1]["file"] == second_basename
         assert manifest["records"][-1]["step"] == 20_000
+        # The first state file was GC'd (no longer referenced by the
+        # manifest).
+        assert not (tmp_path / first_basename).exists()
+        # The second state file is present.
+        assert (tmp_path / second_basename).exists()
 
 
 def _make_fake_modeller(chains: list[object], num_atoms: int) -> object:

@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest  # used in test annotations and raises
 from biolab_runners.openmm.config import (
     DEFAULT_IRMSD_THRESHOLD_A,
     OpenMMConfig,
@@ -15,7 +16,7 @@ from biolab_runners.openmm.config import (
 from biolab_runners.openmm.runner import OpenMMRunner
 from biolab_runners.openmm.system_builder import build_forcefield
 from biolab_runners.openmm.utils import (
-    load_checkpoint_step,
+    load_checkpoint,
     verify_production_outputs,
 )
 
@@ -287,12 +288,16 @@ class TestVerifyProductionOutputs:
         assert not report["complete"]
 
     def test_complete_dir(self, tmp_path: Path) -> None:
-        # Create all expected files with sufficient sizes
+        # Create all expected files with sufficient sizes. The "state"
+        # indicator is the atomic-save manifest (checkpoint.json) in
+        # v7 — not the legacy state.xml.
         (tmp_path / "trajectory.dcd").write_bytes(b"\x00" * 20_000_000)
         energy_lines = ["#step,time,PE,KE,TE,temp,vol,speed\n"]
         energy_lines.extend(f"{i * 5000},{i * 10},0,0,0,310,0,0\n" for i in range(20))
         (tmp_path / "energy.csv").write_text("".join(energy_lines))
-        (tmp_path / "state.xml").write_text("<State/>")
+        (tmp_path / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": 1_000_000, "file": "state.1M.xml"}]})
+        )
 
         report = verify_production_outputs(tmp_path)
         assert report["complete"]
@@ -300,7 +305,9 @@ class TestVerifyProductionOutputs:
     def test_small_trajectory_incomplete(self, tmp_path: Path) -> None:
         (tmp_path / "trajectory.dcd").write_bytes(b"\x00" * 100)
         (tmp_path / "energy.csv").write_text("step\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n")
-        (tmp_path / "state.xml").write_text("<State/>")
+        (tmp_path / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": 1, "file": "state.1.xml"}]})
+        )
 
         report = verify_production_outputs(tmp_path)
         assert not report["complete"]
@@ -308,45 +315,74 @@ class TestVerifyProductionOutputs:
     def test_few_energy_rows_incomplete(self, tmp_path: Path) -> None:
         (tmp_path / "trajectory.dcd").write_bytes(b"\x00" * 20_000_000)
         (tmp_path / "energy.csv").write_text("step\n1\n")
-        (tmp_path / "state.xml").write_text("<State/>")
+        (tmp_path / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": 1, "file": "state.1.xml"}]})
+        )
 
         report = verify_production_outputs(tmp_path)
         assert not report["complete"]
 
 
-class TestLoadCheckpointStep:
-    """Tests for checkpoint loading."""
+class TestLoadCheckpoint:
+    """Tests for the v7 manifest-based checkpoint loader."""
 
-    def test_no_checkpoint_returns_zero(self, tmp_path: Path) -> None:
-        assert load_checkpoint_step(tmp_path) == 0
+    def test_no_manifest_returns_zero_empty(self, tmp_path: Path) -> None:
+        """No manifest → ``(0, '')``."""
+        step, file = load_checkpoint(tmp_path)
+        assert step == 0
+        assert file == ""
 
-    def test_checkpoint_json(self, tmp_path: Path) -> None:
-        ckpt = {
+    def test_manifest_returns_step_and_file(self, tmp_path: Path) -> None:
+        """Manifest records the step AND the state file basename."""
+        manifest = {
             "records": [
-                {"step": 1000000, "time_ns": 2.0},
-                {"step": 2000000, "time_ns": 4.0},
+                {
+                    "step": 1_000_000,
+                    "file": "state.1000000_12345_1700000000000000000.xml",
+                }
             ]
         }
-        (tmp_path / "checkpoint.json").write_text(json.dumps(ckpt))
-        assert load_checkpoint_step(tmp_path) == 2000000
+        (tmp_path / "checkpoint.json").write_text(json.dumps(manifest))
+        step, file = load_checkpoint(tmp_path)
+        assert step == 1_000_000
+        assert file == "state.1000000_12345_1700000000000000000.xml"
 
-    def test_no_manifest_returns_zero(self, tmp_path: Path) -> None:
-        """Only checkpoint.json is the authoritative source now.
+    def test_no_manifest_returns_zero_even_with_energy(self, tmp_path: Path) -> None:
+        """energy.csv alone no longer yields a step.
 
         The previous energy.csv fallback was removed because energy.csv
         advances at save_every_steps while state.xml saves at
         checkpoint_every_steps — they can be many hours of steps
         apart, and using the energy row would silently shorten the
-        run. The runner's fail-fast for orphaned state.xml is
+        run. The runner's fail-fast for orphaned state files is
         covered in ``TestOrphanedStateFailsFast``.
         """
         (tmp_path / "energy.csv").write_text("#step,time\n5000,10\n10000,20\n15000,30\n")
-        assert load_checkpoint_step(tmp_path) == 0
+        step, _ = load_checkpoint(tmp_path)
+        assert step == 0
 
     def test_malformed_manifest_returns_zero(self, tmp_path: Path) -> None:
-        """A manifest that won't parse returns 0 — same as missing."""
+        """A manifest that won't parse returns (0, '') — same as missing."""
         (tmp_path / "checkpoint.json").write_text("not json {{{")
-        assert load_checkpoint_step(tmp_path) == 0
+        step, file = load_checkpoint(tmp_path)
+        assert step == 0
+        assert file == ""
+
+    def test_manifest_with_zero_step_returns_zero(self, tmp_path: Path) -> None:
+        """A manifest with a zero step is treated as no checkpoint."""
+        (tmp_path / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": 0, "file": "state.0.xml"}]})
+        )
+        step, file = load_checkpoint(tmp_path)
+        assert step == 0
+        assert file == ""
+
+    def test_manifest_with_missing_file_returns_zero(self, tmp_path: Path) -> None:
+        """A manifest with no ``file`` field is treated as no checkpoint."""
+        (tmp_path / "checkpoint.json").write_text(json.dumps({"records": [{"step": 1_000_000}]}))
+        step, file = load_checkpoint(tmp_path)
+        assert step == 0
+        assert file == ""
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +416,10 @@ class TestOpenMMRunner:
         energy_lines = ["#step,time\n"]
         energy_lines.extend(f"{i * 5000},{i * 10}\n" for i in range(20))
         (out / "energy.csv").write_text("".join(energy_lines))
-        (out / "state.xml").write_text("<State/>")
+        # v7: the "state" indicator is the manifest (checkpoint.json).
+        (out / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": 100_000, "file": "state.100000_1_1.xml"}]})
+        )
 
         config = OpenMMConfig(output_dir=str(out))
         runner = OpenMMRunner(config)
@@ -433,9 +472,11 @@ class TestResumeAccounting:
         # Simulate checkpoint after full equil (200k steps) + 1 ns production (500k steps)
         checkpoint_step = config.total_equil_steps + 500_000
         # The atomic-save manifest is the authoritative source for the
-        # saved step — energy.csv is no longer consulted for resume.
-        (out / "checkpoint.json").write_text(json.dumps({"records": [{"step": checkpoint_step}]}))
-        (out / "state.xml").write_text("<State/>")
+        # saved step AND the file to load. In v7, the manifest's step
+        # is the absolute OpenMM step, not the local counter.
+        (out / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": checkpoint_step, "file": "state.test.xml"}]})
+        )
 
         runner = OpenMMRunner(config)
         resume = runner._resolve_skip_or_resume(
@@ -453,8 +494,9 @@ class TestResumeAccounting:
 
         config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
         checkpoint_step = config.total_equil_steps  # just finished equilibration
-        (out / "checkpoint.json").write_text(json.dumps({"records": [{"step": checkpoint_step}]}))
-        (out / "state.xml").write_text("<State/>")
+        (out / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": checkpoint_step, "file": "state.test.xml"}]})
+        )
 
         runner = OpenMMRunner(config)
         resume = runner._resolve_skip_or_resume(
@@ -466,28 +508,30 @@ class TestResumeAccounting:
 
 
 class TestForceTrueQuarantine:
-    """Regression test for the v5 BLOCKER: ``runner.run(force=True)`` must
-    actually retire the stale checkpoint files (state.xml +
-    checkpoint.json + energy.csv) before the fresh build, so an
-    interrupted forced run cannot leave the directory in a state
-    where a subsequent non-forced invocation re-derives a stale step
-    from the leftover energy.csv / checkpoint.json and pairs it with
-    a freshly-built topology.
+    """Regression test for the v5 BLOCKER (extended for v7): ``runner.run(force=True)``
+    must actually retire the stale checkpoint files (the manifest,
+    the energy log, AND any state file under ``state*.xml``) before
+    the fresh build, so an interrupted forced run cannot leave the
+    directory with a stale state that a subsequent non-forced
+    invocation could load onto a freshly-built System.
 
-    The previous fix simply skipped reading state.xml — that did
-    NOT remove it. If the forced run was interrupted mid-build
-    (before the new state.xml was written), the next non-forced
-    invocation could still load the old state onto a fresh System.
+    The v7 save format uses generation-versioned state files
+    (``state.<step>_<pid>_<nanos>.xml``) referenced by the manifest
+    (``checkpoint.json``). The quarantine must move ALL of them.
     """
 
     def _populate_stale_checkpoint(self, out: Path, step: int) -> None:
-        """Pre-populate state.xml + checkpoint.json + energy.csv."""
-        (out / "state.xml").write_text("<State/>")
-        (out / "checkpoint.json").write_text(json.dumps({"records": [{"step": step}]}))
+        """Pre-populate a v7 stale checkpoint."""
+        state_basename = f"state.{step}_1_1.xml"
+        state_path = out / state_basename
+        state_path.write_text("<State/>")
+        (out / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": step, "file": state_basename}]})
+        )
         (out / "energy.csv").write_text(f"#step,time\n{step},{step}\n")
 
-    def test_force_true_quarantines_all_three_files(self, tmp_path: Path) -> None:
-        """force=True moves state.xml + checkpoint.json + energy.csv to .stale/<UTC>/."""
+    def test_force_true_quarantines_all_files(self, tmp_path: Path) -> None:
+        """force=True moves state.*.xml + checkpoint.json + energy.csv to .stale/<UTC>/."""
         out = tmp_path / "output"
         out.mkdir()
 
@@ -503,16 +547,17 @@ class TestForceTrueQuarantine:
         stale_parents = list((out / ".stale").iterdir())
         assert len(stale_parents) == 1, f"expected one stale dir, got {stale_parents}"
         stale_dir = stale_parents[0]
-        assert (stale_dir / "state.xml").exists()
+        # The state file is in the stale directory under its versioned name.
+        stale_state_files = list(stale_dir.glob("state*.xml"))
+        assert len(stale_state_files) == 1
+        assert stale_state_files[0].name == "state.10000_1_1.xml"
         assert (stale_dir / "checkpoint.json").exists()
         assert (stale_dir / "energy.csv").exists()
 
-        # The original resumable files are GONE from output_dir —
-        # that's the contract that makes a subsequent non-forced run
-        # unable to re-derive a stale step.
-        assert not (out / "state.xml").exists()
+        # The original files are GONE from output_dir.
         assert not (out / "checkpoint.json").exists()
         assert not (out / "energy.csv").exists()
+        assert not any(out.glob("state*.xml"))
 
         # resume_xml must be empty so prepare_simulation does NOT
         # try to loadState a (no-longer-existing) checkpoint.
@@ -546,7 +591,7 @@ class TestForceTrueQuarantine:
         1. Stale checkpoint files exist.
         2. force=True invocation quarantines them.
         3. Run is interrupted AFTER quarantine but BEFORE a new
-           state.xml is written (simulated by writing a fresh
+           state file is written (simulated by writing a fresh
            topology.pdb to mimic an interrupted-during-equilibration
            outcome).
         4. A subsequent non-force invocation must NOT see a non-empty
@@ -569,7 +614,7 @@ class TestForceTrueQuarantine:
 
         # Step 3: simulate interruption by writing a fresh topology.pdb
         # (the forced run had time to overwrite topology.pdb but did
-        # NOT survive long enough to write a new state.xml)
+        # NOT survive long enough to write a new state file)
         (out / "topology.pdb").write_bytes(b"X" * 150_000)
 
         # Step 4: subsequent non-forced invocation — must not see a
@@ -587,9 +632,10 @@ class TestForceTrueQuarantine:
 
 
 class TestOrphanedStateFailsFast:
-    """Regression tests for the v6 BLOCKER: a non-empty ``state.xml``
-    without a matching ``checkpoint.json`` manifest is treated as
-    orphaned and rejected.
+    """Regression tests for the v6 BLOCKER: a non-empty state file
+    (legacy ``state.xml`` or v7 ``state.<gen>.xml``) without a
+    matching ``checkpoint.json`` manifest is treated as orphaned
+    and rejected.
 
     The previous load_checkpoint_step fell back to ``energy.csv``'s
     last row when the manifest was missing, which silently shortened
@@ -600,8 +646,8 @@ class TestOrphanedStateFailsFast:
     when the state/manifest pair is broken.
     """
 
-    def test_state_with_no_manifest_fails_fast(self, tmp_path: Path) -> None:
-        """state.xml exists, checkpoint.json missing → no resume, error set."""
+    def test_legacy_state_with_no_manifest_fails_fast(self, tmp_path: Path) -> None:
+        """Legacy state.xml exists, checkpoint.json missing → no resume, error set."""
         out = tmp_path / "output"
         out.mkdir()
         (out / "state.xml").write_text("<State/>")
@@ -623,8 +669,26 @@ class TestOrphanedStateFailsFast:
         assert "checkpoint.json" in result.error
         assert "force=True" in result.error
 
+    def test_v7_state_with_no_manifest_fails_fast(self, tmp_path: Path) -> None:
+        """v7 state.<gen>.xml exists, checkpoint.json missing → no resume, error set."""
+        out = tmp_path / "output"
+        out.mkdir()
+        (out / "state.500000_12345_170000000.xml").write_text("<State/>")
+        # No checkpoint.json — orphaned state.
+
+        config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
+        runner = OpenMMRunner(config)
+        result = SimulationResult(config=config)
+        resume = runner._resolve_skip_or_resume(
+            force=False, output_dir=out, config=config, result=result
+        )
+
+        assert resume is None
+        assert result.error != ""
+        assert "force=True" in result.error
+
     def test_state_with_corrupt_manifest_fails_fast(self, tmp_path: Path) -> None:
-        """state.xml exists, checkpoint.json is malformed → no resume, error set."""
+        """state file exists, checkpoint.json is malformed → no resume, error set."""
         out = tmp_path / "output"
         out.mkdir()
         (out / "state.xml").write_text("<State/>")
@@ -668,10 +732,10 @@ class TestOrphanedStateFailsFast:
 
 
 class TestResumeStepUsesManifestNotEnergy:
-    """Regression tests for the v6 BLOCKER: ``load_checkpoint_step``
+    """Regression tests for the v6 BLOCKER: ``load_checkpoint``
     must use the manifest (checkpoint.json), not the last row of
     energy.csv. The two files advance at very different cadences —
-    energy.csv at save_every_steps (~10 ps), state.xml at
+    energy.csv at save_every_steps (~10 ps), state files at
     checkpoint_every_steps (~2 hr) — so the energy row can be
     hundreds of thousands of steps ahead of the saved state.
     """
@@ -686,10 +750,11 @@ class TestResumeStepUsesManifestNotEnergy:
         """
         out = tmp_path / "output"
         out.mkdir()
-        manifest_step = 500_000
+        absolute_step = 500_000
         energy_step = 700_000  # 200k steps ahead of the saved state
-        (out / "checkpoint.json").write_text(json.dumps({"records": [{"step": manifest_step}]}))
-        (out / "state.xml").write_text("<State/>")
+        (out / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": absolute_step, "file": "state.500000_1_1.xml"}]})
+        )
         (out / "energy.csv").write_text(f"#step,time\n{energy_step},{energy_step}\n")
 
         config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
@@ -703,17 +768,19 @@ class TestResumeStepUsesManifestNotEnergy:
         # The start step must be the manifest step (500_000), not the
         # energy step (700_000). Equil was 200_000 steps, so the
         # production-done count is 500_000 - 200_000 = 300_000.
-        assert start_step == manifest_step, (
-            f"start_step must be the manifest step ({manifest_step}), "
+        assert start_step == absolute_step, (
+            f"start_step must be the manifest step ({absolute_step}), "
             f"not the energy step ({energy_step}); got {start_step}"
         )
         # remaining = total_steps - production done = 50_000_000 - 300_000
         assert remaining_steps == config.total_steps - 300_000
 
-    def test_load_checkpoint_step_ignores_energy_csv(self, tmp_path: Path) -> None:
+    def test_load_checkpoint_ignores_energy_csv(self, tmp_path: Path) -> None:
         """energy.csv alone no longer yields a step."""
         (tmp_path / "energy.csv").write_text("#step,time\n5000,10\n10000,20\n15000,30\n")
-        assert load_checkpoint_step(tmp_path) == 0
+        step, file = load_checkpoint(tmp_path)
+        assert step == 0
+        assert file == ""
 
 
 class TestQuarantineTimestampUniqueness:
@@ -736,16 +803,20 @@ class TestQuarantineTimestampUniqueness:
         config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
         runner = OpenMMRunner(config)
 
-        # First invocation: populates a stale checkpoint and quarantines it.
-        (out / "state.xml").write_text("<State/>")
-        (out / "checkpoint.json").write_text(json.dumps({"records": [{"step": 1}]}))
+        # First invocation: populates a stale v7 checkpoint and quarantines it.
+        (out / "state.1_1_1.xml").write_text("<State/>")
+        (out / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": 1, "file": "state.1_1_1.xml"}]})
+        )
         result1 = SimulationResult(config=config)
         runner._resolve_skip_or_resume(force=True, output_dir=out, config=config, result=result1)
 
         # Second invocation: must produce a NEW .stale/<ts>/ dir, not
         # raise FileExistsError on the first one.
-        (out / "state.xml").write_text("<State/>")  # second stale batch
-        (out / "checkpoint.json").write_text(json.dumps({"records": [{"step": 2}]}))
+        (out / "state.2_1_1.xml").write_text("<State/>")  # second stale batch
+        (out / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": 2, "file": "state.2_1_1.xml"}]})
+        )
         result2 = SimulationResult(config=config)
         runner._resolve_skip_or_resume(force=True, output_dir=out, config=config, result=result2)
 
@@ -825,8 +896,8 @@ class TestInstallSigtermHandler:
         config = OpenMMConfig()
         OpenMMRunner._install_sigterm_handler(
             simulation=MagicMock(),
-            state_xml_path=str(tmp_path / "state.xml"),
             output_dir=tmp_path,
+            start_step=0,
             steps_box=[0],
             config=config,
         )
@@ -836,13 +907,12 @@ class TestInstallSigtermHandler:
 
     def test_handler_saves_state_atomic(self, tmp_path: Path) -> None:
         """The handler must atomically save state + manifest with the
-        *current* step count from steps_box[0], not a stale value."""
+        ABSOLUTE step (``start_step + steps_box[0]``), not the local
+        counter — the v6 BLOCKER fix."""
         import signal
 
         config = OpenMMConfig()
         sim = MagicMock()
-        # Make saveState actually write a file (the atomic helper
-        # calls saveState on a temp path before rename).
         sim.saveState.side_effect = lambda path: Path(path).write_text("<State/>")
         # Capture the registered handler
         captured: dict[str, object] = {}
@@ -850,12 +920,14 @@ class TestInstallSigtermHandler:
         def fake_signal(signum: int, handler: object) -> None:
             captured[signum] = handler
 
+        start_step = 200_000  # already done equil
+        local_steps = 12_345  # invocation-local production steps
         with patch("biolab_runners.openmm.runner.signal.signal", side_effect=fake_signal):
             OpenMMRunner._install_sigterm_handler(
                 simulation=sim,
-                state_xml_path=str(tmp_path / "state.xml"),
                 output_dir=tmp_path,
-                steps_box=[12345],  # current step
+                start_step=start_step,
+                steps_box=[local_steps],
                 config=config,
             )
 
@@ -864,13 +936,12 @@ class TestInstallSigtermHandler:
         # Invoke with a non-zero current step
         with patch("biolab_runners.openmm.runner.sys.exit") as mock_exit:
             handler(signal.SIGTERM, None)  # type: ignore[arg-type, misc]
-        # Atomic save: state.xml + checkpoint.json both exist with
-        # matching step. The state.xml path is captured by saveState
-        # via MagicMock (the temp path, not the canonical one).
+        # Atomic save: state xml + manifest both exist. The manifest's
+        # step is the ABSOLUTE step (start_step + local = 212_345),
+        # NOT the local counter (12_345). This is the v7 BLOCKER fix.
         assert sim.saveState.called
-        # Manifest records the current step from steps_box.
         manifest = json.loads((tmp_path / "checkpoint.json").read_text())
-        assert manifest["records"][-1]["step"] == 12345
+        assert manifest["records"][-1]["step"] == start_step + local_steps
         mock_exit.assert_called_once_with(0)
 
     def test_handler_swallows_save_state_errors(self, tmp_path: Path) -> None:
@@ -890,8 +961,8 @@ class TestInstallSigtermHandler:
         with patch("biolab_runners.openmm.runner.signal.signal", side_effect=fake_signal):
             OpenMMRunner._install_sigterm_handler(
                 simulation=sim,
-                state_xml_path=str(tmp_path / "state.xml"),
                 output_dir=tmp_path,
+                start_step=0,
                 steps_box=[0],
                 config=config,
             )
@@ -900,8 +971,14 @@ class TestInstallSigtermHandler:
             captured[signal.SIGTERM](signal.SIGTERM, None)  # type: ignore[arg-type, misc]
         # Still exited cleanly even though saveState failed
         mock_exit.assert_called_once_with(0)
-        # No partial state.xml was committed.
-        assert not (tmp_path / "state.xml").exists()
+        # No state file was committed (the manifest rename never ran).
+        assert not any((tmp_path).glob("state*.xml"))
+        manifest = tmp_path / "checkpoint.json"
+        if manifest.exists():
+            # The manifest is unchanged — the previous (coherent) checkpoint
+            # remains active if it existed.
+            data = json.loads(manifest.read_text())
+            assert data["records"][-1]["step"] != 0  # not the half-saved new step
 
 
 # ---------------------------------------------------------------------------
@@ -910,8 +987,13 @@ class TestInstallSigtermHandler:
 
 
 class TestMaybeCheckpoint:
-    """``_maybe_checkpoint`` writes a state.xml checkpoint if the interval
+    """``_maybe_checkpoint`` writes a state checkpoint if the interval
     has elapsed or if this is the last chunk.
+
+    The save is atomic: state file written at a versioned name,
+    manifest references it, single ``os.replace`` on the manifest is
+    the commit point. The manifest records the absolute step
+    (``start_step + steps_done``), not the local counter.
 
     Note: ``OpenMMConfig.checkpoint_every_steps`` is computed from
     ``checkpoint_interval_hours`` in ``__post_init__``, so the tests set
@@ -927,8 +1009,8 @@ class TestMaybeCheckpoint:
         # Force steps_done to be small (not yet at the end)
         result = OpenMMRunner._maybe_checkpoint(
             simulation=sim,
-            state_xml_path=str(tmp_path / "state.xml"),
             output_dir=tmp_path,
+            start_step=0,
             steps_done=500,  # only 500 since last_ckpt_step=0
             last_ckpt_step=0,
             remaining_steps=10_000_000,
@@ -939,21 +1021,23 @@ class TestMaybeCheckpoint:
         sim.saveState.assert_not_called()
 
     def test_checkpoint_when_interval_elapsed(self, tmp_path: Path) -> None:
-        """Interval elapsed → atomic save writes state.xml + checkpoint.json."""
+        """Interval elapsed → atomic save writes state file + manifest.
+
+        The manifest's step is the ABSOLUTE step
+        (``start_step + steps_done``), not the local counter — the v7
+        BLOCKER fix."""
         sim = MagicMock()
-        # The atomic save helper calls saveState on a temp path then
-        # renames. Wire a side_effect so the temp file actually
-        # exists at rename time.
         sim.saveState.side_effect = lambda path: Path(path).write_text("<State/>")
         # 1 ns @ 2.0 fs = 500 steps between checkpoints
         config = OpenMMConfig(
             timestep_fs=2.0,
             checkpoint_interval_hours=500.0 / 3600.0 / 1000.0,
         )
+        start_step = 200_000  # already done equil
         result = OpenMMRunner._maybe_checkpoint(
             simulation=sim,
-            state_xml_path=str(tmp_path / "state.xml"),
             output_dir=tmp_path,
+            start_step=start_step,
             steps_done=1500,  # > 500 since last_ckpt=0
             last_ckpt_step=0,
             remaining_steps=10_000_000,
@@ -961,14 +1045,16 @@ class TestMaybeCheckpoint:
             t0=1000.0,  # fixed past time — avoids wall-clock dependency
         )
         assert result == 1500
-        # The atomic save commits both files together.
-        assert (tmp_path / "state.xml").exists()
+        # The atomic save committed both files. The manifest's step is
+        # the absolute step (start_step + steps_done = 201_500).
         assert (tmp_path / "checkpoint.json").exists()
-        # The manifest records the exact step — load_checkpoint_step
-        # can read it back. This is the v6 BLOCKER fix: the saved
-        # step is NO LONGER inferred from energy.csv's last row.
         manifest = json.loads((tmp_path / "checkpoint.json").read_text())
-        assert manifest["records"][-1]["step"] == 1500
+        assert manifest["records"][-1]["step"] == start_step + 1500
+        # The state file is at its versioned name (NOT canonical state.xml).
+        state_file = manifest["records"][-1]["file"]
+        assert state_file.startswith("state.201500_")
+        assert state_file.endswith(".xml")
+        assert (tmp_path / state_file).exists()
 
     def test_checkpoint_at_end_of_run(self, tmp_path: Path) -> None:
         """Even if the interval hasn't elapsed, checkpoint when steps_done
@@ -981,8 +1067,8 @@ class TestMaybeCheckpoint:
         )
         result = OpenMMRunner._maybe_checkpoint(
             simulation=sim,
-            state_xml_path=str(tmp_path / "state.xml"),
             output_dir=tmp_path,
+            start_step=200_000,
             steps_done=10_000,  # at remaining_steps
             last_ckpt_step=9_500,
             remaining_steps=10_000,
@@ -990,8 +1076,9 @@ class TestMaybeCheckpoint:
             t0=1000.0,  # fixed past time — avoids wall-clock dependency
         )
         assert result == 10_000
-        assert (tmp_path / "state.xml").exists()
         assert (tmp_path / "checkpoint.json").exists()
+        manifest = json.loads((tmp_path / "checkpoint.json").read_text())
+        assert manifest["records"][-1]["step"] == 210_000  # absolute
 
     def test_ns_per_day_handles_zero_elapsed(self, tmp_path: Path) -> None:
         """If t0 == time.time() (zero elapsed), don't divide by zero.
@@ -1008,8 +1095,8 @@ class TestMaybeCheckpoint:
         )
         result = OpenMMRunner._maybe_checkpoint(
             simulation=sim,
-            state_xml_path=str(tmp_path / "state.xml"),
             output_dir=tmp_path,
+            start_step=200_000,
             steps_done=2000,  # > 500 since last_ckpt=0 → checkpoint
             last_ckpt_step=0,
             remaining_steps=10_000_000,
@@ -1018,5 +1105,178 @@ class TestMaybeCheckpoint:
         )
         # Should not raise; ns_per_day is 0 since elapsed is 0
         assert result == 2000
-        assert (tmp_path / "state.xml").exists()
         assert (tmp_path / "checkpoint.json").exists()
+
+
+class TestMultiResumeCumulativeAccounting:
+    """Regression test for the v7 BLOCKER #1: the manifest's step
+    must be the ABSOLUTE OpenMM step, monotonically increasing across
+    multiple resume cycles.
+
+    The v6 design wrote the invocation-local ``steps_done`` to the
+    manifest. On a resume, this caused the saved step to appear to
+    move backwards (or to start at 0), silently shortening the run.
+    The v7 design writes ``start_step + steps_done`` to the manifest
+    so the saved step is the absolute step the simulation was at
+    when the state file was written.
+    """
+
+    def test_multi_resume_step_is_cumulative_and_monotonic(self, tmp_path: Path) -> None:
+        """Simulate the multi-resume protocol:
+
+        1. Start fresh: equil runs, simulation at step 200_000.
+        2. Run 100_000 production steps → save at step 300_000.
+        3. Resume from step 300_000, run 750_000 more → save at step 1_050_000.
+        4. Resume again, run 200_000 more → save at step 1_250_000.
+
+        Each save must record the absolute step. The next resume
+        must read the absolute step and compute remaining_steps
+        correctly.
+        """
+        out = tmp_path / "output"
+        out.mkdir()
+
+        config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
+
+        # Simulate three "_atomic_save_checkpoint" sequences.
+        # Save #1: fresh, start_step=200_000 (after equil), steps_done=100_000
+        from biolab_runners.openmm.system_builder import _atomic_save_checkpoint
+
+        sim = MagicMock()
+        sim.saveState.side_effect = lambda path: Path(path).write_text("<State/>")
+
+        # Save #1: end of first invocation
+        _atomic_save_checkpoint(sim, out, absolute_step=300_000)
+        # Save #2: end of second invocation (resumed from 300_000)
+        _atomic_save_checkpoint(sim, out, absolute_step=1_050_000)
+        # Save #3: end of third invocation (resumed from 1_050_000)
+        _atomic_save_checkpoint(sim, out, absolute_step=1_250_000)
+
+        # Read the manifest.
+        step, file = load_checkpoint(out)
+        assert step == 1_250_000, (
+            f"manifest step must be the absolute final step (1_250_000), got {step}"
+        )
+        assert file.startswith("state.1250000_")
+        assert (out / file).exists()
+
+        # Now resume and verify the runner computes remaining_steps
+        # correctly from the absolute step.
+        runner = OpenMMRunner(config)
+        resume = runner._resolve_skip_or_resume(
+            force=False, output_dir=out, config=config, result=SimulationResult(config=config)
+        )
+        assert resume is not None
+        start_step, remaining_steps, _ = resume
+        # Simulator is at step 1_250_000 when the loop starts.
+        assert start_step == 1_250_000
+        # Production done = 1_250_000 - 200_000 (equil) = 1_050_000.
+        # remaining = total_steps - 1_050_000.
+        assert remaining_steps == config.total_steps - 1_050_000
+
+        # Sanity: the saved step is monotonically increasing. The
+        # LAST save is the one referenced by the manifest; previous
+        # state files were GC'd by the atomic save.
+        state_files = list(out.glob("state*.xml"))
+        assert len(state_files) == 1, (
+            f"expected exactly 1 state file (the active one), got {state_files}"
+        )
+        assert state_files[0].name == file
+
+    def test_save_writes_absolute_step_with_start_step(self, tmp_path: Path) -> None:
+        """The atomic save called with start_step + steps_done
+        produces a manifest whose step is the absolute value."""
+        from biolab_runners.openmm.system_builder import _atomic_save_checkpoint
+
+        sim = MagicMock()
+        sim.saveState.side_effect = lambda path: Path(path).write_text("<State/>")
+
+        # Resume scenario: start_step = 700_000 (saved step), steps_done = 100_000
+        start_step = 700_000
+        steps_done = 100_000
+        absolute_step = start_step + steps_done
+        _atomic_save_checkpoint(sim, tmp_path, absolute_step=absolute_step)
+
+        step, _ = load_checkpoint(tmp_path)
+        assert step == absolute_step, (
+            f"manifest step must be the absolute step ({absolute_step}), "
+            f"not the local counter ({steps_done}); got {step}"
+        )
+
+
+class TestAtomicityBetweenStateAndManifest:
+    """Regression test for the v7 BLOCKER #2: a crash mid-save MUST
+    leave either the previous checkpoint fully active or the new
+    checkpoint fully active — never a mix. The v6 design used two
+    ``os.replace`` calls (one for state, one for manifest) which
+    were individually atomic but the pair was not. The v7 design
+    uses a generation-versioned state file (uniquely-named, so no
+    rename needed) and a single ``os.replace`` on the manifest as
+    the atomic commit point.
+    """
+
+    def test_crash_between_state_publication_and_manifest_publication(self, tmp_path: Path) -> None:
+        """If the manifest rename fails (or the process is killed
+        between writing the state file and renaming the manifest),
+        the previous checkpoint MUST remain active.
+
+        Simulated by patching the manifest's ``os.replace`` to raise.
+        The state file is written (it's uniquely-named, no rename
+        needed), but the manifest rename fails. The next resume
+        loads the PREVIOUS manifest (still active), not the half-
+        published new state.
+        """
+        from biolab_runners.openmm import system_builder as sb
+        from biolab_runners.openmm.system_builder import _atomic_save_checkpoint
+
+        # Pre-create a previous coherent checkpoint.
+        previous_state = tmp_path / "state.500_12345_1000.xml"
+        previous_state.write_text("<PREVIOUS_STATE/>")
+        previous_manifest = {"records": [{"step": 500, "file": "state.500_12345_1000.xml"}]}
+        (tmp_path / "checkpoint.json").write_text(json.dumps(previous_manifest))
+
+        # Now simulate a new save that fails during the manifest rename.
+        sim = MagicMock()
+        sim.saveState.side_effect = lambda path: Path(path).write_text("<NEW_STATE_PARTIAL/>")
+
+        original_replace = sb.os.replace
+
+        def failing_replace(src: str, dst: str) -> None:
+            # Let the state file rename succeed (it's a no-op in v7 —
+            # the state file is written directly to its versioned name,
+            # no rename needed). Let other calls succeed; only the
+            # manifest rename fails.
+            if str(dst).endswith("checkpoint.json"):
+                raise OSError("simulated disk-full during manifest rename")
+            original_replace(src, dst)
+
+        sb.os.replace = failing_replace
+        try:
+            with pytest.raises(OSError, match="simulated"):
+                _atomic_save_checkpoint(sim, tmp_path, absolute_step=999_999)
+        finally:
+            sb.os.replace = original_replace
+
+        # The MANIFEST is unchanged — the previous checkpoint remains
+        # active. The next resume reads the previous step (500), not
+        # the half-saved new step (999_999).
+        step, file = load_checkpoint(tmp_path)
+        assert step == 500, (
+            f"manifest must be unchanged after a failed save; got step={step} (expected 500)"
+        )
+        assert file == "state.500_12345_1000.xml"
+
+        # The half-published state file is on disk but unreferenced —
+        # it WILL be GC'd on the next successful save.
+        new_state_files = [
+            f for f in tmp_path.glob("state*.xml") if f.name != "state.500_12345_1000.xml"
+        ]
+        assert len(new_state_files) == 1
+        # The next save will GC this orphan.
+        sim.saveState.side_effect = lambda path: Path(path).write_text("<State/>")
+        _atomic_save_checkpoint(sim, tmp_path, absolute_step=800_000)
+        # Orphan is gone; new state file is present.
+        assert not new_state_files[0].exists()
+        step, file = load_checkpoint(tmp_path)
+        assert step == 800_000
+        assert (tmp_path / file).exists()

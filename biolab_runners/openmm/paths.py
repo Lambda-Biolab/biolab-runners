@@ -33,10 +33,14 @@ class FileNames:
 
     # The set of files that together indicate a complete production run.
     # verify_production_outputs() checks each of these in utils.py.
+    # The "state" indicator is now the atomic-save manifest
+    # (CHECKPOINT_JSON) — state files are generation-versioned
+    # (state.<gen>.xml) and referenced by the manifest, not stored
+    # at a canonical path.
     PRODUCTION_OUTPUT_FILES: tuple[str, ...] = (
         TRAJECTORY,
         ENERGY,
-        STATE_XML,
+        CHECKPOINT_JSON,
     )
 
     # Default fallback names used by _resolve_pdb when the explicit

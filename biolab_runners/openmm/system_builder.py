@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import shutil
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -58,20 +59,20 @@ class SimulationContext:
     is_resuming: bool = False
 
 
-# Files that together describe a resumable run. ``load_checkpoint_step``
-# reads ``checkpoint.json`` (the atomic-save manifest — see
-# ``biolab_runners.openmm.utils``); ``simulation.loadState`` reads
-# ``state.xml``. ``energy.csv`` is also kept in the quarantine because
-# it carries the per-step reporter rows and the user may want to
-# inspect a stale trajectory step-by-step; it is no longer consulted
-# to determine the resume step (its write cadence differs from
-# state.xml saves and would silently shorten runs — see
-# ``AGENTS.md "Atomic checkpoint" rule``).
+# Files that together describe a resumable run. The manifest
+# (``checkpoint.json``) is the source of truth for the saved step
+# and the state file to load. ``energy.csv`` is also kept in the
+# quarantine because it carries the per-step reporter rows and the
+# user may want to inspect a stale trajectory step-by-step. The
+# state files are generation-versioned (``state.<step>_<pid>_<nanos>.xml``)
+# and are glogbed in the quarantine (see :func:`quarantine_stale_checkpoint`).
 RESUMABLE_FILES: tuple[str, ...] = (
-    FileNames.STATE_XML,
     FileNames.CHECKPOINT_JSON,
     FileNames.ENERGY,
 )
+# Glob pattern for state files. Matches both legacy ``state.xml``
+# (from pre-v7 runs) and the v7 ``state.<step>_<pid>_<nanos>.xml``.
+RESUMABLE_STATE_GLOB = "state*.xml"
 
 
 # Threshold for treating ``output_dir/topology.pdb`` as "intact"
@@ -88,12 +89,13 @@ def quarantine_stale_checkpoint(output_dir: Path) -> list[Path]:
     """Move resumable files into a timestamped ``.stale/`` subdirectory.
 
     Used by ``runner.run(force=True)`` to ensure the next non-forced
-    invocation cannot pair a stale ``state.xml`` with a freshly-built
-    topology. ``load_checkpoint_step`` reads both ``checkpoint.json``
-    AND ``energy.csv`` (see ``utils.load_checkpoint_step``), so all
-    three must be moved together — leaving any one behind means the
-    next non-forced run could re-derive a stale step from it and
-    trigger an incompatible ``loadState`` call.
+    invocation cannot pair a stale state file with a freshly-built
+    topology. The v7 save format uses generation-versioned state
+    files (``state.<step>_<pid>_<nanos>.xml``) referenced by the
+    manifest (``checkpoint.json``) — the manifest is the source of
+    truth for the saved step AND the file to load. So the quarantine
+    must move the manifest, the energy log, AND every state file
+    (both legacy ``state.xml`` and the v7 ``state.<gen>.xml``).
 
     Returns the list of files actually moved (those that existed).
     An empty output dir produces an empty list and no ``.stale/``
@@ -107,7 +109,15 @@ def quarantine_stale_checkpoint(output_dir: Path) -> list[Path]:
         directory) for the files that were moved.
     """
     moved: list[Path] = []
-    existing = [name for name in RESUMABLE_FILES if (output_dir / name).exists()]
+    # Collect every file that participates in the resume contract:
+    # the manifest, the energy log, and any state file (legacy or
+    # v7 generation-versioned).
+    existing: list[str] = []
+    for name in RESUMABLE_FILES:
+        if (output_dir / name).exists():
+            existing.append(name)
+    for state_file in output_dir.glob(RESUMABLE_STATE_GLOB):
+        existing.append(state_file.name)
     if not existing:
         return moved
 
@@ -497,68 +507,131 @@ def _topology_intact(output_dir: Path) -> bool:
 
 def _atomic_save_checkpoint(
     simulation: object,
-    state_xml_path: str | Path,
     output_dir: Path,
-    step: int,
-) -> None:
-    """Atomically commit ``state.xml`` and the step manifest together.
+    absolute_step: int,
+) -> str:
+    """Atomically commit a state file plus the manifest as one transaction.
 
-    Both files are first written to a per-process temp path
-    (``state.xml.tmp.<pid>.<step>`` and
-    ``checkpoint.json.tmp.<pid>.<step>``), then atomically renamed
-    to their canonical names via :func:`os.replace`. After this
-    function returns, the two files on disk are guaranteed to be in
-    sync (both present and matching, or both absent). An interrupted
-    save — SIGTERM mid-``saveState``, disk-full mid-rename, kernel
-    OOM, etc. — leaves the canonical files unchanged; the
-    ``.tmp.*`` orphans are ignored by the runner.
+    Design (v7, generation-versioned state files):
 
-    The previous protocol saved only ``state.xml`` and derived the
-    saved step from the last row of ``energy.csv``. That was unsafe:
-    ``energy.csv`` advances every ``save_every_steps`` (~10 ps) while
-    ``state.xml`` saves every ``checkpoint_every_steps`` (~2 hr),
-    so a crash mid-cycle would leave energy rows hundreds of thousands
-    of steps ahead of the saved state. The next run would resume from
-    the older state but compute ``remaining_steps`` from the newer
-    energy row, silently shortening the run.
+    1. Write a uniquely-named state file directly:
+       ``state.<step>_<pid>_<nanos>.xml``. The filename is the
+       file's identity — there is no canonical ``state.xml``. The
+       filename includes the step and nanosecond timestamp so two
+       concurrent saves from the same process produce distinct
+       files (no collisions).
+
+    2. Write the manifest to a temp file with the new content
+       referencing the state file by basename, then atomically
+       ``os.replace`` it to ``checkpoint.json``. THIS is the
+       single atomic commit point.
+
+    3. Garbage-collect any ``state.*.xml`` that is no longer
+       referenced by the manifest.
+
+    Crash semantics:
+    - Crash before the manifest rename → the previous manifest is
+      still active, the new state file is an orphan (GC'd next run).
+      The resume path loads the previous (coherent) state.
+    - Crash after the manifest rename → the new manifest is active
+      and references the new state file. The resume path loads the
+      new (coherent) state.
+    - Crash mid-``saveState`` → the new state file may be partial
+      or missing, but the manifest still references the previous
+      state file. The resume path loads the previous state.
+
+    The v6 design used two ``os.replace`` calls (one for state.xml,
+    one for the manifest) — those are individually atomic but the
+    pair is not. A crash between the two renames leaves a new state
+    paired with an old manifest; the resume path accepts both
+    because it validates only that the state exists and the manifest
+    has a positive step. The v7 design fixes that by making the
+    manifest rename the single commit point.
 
     Args:
         simulation: OpenMM Simulation exposing ``saveState(path)``.
-        state_xml_path: Final destination for the saved state.
-        output_dir: Directory holding the manifest (``checkpoint.json``).
-        step: The exact step the saved state corresponds to. Written
-            into the manifest under ``{"records": [{"step": step}]}``
-            so :func:`biolab_runners.openmm.utils.load_checkpoint_step`
-            can resume from it authoritatively.
+        output_dir: Directory holding the manifest and the
+            generation-versioned state files.
+        absolute_step: The ABSOLUTE OpenMM step the saved state
+            corresponds to. This is what the runner computed as
+            ``start_step + steps_done`` (where ``start_step`` is
+            the absolute step the simulation was at when the
+            production loop started: ``total_equil_steps`` for
+            fresh runs, ``manifest_step`` for resumed runs). The
+            v6 protocol wrote the invocation-local ``steps_done``
+            instead, which silently broke accounting on resumes.
+
+    Returns:
+        The basename of the saved state file. The runner does not
+        currently use this, but it is useful for tests and logs.
     """
-    state_path = Path(state_xml_path)
-    manifest_path = output_dir / FileNames.CHECKPOINT_JSON
-
-    # Per-process + per-step temp suffix so two concurrent saves from
-    # the same host cannot collide (e.g. parallel CI jobs writing to
-    # the same output_dir). The step disambiguates two saves from the
-    # same process — it changes between _maybe_checkpoint calls.
     pid = os.getpid()
-    state_tmp = state_path.with_suffix(state_path.suffix + f".tmp.{pid}.{step}")
-    manifest_tmp = manifest_path.with_suffix(manifest_path.suffix + f".tmp.{pid}.{step}")
+    nanos = time.time_ns()
+    state_basename = f"state.{absolute_step}_{pid}_{nanos}.xml"
+    state_path = output_dir / state_basename
 
-    # Write both temp files. If we crash here, neither canonical
-    # file is touched — the .tmp files are orphans and the runner
-    # sees no checkpoint on the next invocation.
-    simulation.saveState(str(state_tmp))  # type: ignore[union-attr]
-    manifest_tmp.write_text(json.dumps({"records": [{"step": step}]}))
+    # Write the state file directly. The unique filename eliminates
+    # the need for a temp+rename on the state file itself — there
+    # is nothing to overwrite. OpenMM's ``saveState`` writes the
+    # XML and closes the file atomically (per POSIX write+close).
+    simulation.saveState(str(state_path))  # type: ignore[union-attr]
 
-    # Atomic rename. os.replace is atomic on POSIX if src/dst are
-    # on the same filesystem (which they are here — both live in
-    # output_dir). After these two calls return, both canonical
-    # files are visible together — the resume path will find a
-    # consistent pair or no pair at all.
-    os.replace(str(state_tmp), str(state_path))
+    # Manifest — THIS is the single atomic commit point. The temp
+    # file is written first, then atomically renamed to the
+    # canonical manifest path. If we crash before the rename, the
+    # previous manifest is still active. If we crash after the
+    # rename, the new manifest references the just-written state.
+    manifest_path = output_dir / FileNames.CHECKPOINT_JSON
+    manifest_payload = {"records": [{"step": absolute_step, "file": state_basename}]}
+    manifest_tmp = manifest_path.with_suffix(manifest_path.suffix + f".tmp.{pid}.{absolute_step}")
+    manifest_tmp.write_text(json.dumps(manifest_payload))
     os.replace(str(manifest_tmp), str(manifest_path))
 
+    # Garbage-collect orphan state files (best-effort, must not
+    # raise — the save above already succeeded).
+    _gc_orphan_states(output_dir)
+
     logger.info(
-        "Atomic checkpoint: state=%s manifest=%s step=%d",
-        state_path.name,
-        manifest_path.name,
-        step,
+        "Atomic checkpoint: state=%s manifest=checkpoint.json step=%d",
+        state_basename,
+        absolute_step,
     )
+    return state_basename
+
+
+def _gc_orphan_states(output_dir: Path) -> None:
+    """Remove ``state.*.xml`` files not referenced by the manifest.
+
+    After each atomic save, the manifest references exactly one
+    state file. Any other ``state.<gen>.xml`` in the directory is
+    an orphan from a previous interrupted save — safe to delete
+    since the resume path would never load it.
+
+    Failures are logged but not raised (orphan cleanup must not
+    interfere with the save that just succeeded).
+
+    Args:
+        output_dir: Directory holding the manifest and state files.
+    """
+    manifest_path = output_dir / FileNames.CHECKPOINT_JSON
+    if not manifest_path.exists():
+        return
+    try:
+        data = json.loads(manifest_path.read_text())
+        records = data.get("records", [])
+        if not records:
+            return
+        active_file = str(records[-1].get("file", ""))
+    except (json.JSONDecodeError, KeyError, IndexError, OSError, ValueError):
+        return
+
+    if not active_file:
+        return
+
+    for state_file in output_dir.glob("state.*.xml"):
+        if state_file.name == active_file:
+            continue
+        try:
+            state_file.unlink()
+        except OSError as exc:
+            logger.warning("Could not GC orphan state %s: %s", state_file, exc)
