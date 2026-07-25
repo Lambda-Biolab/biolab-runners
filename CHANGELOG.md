@@ -4,9 +4,26 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — 2026-07-25
+- **Architecture (run-state machine extraction, v15)**: Extracted the
+  pre-run decision tree and skip-population logic from `OpenMMRunner`
+  into a new `biolab_runners.openmm.run_state` deep module. The nine
+  private decision-tree methods (`_resolve_skip_or_resume`,
+  `_handle_manifest_branch`, `_populate_skip_result`, etc. — 20+ test
+  sites bypassed `run()` to test them directly) are gone. The
+  question "given the on-disk checkpoint state, what should the runner
+  do?" now has a single public interface: `decide(output_dir, config,
+  force) -> ResumePlan` returns a structured `ResumePlan` with one of
+  four actions (`FRESH` / `RESUME` / `SKIP` / `FAIL_FAST`). The runner
+  became a thin dispatcher: it asks `decide`, then matches on
+  `plan.action`. `populate_skip_result(plan, output_dir, config,
+  result)` handles the skip-population (artifact validation + terminal
+  reconstruction) on the SKIP branch. The runner shrinks from 1304
+  → 933 LOC. Tests were rewritten at the new public interface (per
+  DEEPENING.md: old unit tests on shallow modules become waste once
+  tests at the deepened module's interface exist) — `tests/test_run_state.py`
+  (30 tests) covers all four actions and key failure modes; the 19
+  private-API tests in `test_openmm_runner.py` are deleted.
 
-### Changed
 - **Architecture (checkpoint extraction, v14)**: Extracted the entire
   checkpoint domain — manifest read/validate, atomic save, orphan GC,
   quarantine, terminal classification, production step math — from

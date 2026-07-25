@@ -22,7 +22,8 @@ biolab_runners/
 │   └── utils.py      # YAML writer, output parser, availability check
 └── openmm/
     ├── config.py         # OpenMMConfig, SimulationResult
-    ├── runner.py         # OpenMMRunner class (orchestrate pipeline, run production)
+    ├── runner.py         # OpenMMRunner class (thin dispatcher — MD mechanics only)
+    ├── run_state.py      # Decide fresh/resume/skip/fail-fast + skip-population (deep module — owns the run-state decision)
     ├── system_builder.py # ForceField, Modeller, System, Integrator, Cα restraint, prepare_simulation
     ├── checkpoint.py     # Manifest, atomic save, orphan GC, quarantine, terminal classification (deep module — owns the entire checkpoint lifecycle)
     ├── geometry.py       # Pure-numpy PBC math (pbc_correct, min_pbc_distance)
@@ -31,7 +32,9 @@ biolab_runners/
     └── utils.py          # Availability checks (openmm_available, pdbfixer_available) + diagnostic reporter (verify_production_outputs)
 ```
 
-The checkpoint invariants (atomic save, manifest binding, terminal schema, force=True quarantine) all describe `biolab_runners.openmm.checkpoint` — that module is the single source of truth for the checkpoint protocol. `system_builder.py` does the system construction only; it does NOT touch the manifest. `runner.py` orchestrates by calling into `checkpoint.py` and `system_builder.py`.
+The checkpoint invariants (atomic save, manifest binding, terminal schema, force=True quarantine) all describe `biolab_runners.openmm.checkpoint` — that module is the single source of truth for the checkpoint protocol. `system_builder.py` does the system construction only; it does NOT touch the manifest.
+
+`biolab_runners.openmm.run_state` owns the pre-run decision tree (manifest present? terminal? corrupted? orphan? force?) and the skip-population logic (artifact validation, terminal reconstruction). `runner.py` is a thin dispatcher: it asks `run_state.decide()` for a `ResumePlan`, then acts on `plan.action` (FRESH / RESUME / SKIP / FAIL_FAST). The runner does NOT know about manifest internals, terminal schemas, or quarantine — those are decisions owned by the modules that own the data.
 
 ## Domain Rules
 
