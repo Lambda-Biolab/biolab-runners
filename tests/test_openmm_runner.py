@@ -281,16 +281,25 @@ class TestSimulationResult:
 
 
 class TestVerifyProductionOutputs:
-    """Tests for verify_production_outputs."""
+    """Tests for verify_production_outputs (diagnostic helper, not a completion oracle).
 
-    def test_empty_dir_not_complete(self, tmp_path: Path) -> None:
+    v8 change: ``verify_production_outputs`` no longer reports a
+    ``complete`` boolean — the field is hard-coded to ``False`` and
+    the function returns only per-file metadata. Completion is
+    decided by :func:`is_run_complete` (manifest step + early
+    metadata). A large trajectory and many energy rows are NOT
+    evidence of completion — a mid-production checkpoint produces
+    both while the run is still in progress.
+    """
+
+    def test_empty_dir_complete_is_false(self, tmp_path: Path) -> None:
         report = verify_production_outputs(tmp_path)
-        assert not report["complete"]
+        assert report["complete"] is False
 
-    def test_complete_dir(self, tmp_path: Path) -> None:
-        # Create all expected files with sufficient sizes. The "state"
-        # indicator is the atomic-save manifest (checkpoint.json) in
-        # v7 — not the legacy state.xml.
+    def test_complete_dir_still_reports_complete_false(self, tmp_path: Path) -> None:
+        """A directory with large trajectory + many energy rows is
+        STILL reported as not-complete — completion is not a
+        per-file check. The diagnostic report lists what exists."""
         (tmp_path / "trajectory.dcd").write_bytes(b"\x00" * 20_000_000)
         energy_lines = ["#step,time,PE,KE,TE,temp,vol,speed\n"]
         energy_lines.extend(f"{i * 5000},{i * 10},0,0,0,310,0,0\n" for i in range(20))
@@ -300,9 +309,17 @@ class TestVerifyProductionOutputs:
         )
 
         report = verify_production_outputs(tmp_path)
-        assert report["complete"]
+        # completion is determined by is_run_complete, not by file size.
+        assert report["complete"] is False
+        # ...but the diagnostic info lists the actual files.
+        files = report["files"]
+        assert files["trajectory.dcd"]["exists"] is True  # type: ignore[index]
+        assert files["trajectory.dcd"]["size_bytes"] == 20_000_000  # type: ignore[index]
+        # 1 header + 20 data rows
+        assert files["energy.csv"]["rows"] == 21  # type: ignore[index]
+        assert files["checkpoint.json"]["exists"] is True  # type: ignore[index]
 
-    def test_small_trajectory_incomplete(self, tmp_path: Path) -> None:
+    def test_small_trajectory_recorded_as_file_info(self, tmp_path: Path) -> None:
         (tmp_path / "trajectory.dcd").write_bytes(b"\x00" * 100)
         (tmp_path / "energy.csv").write_text("step\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n")
         (tmp_path / "checkpoint.json").write_text(
@@ -310,9 +327,12 @@ class TestVerifyProductionOutputs:
         )
 
         report = verify_production_outputs(tmp_path)
-        assert not report["complete"]
+        # The diagnostic report records the file's size without
+        # declaring the directory complete.
+        assert report["files"]["trajectory.dcd"]["size_bytes"] == 100  # type: ignore[index]
+        assert report["complete"] is False
 
-    def test_few_energy_rows_incomplete(self, tmp_path: Path) -> None:
+    def test_few_energy_rows_recorded_as_file_info(self, tmp_path: Path) -> None:
         (tmp_path / "trajectory.dcd").write_bytes(b"\x00" * 20_000_000)
         (tmp_path / "energy.csv").write_text("step\n1\n")
         (tmp_path / "checkpoint.json").write_text(
@@ -320,7 +340,107 @@ class TestVerifyProductionOutputs:
         )
 
         report = verify_production_outputs(tmp_path)
-        assert not report["complete"]
+        # 1 header + 1 data row
+        assert report["files"]["energy.csv"]["rows"] == 2  # type: ignore[index]
+        assert report["complete"] is False
+
+
+class TestIsRunComplete:
+    """Tests for is_run_complete — the authoritative completion oracle.
+
+    v8 change: a run is terminal when EITHER the manifest step has
+    crossed total_equil_steps + total_steps (normal completion) OR
+    a valid ``early_abort.json`` exists with ``aborted=True``
+    (intentional early termination). File size and energy row
+    counts are NOT considered — a mid-production checkpoint can
+    produce a 50 MB trajectory and tens of thousands of energy
+    rows while the run is still in progress.
+    """
+
+    def test_no_manifest_returns_in_progress(self, tmp_path: Path) -> None:
+        from biolab_runners.openmm.utils import is_run_complete
+
+        config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
+        complete, reason = is_run_complete(tmp_path, config)
+        assert complete is False
+        assert reason == "in_progress"
+
+    def test_manifest_below_target_returns_in_progress(self, tmp_path: Path) -> None:
+        """Manifest step below target → in progress."""
+        from biolab_runners.openmm.utils import is_run_complete
+
+        config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
+        # Build the referenced state file so load_checkpoint validates.
+        state_basename = "state.500000_1_1.xml"
+        (tmp_path / state_basename).write_text("<State/>")
+        (tmp_path / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": 500_000, "file": state_basename}]})
+        )
+
+        complete, reason = is_run_complete(tmp_path, config)
+        assert complete is False
+        assert reason == "in_progress"
+
+    def test_manifest_at_target_returns_normal_completion(self, tmp_path: Path) -> None:
+        """Manifest step == target → terminal (normal completion)."""
+        from biolab_runners.openmm.utils import is_run_complete
+
+        config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
+        target = config.total_equil_steps + config.total_steps
+        state_basename = f"state.{target}_1_1.xml"
+        (tmp_path / state_basename).write_text("<State/>")
+        (tmp_path / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": target, "file": state_basename}]})
+        )
+
+        complete, reason = is_run_complete(tmp_path, config)
+        assert complete is True
+        assert "normal_completion" in reason
+        assert str(target) in reason
+
+    def test_early_abort_returns_complete(self, tmp_path: Path) -> None:
+        """early_abort.json with aborted=True → terminal, even at low step."""
+        from biolab_runners.openmm.utils import is_run_complete
+
+        config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
+        # No manifest at all; only the early_abort marker exists.
+        (tmp_path / "early_abort.json").write_text(
+            json.dumps(
+                {"aborted": True, "abort_reason": "early_dissociation", "abort_step": 5_000_000}
+            )
+        )
+
+        complete, reason = is_run_complete(tmp_path, config)
+        assert complete is True
+        assert reason.startswith("early_abort_step_")
+
+    def test_early_abort_with_aborted_false_does_not_count(self, tmp_path: Path) -> None:
+        """early_abort.json with aborted=False → not terminal."""
+        from biolab_runners.openmm.utils import is_run_complete
+
+        config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
+        (tmp_path / "early_abort.json").write_text(json.dumps({"aborted": False}))
+
+        complete, reason = is_run_complete(tmp_path, config)
+        assert complete is False
+        assert reason == "in_progress"
+
+    def test_large_trajectory_does_not_make_run_complete(self, tmp_path: Path) -> None:
+        """A large trajectory + many energy rows WITHOUT a manifest at
+        the target step is NOT terminal. This is the v8 BLOCKER #1
+        regression: file size alone must not mark a run complete."""
+        from biolab_runners.openmm.utils import is_run_complete
+
+        config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
+        (tmp_path / "trajectory.dcd").write_bytes(b"\x00" * 50_000_000)
+        energy_lines = ["#step,time,PE,KE,TE,temp,vol,speed\n"]
+        energy_lines.extend(f"{i * 5000},{i * 10},0,0,0,310,0,0\n" for i in range(10_000))
+        (tmp_path / "energy.csv").write_text("".join(energy_lines))
+        # No manifest — the previous behaviour would have declared
+        # this complete based on file size alone.
+        complete, reason = is_run_complete(tmp_path, config)
+        assert complete is False
+        assert reason == "in_progress"
 
 
 class TestLoadCheckpoint:
@@ -333,19 +453,24 @@ class TestLoadCheckpoint:
         assert file == ""
 
     def test_manifest_returns_step_and_file(self, tmp_path: Path) -> None:
-        """Manifest records the step AND the state file basename."""
+        """Manifest records the step AND the state file basename.
+
+        v8: load_checkpoint validates the referenced state file.
+        The test fixture must create it on disk (non-empty)."""
+        state_basename = "state.1000000_12345_1700000000000000000.xml"
+        (tmp_path / state_basename).write_text("<State/>")
         manifest = {
             "records": [
                 {
                     "step": 1_000_000,
-                    "file": "state.1000000_12345_1700000000000000000.xml",
+                    "file": state_basename,
                 }
             ]
         }
         (tmp_path / "checkpoint.json").write_text(json.dumps(manifest))
         step, file = load_checkpoint(tmp_path)
         assert step == 1_000_000
-        assert file == "state.1000000_12345_1700000000000000000.xml"
+        assert file == state_basename
 
     def test_no_manifest_returns_zero_even_with_energy(self, tmp_path: Path) -> None:
         """energy.csv alone no longer yields a step.
@@ -384,6 +509,164 @@ class TestLoadCheckpoint:
         assert step == 0
         assert file == ""
 
+    def test_manifest_with_missing_state_file_raises(self, tmp_path: Path) -> None:
+        """v8 BLOCKER #2: a manifest referencing a missing state file
+        raises InvalidCheckpointError.
+
+        The previous behaviour silently accepted the manifest step
+        and let ``prepare_simulation`` build a fresh System with
+        production accounting inherited from the never-loaded
+        checkpoint — a quietly-wrong fresh build.
+        """
+        from biolab_runners.openmm.utils import InvalidCheckpointError
+
+        (tmp_path / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": 1_000_000, "file": "state.1000000_1_1.xml"}]})
+        )
+        # No state file exists.
+        with pytest.raises(InvalidCheckpointError, match="does not exist"):
+            load_checkpoint(tmp_path)
+
+    def test_manifest_with_empty_state_file_raises(self, tmp_path: Path) -> None:
+        """v8 BLOCKER #2: a manifest referencing an empty state file
+        raises InvalidCheckpointError — the state was likely truncated
+        mid-write."""
+        from biolab_runners.openmm.utils import InvalidCheckpointError
+
+        state_basename = "state.1000000_1_1.xml"
+        (tmp_path / state_basename).write_text("")  # zero bytes
+        (tmp_path / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": 1_000_000, "file": state_basename}]})
+        )
+        with pytest.raises(InvalidCheckpointError, match="empty"):
+            load_checkpoint(tmp_path)
+
+    def test_manifest_with_absolute_state_path_raises(self, tmp_path: Path) -> None:
+        """v8 BLOCKER #2: a manifest referencing an absolute path
+        (e.g. ``/etc/passwd``) raises InvalidCheckpointError.
+
+        The runner must not be tricked into loading arbitrary files
+        via path injection."""
+        from biolab_runners.openmm.utils import InvalidCheckpointError
+
+        (tmp_path / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": 1_000_000, "file": "/etc/passwd"}]})
+        )
+        with pytest.raises(InvalidCheckpointError, match="basename"):
+            load_checkpoint(tmp_path)
+
+    def test_manifest_with_path_traversal_raises(self, tmp_path: Path) -> None:
+        """v8 BLOCKER #2: a manifest referencing ``../state.xml``
+        raises InvalidCheckpointError. Path traversal is rejected."""
+        from biolab_runners.openmm.utils import InvalidCheckpointError
+
+        (tmp_path / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": 1_000_000, "file": "../state.xml"}]})
+        )
+        with pytest.raises(InvalidCheckpointError, match="basename"):
+            load_checkpoint(tmp_path)
+
+    def test_manifest_with_subdir_state_path_raises(self, tmp_path: Path) -> None:
+        """v8 BLOCKER #2: a manifest referencing ``subdir/state.xml``
+        raises InvalidCheckpointError. Only basenames are allowed."""
+        from biolab_runners.openmm.utils import InvalidCheckpointError
+
+        (tmp_path / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": 1_000_000, "file": "subdir/state.xml"}]})
+        )
+        with pytest.raises(InvalidCheckpointError, match="basename"):
+            load_checkpoint(tmp_path)
+
+    def test_manifest_with_unknown_format_raises(self, tmp_path: Path) -> None:
+        """v8 BLOCKER #2: a manifest referencing ``state.42.txt``
+        raises InvalidCheckpointError. Only ``state.xml`` or
+        ``state.<step>_<pid>_<nanos>.xml`` are valid basenames."""
+        from biolab_runners.openmm.utils import InvalidCheckpointError
+
+        (tmp_path / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": 1_000_000, "file": "state.42.txt"}]})
+        )
+        with pytest.raises(InvalidCheckpointError, match=r"invalid.*name"):
+            load_checkpoint(tmp_path)
+
+    def test_legacy_state_xml_basename_accepted(self, tmp_path: Path) -> None:
+        """v8 BLOCKER #2: the legacy ``state.xml`` basename is still
+        accepted (a pre-v7 manifest may still be readable)."""
+        (tmp_path / "state.xml").write_text("<State/>")
+        (tmp_path / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": 1_000_000, "file": "state.xml"}]})
+        )
+        step, file = load_checkpoint(tmp_path)
+        assert step == 1_000_000
+        assert file == "state.xml"
+
+
+class TestInvalidCheckpointErrorSurfacesToRunner:
+    """v8 BLOCKER #2: a manifest with an invalid state reference
+    must surface as ``result.error`` from the runner, not degrade
+    into a fresh build."""
+
+    def test_missing_state_file_sets_result_error(self, tmp_path: Path) -> None:
+        out = tmp_path / "output"
+        out.mkdir()
+        # Manifest references a state file that doesn't exist.
+        (out / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": 1_000_000, "file": "state.1000000_1_1.xml"}]})
+        )
+        config = OpenMMConfig(output_dir=str(out))
+        runner = OpenMMRunner(config)
+        result = SimulationResult(config=config)
+        resume = runner._resolve_skip_or_resume(
+            force=False, output_dir=out, config=config, result=result
+        )
+        assert resume is None, "dangling manifest must not resume"
+        assert result.error != ""
+        assert "force=True" in result.error
+        assert "state.1000000_1_1.xml" in result.error
+
+    def test_path_traversal_in_manifest_sets_result_error(self, tmp_path: Path) -> None:
+        out = tmp_path / "output"
+        out.mkdir()
+        (out / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": 1_000_000, "file": "../state.xml"}]})
+        )
+        config = OpenMMConfig(output_dir=str(out))
+        runner = OpenMMRunner(config)
+        result = SimulationResult(config=config)
+        resume = runner._resolve_skip_or_resume(
+            force=False, output_dir=out, config=config, result=result
+        )
+        assert resume is None
+        assert result.error != ""
+        assert "force=True" in result.error
+
+    def test_force_true_recovers_from_invalid_manifest(self, tmp_path: Path) -> None:
+        """force=True quarantines the invalid manifest (and any state
+        files) so the next non-forced invocation starts fresh."""
+        out = tmp_path / "output"
+        out.mkdir()
+        (out / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": 1_000_000, "file": "../state.xml"}]})
+        )
+        # Also drop a v7 orphan state file to make sure quarantine
+        # moves everything.
+        (out / "state.42_1_1.xml").write_text("<State/>")
+        config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
+        runner = OpenMMRunner(config)
+        result = SimulationResult(config=config)
+        resume = runner._resolve_skip_or_resume(
+            force=True, output_dir=out, config=config, result=result
+        )
+        assert resume is not None
+        # Both the manifest and the orphan state file are gone.
+        assert not (out / "checkpoint.json").exists()
+        assert not (out / "state.42_1_1.xml").exists()
+        # Stale dir contains both.
+        stale_dirs = list((out / ".stale").iterdir())
+        assert len(stale_dirs) == 1
+        assert (stale_dirs[0] / "checkpoint.json").exists()
+        assert (stale_dirs[0] / "state.42_1_1.xml").exists()
+
 
 # ---------------------------------------------------------------------------
 # Runner tests (mocked OpenMM)
@@ -409,23 +692,94 @@ class TestOpenMMRunner:
         assert result.trajectory_path == ""
 
     def test_idempotent_skip(self, tmp_path: Path) -> None:
-        """Existing complete output should be reused."""
+        """Existing complete output should be reused.
+
+        v8 change: the skip path is gated by the manifest's step
+        crossing ``total_equil_steps + total_steps`` (normal
+        completion) OR a valid ``early_abort.json``. The earlier
+        version of this test populated a manifest at step 100_000
+        (below the default 200_000-equil endpoint) and no early
+        abort marker — that pinned the buggy behaviour where file
+        size alone made the run look complete. This test now sets
+        the manifest to the END step so the run is genuinely
+        terminal, and the trajectory/energy files are present as a
+        realistic artifact.
+
+        The v8 BLOCKER #1 regression is covered by
+        ``TestIsRunComplete.test_large_trajectory_does_not_make_run_complete``
+        and ``TestIntermediateCheckpointResumesInsteadOfSkips``.
+        """
         out = tmp_path / "output"
         out.mkdir()
+        config = OpenMMConfig(output_dir=str(out))
+        target = config.total_equil_steps + config.total_steps
+        state_basename = f"state.{target}_1_1.xml"
+        # The manifest references this state file — it must exist on
+        # disk (load_checkpoint validates the reference). We don't
+        # actually loadState in the skip path, but the validator
+        # requires a non-empty file.
+        (out / state_basename).write_text("<State/>")
         (out / "trajectory.dcd").write_bytes(b"\x00" * 20_000_000)
         energy_lines = ["#step,time\n"]
         energy_lines.extend(f"{i * 5000},{i * 10}\n" for i in range(20))
         (out / "energy.csv").write_text("".join(energy_lines))
-        # v7: the "state" indicator is the manifest (checkpoint.json).
         (out / "checkpoint.json").write_text(
-            json.dumps({"records": [{"step": 100_000, "file": "state.100000_1_1.xml"}]})
+            json.dumps({"records": [{"step": target, "file": state_basename}]})
         )
 
-        config = OpenMMConfig(output_dir=str(out))
         runner = OpenMMRunner(config)
         result = runner.run()
         assert result.trajectory_path == str(out / "trajectory.dcd")
+        assert result.state_xml_path == str(out / state_basename)
         assert result.error == ""
+
+    def test_intermediate_checkpoint_resumes_instead_of_skipping(self, tmp_path: Path) -> None:
+        """v8 BLOCKER #1 regression: a sufficiently-large intermediate
+        checkpoint (large trajectory + many energy rows + valid
+        intermediate manifest) must resume, NOT skip as complete.
+
+        The previous behaviour declared any directory with a 10+ MB
+        trajectory and 10+ energy rows as complete. After a mid-
+        production checkpoint and process restart, the next
+        invocation would skip instead of resuming — silently
+        re-running a production loop that may not match the saved
+        state. The v8 fix uses ``is_run_complete``: completion
+        requires the manifest step to reach the target, not just
+        file presence.
+        """
+        out = tmp_path / "output"
+        out.mkdir()
+        config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
+
+        # Simulate a mid-production checkpoint: manifest at step
+        # 5_000_000 (well below the target of 50_200_000).
+        mid_step = 5_000_000
+        state_basename = f"state.{mid_step}_1_1.xml"
+        (out / state_basename).write_text("<State/>")
+        (out / "trajectory.dcd").write_bytes(b"\x00" * 50_000_000)  # > 10 MB
+        energy_lines = ["#step,time,PE,KE,TE,temp,vol,speed\n"]
+        energy_lines.extend(f"{i * 5000},{i * 10},0,0,0,310,0,0\n" for i in range(10_000))
+        (out / "energy.csv").write_text("".join(energy_lines))
+        (out / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": mid_step, "file": state_basename}]})
+        )
+
+        runner = OpenMMRunner(config)
+        # _resolve_skip_or_resume must return a RESUME tuple, not None.
+        result = SimulationResult(config=config)
+        resume = runner._resolve_skip_or_resume(
+            force=False, output_dir=out, config=config, result=result
+        )
+        assert resume is not None, (
+            "intermediate checkpoint must not be reported as complete; "
+            f"got result.error={result.error!r}"
+        )
+        start_step, remaining_steps, resume_xml = resume
+        assert start_step == mid_step
+        # remaining = total_steps - (mid_step - total_equil_steps) — same
+        # accounting as the resumed-equilibrium case.
+        assert remaining_steps == config.total_steps - (mid_step - config.total_equil_steps)
+        assert resume_xml == str(out / state_basename)
 
     def test_missing_openmm_returns_error(self, tmp_path: Path) -> None:
         """Missing OpenMM should return error, not crash.
@@ -472,10 +826,14 @@ class TestResumeAccounting:
         # Simulate checkpoint after full equil (200k steps) + 1 ns production (500k steps)
         checkpoint_step = config.total_equil_steps + 500_000
         # The atomic-save manifest is the authoritative source for the
-        # saved step AND the file to load. In v7, the manifest's step
-        # is the absolute OpenMM step, not the local counter.
+        # saved step AND the file to load. v8: load_checkpoint validates
+        # the referenced state file — it must exist on disk and be
+        # non-empty. The v6/v7 test fixture referenced a non-existent
+        # state.test.xml and pinned the silent-degradation behaviour.
+        state_basename = f"state.{checkpoint_step}_1_1.xml"
+        (out / state_basename).write_text("<State/>")
         (out / "checkpoint.json").write_text(
-            json.dumps({"records": [{"step": checkpoint_step, "file": "state.test.xml"}]})
+            json.dumps({"records": [{"step": checkpoint_step, "file": state_basename}]})
         )
 
         runner = OpenMMRunner(config)
@@ -494,8 +852,11 @@ class TestResumeAccounting:
 
         config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
         checkpoint_step = config.total_equil_steps  # just finished equilibration
+        # v8: state file must exist on disk.
+        state_basename = f"state.{checkpoint_step}_1_1.xml"
+        (out / state_basename).write_text("<State/>")
         (out / "checkpoint.json").write_text(
-            json.dumps({"records": [{"step": checkpoint_step, "file": "state.test.xml"}]})
+            json.dumps({"records": [{"step": checkpoint_step, "file": state_basename}]})
         )
 
         runner = OpenMMRunner(config)
@@ -752,8 +1113,11 @@ class TestResumeStepUsesManifestNotEnergy:
         out.mkdir()
         absolute_step = 500_000
         energy_step = 700_000  # 200k steps ahead of the saved state
+        # v8: load_checkpoint validates the referenced state file.
+        state_basename = f"state.{absolute_step}_1_1.xml"
+        (out / state_basename).write_text("<State/>")
         (out / "checkpoint.json").write_text(
-            json.dumps({"records": [{"step": absolute_step, "file": "state.500000_1_1.xml"}]})
+            json.dumps({"records": [{"step": absolute_step, "file": state_basename}]})
         )
         (out / "energy.csv").write_text(f"#step,time\n{energy_step},{energy_step}\n")
 
@@ -1280,3 +1644,151 @@ class TestAtomicityBetweenStateAndManifest:
         step, file = load_checkpoint(tmp_path)
         assert step == 800_000
         assert (tmp_path / file).exists()
+
+
+class TestFinalizeResultStateXmlPath:
+    """v8 BLOCKER #3 regression: ``_finalize_result`` must populate
+    ``SimulationResult.state_xml_path`` with the committed state
+    file path. The previous behaviour silently produced ``md_result.json``
+    records with an empty ``state_xml_path`` field after successful
+    runs — breaking the public result contract.
+    """
+
+    def test_finalize_sets_state_xml_path_on_fresh_run(self, tmp_path: Path) -> None:
+        """A normal finalization (fresh run ending at the target step)
+        must commit a state file and assign result.state_xml_path."""
+        from biolab_runners.openmm.runner import OpenMMRunner
+
+        config = OpenMMConfig(output_dir=str(tmp_path), production_ns=1.0, timestep_fs=2.0)
+        result = SimulationResult(config=config)
+        sim = MagicMock()
+        sim.saveState.side_effect = lambda path: Path(path).write_text("<State/>")
+
+        OpenMMRunner._finalize_result(
+            ctx=MagicMock(simulation=sim),
+            result=result,
+            energy_fh=MagicMock(),
+            traj_path=str(tmp_path / "trajectory.dcd"),
+            energy_path=str(tmp_path / "energy.csv"),
+            start_step=config.total_equil_steps,
+            steps_done=config.total_steps,
+            t0=time.time() - 60.0,  # some elapsed
+            output_dir=tmp_path,
+        )
+
+        # result.state_xml_path is set to the versioned state file
+        # committed by the atomic save.
+        assert result.state_xml_path != "", (
+            f"result.state_xml_path must be set after finalize; got {result.state_xml_path!r}"
+        )
+        assert Path(result.state_xml_path).exists()
+        # The manifest references the same file.
+        step, file = load_checkpoint(tmp_path)
+        assert Path(result.state_xml_path).name == file
+        assert step == config.total_equil_steps + config.total_steps
+
+    def test_finalize_skips_duplicate_save_when_already_committed(self, tmp_path: Path) -> None:
+        """v8 SUGGESTION regression: if the manifest already commits
+        at the final step (the typical case — ``_maybe_checkpoint``
+        saved on the last chunk), ``_finalize_result`` must skip the
+        re-serialise and reuse the manifest's reference. ``sim.saveState``
+        must NOT be called a second time."""
+        from biolab_runners.openmm.runner import OpenMMRunner
+
+        config = OpenMMConfig(output_dir=str(tmp_path), production_ns=1.0, timestep_fs=2.0)
+        # Pre-create a manifest at the final step (as if _maybe_checkpoint
+        # already saved at the end of the production loop).
+        final_step = config.total_equil_steps + config.total_steps
+        state_basename = f"state.{final_step}_12345_999.xml"
+        (tmp_path / state_basename).write_text("<State/>")
+        (tmp_path / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": final_step, "file": state_basename}]})
+        )
+
+        sim = MagicMock()
+        sim.saveState.side_effect = lambda path: Path(path).write_text("<State/>")
+
+        result = SimulationResult(config=config)
+        OpenMMRunner._finalize_result(
+            ctx=MagicMock(simulation=sim),
+            result=result,
+            energy_fh=MagicMock(),
+            traj_path=str(tmp_path / "trajectory.dcd"),
+            energy_path=str(tmp_path / "energy.csv"),
+            start_step=config.total_equil_steps,
+            steps_done=config.total_steps,
+            t0=time.time() - 60.0,
+            output_dir=tmp_path,
+        )
+
+        # result.state_xml_path is set to the existing state file
+        # (no duplicate save).
+        assert result.state_xml_path == str(tmp_path / state_basename)
+        # sim.saveState must NOT be called again — the manifest already
+        # commits at the final step.
+        sim.saveState.assert_not_called()
+        # No second state file was created.
+        assert len(list(tmp_path.glob("state*.xml"))) == 1
+
+    def test_finalize_saves_when_manifest_step_is_stale(self, tmp_path: Path) -> None:
+        """When the manifest step is below the finalize target (e.g. a
+        mid-production checkpoint), ``_finalize_result`` MUST do a
+        fresh save. This is the production-loop end-of-run case where
+        the loop ended without the final ``_maybe_checkpoint`` saving
+        at exactly the target step."""
+        from biolab_runners.openmm.runner import OpenMMRunner
+
+        config = OpenMMConfig(output_dir=str(tmp_path), production_ns=1.0, timestep_fs=2.0)
+        # Pre-existing manifest at a step below the final step.
+        prior_step = config.total_equil_steps
+        state_basename = f"state.{prior_step}_12345_999.xml"
+        (tmp_path / state_basename).write_text("<State/>")
+        (tmp_path / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": prior_step, "file": state_basename}]})
+        )
+
+        sim = MagicMock()
+        sim.saveState.side_effect = lambda path: Path(path).write_text("<State/>")
+
+        result = SimulationResult(config=config)
+        OpenMMRunner._finalize_result(
+            ctx=MagicMock(simulation=sim),
+            result=result,
+            energy_fh=MagicMock(),
+            traj_path=str(tmp_path / "trajectory.dcd"),
+            energy_path=str(tmp_path / "energy.csv"),
+            start_step=config.total_equil_steps,
+            steps_done=config.total_steps,
+            t0=time.time() - 60.0,
+            output_dir=tmp_path,
+        )
+
+        # saveState WAS called — the manifest step didn't match the target.
+        assert sim.saveState.called
+        # The manifest now references the final step.
+        final_step = config.total_equil_steps + config.total_steps
+        step, file = load_checkpoint(tmp_path)
+        assert step == final_step
+        assert Path(result.state_xml_path).name == file
+
+    def test_skip_path_sets_state_xml_path(self, tmp_path: Path) -> None:
+        """The idempotent skip path (terminal run) must populate
+        ``result.state_xml_path`` from the manifest. ``md_result.json``
+        records were previously missing this field — a silent break
+        of the public contract."""
+        out = tmp_path / "output"
+        out.mkdir()
+        config = OpenMMConfig(output_dir=str(out))
+        target = config.total_equil_steps + config.total_steps
+        state_basename = f"state.{target}_1_1.xml"
+        (out / state_basename).write_text("<State/>")
+        (out / "trajectory.dcd").write_bytes(b"\x00" * 20_000_000)
+        (out / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": target, "file": state_basename}]})
+        )
+
+        runner = OpenMMRunner(config)
+        result = runner.run()
+        assert result.error == ""
+        # The skip path populated state_xml_path from the manifest.
+        assert result.state_xml_path == str(out / state_basename)

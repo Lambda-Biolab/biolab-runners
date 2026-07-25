@@ -54,8 +54,9 @@ from biolab_runners.openmm.system_builder import (
     quarantine_stale_checkpoint,
 )
 from biolab_runners.openmm.utils import (
+    InvalidCheckpointError,
+    is_run_complete,
     load_checkpoint,
-    verify_production_outputs,
 )
 
 logger = logging.getLogger(__name__)
@@ -217,27 +218,52 @@ class OpenMMRunner:
     ) -> tuple[int, int, str] | None:
         """Handle idempotency + checkpoint resolution.
 
-        When ``force=True`` and a prior checkpoint exists, the
-        resumable files (the manifest, the energy log, and any
-        state file under ``state*.xml``) are moved into a
-        timestamped ``output_dir/.stale/<UTC>/`` directory BEFORE
-        this method returns. This guarantees the next non-forced
-        invocation cannot pair a stale state file with a
-        freshly-built topology, even if the forced run is interrupted
-        before producing a new manifest of its own.
+        Decision tree (in order):
 
-        When a non-forced invocation finds a state file (legacy
-        ``state.xml`` or v7 ``state.<gen>.xml``) but no valid
-        manifest, the saved state's step is unknown — falling back
-        to a fresh build would overwrite the topology and re-introduce
-        the incompatibility class the "Resume safety" /
-        "Atomic checkpoint" rules exist to avoid. We fail fast
-        instead, and require the user to invoke
-        ``runner.run(force=True)`` to discard the orphaned state.
+        1. ``force=True`` ⇒ quarantine all resumable files, then
+           proceed to a fresh build. The quarantine moves the
+           manifest, the energy log, and every state file
+           (``state*.xml``) into ``output_dir/.stale/<UTC>/`` BEFORE
+           we return — so the next non-forced invocation (or this
+           one, if interrupted mid-build) cannot pair a stale
+           state with a fresh topology.
 
-        Returns None if the simulation is already complete (result populated)
-        or the checkpoint is orphaned (result.error set),
-        otherwise (start_step, remaining_steps, resume_xml).
+        2. Read the manifest via :func:`load_checkpoint`. The
+           function validates the referenced state file (basename,
+           expected name pattern, exists, non-empty); an invalid
+           reference raises :class:`InvalidCheckpointError` which
+           we convert into ``result.error`` and abort. The earlier
+           "verify_production_outputs(...) → complete=True" gate
+           was removed because a mid-production checkpoint can
+           produce a large trajectory and many energy rows WITHOUT
+           the run being complete — file presence does not imply
+           completion.
+
+        3. If the manifest is valid (step > 0, state file valid),
+           call :func:`is_run_complete`: a run is terminal when
+           ``manifest_step >= total_equil_steps + total_steps``
+           (normal completion) OR ``early_abort.json`` exists with
+           ``aborted=True`` (intentional early termination). If
+           complete, populate the result (including
+           ``state_xml_path`` from the manifest) and return None.
+
+        4. Otherwise, return the resume tuple ``(start_step,
+           remaining_steps, resume_xml)``. ``start_step`` is the
+           absolute step the simulation will be at when the
+           production loop starts (the manifest's step for resumes,
+           ``total_equil_steps`` for fresh runs).
+
+        5. If no manifest exists but state files (legacy or v7)
+           are on disk, the checkpoint is orphaned — fail fast
+           with ``force=True`` guidance. Pairing an orphan state
+           with a freshly-built System would re-introduce the
+           incompatibility the "Resume safety" / "Atomic
+           checkpoint" rules exist to avoid.
+
+        Returns None if the simulation is already complete (result
+        populated) or the checkpoint is orphaned / invalid (result
+        error set); otherwise (start_step, remaining_steps,
+        resume_xml).
 
         ``start_step`` is the ABSOLUTE step the simulation will be at
         when the production loop starts:
@@ -255,51 +281,72 @@ class OpenMMRunner:
                     len(moved),
                     moved[0].parent,
                 )
-        else:
-            verification = verify_production_outputs(output_dir)
-            if verification["complete"]:
+
+        # Read the manifest. ``load_checkpoint`` validates the
+        # referenced state file (basename, pattern, exists, size) —
+        # InvalidCheckpointError surfaces a dangling or unsafe
+        # reference immediately. The previous behaviour silently
+        # accepted a manifest with a non-existent state file and
+        # let ``prepare_simulation`` build a fresh System with
+        # production accounting inherited from the (never-loaded)
+        # checkpoint — a quietly-wrong fresh build.
+        manifest_step = 0
+        state_file = ""
+        resume_xml = ""
+        try:
+            manifest_step, state_file = load_checkpoint(output_dir)
+        except InvalidCheckpointError as exc:
+            result.error = str(exc)
+            logger.error(result.error)
+            return None
+
+        if manifest_step > 0:
+            # A valid manifest exists. Determine completion from
+            # the manifest step + early-abort metadata — NOT from
+            # ``verify_production_outputs`` (a mid-production
+            # checkpoint can produce a large trajectory and many
+            # energy rows while the run is still in progress).
+            target_step = config.total_equil_steps + config.total_steps
+            complete, reason = is_run_complete(output_dir, config)
+            if complete:
                 logger.info(
-                    "Skipping MD — trajectory already complete at %s. Use force=True to re-run.",
-                    output_dir / FileNames.TRAJECTORY,
+                    "Skipping MD — run is already terminal (%s) at step %d",
+                    reason,
+                    manifest_step,
                 )
                 result.trajectory_path = str(output_dir / FileNames.TRAJECTORY)
                 result.energy_path = str(output_dir / FileNames.ENERGY)
                 result.topology_path = str(output_dir / FileNames.TOPOLOGY)
+                result.state_xml_path = str(output_dir / state_file)
                 return None
 
-        manifest_step = 0
-        state_file = ""
-        resume_xml = ""
-        if not force:
-            # load_checkpoint reads ONLY the atomic-save manifest.
-            # It returns (step, file) — the file is the basename of
-            # the state file referenced by the manifest.
-            manifest_step, state_file = load_checkpoint(output_dir)
-            if manifest_step > 0:
-                resume_xml = str(output_dir / state_file)
-                logger.info(
-                    "Resuming from checkpoint at step %d (%.2f ns)",
-                    manifest_step,
-                    manifest_step * config.timestep_fs / 1e6,
+            resume_xml = str(output_dir / state_file)
+            logger.info(
+                "Resuming from checkpoint at step %d (%.2f ns of %d needed)",
+                manifest_step,
+                manifest_step * config.timestep_fs / 1e6,
+                target_step,
+            )
+        else:
+            # No valid manifest. If a state file exists from a
+            # v6 run (legacy state.xml) or from a v7 interrupted
+            # save that landed before the manifest rename, it is
+            # orphaned — fail fast. Pairing the orphan with a
+            # freshly-built System would re-introduce the
+            # incompatibility this rule exists to avoid.
+            leftover_states = list(output_dir.glob("state*.xml"))
+            if leftover_states:
+                result.error = (
+                    f"State file(s) exist at {leftover_states} but "
+                    f"the manifest {FileNames.CHECKPOINT_JSON} is "
+                    f"missing or invalid — the saved state's step is "
+                    f"unknown. Pairing it with a freshly-built System "
+                    f"would re-introduce the incompatibility this rule "
+                    f"exists to avoid. Re-run with force=True to "
+                    f"discard the orphaned checkpoint."
                 )
-            else:
-                # No valid manifest. If a state file exists from a
-                # v6 run (legacy state.xml) or from a v7 interrupted
-                # save that landed before the manifest rename, it is
-                # orphaned — fail fast.
-                leftover_states = list(output_dir.glob("state*.xml"))
-                if leftover_states:
-                    result.error = (
-                        f"State file(s) exist at {leftover_states} but "
-                        f"the manifest {FileNames.CHECKPOINT_JSON} is "
-                        f"missing or invalid — the saved state's step is "
-                        f"unknown. Pairing it with a freshly-built System "
-                        f"would re-introduce the incompatibility this rule "
-                        f"exists to avoid. Re-run with force=True to "
-                        f"discard the orphaned checkpoint."
-                    )
-                    logger.error(result.error)
-                    return None
+                logger.error(result.error)
+                return None
 
         # Compute ``start_step`` (the absolute step the simulator is at
         # when the production loop starts) and ``remaining_steps``
@@ -311,10 +358,21 @@ class OpenMMRunner:
 
         production_steps_done = max(0, start_step - config.total_equil_steps)
         remaining_steps = max(0, config.total_steps - production_steps_done)
-        if remaining_steps == 0:
-            logger.info("No remaining steps — simulation already complete")
-            result.trajectory_path = str(output_dir / FileNames.TRAJECTORY)
-            result.energy_path = str(output_dir / FileNames.ENERGY)
+        if remaining_steps == 0 and not force:
+            # Defensive: a manifest at the END step is terminal, but
+            # is_run_complete should have caught it. If we reach here
+            # anyway (e.g. config changed mid-run), populate the
+            # result and skip.
+            logger.info(
+                "No remaining steps — manifest at step %d, target %d",
+                manifest_step,
+                config.total_equil_steps + config.total_steps,
+            )
+            if state_file:
+                result.trajectory_path = str(output_dir / FileNames.TRAJECTORY)
+                result.energy_path = str(output_dir / FileNames.ENERGY)
+                result.topology_path = str(output_dir / FileNames.TOPOLOGY)
+                result.state_xml_path = str(output_dir / state_file)
             return None
 
         return start_step, remaining_steps, resume_xml
@@ -409,7 +467,7 @@ class OpenMMRunner:
         t0: float,
         output_dir: Path,
     ) -> None:
-        """Save final state atomically, close reporters, populate result.
+        """Save final state atomically (or skip if already saved), close reporters, populate result.
 
         The final state save goes through ``_atomic_save_checkpoint``
         so the manifest is updated together with the state file. The
@@ -418,6 +476,24 @@ class OpenMMRunner:
         when the production loop ends. The v6 design wrote the
         invocation-local ``steps_done`` instead, which silently
         broke accounting on resumes.
+
+        SUGGESTION (double-save): the production loop's last
+        ``_maybe_checkpoint`` typically saves at the final step
+        (because ``steps_done == remaining_steps`` triggers the
+        unconditional save at the end of the loop). A second save
+        here would re-serialise the entire state file (potentially
+        hundreds of MB) just to rewrite the same content. We read
+        the manifest and skip the save when the atomic commit has
+        already happened at the same absolute step. The manifest
+        rename is fast (~KB), so the extra read is cheap.
+
+        ``result.state_xml_path`` is set from the committed state
+        file (the basename returned by ``_atomic_save_checkpoint``
+        when a save happens, or read from the manifest when the
+        save is skipped, or read from the manifest for the
+        no-resumed-step case). The runner contract is that the
+        returned path names the commit-time state file the
+        manifest references.
         """
         config = result.config
         elapsed = time.time() - t0
@@ -425,11 +501,34 @@ class OpenMMRunner:
         ns_per_day = (total_ns / elapsed) * 86400 if elapsed > 0 else 0
 
         absolute_step = start_step + steps_done
-        _atomic_save_checkpoint(ctx.simulation, output_dir, absolute_step)
+        state_basename = ""
+        try:
+            existing_step, existing_file = load_checkpoint(output_dir)
+        except InvalidCheckpointError:
+            # The manifest is in an odd state (e.g. empty state file)
+            # — fall through and force a fresh save. The
+            # quarantine stays for the user to inspect; the new
+            # save at absolute_step will overwrite it.
+            existing_step, existing_file = 0, ""
+
+        if existing_step == absolute_step and existing_file:
+            # The last ``_maybe_checkpoint`` already committed the
+            # state at this absolute step. Reuse the manifest's
+            # reference instead of re-serialising the state file.
+            logger.info(
+                "Final atomic save skipped — commit already at step %d (%s)",
+                existing_step,
+                existing_file,
+            )
+            state_basename = existing_file
+        else:
+            state_basename = _atomic_save_checkpoint(ctx.simulation, output_dir, absolute_step)
+
         energy_fh.close()  # type: ignore[union-attr]
 
         result.trajectory_path = traj_path
         result.energy_path = energy_path
+        result.state_xml_path = str(output_dir / state_basename)
         result.total_ns = round(total_ns, 2)
         result.elapsed_seconds = round(elapsed, 1)
         result.ns_per_day = round(ns_per_day, 1)
@@ -443,6 +542,7 @@ class OpenMMRunner:
             "num_atoms": result.num_atoms,
             "trajectory": traj_path,
             "energy": energy_path,
+            "state": str(output_dir / state_basename),
             "early_abort": result.early_abort,
             "abort_reason": result.abort_reason,
             "final_absolute_step": absolute_step,

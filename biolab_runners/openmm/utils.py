@@ -4,15 +4,37 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import subprocess
 import typing
+from pathlib import Path
 
 if typing.TYPE_CHECKING:
-    from pathlib import Path
+    from biolab_runners.openmm.config import OpenMMConfig
 
 from biolab_runners.openmm.paths import FileNames
 
 logger = logging.getLogger(__name__)
+
+
+# Pattern for state file basenames accepted by the manifest. The
+# legacy v6 format is a bare ``state.xml``; the v7 format is the
+# generation-versioned ``state.<step>_<pid>_<nanos>.xml``. The
+# validator below rejects anything else (path separators, weird
+# extensions, empty strings) so the resume path cannot be tricked
+# into loading a non-state file or escaping the output directory.
+_STATE_FILENAME_RE = re.compile(r"^state(\.xml|\.\d+_\d+_\d+\.xml)$")
+
+
+class InvalidCheckpointError(Exception):
+    """Raised when ``checkpoint.json`` references a state file that is invalid.
+
+    The runner converts this into a ``result.error`` and refuses to proceed —
+    the user must invoke ``runner.run(force=True)`` to discard the corrupt
+    checkpoint (the quarantine moves the manifest + state files into
+    ``.stale/<UTC>/`` together, so the next non-forced invocation starts from
+    a fresh build).
+    """
 
 
 def openmm_available(platform: str = "OpenCL") -> bool:
@@ -65,24 +87,29 @@ def pdbfixer_available() -> bool:
 
 
 def verify_production_outputs(output_dir: Path) -> dict[str, object]:
-    """Verify that production MD outputs are complete.
+    """Build a diagnostic report on the production output directory.
 
-    Checks for expected files and validates basic integrity (file sizes,
-    energy row counts). The "state presence" check is now against
-    the atomic-save manifest (``checkpoint.json``) — the v7 save
-    format uses generation-versioned state files
-    (``state.<gen>.xml``) referenced by the manifest, not a canonical
-    ``state.xml``.
+    This is a pure diagnostic helper — it reports per-file size and
+    row counts but does NOT decide whether a run is complete.
+    Completion is determined by :func:`is_run_complete` (which uses
+    the manifest's absolute step + early-abort metadata), not by
+    ``"files exist + size > threshold"``. The earlier "complete"
+    field was removed because a mid-production checkpoint can
+    produce a large trajectory and many energy rows while the run
+    is still in progress — file presence does not imply completion.
 
     Args:
         output_dir: Directory containing MD outputs.
 
     Returns:
-        Verification report dict with "complete" boolean and file details.
+        Diagnostic report dict with file metadata (existence, size,
+        row count for the energy log). The "complete" field is
+        always False; callers that want a completion verdict must
+        call :func:`is_run_complete` instead.
     """
     report: dict[str, object] = {
         "output_dir": str(output_dir),
-        "complete": True,
+        "complete": False,
         "files": {},
     }
 
@@ -99,22 +126,16 @@ def verify_production_outputs(output_dir: Path) -> dict[str, object]:
         if filename == FileNames.ENERGY and exists:
             lines = len(path.read_text().strip().splitlines())
             file_info["rows"] = lines
-            if lines < 10:
-                file_info["warning"] = "Very few energy rows — run may be incomplete"
-                report["complete"] = False
 
-        if filename == FileNames.TRAJECTORY and exists and size < 10_000_000:
-            file_info["warning"] = "Trajectory < 10 MB — likely incomplete"
-            report["complete"] = False
-
-        if not exists:
-            report["complete"] = False
+        if filename == FileNames.TRAJECTORY and exists:
+            file_info["note"] = (
+                "Trajectory size alone does not imply completion — "
+                "see is_run_complete() for the authoritative verdict."
+            )
 
         report["files"][filename] = file_info  # type: ignore[index]
 
-    # The manifest always exists if the run is complete — it is the
-    # last thing the atomic save commits. Insert its info into the
-    # report for completeness.
+    # Insert manifest info for completeness.
     manifest_path = output_dir / FileNames.CHECKPOINT_JSON
     if manifest_path.exists():
         report["files"][FileNames.CHECKPOINT_JSON] = {  # type: ignore[index]
@@ -123,6 +144,126 @@ def verify_production_outputs(output_dir: Path) -> dict[str, object]:
         }
 
     return report
+
+
+def is_run_complete(output_dir: Path, config: OpenMMConfig) -> tuple[bool, str]:
+    """Determine whether a production run is terminal.
+
+    A run is terminal when EITHER:
+
+    1. **Normal completion**: ``manifest_step >= total_equil_steps +
+       total_steps``. The manifest's step is the absolute OpenMM
+       step (``start_step + steps_done``), so this signal is
+       unambiguous — not dependent on file sizes or energy row
+       counts.
+
+    2. **Intentional early termination**: ``early_abort.json`` exists
+       with ``aborted=True`` and a positive ``abort_step``. The
+       atomically-committed abort metadata is the explicit terminal
+       marker for the offline-mdtraj gate.
+
+    Otherwise the run is in progress (or interrupted) and the
+    caller should resume.
+
+    Args:
+        output_dir: MD output directory.
+        config: The OpenMMConfig used to compute total_equil_steps
+            and total_steps.
+
+    Returns:
+        ``(complete, reason)``. ``complete`` is True for the two
+        terminal cases; ``reason`` is a human-readable explanation
+        (e.g. ``"normal_completion_50_200_000"``,
+        ``"early_abort_aborted"`` or ``"in_progress"``).
+    """
+    manifest_step, _ = load_checkpoint(output_dir)
+    if manifest_step > 0:
+        target_step = config.total_equil_steps + config.total_steps
+        if manifest_step >= target_step:
+            return True, f"normal_completion_step_{manifest_step}_of_{target_step}"
+
+    abort_path = output_dir / FileNames.EARLY_ABORT_JSON
+    if abort_path.exists():
+        try:
+            abort_meta = json.loads(abort_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            abort_meta = {}
+        if abort_meta.get("aborted") is True:
+            abort_step = int(abort_meta.get("abort_step", 0))
+            return True, f"early_abort_step_{abort_step}"
+
+    return False, "in_progress"
+
+
+def _validate_state_file_reference(output_dir: Path, state_file: str) -> Path:
+    """Validate the state file path encoded in a manifest record.
+
+    Returns the absolute path on success. Raises
+    :class:`InvalidCheckpointError` if the reference is unsafe or
+    refers to a file that is missing or empty.
+
+    Validation gates (each must pass):
+
+    1. ``state_file`` is a basename (``Path(s).name == s``).
+       Rejects absolute paths, ``../`` traversal, ``subdir/foo``.
+
+    2. ``state_file`` matches the expected pattern
+       (``state.xml`` or ``state.<digits>_<digits>_<digits>.xml``).
+       Rejects typos, unexpected extensions, anything else.
+
+    3. ``(output_dir / state_file).is_file()`` — the file is on
+       disk. Rejects dangling manifests (the v6 save would have
+       detected this only after ``loadState`` raised).
+
+    4. ``stat().st_size > 0`` — the file is non-empty. Rejects
+       truncated state files (OpenMM's ``saveState`` may write
+       half a file if the process is killed mid-write).
+
+    Args:
+        output_dir: Directory containing the state file.
+        state_file: The basename from the manifest record.
+
+    Returns:
+        The validated absolute path to the state file.
+
+    Raises:
+        InvalidCheckpointError: If any gate fails. The error
+            message includes the offending value and the required
+            remediation (``force=True`` to discard).
+    """
+    if not state_file:
+        raise InvalidCheckpointError(
+            "The manifest references an empty state file path. "
+            "Re-run with force=True to discard the checkpoint."
+        )
+    if Path(state_file).name != state_file:
+        raise InvalidCheckpointError(
+            f"The manifest references a state file with a path "
+            f"that is not a basename: {state_file!r}. Path traversal "
+            f"and absolute paths are rejected. Re-run with force=True "
+            f"to discard the checkpoint."
+        )
+    if not _STATE_FILENAME_RE.match(state_file):
+        raise InvalidCheckpointError(
+            f"The manifest references a state file with an invalid "
+            f"name: {state_file!r}. Expected 'state.xml' (legacy) or "
+            f"'state.<step>_<pid>_<nanos>.xml' (v7). Re-run with "
+            f"force=True to discard the checkpoint."
+        )
+    state_path = output_dir / state_file
+    if not state_path.is_file():
+        raise InvalidCheckpointError(
+            f"The manifest references a state file that does not "
+            f"exist: {state_path}. The run cannot be resumed safely. "
+            f"Re-run with force=True to discard the checkpoint."
+        )
+    if state_path.stat().st_size == 0:
+        raise InvalidCheckpointError(
+            f"The manifest references an empty state file: {state_path}. "
+            f"The state was likely truncated mid-write. Re-run with "
+            f"force=True to discard the checkpoint."
+        )
+    return state_path
 
 
 def load_checkpoint(output_dir: Path) -> tuple[int, str]:
@@ -145,14 +286,35 @@ def load_checkpoint(output_dir: Path) -> tuple[int, str]:
     referenced by the manifest is an orphan that can be safely
     garbage-collected.
 
+    After parsing the manifest, the returned ``state_file`` is
+    validated via :func:`_validate_state_file_reference` — a
+    manifest that names a missing, empty, or unsafe state file
+    raises :class:`InvalidCheckpointError`. The runner converts
+    this into a ``result.error`` and aborts the resume; the user
+    must invoke ``runner.run(force=True)`` to discard the corrupt
+    checkpoint. A dangling manifest cannot degrade into a fresh
+    build because ``prepare_simulation`` would silently build a new
+    system with a different water count and pair it with the
+    stale state, re-introducing the incompatibility
+    (:attr:`biolab_runners.openmm.config.OpenMMConfig` "Resume
+    safety" rule).
+
     Args:
         output_dir: MD output directory.
 
     Returns:
         ``(absolute_step, state_file_basename)`` on success — both
         non-empty. ``(0, "")`` if no manifest exists or the manifest
-        is invalid. The runner treats (0, "") as "no resumable
+        is malformed (no ``records`` array, last record has no
+        ``step`` or ``file``, step is non-positive, or ``file`` is
+        empty). The runner treats (0, "") as "no resumable
         checkpoint" and fails fast on any orphaned state file.
+
+    Raises:
+        InvalidCheckpointError: If the manifest references a state
+            file that is not a basename, doesn't match the expected
+            pattern, doesn't exist, or is empty. The runner catches
+            this and surfaces it as a user-facing error.
     """
     manifest_path = output_dir / FileNames.CHECKPOINT_JSON
     if not manifest_path.exists():
@@ -166,9 +328,19 @@ def load_checkpoint(output_dir: Path) -> tuple[int, str]:
         step = int(last.get("step", 0))
         file = str(last.get("file", ""))
         if step > 0 and file:
+            # Validate the referenced state file. The runner catches
+            # InvalidCheckpointError and surfaces the message to the
+            # user — the resume path cannot proceed with a dangling
+            # or unsafe reference.
+            _validate_state_file_reference(output_dir, file)
             return step, file
     except (json.JSONDecodeError, KeyError, IndexError, OSError, ValueError):
         pass
+    except InvalidCheckpointError:
+        # Re-raise so the runner can convert it to a result.error.
+        # (The bare ``except`` above would otherwise swallow our
+        # own exception class.)
+        raise
     return 0, ""
 
 
@@ -179,6 +351,15 @@ def load_checkpoint_step(output_dir: Path) -> int:
     exists. Kept for callers that only need the step (e.g. logs);
     new code should call :func:`load_checkpoint` directly to also
     get the file the manifest references.
+
+    Note: unlike :func:`load_checkpoint`, this function does NOT
+    raise on a manifest that references a missing state file. It
+    only returns the step. Callers that need to either load the
+    state or detect the dangling manifest must use
+    :func:`load_checkpoint`.
     """
-    step, _ = load_checkpoint(output_dir)
+    try:
+        step, _ = load_checkpoint(output_dir)
+    except InvalidCheckpointError:
+        return 0
     return step
