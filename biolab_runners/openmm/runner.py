@@ -711,16 +711,32 @@ class OpenMMRunner:
         ``total_equil_steps`` gives the cumulative production
         steps across all resumes — the right value to report as
         ``total_ns`` for a resumed run.
+
+        v11 BLOCKER #1: ``ns_per_day`` is INVOCATION-LOCAL
+        production ns / current-invocation wall time. The previous
+        formula divided cumulative production by invocation-local
+        elapsed, which inflated the reported throughput on every
+        resumed run (e.g. 100 ns production split across two
+        invocations would report 100 ns/day from the second
+        invocation even if it only ran 1 ns). The two accounting
+        scopes are kept separate: cumulative production for
+        ``total_ns``, invocation-local production for
+        ``ns_per_day``. If cumulative throughput is needed,
+        ``md_summary.json`` carries ``total_ns`` and
+        ``elapsed_seconds`` which can be divided externally.
         """
         config = result.config
         elapsed = time.time() - t0
         absolute_step = start_step + steps_done
         # v10 BLOCKER #3: production ns = absolute_step - total_equil_steps.
         total_ns_value = _production_ns(absolute_step, config)
-        # ns_per_day is reported over production time, not wall time
-        # of the current invocation — otherwise a resumed run
-        # reports an inflated throughput.
-        ns_per_day = (total_ns_value / elapsed) * 86400 if elapsed > 0 else 0
+        # v11 BLOCKER #1: ns_per_day is invocation-local throughput.
+        # We can't mix cumulative production with invocation-local
+        # wall time — the result would be inflated on every
+        # resumed run. Use the steps_done *this invocation* for
+        # the throughput denominator.
+        invocation_production_ns = steps_done * config.timestep_fs / 1e6
+        ns_per_day = (invocation_production_ns / elapsed) * 86400 if elapsed > 0 else 0
 
         state_basename = ""
         try:
@@ -1085,14 +1101,30 @@ class OpenMMRunner:
             _atomic_save_checkpoint(
                 simulation, output_dir, absolute_step, terminal=terminal_payload
             )
-            OpenMMRunner._write_abort_metadata(
-                verdict,
-                output_dir,
-                abort_thresh,
-                config,
-                absolute_step=absolute_step,
-                production_ns=production_ns_value,
-            )
+            # v11 BLOCKER #2: the derived ``early_abort.json`` is
+            # NOT authoritative — the manifest has already
+            # committed the terminal decision. A failure to write
+            # the derived file (full disk, permission denied,
+            # etc.) must NOT crash an already-committed terminal
+            # run. The runner's caller still needs a coherent
+            # SimulationResult (with early_abort=True).
+            try:
+                OpenMMRunner._write_abort_metadata(
+                    verdict,
+                    output_dir,
+                    abort_thresh,
+                    config,
+                    absolute_step=absolute_step,
+                    production_ns=production_ns_value,
+                )
+            except OSError as exc:
+                logger.warning(
+                    "Terminal checkpoint committed, but early_abort.json "
+                    "could not be written: %s. The manifest's terminal "
+                    "payload is authoritative; downstream consumers may "
+                    "miss the derived marker until the next invocation.",
+                    exc,
+                )
             return True, verdict.reason
 
         # Past the 10 ns checkpoint and no abort fired → gate has made its

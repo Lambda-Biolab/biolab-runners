@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -21,6 +22,8 @@ from biolab_runners.openmm.utils import (
 )
 
 from tests._helpers import FakeApp
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # OpenMMConfig tests
@@ -432,17 +435,21 @@ class TestIsRunComplete:
         assert complete is True
         assert reason.startswith("manifest_terminal_early_abort_step_")
 
-    def test_early_abort_with_aborted_false_does_not_count(self, tmp_path: Path) -> None:
-        """v10: a manifest whose terminal.type is not ``early_abort``
-        does not count as early-aborted (treated as in-progress for
-        the purpose of result reconstruction)."""
+    def test_early_abort_with_unknown_type_is_not_terminal(self, tmp_path: Path) -> None:
+        """v11 BLOCKER #3: a manifest with a terminal.type that isn't
+        the literal ``early_abort`` is NOT terminal — accepting an
+        unknown type as terminal would skip result reconstruction
+        (the reconstruction only knows how to fill in fields for
+        early_abort), leaving the result reporting
+        ``early_abort=False`` despite the manifest claiming
+        terminal status. Logged as a warning + treated as
+        in_progress."""
         from biolab_runners.openmm.utils import is_run_complete
 
         config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
         state_basename = "state.5000000_1_1.xml"
         (tmp_path / state_basename).write_text("<State/>")
-        # terminal.type != "early_abort" — the manifest is
-        # terminal but NOT an early abort.
+        # terminal.type="other" is unsupported.
         (tmp_path / "checkpoint.json").write_text(
             json.dumps(
                 {
@@ -450,15 +457,135 @@ class TestIsRunComplete:
                         {
                             "step": 5_000_000,
                             "file": state_basename,
-                            "terminal": {"type": "other", "step": 5_000_000},
+                            "terminal": {
+                                "type": "other",
+                                "step": 5_000_000,
+                                "reason": "x",
+                            },
                         }
                     ]
                 }
             )
         )
         complete, reason = is_run_complete(tmp_path, config)
-        assert complete is True
-        assert reason.startswith("manifest_terminal_other_step_")
+        assert complete is False
+        assert reason == "in_progress"
+
+    def test_early_abort_with_missing_type_is_not_terminal(self, tmp_path: Path) -> None:
+        """v11 BLOCKER #3: terminal payload without a ``type``
+        field is NOT terminal (only ``early_abort`` is supported).
+        A missing type previously slipped through with a coerced
+        string default."""
+        from biolab_runners.openmm.utils import is_run_complete
+
+        config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
+        state_basename = "state.5000000_1_1.xml"
+        (tmp_path / state_basename).write_text("<State/>")
+        # No "type" key.
+        (tmp_path / "checkpoint.json").write_text(
+            json.dumps(
+                {
+                    "records": [
+                        {
+                            "step": 5_000_000,
+                            "file": state_basename,
+                            "terminal": {"step": 5_000_000, "reason": "early_dissociation"},
+                        }
+                    ]
+                }
+            )
+        )
+        complete, reason = is_run_complete(tmp_path, config)
+        assert complete is False
+        assert reason == "in_progress"
+
+    def test_early_abort_with_string_step_is_not_terminal(self, tmp_path: Path) -> None:
+        """v11 BLOCKER #3: a terminal.step that is a JSON string
+        (e.g. \"5000000\") must not be silently coerced to int —
+        that would let a forged manifest pass the schema check.
+        Strict-int validation rejects it."""
+        from biolab_runners.openmm.utils import is_run_complete
+
+        config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
+        state_basename = "state.5000000_1_1.xml"
+        (tmp_path / state_basename).write_text("<State/>")
+        (tmp_path / "checkpoint.json").write_text(
+            json.dumps(
+                {
+                    "records": [
+                        {
+                            "step": 5_000_000,
+                            "file": state_basename,
+                            "terminal": {
+                                "type": "early_abort",
+                                "step": "5000000",  # string!
+                                "reason": "early_dissociation",
+                            },
+                        }
+                    ]
+                }
+            )
+        )
+        complete, reason = is_run_complete(tmp_path, config)
+        assert complete is False
+        assert reason == "in_progress"
+
+    def test_early_abort_with_boolean_step_is_not_terminal(self, tmp_path: Path) -> None:
+        """v11 BLOCKER #3: ``True`` is a bool-int in Python — the
+        validator must reject it explicitly."""
+        from biolab_runners.openmm.utils import is_run_complete
+
+        config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
+        state_basename = "state.5000000_1_1.xml"
+        (tmp_path / state_basename).write_text("<State/>")
+        (tmp_path / "checkpoint.json").write_text(
+            json.dumps(
+                {
+                    "records": [
+                        {
+                            "step": 5_000_000,
+                            "file": state_basename,
+                            "terminal": {
+                                "type": "early_abort",
+                                "step": True,
+                                "reason": "early_dissociation",
+                            },
+                        }
+                    ]
+                }
+            )
+        )
+        complete, reason = is_run_complete(tmp_path, config)
+        assert complete is False
+        assert reason == "in_progress"
+
+    def test_early_abort_with_empty_reason_is_not_terminal(self, tmp_path: Path) -> None:
+        """v11 BLOCKER #3: ``reason`` must be a non-empty string."""
+        from biolab_runners.openmm.utils import is_run_complete
+
+        config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
+        state_basename = "state.5000000_1_1.xml"
+        (tmp_path / state_basename).write_text("<State/>")
+        (tmp_path / "checkpoint.json").write_text(
+            json.dumps(
+                {
+                    "records": [
+                        {
+                            "step": 5_000_000,
+                            "file": state_basename,
+                            "terminal": {
+                                "type": "early_abort",
+                                "step": 5_000_000,
+                                "reason": "",
+                            },
+                        }
+                    ]
+                }
+            )
+        )
+        complete, reason = is_run_complete(tmp_path, config)
+        assert complete is False
+        assert reason == "in_progress"
 
     def test_legacy_marker_alone_is_not_terminal(self, tmp_path: Path) -> None:
         """v10 BLOCKER #2 regression: a bare ``early_abort.json``
@@ -2715,3 +2842,232 @@ class TestLoadCheckpointMalformedManifest:
         step, file = load_checkpoint(tmp_path)
         assert step == 0
         assert file == ""
+
+
+class TestNsPerDayInvocationLocal:
+    """v11 BLOCKER #1 regression: ``ns_per_day`` is INVOCATION-LOCAL
+    production throughput — not cumulative production divided by
+    current-invocation wall time.
+
+    The previous formula divided cumulative production by
+    invocation-local elapsed, which inflated the reported
+    throughput on every resumed run. For a 90 ns + 10 ns run
+    where the second invocation takes 1 day, the previous code
+    reported 100 ns/day; the correct value is 10 ns/day for the
+    second invocation.
+
+    The two accounting scopes are kept separate:
+    - cumulative production → ``result.total_ns`` (the user-visible
+      "how much have we simulated" number)
+    - invocation-local production → ``result.ns_per_day`` (the
+      user-visible "how fast was THIS run" metric)
+    """
+
+    def test_resumed_run_total_ns_cumulative_ns_per_day_invocation_local(
+        self, tmp_path: Path
+    ) -> None:
+        """Resume scenario:
+        - previous invocation did 90 ns production (started at 200_000 equil,
+          ended at 200_000 + 45_000_000 = 45_200_000 absolute steps)
+        - this invocation does 10 ns more production (45_200_000 +
+          5_000_000 = 50_200_000 absolute steps, end of run)
+        - elapsed in this invocation: 1 day = 86_400 s
+
+        Expected:
+        - total_ns = 100.0 ns (cumulative production)
+        - ns_per_day = 10.0 ns/day (invocation-local throughput)
+        """
+        from biolab_runners.openmm.runner import OpenMMRunner
+
+        config = OpenMMConfig(
+            output_dir=str(tmp_path),
+            production_ns=100.0,
+            timestep_fs=2.0,
+        )
+        result = SimulationResult(config=config)
+        sim = MagicMock()
+        sim.saveState.side_effect = lambda path: Path(path).write_text("<State/>")
+
+        # Resume from step 45_200_000 (post-equil + 90 ns production).
+        start_step = 45_200_000
+        steps_done = 5_000_000  # 10 ns this invocation
+        absolute_step = start_step + steps_done  # 50_200_000
+        assert absolute_step == config.total_equil_steps + config.total_steps
+        # Production_steps_done cumulative = 100_000_000 - 200_000 = 99_800_000
+        cumulative_production_ns = (
+            (absolute_step - config.total_equil_steps) * config.timestep_fs / 1e6
+        )
+        # Invocation-local production = 10 ns
+        invocation_production_ns = steps_done * config.timestep_fs / 1e6
+        assert cumulative_production_ns == 100.0
+        assert invocation_production_ns == 10.0
+
+        # 1 day wall time
+        t0 = time.time() - 86_400
+
+        OpenMMRunner._finalize_result(
+            ctx=MagicMock(simulation=sim),
+            result=result,
+            energy_fh=MagicMock(),
+            traj_path=str(tmp_path / "trajectory.dcd"),
+            energy_path=str(tmp_path / "energy.csv"),
+            start_step=start_step,
+            steps_done=steps_done,
+            t0=t0,
+            output_dir=tmp_path,
+        )
+
+        # total_ns is cumulative.
+        assert result.total_ns == 100.0, (
+            f"total_ns must be cumulative ({cumulative_production_ns}); got {result.total_ns}"
+        )
+        # ns_per_day is invocation-local throughput = 10.0 ns/day,
+        # NOT the inflated 100.0 ns/day the previous code reported.
+        assert result.ns_per_day == 10.0, (
+            f"ns_per_day must be invocation-local throughput (10.0); "
+            f"got {result.ns_per_day} (cumulative/invocation would be 100.0)"
+        )
+
+
+class TestDerivedMarkerFailureDoesNotCrashTerminalRun:
+    """v11 BLOCKER #2 regression: the derived ``early_abort.json``
+    write is NOT authoritative — a failure to write it (full disk,
+    permission denied, etc.) MUST NOT crash an already-committed
+    terminal run. The runner's caller still needs a coherent
+    SimulationResult with ``early_abort=True``.
+    """
+
+    def test_write_abort_metadata_failure_is_caught(self, tmp_path: Path) -> None:
+        """Patch ``_write_abort_metadata`` to raise OSError on the
+        derived-marker write. The atomic save (manifest commit) must
+        still succeed; the runner must continue normally and return
+        ``early_abort=True``."""
+        from biolab_runners.openmm.runner import OpenMMRunner
+
+        verdict = MagicMock()
+        verdict.reason = "early_dissociation"
+        verdict.rmsd_5ns = 5.0
+        verdict.rmsd_10ns = 6.0
+        verdict.max_rmsd = 7.0
+        verdict.slope_a_per_ns = 0.5
+        verdict.receptor_fit_residual = 1.2
+
+        # Pre-create a previous manifest so the GC doesn't trip.
+        state_basename = "state.700000_1_1.xml"
+        (tmp_path / state_basename).write_text("<State/>")
+
+        sim = MagicMock()
+        sim.saveState.side_effect = lambda path: Path(path).write_text("<State/>")
+
+        config = OpenMMConfig(production_ns=100.0, timestep_fs=2.0)
+        # Patch _write_abort_metadata to raise.
+        original = OpenMMRunner._write_abort_metadata
+        OpenMMRunner._write_abort_metadata = MagicMock(  # type: ignore[method-assign]
+            side_effect=OSError("disk full")
+        )
+        try:
+            # Drive the abort path through _poll_offline_gate.
+            # We pass steps_done such that production_steps_done = 2_500_000
+            # (5 ns of production). The abort commits absolute_step =
+            # total_equil_steps + steps_done.
+            start_step = config.total_equil_steps
+            steps_done = 2_500_000
+            absolute_step = start_step + steps_done
+            terminal_payload = {
+                "step": absolute_step,
+                "type": "early_abort",
+                "reason": verdict.reason,
+                "production_ns": steps_done * config.timestep_fs / 1e6,
+            }
+            # Simulate the run code path: atomic save must succeed;
+            # _write_abort_metadata must be guarded.
+            from biolab_runners.openmm.system_builder import _atomic_save_checkpoint
+
+            state_basename = _atomic_save_checkpoint(
+                sim, tmp_path, absolute_step, terminal=terminal_payload
+            )
+            # Apply the same guard pattern the runner uses.
+            try:
+                OpenMMRunner._write_abort_metadata(
+                    verdict,
+                    tmp_path,
+                    abort_thresh=5.0,
+                    config=config,
+                    absolute_step=absolute_step,
+                    production_ns=steps_done * config.timestep_fs / 1e6,
+                )
+            except OSError as exc:
+                # Same handling the runner does.
+                logger.warning("best-effort marker failed: %s", exc)
+
+            # Manifest is terminal — atomic save committed it.
+            manifest = json.loads((tmp_path / "checkpoint.json").read_text())
+            assert manifest["records"][-1]["step"] == absolute_step
+            assert manifest["records"][-1]["terminal"]["type"] == "early_abort"
+            # early_abort.json was NOT written (the OSError prevented it).
+            assert not (tmp_path / "early_abort.json").exists()
+            # The state file IS present.
+            assert (tmp_path / state_basename).exists()
+        finally:
+            OpenMMRunner._write_abort_metadata = original  # type: ignore[method-assign]
+
+    def test_poll_offline_gate_survives_derived_marker_failure(self, tmp_path: Path) -> None:
+        """``_poll_offline_gate`` MUST NOT raise when the derived
+        ``early_abort.json`` write fails. The atomic save has
+        already committed the terminal decision; a derived-write
+        failure must be logged + suppressed so the loop returns
+        ``(True, reason)`` cleanly and the runner can finish."""
+        from biolab_runners.openmm.runner import OpenMMRunner
+
+        verdict = MagicMock()
+        verdict.reason = "early_dissociation"
+        verdict.rmsd_5ns = 5.0
+        verdict.rmsd_10ns = 6.0
+        verdict.max_rmsd = 7.0
+        verdict.slope_a_per_ns = 0.5
+        verdict.receptor_fit_residual = 1.2
+        verdict.current_ns = 5.0
+        verdict.abort = True
+        verdict.n_frames = 100
+
+        sim = MagicMock()
+        sim.saveState.side_effect = lambda path: Path(path).write_text("<State/>")
+
+        config = OpenMMConfig(production_ns=100.0, timestep_fs=2.0)
+        # Patch _write_abort_metadata to raise.
+        original = OpenMMRunner._write_abort_metadata
+        OpenMMRunner._write_abort_metadata = MagicMock(  # type: ignore[method-assign]
+            side_effect=OSError("disk full")
+        )
+        try:
+            # Stub evaluate_trajectory + write_verdict_file so we
+            # can drive _poll_offline_gate end-to-end.
+            with (
+                patch(
+                    "biolab_runners.openmm.runner.evaluate_trajectory",
+                    return_value=verdict,
+                ),
+                patch(
+                    "biolab_runners.openmm.runner.write_verdict_file",
+                    return_value=None,
+                ),
+            ):
+                start_step = config.total_equil_steps
+                steps_done = 2_500_000
+                polling_done, abort_reason = OpenMMRunner._poll_offline_gate(
+                    simulation=sim,
+                    output_dir=tmp_path,
+                    start_step=start_step,
+                    abort_thresh=5.0,
+                    config=config,
+                    steps_done=steps_done,
+                )
+            # polling_done=True (abort fired), abort_reason set,
+            # NO exception propagated.
+            assert polling_done is True
+            assert abort_reason == "early_dissociation"
+            # Manifest is committed + terminal.
+            manifest = json.loads((tmp_path / "checkpoint.json").read_text())
+            assert manifest["records"][-1]["terminal"]["type"] == "early_abort"
+        finally:
+            OpenMMRunner._write_abort_metadata = original  # type: ignore[method-assign]

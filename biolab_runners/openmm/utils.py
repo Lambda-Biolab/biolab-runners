@@ -556,30 +556,59 @@ def _check_manifest_terminal(
     ``step == manifest.step`` (the binding is enforced here). A
     missing, zero, malformed, or mismatched step is logged as a
     warning and treated as "no terminal payload → in progress".
+
+    v11 BLOCKER #3: the COMPLETE terminal schema must validate.
+    The terminal record MUST have:
+      - ``step``: a positive ``int`` (NOT str / bool / None).
+      - ``type``: the literal string ``"early_abort"``. Any other
+        value (missing, unknown, or unsupported type) is logged
+        as a warning and treated as non-terminal — accepting an
+        unknown type as terminal would skip result reconstruction
+        (``_reconstruct_terminal_result`` only knows how to fill
+        in fields for ``early_abort``), leaving the result
+        reporting ``early_abort=False`` despite the manifest
+        claiming terminal status.
+      - ``reason``: a non-empty ``str``.
     """
     terminal = last_record.get("terminal")
     if not isinstance(terminal, dict):
         return None
+    # v11 BLOCKER #3: step must be a strict positive int (no
+    # string coercion). JSON int → Python int; JSON str or bool
+    # is rejected so a forged manifest with ``"step": "5000000"``
+    # cannot pass.
     raw_terminal_step = terminal.get("step")
-    try:
-        terminal_step = (
-            int(str(raw_terminal_step))
-            if raw_terminal_step is not None and not isinstance(raw_terminal_step, bool)
-            else 0
-        )
-    except (TypeError, ValueError):
-        terminal_step = 0
-    if terminal_step == manifest_step and terminal_step > 0:
-        terminal_type = str(terminal.get("type", "unknown"))
-        return True, f"manifest_terminal_{terminal_type}_step_{terminal_step}"
-    if terminal_step > 0:
+    if (
+        not isinstance(raw_terminal_step, int)
+        or isinstance(raw_terminal_step, bool)
+        or raw_terminal_step <= 0
+    ):
+        return None
+    if raw_terminal_step != manifest_step:
         logger.warning(
             "Manifest has terminal.step=%d but record step=%d; "
             "treating as in_progress (binding mismatch)",
-            terminal_step,
+            raw_terminal_step,
             manifest_step,
         )
-    return None
+        return None
+    # v11 BLOCKER #3: type must be the literal ``early_abort``.
+    # No ``str(...)`` coercion — anything other than the exact
+    # string is logged + treated as non-terminal.
+    terminal_type = terminal.get("type")
+    if terminal_type != "early_abort":
+        logger.warning(
+            "Manifest terminal.type=%r is not supported "
+            "(only 'early_abort' is implemented); treating as in_progress",
+            terminal_type,
+        )
+        return None
+    # v11 BLOCKER #3: reason must be a non-empty string.
+    reason = terminal.get("reason")
+    if not isinstance(reason, str) or not reason:
+        logger.warning("Manifest terminal.reason is missing or empty; treating as in_progress")
+        return None
+    return True, f"manifest_terminal_{terminal_type}_step_{raw_terminal_step}"
 
 
 def load_terminal_payload(output_dir: Path, config: OpenMMConfig) -> dict[str, object] | None:
@@ -611,22 +640,22 @@ def load_terminal_payload(output_dir: Path, config: OpenMMConfig) -> dict[str, o
     terminal = last_record.get("terminal")
     if not isinstance(terminal, dict):
         return None
+    # v11 BLOCKER #3: step must be a strict positive int (no
+    # string coercion). Same gate as _check_manifest_terminal so
+    # the reconstruction and the completion check agree on which
+    # payloads are valid.
     raw_tstep = terminal.get("step")
-    try:
-        terminal_step = (
-            int(str(raw_tstep)) if raw_tstep is not None and not isinstance(raw_tstep, bool) else 0
-        )
-    except (TypeError, ValueError):
+    if not isinstance(raw_tstep, int) or isinstance(raw_tstep, bool) or raw_tstep <= 0:
         return None
-    if terminal_step != manifest_step or terminal_step <= 0:
+    if raw_tstep != manifest_step:
         return None
     # Normalised payload — production_ns is computed from the
     # v10 BLOCKER #3 invariant, not read from a stored field.
     payload: dict[str, object] = {
-        "step": terminal_step,
+        "step": raw_tstep,
         "type": str(terminal.get("type", "unknown")),
         "reason": str(terminal.get("reason", "")),
-        "production_ns": production_ns(terminal_step, config),
+        "production_ns": production_ns(raw_tstep, config),
     }
     # Pass through optional fields if present and well-typed.
     for opt in ("gate", "target", "peptide_id"):
