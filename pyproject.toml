@@ -46,6 +46,8 @@ dev = [
     "pytest>=8.0",
     "pytest-cov",
     "complexipy>=0.8",
+    "pre-commit>=3.5",
+    "hypothesis>=6.0",
     "numpy>=1.26",  # required by the OpenMM runner Kabsch-aligned RMSD tests
 ]
 
@@ -81,15 +83,25 @@ select = [
     "TCH", # flake8-type-checking
     "ARG", # flake8-unused-arguments
     "C90", # mccabe cyclomatic complexity
+    "RUF", # ruff-specific rules
+    "ANN", # flake8-annotations
+    "PT",  # flake8-pytest-style
 ]
 ignore = [
     "D100",  # missing module docstring (allow for __init__.py)
     "D104",  # missing public package docstring
     "D107",  # missing docstring in __init__
-    "S101",  # assert used (needed for tests)
     "S603",  # subprocess call — pipeline shells out to boltz CLI
     "S607",  # partial path for subprocess — boltz binary is on PATH
     "S602",  # subprocess shell — not used
+    # RUF001/002/003: ambiguous unicode (e.g. "α" instead of "a"). This
+    # is a computational-biology library where Greek letters, ×, −, and
+    # similar glyphs are correct domain notation (Cα, RMSD, ångström),
+    # not ambiguous characters. ASCII transliteration would hurt
+    # readability for the intended audience.
+    "RUF001",
+    "RUF002",
+    "RUF003",
 ]
 
 [tool.ruff.lint.mccabe]
@@ -99,20 +111,74 @@ max-complexity = 10
 convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["D", "S", "ARG", "TC003", "SIM117"]
+"tests/**" = [
+    "D",     # docstring rules (tests are self-documenting via test names)
+    "S",     # security (asserts, subprocess mocks are safe in tests)
+    "ARG",   # unused arguments (fixtures may pass extras)
+    "TC003", # type-checking block (tests import broadly)
+    "SIM117", # combine multiple with statements (test readability)
+    "ANN",   # annotations (tests use pytest fixtures; full annotations noisy)
+    "PT",    # pytest-style (existing tests use class grouping, not function-style)
+    "N802",  # camelCase function names (test mocks mirror OpenMM's camelCase API)
+    "N815",  # mixedCase in class scope (test mocks mirror OpenMM's mixedCase attrs)
+]
 
 # --- Pyright ---
 [tool.pyright]
+# Production-only type checking. Tests are excluded because the mock
+# infrastructure (types.ModuleType, MagicMock, "object"-typed stubs)
+# generates reports that the test code intentionally accepts. CI and
+# `make check_types` both run `pyright biolab_runners/` which respects
+# this include.
 include = ["biolab_runners"]
 pythonVersion = "3.11"
-typeCheckingMode = "basic"
-reportMissingImports = false
-reportMissingModuleSource = false
+typeCheckingMode = "standard"
+# `mdtraj` is an optional dep under the `openmm` extra; imported lazily
+# inside `biolab_runners/openmm/offline_gate.py`. Pyright can't see the
+# dep unless the extra is installed, so silence the missing-import
+# diagnostic specifically.
+reportMissingImports = "warning"
 reportAttributeAccessIssue = "warning"
 
 # --- Pytest ---
 [tool.pytest.ini_options]
+minversion = "8.0"
 testpaths = ["tests"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--tb=short",
+    "--cov=biolab_runners",
+    "--cov-branch",
+    "--cov-report=term-missing",
+]
 markers = [
-    "slow: long-running integration tests (e.g., live OpenMM simulations). Skipped by default; run with `pytest -m slow`.",
+    # The current pytest suite runs entirely with mocks + numpy + the
+    # optional `mdtraj` extra. No tests require real GPU hardware,
+    # the live boltz CLI, or network access — so no markers are
+    # defined. Add markers here when such tests are introduced and
+    # gate them via `--strict-markers` + `pytest -m <marker>` in CI.
+]
+
+# --- Coverage ---
+[tool.coverage.run]
+branch = true
+source = ["biolab_runners"]
+omit = [
+    "biolab_runners/__init__.py",
+]
+
+[tool.coverage.report]
+# Threshold enforced via `make validate` → pytest → --cov-fail-under below.
+# Current floor: 70%. Aspirational target: 80% (needs integration tests
+# for runner.py/system_builder.py OpenMM-coupled paths).
+fail_under = 70
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
 ]

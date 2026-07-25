@@ -42,4 +42,4 @@ Thumbs.db
 *.tmp
 *.log
 smoke_test/
-uv.lock
+# uv.lock is intentionally NOT ignored — committed for reproducible CI builds.

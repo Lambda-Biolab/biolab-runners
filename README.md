@@ -24,6 +24,17 @@ Extracted from the [OralBiome-AMP](https://github.com/Lambda-Biolab/OralBiome-AM
 
 ## Installation
 
+### With `uv` (recommended — matches the project's lockfile)
+
+```bash
+# Clone and install all extras
+git clone https://github.com/Lambda-Biolab/biolab-runners
+cd biolab-runners
+uv sync --all-extras
+```
+
+### With `pip`
+
 ```bash
 # Core (no heavy dependencies)
 pip install biolab-runners
@@ -129,10 +140,10 @@ print(f"Early abort: {result.early_abort} ({result.abort_reason})")
 
 ### OpenMM Buffer Presets
 
-`OpenMMConfig` ships with preset classmethods for common biological environments. Presets set ionic concentrations, pH, and temperature; all other fields can still be passed as keyword overrides.
+`OpenMMConfig` ships with preset classmethods for common biological environments. Presets set ionic concentration (NaCl only — see caveat below), pH, and temperature; all other fields can still be passed as keyword overrides.
 
 ```python
-# Saliva-like (140 mM NaCl + 1.4 mM CaCl2 + 0.5 mM KH2PO4, pH 6.2, 310 K)
+# Saliva-like (140 mM NaCl, pH 6.2, 310 K)
 config = OpenMMConfig.saliva(
     receptor_pdb="receptor.pdb",
     peptide_pdb="peptide.pdb",
@@ -162,7 +173,9 @@ config = OpenMMConfig.physiological(
 )
 ```
 
-For environments not covered by a preset, instantiate `OpenMMConfig` directly and set `nacl_mol`, `cacl2_mol`, `kh2po4_mol`, `protonation_ph`, and `temperature_k` explicitly.
+For environments not covered by a preset, instantiate `OpenMMConfig` directly and set `nacl_mol`, `protonation_ph`, and `temperature_k` explicitly.
+
+**Ionic strength:** the runner currently models only NaCl ionic strength (the `addSolvent(ionicStrength=…)` call takes a single value). The saliva preset's Ca²⁺ and KH₂PO₄ contributions from the original literature composition are documented in the docstring as unmodelled context — they don't reach the OpenMM call. Multi-ion modeling is future work.
 
 Note: very low pH (e.g. gastric) affects protonation of His/Asp/Glu/N-termini. Verify that the selected protein force field handles the target regime.
 
@@ -174,13 +187,11 @@ result = runner.run(dry_run=True)  # Validates config, no GPU needed
 
 ## Quality Gates (Boltz-2)
 
-Predictions are automatically classified:
-
-| Gate | Criteria |
-|------|----------|
-| **PASS** | ipTM >= 0.7, pLDDT >= 70, no clashes |
-| **CONDITIONAL** | ipTM 0.5-0.7, or pLDDT 50-70, or 1-3 mild clashes |
-| **FAIL** | ipTM < 0.5, or pLDDT < 50, or severe clashes, or > 3 clashes |
+Predictions are automatically classified into `PASS` / `CONDITIONAL` / `FAIL`
+based on ipTM, pLDDT, and clash counts. The thresholds are the single source
+of truth in `biolab_runners.boltz2.config` (constants `IPTM_PASS`,
+`IPTM_CONDITIONAL`, `PLDDT_PASS`, `PLDDT_CONDITIONAL`, `CONFIDENCE_SCORE_*`,
+and the per-atom clash heuristic in `apply_quality_gate`).
 
 ## Early Abort (OpenMM)
 
@@ -193,7 +204,7 @@ The MD runner checks peptide stability at 5 ns and 10 ns:
 
 ## Equilibration Protocol
 
-3-stage protocol for peptide-protein complexes:
+3-stage protocol (defined in `biolab_runners.openmm.runner._run_equilibration`):
 
 1. **NVT 100 ps** — Strong backbone restraints (k=1000 kJ/mol/nm²)
 2. **NPT 100 ps** — Reduced restraints (k=100 kJ/mol/nm²)
@@ -203,20 +214,28 @@ Solvation: dodecahedral box with TIP3P water. Ionic conditions are configurable 
 
 ## Development
 
+The full gate (`make validate`) runs ruff → pyright → complexipy → pytest and
+is CI-safe (read-only).
+
 ```bash
-# Install dev dependencies
+# Install dev dependencies (with uv)
+uv sync --all-extras
+
+# Or with pip
 pip install -e ".[all]"
-pip install ruff pyright pytest pytest-cov
 
-# Lint
-ruff check biolab_runners/ tests/
-ruff format --check biolab_runners/ tests/
+# Full validation gate (lint + type + complexity + tests)
+make validate
 
-# Type check
-pyright biolab_runners/
+# Auto-fix lint/format issues
+make lint_fix
 
-# Test
-pytest tests/ -v
+# Run tests only
+make test
+
+# Smoke test (requires real OpenMM + GPU; runs the existing
+# smoke_test/run_smoke.py driver)
+make smoke_test
 ```
 
 ## License

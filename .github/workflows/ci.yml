@@ -3,8 +3,10 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -17,26 +19,62 @@ jobs:
         python-version: ["3.11", "3.12"]
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
         with:
           python-version: ${{ matrix.python-version }}
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[all]" || pip install -e .
-          pip install ruff pyright pytest pytest-cov
+        # --extra openmm brings openmm + pdbfixer + numpy + mdtraj.
+        # Without --all-extras we skip boltz2 (requires the boltz
+        # binary on PATH and a GPU, not needed for the unit-test
+        # suite, which mocks the CLI). Saves ~30 s per CI run.
+        run: uv sync --frozen --extra openmm --group dev
 
       - name: Lint with ruff
         run: |
-          ruff check biolab_runners/ tests/
-          ruff format --check biolab_runners/ tests/
+          uv run ruff check biolab_runners/ tests/
+          uv run ruff format --check biolab_runners/ tests/
 
       - name: Type check with pyright
-        run: pyright biolab_runners/
+        run: uv run pyright biolab_runners/
+
+      - name: Check complexity
+        run: uv run complexipy biolab_runners/ --max-complexity-allowed 15
 
       - name: Run tests
-        run: pytest tests/ -v --tb=short
+        run: uv run pytest tests/ -v --tb=short
+
+  # Smoke test job — requires a self-hosted runner with a CUDA-capable
+  # GPU and OpenMM built with CUDA support (not available on GitHub-hosted
+  # runners). Trigger manually with `workflow_dispatch` after the lint
+  # gate is green. Run on tagged releases for an end-to-end check.
+  smoke-test:
+    # Triggered by tag pushes (v*) or manual dispatch — NOT on regular
+    # PRs or main-branch pushes. Requires a self-hosted runner with a
+    # CUDA-capable GPU + OpenMM built with CUDA support (not available
+    # on GitHub-hosted runners). Run ``workflow_dispatch`` from the
+    # Actions tab to invoke manually.
+    runs-on: [self-hosted, gpu]
+    needs: lint-and-test
+    if: |
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Install uv
+        uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Install dependencies
+        # Smoke test needs the boltz2 extra too (the boltz CLI is
+        # referenced indirectly through biolab_runners imports).
+        run: uv sync --frozen --all-extras --group dev
+      - name: Run smoke test
+        run: make smoke_test

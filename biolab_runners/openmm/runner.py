@@ -33,37 +33,35 @@ import logging
 import signal
 import sys
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 
 from biolab_runners.openmm.config import OpenMMConfig, SimulationResult
+from biolab_runners.openmm.geometry import (
+    collect_chain_ca_positions,
+    min_pbc_distance,
+)
 from biolab_runners.openmm.offline_gate import (
     DEFAULT_GATE_10NS,
+    GateVerdict,
     evaluate_trajectory,
     write_verdict_file,
 )
-from biolab_runners.openmm.utils import (
-    load_checkpoint_step,
-    verify_production_outputs,
+from biolab_runners.openmm.paths import FileNames
+from biolab_runners.openmm.system_builder import (
+    SimulationContext,
+    _atomic_save_checkpoint,
+    prepare_simulation,
+    quarantine_stale_checkpoint,
 )
-
-
-@dataclass
-class _MdContext:
-    """Mutable carrier for simulation state passed between run() helpers."""
-
-    simulation: object = None
-    modeller: object = None
-    restraint_force: object = None
-    ca_indices: list[int] = field(default_factory=list)
-    chains: list[object] = field(default_factory=list)
-    openmm_mod: object = None
-    app_mod: object = None
-    unit_mod: object = None
-    np_mod: object = None
-    platform: object = None
-    is_resuming: bool = False
-
+from biolab_runners.openmm.utils import (
+    InvalidCheckpointError,
+    is_run_complete,
+    load_checkpoint,
+    load_terminal_payload,
+)
+from biolab_runners.openmm.utils import (
+    production_ns as _production_ns,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +158,13 @@ class OpenMMRunner:
         resume_state = self._resolve_skip_or_resume(force, output_dir, config, result)
         if resume_state is None:
             return result
+        # ``start_step`` is the ABSOLUTE step the simulation will be at
+        # when the production loop starts. For a fresh run, equil runs
+        # inside _prepare_simulation, so the simulation is at
+        # total_equil_steps when the loop starts. For a resumed run,
+        # loadState sets the simulation to the saved step. The
+        # production loop computes its absolute step as
+        # ``start_step + steps_done`` (local).
         start_step, remaining_steps, resume_xml = resume_state
 
         ctx = self._prepare_simulation(config, output_dir, resume_xml, result)
@@ -168,9 +173,8 @@ class OpenMMRunner:
 
         abort_thresh = config.target_irmsd_threshold_a * _ABORT_MULTIPLIER
 
-        traj_path = str(output_dir / "trajectory.dcd")
-        energy_path = str(output_dir / "energy.csv")
-        state_xml_path = str(output_dir / "state.xml")
+        traj_path = str(output_dir / FileNames.TRAJECTORY)
+        energy_path = str(output_dir / FileNames.ENERGY)
 
         energy_fh = self._setup_reporters(ctx, config, traj_path, energy_path, remaining_steps)
 
@@ -182,11 +186,11 @@ class OpenMMRunner:
         )
 
         t0 = time.time()
-        _, abort_reason = self._run_production_loop(
+        steps_done, abort_reason = self._run_production_loop(
             simulation=ctx.simulation,
             config=config,
+            start_step=start_step,
             remaining_steps=remaining_steps,
-            state_xml_path=state_xml_path,
             output_dir=output_dir,
             enable_early_abort=enable_early_abort,
             abort_thresh=abort_thresh,
@@ -202,12 +206,11 @@ class OpenMMRunner:
             energy_fh=energy_fh,
             traj_path=traj_path,
             energy_path=energy_path,
-            state_xml_path=state_xml_path,
-            remaining_steps=remaining_steps,
+            start_step=start_step,
+            steps_done=steps_done,
             t0=t0,
             output_dir=output_dir,
         )
-        _ = start_step  # consumed via remaining_steps
         return result
 
     def _resolve_skip_or_resume(
@@ -219,45 +222,390 @@ class OpenMMRunner:
     ) -> tuple[int, int, str] | None:
         """Handle idempotency + checkpoint resolution.
 
-        Returns None if the simulation is already complete (result populated),
-        otherwise (start_step, remaining_steps, resume_xml).
+        Decision tree (in order):
+
+        1. ``force=True`` ⇒ quarantine all resumable files, then
+           proceed to a fresh build. The quarantine moves the
+           manifest, the energy log, every state file
+           (``state*.xml``), AND the generation-scoped terminal
+           marker ``early_abort.json`` (if present) into
+           ``output_dir/.stale/<UTC>/`` BEFORE we return — so the
+           next non-forced invocation (or this one, if interrupted
+           mid-build) cannot pair a stale state with a fresh
+           topology, AND a stale abort marker cannot mis-classify
+           a mid-production checkpoint as terminal (v9 BLOCKER #1).
+
+        2. Read the manifest via :func:`load_checkpoint`. The
+           function validates the referenced state file (basename,
+           expected name pattern, exists, non-empty); an invalid
+           reference raises :class:`InvalidCheckpointError` which
+           we convert into ``result.error`` and abort. The earlier
+           "verify_production_outputs(...) → complete=True" gate
+           was removed because a mid-production checkpoint can
+           produce a large trajectory and many energy rows WITHOUT
+           the run being complete — file presence does not imply
+           completion.
+
+        3. If the manifest is valid (step > 0, state file valid),
+           call :func:`is_run_complete`: a run is terminal when
+           ``manifest_step >= total_equil_steps + total_steps``
+           (normal completion) OR ``early_abort.json`` exists with
+           ``aborted=True`` (intentional early termination). If
+           complete, populate the result (including
+           ``state_xml_path`` from the manifest) and return None.
+
+        4. Otherwise, return the resume tuple ``(start_step,
+           remaining_steps, resume_xml)``. ``start_step`` is the
+           absolute step the simulation will be at when the
+           production loop starts (the manifest's step for resumes,
+           ``total_equil_steps`` for fresh runs).
+
+        5. If no manifest exists but state files (legacy or v7)
+           are on disk, the checkpoint is orphaned — fail fast
+           with ``force=True`` guidance. Pairing an orphan state
+           with a freshly-built System would re-introduce the
+           incompatibility the "Resume safety" / "Atomic
+           checkpoint" rules exist to avoid.
+
+        Returns None if the simulation is already complete (result
+        populated) or the checkpoint is orphaned / invalid (result
+        error set); otherwise (start_step, remaining_steps,
+        resume_xml).
+
+        ``start_step`` is the ABSOLUTE step the simulation will be at
+        when the production loop starts:
+        - Fresh run: ``config.total_equil_steps`` (equil runs inside
+          ``_prepare_simulation`` before the loop).
+        - Resumed run: the absolute step from the manifest (the
+          ``loadState`` in ``prepare_simulation`` sets the simulator
+          to this step).
         """
-        if not force:
-            verification = verify_production_outputs(output_dir)
-            if verification["complete"]:
+        if force:
+            moved = quarantine_stale_checkpoint(output_dir)
+            if moved:
                 logger.info(
-                    "Skipping MD — trajectory already complete at %s. Use force=True to re-run.",
-                    output_dir / "trajectory.dcd",
-                )
-                result.trajectory_path = str(output_dir / "trajectory.dcd")
-                result.energy_path = str(output_dir / "energy.csv")
-                result.state_xml_path = str(output_dir / "state.xml")
-                result.topology_path = str(output_dir / "topology.pdb")
-                return None
-
-        start_step = 0
-        resume_xml = ""
-        state_xml = output_dir / "state.xml"
-        if not force and state_xml.exists() and state_xml.stat().st_size > 0:
-            start_step = load_checkpoint_step(output_dir)
-            if start_step > 0:
-                resume_xml = str(state_xml)
-                logger.info(
-                    "Resuming from checkpoint at step %d (%.2f ns)",
-                    start_step,
-                    start_step * config.timestep_fs / 1e6,
+                    "force=True: quarantined %d stale checkpoint file(s) to %s",
+                    len(moved),
+                    moved[0].parent,
                 )
 
-        production_steps_done = max(0, start_step - config.total_equil_steps)
-        remaining_steps = max(0, config.total_steps - production_steps_done)
-        if remaining_steps == 0:
-            logger.info("No remaining steps — simulation already complete")
-            result.trajectory_path = str(output_dir / "trajectory.dcd")
-            result.energy_path = str(output_dir / "energy.csv")
-            result.state_xml_path = str(state_xml)
+        # Read the manifest. ``load_checkpoint`` validates the
+        # referenced state file (basename, pattern, exists, size,
+        # and v10 BLOCKER #1: embedded-step equality) —
+        # InvalidCheckpointError surfaces a dangling or unsafe
+        # reference immediately.
+        manifest_step, state_file = OpenMMRunner._read_manifest_or_set_error(output_dir, result)
+        if result.error:
             return None
 
+        if manifest_step > 0:
+            return OpenMMRunner._handle_manifest_branch(
+                result, output_dir, config, manifest_step, state_file
+            )
+
+        orphan_error = OpenMMRunner._check_orphan_state_files(output_dir)
+        if orphan_error is not None:
+            result.error = orphan_error
+            logger.error(result.error)
+            return None
+
+        return OpenMMRunner._build_fresh_resume_tuple(config)
+
+    @staticmethod
+    def _reconstruct_terminal_result(
+        result: SimulationResult,
+        output_dir: Path,
+        config: OpenMMConfig,
+        reason: str,
+    ) -> None:
+        """Populate ``result`` from the manifest's terminal payload.
+
+        v10 BLOCKER #2: terminal status is part of the manifest's
+        ``terminal`` payload (committed atomically with the state
+        file via :func:`biolab_runners.openmm.system_builder._atomic_save_checkpoint`).
+        Reconstructed values come from
+        :func:`biolab_runners.openmm.utils.load_terminal_payload`,
+        which reads the validated manifest record and computes
+        ``production_ns`` from the v10 BLOCKER #3 invariant
+        (``absolute_step - total_equil_steps``).
+
+        For normal-completion terminals (no abort marker) the
+        function is a no-op — the result's artifact paths and
+        ``state_xml_path`` are already populated by the caller.
+        For manifest-terminal payloads (early_abort type), the
+        function populates ``early_abort=True``, ``abort_reason``,
+        and ``total_ns`` from the payload.
+        """
+        if not reason.startswith("manifest_terminal_"):
+            # Normal completion — caller already set the artifact
+            # paths. No-op.
+            return
+        payload = load_terminal_payload(output_dir, config)
+        if payload is None:
+            # The manifest claims terminal but the payload failed
+            # to validate. Log and leave result.early_abort=False
+            # so the caller notices the inconsistency.
+            logger.warning(
+                "Run classified as terminal via manifest payload "
+                "(reason=%s) but the payload failed to re-validate; "
+                "result.early_abort is left False",
+                reason,
+            )
+            return
+        if payload.get("type") == "early_abort":
+            result.early_abort = True
+            result.abort_reason = str(payload.get("reason", ""))
+            # v10 BLOCKER #3: production_ns is the canonical
+            # value (computed from absolute_step - total_equil_steps).
+            try:
+                result.total_ns = float(str(payload.get("production_ns", 0.0)))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                result.total_ns = 0.0
+            logger.info(
+                "Reconstructing early-abort result: reason=%r production_ns=%.2f",
+                result.abort_reason,
+                result.total_ns,
+            )
+
+    @staticmethod
+    def _populate_skip_result(
+        result: SimulationResult,
+        output_dir: Path,
+        config: OpenMMConfig,
+        manifest_step: int,
+        state_file: str,
+        reason: str,
+    ) -> str | None:
+        """Populate ``result`` for an idempotent skip + return artifact error.
+
+        v10 BLOCKER #4: terminal classification is from the manifest,
+        but the SCIENTIFIC outputs (trajectory, energy, topology) must
+        also be present and usable. Returns the artifact error message
+        if validation fails, or ``None`` after populating the result
+        fields on success.
+
+        Also populates ``result.total_ns`` from the v10 BLOCKER #3
+        invariant (production ns = max(0, absolute_step -
+        total_equil_steps) * timestep_fs / 1e6) and the
+        ``_reconstruct_terminal_result`` payload (manifest's
+        ``terminal`` field, v10 BLOCKER #2).
+        """
+        artifact_error = OpenMMRunner._validate_terminal_artifacts(output_dir)
+        if artifact_error is not None:
+            return artifact_error
+        result.trajectory_path = str(output_dir / FileNames.TRAJECTORY)
+        result.energy_path = str(output_dir / FileNames.ENERGY)
+        result.topology_path = str(output_dir / FileNames.TOPOLOGY)
+        result.state_xml_path = str(output_dir / state_file)
+        # v10 BLOCKER #3: total_ns is PRODUCTION ns.
+        if reason.startswith("normal_completion_step_"):
+            result.total_ns = round(_production_ns(manifest_step, config), 2)
+        OpenMMRunner._reconstruct_terminal_result(result, output_dir, config, reason)
+        return None
+
+    @staticmethod
+    def _populate_defensive_skip(
+        output_dir: Path,
+        config: OpenMMConfig,
+        manifest_step: int,
+        state_file: str,
+        result: SimulationResult,
+    ) -> bool:
+        """Defensive skip when remaining_steps=0 but no terminal classification.
+
+        ``is_run_complete`` should have classified this case as
+        terminal before we got here. If it didn't (e.g. config
+        changed mid-run, or the manifest predates the
+        ``terminal`` field), populate the artifact paths and
+        return True so the caller returns None (skip).
+        """
+        logger.info(
+            "No remaining steps — manifest at step %d, target %d",
+            manifest_step,
+            config.total_equil_steps + config.total_steps,
+        )
+        if state_file:
+            result.trajectory_path = str(output_dir / FileNames.TRAJECTORY)
+            result.energy_path = str(output_dir / FileNames.ENERGY)
+            result.topology_path = str(output_dir / FileNames.TOPOLOGY)
+            result.state_xml_path = str(output_dir / state_file)
+        return True
+
+    @staticmethod
+    def _build_fresh_resume_tuple(
+        config: OpenMMConfig,
+    ) -> tuple[int, int, str]:
+        """Build the resume tuple for a fresh run (no manifest, no orphan).
+
+        For a fresh run, equil runs inside ``_prepare_simulation``,
+        so ``start_step = config.total_equil_steps`` and
+        ``remaining_steps = config.total_steps``.
+        """
+        start_step = config.total_equil_steps
+        production_steps_done = max(0, start_step - config.total_equil_steps)
+        remaining_steps = max(0, config.total_steps - production_steps_done)
+        return start_step, remaining_steps, ""
+
+    @staticmethod
+    def _handle_manifest_branch(
+        result: SimulationResult,
+        output_dir: Path,
+        config: OpenMMConfig,
+        manifest_step: int,
+        state_file: str,
+    ) -> tuple[int, int, str] | None:
+        """Branch when a valid manifest exists.
+
+        Either classify the run as terminal (return None + populate
+        the result), or return the resume tuple ``(start_step,
+        remaining_steps, resume_xml)``, or fail fast on a malformed
+        terminal payload (v13 BLOCKER — present but invalid must
+        NOT fall through to resume or normal completion).
+        """
+        target_step = config.total_equil_steps + config.total_steps
+        complete, reason = is_run_complete(output_dir, config)
+        if complete:
+            logger.info(
+                "Skipping MD — run is already terminal (%s) at step %d",
+                reason,
+                manifest_step,
+            )
+            skip_error = OpenMMRunner._populate_skip_result(
+                result, output_dir, config, manifest_step, state_file, reason
+            )
+            if skip_error is not None:
+                result.error = skip_error
+                logger.error(result.error)
+                return None
+            return None
+        # v13 BLOCKER: a malformed terminal payload at the target
+        # step is reported by ``is_run_complete`` as
+        # ``(False, "invalid_terminal_...")`` — the manifest is in
+        # an ambiguous state and the runner must fail loudly rather
+        # than fall through to a resume that would either
+        # reclassify the run as normal completion (overwriting the
+        # bad terminal) or commit a new terminal without addressing
+        # the schema error. The user must investigate via
+        # ``force=True`` (which quarantines the malformed manifest
+        # alongside the other resumable files).
+        if reason.startswith("invalid_terminal_"):
+            result.error = (
+                f"Manifest carries a malformed terminal payload at "
+                f"step {manifest_step} (reason={reason!r}). The "
+                f"user attempted to record a terminal decision but "
+                f"the schema is wrong; the run is in an ambiguous "
+                f"state. Re-run with force=True to quarantine the "
+                f"manifest and start fresh."
+            )
+            logger.error(result.error)
+            return None
+        logger.info(
+            "Resuming from checkpoint at step %d (%.2f ns of %d needed)",
+            manifest_step,
+            manifest_step * config.timestep_fs / 1e6,
+            target_step,
+        )
+        resume_xml = str(output_dir / state_file)
+        start_step = manifest_step
+        production_steps_done = max(0, start_step - config.total_equil_steps)
+        remaining_steps = max(0, config.total_steps - production_steps_done)
         return start_step, remaining_steps, resume_xml
+
+    @staticmethod
+    def _read_manifest_or_set_error(output_dir: Path, result: SimulationResult) -> tuple[int, str]:
+        r"""Read the manifest; on failure, set result.error and return (0, "").
+
+        Returns (manifest_step, state_file_basename). On
+        ``InvalidCheckpointError`` (e.g. v10 BLOCKER #1 step
+        mismatch, dangling state file), sets ``result.error`` and
+        returns (0, "").
+        """
+        try:
+            return load_checkpoint(output_dir)
+        except InvalidCheckpointError as exc:
+            result.error = str(exc)
+            logger.error(result.error)
+            return 0, ""
+
+    @staticmethod
+    def _check_orphan_state_files(output_dir: Path) -> str | None:
+        """Detect orphaned state files when no manifest is present.
+
+        No valid manifest + state files on disk (legacy ``state.xml``
+        from a v6 run or v7 ``state.<gen>.xml`` from an interrupted
+        save that landed before the manifest rename) is an orphan
+        condition. Pairing the orphan state with a freshly-built
+        System would re-introduce the incompatibility the "Resume
+        safety" rule exists to avoid.
+
+        Returns:
+            The error message string if orphan files are detected,
+            ``None`` if the directory is clean (no state files
+            without a manifest).
+        """
+        leftover_states = list(output_dir.glob("state*.xml"))
+        if not leftover_states:
+            return None
+        return (
+            f"State file(s) exist at {leftover_states} but "
+            f"the manifest {FileNames.CHECKPOINT_JSON} is "
+            f"missing or invalid — the saved state's step is "
+            f"unknown. Pairing it with a freshly-built System "
+            f"would re-introduce the incompatibility this rule "
+            f"exists to avoid. Re-run with force=True to "
+            f"discard the orphaned checkpoint."
+        )
+
+    @staticmethod
+    def _validate_terminal_artifacts(output_dir: Path) -> str | None:
+        """Verify that a terminal run has its promised outputs.
+
+        v10 BLOCKER #4: ``is_run_complete`` returns true based on
+        the manifest's terminal decision, but a terminal run also
+        needs the scientific outputs (trajectory, energy log,
+        topology) to be present and usable. A terminal manifest
+        plus state file but no trajectory / energy returns a
+        result with ``error=""`` and paths pointing to
+        nonexistent files — silently misleading downstream
+        consumers.
+
+        Returns:
+            ``None`` if all required artifacts are present and
+            usable. Otherwise, a human-readable error message
+            naming the first missing or unusable artifact.
+
+        Validation:
+        - trajectory.dcd must exist and be > 0 bytes.
+        - energy.csv must exist and have ≥1 data row.
+        - topology.pdb must exist and be > 0 bytes.
+        """
+        traj = output_dir / FileNames.TRAJECTORY
+        energy = output_dir / FileNames.ENERGY
+        topo = output_dir / FileNames.TOPOLOGY
+        missing: list[str] = []
+        empty: list[str] = []
+        for label, path in (("trajectory", traj), ("energy", energy), ("topology", topo)):
+            if not path.exists():
+                missing.append(label)
+            elif path.stat().st_size == 0:
+                empty.append(label)
+        # Energy.csv is text — a 1-byte file is header only and
+        # counts as empty for the purpose of scientific output.
+        if energy.exists() and energy.stat().st_size > 0:
+            data_rows = max(0, len(energy.read_text().strip().splitlines()) - 1)
+            if data_rows == 0:
+                empty.append("energy (header-only, no data rows)")
+        if missing or empty:
+            problems = [f"missing {n}" for n in missing] + [f"empty {n}" for n in empty]
+            return (
+                "Terminal run is missing required artifacts: "
+                + ", ".join(problems)
+                + ". The checkpoint recorded completion but the "
+                "scientific outputs are not usable; the user must "
+                "investigate the prior run (e.g. disk full during "
+                "trajectory write) and re-run with force=True."
+            )
+        return None
 
     def _prepare_simulation(
         self,
@@ -265,201 +613,24 @@ class OpenMMRunner:
         output_dir: Path,
         resume_xml: str,
         result: SimulationResult,
-    ) -> _MdContext | None:
-        """Import OpenMM, build system, create simulation, equilibrate or resume.
+    ) -> SimulationContext | None:
+        """Build the OpenMM simulation, then equilibrate unless resuming.
 
-        Populates result.error on failure. Returns the simulation context or None.
+        Delegates system/forcefield/topology/integrator assembly to
+        :func:`biolab_runners.openmm.system_builder.prepare_simulation`,
+        then runs the equilibration protocol if the run is not a
+        checkpoint resume.
         """
-        try:
-            import numpy as np  # noqa: I001
-            import openmm
-            import openmm.app as app
-            import openmm.unit as unit
-        except ImportError as exc:
-            result.error = f"OpenMM not installed: {exc}"
-            logger.error(result.error)
+        ctx = prepare_simulation(config, output_dir, resume_xml, result)
+        if ctx is None:
             return None
-
-        try:
-            platform = openmm.Platform.getPlatformByName(config.openmm_platform)
-            if config.openmm_platform == "OpenCL":
-                platform.setPropertyDefaultValue("Precision", "mixed")
-            logger.info("Using platform: %s", platform.getName())
-        except Exception as exc:
-            result.error = f"Platform {config.openmm_platform} not available: {exc}"
-            logger.error(result.error)
-            return None
-
-        forcefield = self._build_forcefield(config, app)
-        is_resuming = bool(resume_xml and Path(resume_xml).exists())
-
-        modeller = self._build_or_load_modeller(
-            config, output_dir, app, forcefield, is_resuming, result
-        )
-        if modeller is None:
-            return None
-
-        self._write_topology(modeller, output_dir, app, result)
-
-        system, integrator = self._assemble_system(forcefield, modeller, config, openmm, app, unit)
-        chains = list(modeller.topology.chains())  # type: ignore[union-attr]
-        restraint_force, ca_indices = self._add_ca_restraint(system, modeller, chains, openmm)
-
-        simulation = app.Simulation(modeller.topology, system, integrator, platform)  # type: ignore[union-attr]
-        simulation.context.setPositions(modeller.positions)  # type: ignore[union-attr]
-
-        if is_resuming:
-            logger.info("Resuming from checkpoint: %s", resume_xml)
-            simulation.loadState(resume_xml)
-        else:
-            self._run_equilibration(
-                simulation,
-                restraint_force,
-                ca_indices,
-                config,
-                unit,
-                output_dir,
-                chains,
-                np,
-            )
-
-        return _MdContext(
-            simulation=simulation,
-            modeller=modeller,
-            restraint_force=restraint_force,
-            ca_indices=ca_indices,
-            chains=chains,
-            openmm_mod=openmm,
-            app_mod=app,
-            unit_mod=unit,
-            np_mod=np,
-            platform=platform,
-            is_resuming=is_resuming,
-        )
-
-    @staticmethod
-    def _build_forcefield(config: OpenMMConfig, app: object) -> object:
-        """Construct the OpenMM ForceField for the configured protein FF + water.
-
-        Uses ``config.water_ff_xml`` when provided, else falls back to
-        ``{water_model}.xml``. The distinction matters: ``Modeller.addSolvent``
-        takes a SHORT model key (``"tip3p"``), whereas ``app.ForceField`` needs
-        an XML filename. Bare ``tip3p.xml`` ships water parameters only, so
-        ionic-strength solvation raises "No template found for residue N (NA)"
-        unless the XML loaded into ForceField carries ion templates. Point
-        ``water_ff_xml`` at e.g. ``"amber14/tip3p.xml"`` for an AMBER water+ions
-        bundle. For CHARMM36m, the built-in ``charmm36/water.xml`` already
-        includes ion templates so this override is unnecessary.
-
-        ``config.extra_forcefields`` is appended after the protein and water
-        XMLs so later entries take precedence for overlapping atom types.
-        """
-        ff_name = config.protein_ff
-        if "charmm" in ff_name.lower():
-            base = ["charmm36.xml", "charmm36/water.xml"]
-        else:
-            water_xml = config.water_ff_xml or f"{config.water_model}.xml"
-            base = [f"{ff_name}.xml", water_xml]
-        return app.ForceField(*base, *config.extra_forcefields)  # type: ignore[union-attr]
-
-    def _build_or_load_modeller(
-        self,
-        config: OpenMMConfig,
-        output_dir: Path,
-        app: object,
-        forcefield: object,
-        is_resuming: bool,
-        result: SimulationResult,
-    ) -> object | None:
-        """Build a fresh solvated modeller or load one from a prior run."""
-        topo_path = output_dir / "topology.pdb"
-        existing_topo = (
-            topo_path if topo_path.exists() and topo_path.stat().st_size > 100_000 else None
-        )
-
-        if is_resuming and existing_topo:
-            logger.info("Resuming: loading solvated topology from %s", existing_topo)
-            topo_pdb = app.PDBFile(str(existing_topo))  # type: ignore[union-attr]
-            modeller = app.Modeller(topo_pdb.topology, topo_pdb.positions)  # type: ignore[union-attr]
-            logger.info("Loaded solvated system: %d atoms", modeller.topology.getNumAtoms())
-            return modeller
-
-        receptor_pdb = self._resolve_pdb(config.receptor_pdb, "receptor.pdb")
-        peptide_pdb = self._resolve_pdb(config.peptide_pdb, "peptide.pdb")
-        modeller = self._build_system(receptor_pdb, peptide_pdb, config, app, forcefield)
-        if modeller is None:
-            result.error = "Failed to build system — no valid PDB files"
-        return modeller
-
-    @staticmethod
-    def _write_topology(
-        modeller: object, output_dir: Path, app: object, result: SimulationResult
-    ) -> None:
-        """Persist the solvated topology PDB and populate result metadata."""
-        topo_path = output_dir / "topology.pdb"
-        with open(str(topo_path), "w") as f:
-            app.PDBFile.writeFile(modeller.topology, modeller.positions, f)  # type: ignore[union-attr]
-        result.num_atoms = modeller.topology.getNumAtoms()  # type: ignore[union-attr]
-        result.topology_path = str(topo_path)
-        logger.info("Topology: %d atoms", result.num_atoms)
-
-    @staticmethod
-    def _assemble_system(
-        forcefield: object,
-        modeller: object,
-        config: OpenMMConfig,
-        openmm: object,
-        app: object,
-        unit: object,
-    ) -> tuple[object, object]:
-        """Create the OpenMM System (with barostat) and integrator."""
-        system = forcefield.createSystem(  # type: ignore[union-attr]
-            modeller.topology,  # type: ignore[union-attr]
-            nonbondedMethod=app.PME,  # type: ignore[union-attr]
-            nonbondedCutoff=1.0 * unit.nanometers,  # type: ignore[union-attr]
-            constraints=app.HBonds,  # type: ignore[union-attr]
-        )
-        system.addForce(
-            openmm.MonteCarloBarostat(  # type: ignore[union-attr]
-                config.pressure_atm * unit.atmospheres,  # type: ignore[union-attr]
-                config.temperature_k * unit.kelvin,  # type: ignore[union-attr]
-                25,
-            )
-        )
-        integrator = openmm.LangevinMiddleIntegrator(  # type: ignore[union-attr]
-            config.temperature_k * unit.kelvin,  # type: ignore[union-attr]
-            1.0 / unit.picoseconds,  # type: ignore[union-attr]
-            config.timestep_fs * unit.femtoseconds,  # type: ignore[union-attr]
-        )
-        return system, integrator
-
-    @staticmethod
-    def _add_ca_restraint(
-        system: object, modeller: object, chains: list[object], openmm: object
-    ) -> tuple[object, list[int]]:
-        """Add the C-alpha CustomExternalForce restraint (k=0) to the system."""
-        ca_indices: list[int] = []
-        for chain in chains:
-            for atom in chain.atoms():  # type: ignore[union-attr]
-                if atom.name == "CA":
-                    ca_indices.append(atom.index)
-
-        restraint_force = openmm.CustomExternalForce(  # type: ignore[union-attr]
-            "k*periodicdistance(x,y,z,x0,y0,z0)^2"
-        )
-        restraint_force.addGlobalParameter("k", 0.0)
-        restraint_force.addPerParticleParameter("x0")
-        restraint_force.addPerParticleParameter("y0")
-        restraint_force.addPerParticleParameter("z0")
-        for idx in ca_indices:
-            pos = modeller.positions[idx]  # type: ignore[union-attr]
-            restraint_force.addParticle(idx, [pos.x, pos.y, pos.z])
-        system.addForce(restraint_force)  # type: ignore[union-attr]
-        return restraint_force, ca_indices
+        if not ctx.is_resuming:
+            self._run_equilibration(ctx, config, output_dir)
+        return ctx
 
     @staticmethod
     def _setup_reporters(
-        ctx: _MdContext,
+        ctx: SimulationContext,
         config: OpenMMConfig,
         traj_path: str,
         energy_path: str,
@@ -473,8 +644,9 @@ class OpenMMRunner:
         simulation = ctx.simulation
         is_resuming = ctx.is_resuming
 
-        dcd_append = is_resuming and Path(traj_path).exists()
-        if not is_resuming and Path(traj_path).exists():
+        traj_exists = Path(traj_path).exists()
+        dcd_append = is_resuming and traj_exists
+        if not is_resuming and traj_exists:
             stale = Path(traj_path).with_suffix(".dcd.stale")
             Path(traj_path).rename(stale)
 
@@ -515,34 +687,115 @@ class OpenMMRunner:
     @staticmethod
     def _finalize_result(
         *,
-        ctx: _MdContext,
+        ctx: SimulationContext,
         result: SimulationResult,
         energy_fh: object,
         traj_path: str,
         energy_path: str,
-        state_xml_path: str,
-        remaining_steps: int,
+        start_step: int,
+        steps_done: int,
         t0: float,
         output_dir: Path,
     ) -> None:
-        """Save final state, close reporters, populate result, write md_summary.json."""
+        """Save final state atomically (or skip if already saved), close reporters, populate result.
+
+        The final state save goes through ``_atomic_save_checkpoint``
+        so the manifest is updated together with the state file. The
+        ``absolute_step`` written to the manifest is ``start_step +
+        steps_done`` — the ABSOLUTE OpenMM step the simulation is at
+        when the production loop ends. The v6 design wrote the
+        invocation-local ``steps_done`` instead, which silently
+        broke accounting on resumes.
+
+        SUGGESTION (double-save): the production loop's last
+        ``_maybe_checkpoint`` typically saves at the final step
+        (because ``steps_done == remaining_steps`` triggers the
+        unconditional save at the end of the loop). A second save
+        here would re-serialise the entire state file (potentially
+        hundreds of MB) just to rewrite the same content. We read
+        the manifest and skip the save when the atomic commit has
+        already happened at the same absolute step. The manifest
+        rename is fast (~KB), so the extra read is cheap.
+
+        ``result.state_xml_path`` is set from the committed state
+        file (the basename returned by ``_atomic_save_checkpoint``
+        when a save happens, or read from the manifest when the
+        save is skipped, or read from the manifest for the
+        no-resumed-step case). The runner contract is that the
+        returned path names the commit-time state file the
+        manifest references.
+
+        v10 BLOCKER #3: ``total_ns`` is COMPLETED PRODUCTION ns
+        (``max(0, absolute_step - total_equil_steps) * timestep_fs /
+        1e6``), not absolute OpenMM ns. Equilibration is protocol
+        setup; it does not count as scientific progress. The
+        ``steps_done`` argument is invocation-local production
+        steps; adding it to ``start_step`` and subtracting
+        ``total_equil_steps`` gives the cumulative production
+        steps across all resumes — the right value to report as
+        ``total_ns`` for a resumed run.
+
+        v11 BLOCKER #1: ``ns_per_day`` is INVOCATION-LOCAL
+        production ns / current-invocation wall time. The previous
+        formula divided cumulative production by invocation-local
+        elapsed, which inflated the reported throughput on every
+        resumed run (e.g. 100 ns production split across two
+        invocations would report 100 ns/day from the second
+        invocation even if it only ran 1 ns). The two accounting
+        scopes are kept separate: cumulative production for
+        ``total_ns``, invocation-local production for
+        ``ns_per_day``. If cumulative throughput is needed,
+        ``md_summary.json`` carries ``total_ns`` and
+        ``elapsed_seconds`` which can be divided externally.
+        """
         config = result.config
         elapsed = time.time() - t0
-        total_ns = remaining_steps * config.timestep_fs / 1e6
-        ns_per_day = (total_ns / elapsed) * 86400 if elapsed > 0 else 0
+        absolute_step = start_step + steps_done
+        # v10 BLOCKER #3: production ns = absolute_step - total_equil_steps.
+        total_ns_value = _production_ns(absolute_step, config)
+        # v11 BLOCKER #1: ns_per_day is invocation-local throughput.
+        # We can't mix cumulative production with invocation-local
+        # wall time — the result would be inflated on every
+        # resumed run. Use the steps_done *this invocation* for
+        # the throughput denominator.
+        invocation_production_ns = steps_done * config.timestep_fs / 1e6
+        ns_per_day = (invocation_production_ns / elapsed) * 86400 if elapsed > 0 else 0
 
-        ctx.simulation.saveState(state_xml_path)  # type: ignore[union-attr]
+        state_basename = ""
+        try:
+            existing_step, existing_file = load_checkpoint(output_dir)
+        except InvalidCheckpointError:
+            # The manifest is in an odd state (e.g. empty state file)
+            # — fall through and force a fresh save. The
+            # quarantine stays for the user to inspect; the new
+            # save at absolute_step will overwrite it.
+            existing_step, existing_file = 0, ""
+
+        if existing_step == absolute_step and existing_file:
+            # The last ``_maybe_checkpoint`` already committed the
+            # state at this absolute step. Reuse the manifest's
+            # reference instead of re-serialising the state file.
+            logger.info(
+                "Final atomic save skipped — commit already at step %d (%s)",
+                existing_step,
+                existing_file,
+            )
+            state_basename = existing_file
+        else:
+            state_basename = _atomic_save_checkpoint(ctx.simulation, output_dir, absolute_step)
+
         energy_fh.close()  # type: ignore[union-attr]
 
         result.trajectory_path = traj_path
         result.energy_path = energy_path
-        result.state_xml_path = state_xml_path
-        result.total_ns = round(total_ns, 2)
+        result.state_xml_path = str(output_dir / state_basename)
+        # v10 BLOCKER #3: total_ns is production ns, not absolute ns.
+        result.total_ns = round(total_ns_value, 2)
         result.elapsed_seconds = round(elapsed, 1)
         result.ns_per_day = round(ns_per_day, 1)
 
         summary = {
-            "total_steps": remaining_steps,
+            "total_steps": steps_done,
             "total_ns": result.total_ns,
             "elapsed_seconds": result.elapsed_seconds,
             "ns_per_day": result.ns_per_day,
@@ -550,14 +803,16 @@ class OpenMMRunner:
             "num_atoms": result.num_atoms,
             "trajectory": traj_path,
             "energy": energy_path,
+            "state": str(output_dir / state_basename),
             "early_abort": result.early_abort,
             "abort_reason": result.abort_reason,
+            "final_absolute_step": absolute_step,
         }
-        (output_dir / "md_summary.json").write_text(json.dumps(summary, indent=2))
+        (output_dir / FileNames.MD_SUMMARY_JSON).write_text(json.dumps(summary, indent=2))
 
         logger.info(
             "Done: %.1f ns in %.1f hours (%.0f ns/day)",
-            total_ns,
+            total_ns_value,
             elapsed / 3600,
             ns_per_day,
         )
@@ -603,93 +858,21 @@ class OpenMMRunner:
 
         return result
 
-    def _resolve_pdb(self, config_path: str, fallback_name: str) -> str:
-        """Resolve a PDB path with fallback to output_dir."""
-        if config_path and Path(config_path).exists():
-            return config_path
-        output_dir = Path(self.config.output_dir)
-        for search_dir in [output_dir.parent, output_dir, Path(".")]:
-            fallback = search_dir / fallback_name
-            if fallback.exists():
-                return str(fallback)
-        return ""
-
     @staticmethod
-    def _build_system(
-        receptor_pdb: str,
-        peptide_pdb: str,
-        config: OpenMMConfig,
-        app: object,  # openmm.app module
-        forcefield: object,
-    ) -> object | None:
-        """Build the solvated peptide-protein complex.
-
-        Returns an openmm.app.Modeller or None if no PDB files are available.
-        """
-        from pdbfixer import PDBFixer
-
-        if receptor_pdb and peptide_pdb:
-            fixer = PDBFixer(filename=receptor_pdb)
-            fixer.findMissingResidues()
-            fixer.findMissingAtoms()
-            fixer.addMissingAtoms()
-            fixer.addMissingHydrogens(config.protonation_ph)
-
-            pep_fixer = PDBFixer(filename=peptide_pdb)
-            pep_fixer.findMissingResidues()
-            pep_fixer.findMissingAtoms()
-            pep_fixer.addMissingAtoms()
-            pep_fixer.addMissingHydrogens(config.protonation_ph)
-
-            modeller = app.Modeller(fixer.topology, fixer.positions)  # type: ignore[union-attr]
-            modeller.add(pep_fixer.topology, pep_fixer.positions)
-        elif receptor_pdb:
-            fixer = PDBFixer(filename=receptor_pdb)
-            fixer.findMissingResidues()
-            fixer.findMissingAtoms()
-            fixer.addMissingAtoms()
-            fixer.addMissingHydrogens(config.protonation_ph)
-            modeller = app.Modeller(fixer.topology, fixer.positions)  # type: ignore[union-attr]
-        else:
-            return None
-
-        import openmm.unit as unit
-
-        logger.info(
-            "Complex: %d atoms, %d residues, %d chains",
-            modeller.topology.getNumAtoms(),
-            modeller.topology.getNumResidues(),
-            modeller.topology.getNumChains(),
-        )
-
-        modeller.addSolvent(  # pyright: ignore[reportOperatorIssue, reportAttributeAccessIssue]
-            forcefield,
-            model=config.water_model,
-            padding=config.box_padding_nm * unit.nanometers,  # pyright: ignore[reportAttributeAccessIssue, reportOperatorIssue]
-            boxShape=config.box_shape,
-            ionicStrength=config.nacl_mol * unit.molar,  # pyright: ignore[reportOperatorIssue]
-        )
-        logger.info("Solvated: %d atoms", modeller.topology.getNumAtoms())
-
-        return modeller
-
-    @staticmethod
-    def _run_equilibration(
-        simulation: object,
-        restraint_force: object,
-        ca_indices: list[int],
-        config: OpenMMConfig,
-        unit: object,
-        output_dir: Path,
-        chains: list[object],
-        np: object,
-    ) -> None:
+    def _run_equilibration(ctx: SimulationContext, config: OpenMMConfig, output_dir: Path) -> None:
         """Run 3-stage equilibration protocol.
 
         Stage 1: NVT 100ps with strong restraints (k=1000 kJ/mol/nm^2)
         Stage 2: NPT 100ps with reduced restraints (k=100)
         Stage 3: NPT 200ps with gradual restraint ramp (100->0) + unrestrained
         """
+        simulation = ctx.simulation
+        restraint_force = ctx.restraint_force
+        ca_indices = ctx.ca_indices
+        unit = ctx.unit_mod
+        chains = ctx.chains
+        np = ctx.np_mod
+
         logger.info("Minimizing energy...")
         simulation.minimizeEnergy(maxIterations=_MAX_MINIMIZATION_ITERS)  # type: ignore[union-attr]
 
@@ -744,7 +927,7 @@ class OpenMMRunner:
         """Measure peptide-receptor Ca min distance after equilibration and write metadata."""
         # OralBiome-AMP#175: match the gate path — use OpenMM's internal
         # unwrapped coordinates (enforcePeriodicBox=False, default). The
-        # downstream _min_pbc_distance does its own PBC-correct min-image
+        # downstream min_pbc_distance does its own PBC-correct min-image
         # math, so the input convention here only needs to stay consistent
         # with what the gate sees; unwrapped is the correct choice.
         eq_positions = (
@@ -752,7 +935,7 @@ class OpenMMRunner:
             .getPositions(asNumpy=True)
             .value_in_unit(unit.angstroms)  # type: ignore[union-attr]
         )
-        rec_ca, pep_ca = OpenMMRunner._collect_chain_ca_positions(chains, eq_positions)
+        rec_ca, pep_ca = collect_chain_ca_positions(chains, eq_positions)
         if not (rec_ca and pep_ca):
             return
 
@@ -761,7 +944,7 @@ class OpenMMRunner:
             .getPeriodicBoxVectors(asNumpy=True)
             .value_in_unit(unit.angstroms)  # type: ignore[union-attr]
         )
-        min_dist = OpenMMRunner._min_pbc_distance(rec_ca, pep_ca, box_vecs, np)
+        min_dist = min_pbc_distance(rec_ca, pep_ca, box_vecs, np)
         logger.info(
             "Post-equilibration peptide-receptor Ca min distance: %.1f A",
             min_dist,
@@ -777,66 +960,17 @@ class OpenMMRunner:
             "displaced": min_dist > _DISPLACEMENT_THRESHOLD_A,
             "threshold_A": _DISPLACEMENT_THRESHOLD_A,
         }
-        (output_dir / "equilibration_metadata.json").write_text(json.dumps(eq_meta, indent=2))
-
-    @staticmethod
-    def _collect_chain_ca_positions(
-        chains: list[object], positions: object
-    ) -> tuple[list[object], list[object]]:
-        """Return (receptor_ca_positions, peptide_ca_positions) lists from chain 0 / chain >0."""
-        rec_ca: list[object] = []
-        pep_ca: list[object] = []
-        for chain_idx, chain in enumerate(chains):
-            for atom in chain.atoms():  # type: ignore[union-attr]
-                if atom.name != "CA":
-                    continue
-                target = rec_ca if chain_idx == 0 else pep_ca
-                target.append(positions[atom.index])  # type: ignore[index]
-        return rec_ca, pep_ca
-
-    @staticmethod
-    def _pbc_correct(diff: object, box_vecs: object, np: object) -> object:
-        """Apply minimum-image PBC correction to displacement vectors.
-
-        Supports general triclinic cells (orthorhombic, dodecahedron,
-        truncated octahedron). The diagonal-only implementation used
-        previously was correct for rectangular boxes but produced spurious
-        large distances for GROMACS-style dodecahedron cells whenever an
-        atom crossed a non-orthogonal face, because the off-diagonal
-        lattice components were silently dropped. Converting ``diff`` to
-        fractional coordinates via the inverse lattice, snapping to the
-        nearest integer image, and converting back gives the correct
-        minimum image for any box shape and reduces exactly to the prior
-        diagonal operation when the lattice is rectangular.
-
-        Accepts any array whose last axis has length 3; the inverse
-        lattice multiplication broadcasts over leading axes.
-        """
-        box = np.asarray(box_vecs)  # type: ignore[union-attr]
-        inv = np.linalg.inv(box)  # type: ignore[union-attr]
-        frac = diff @ inv  # type: ignore[operator]
-        frac = frac - np.round(frac)  # type: ignore[union-attr]
-        return frac @ box  # type: ignore[operator]
-
-    @staticmethod
-    def _min_pbc_distance(
-        rec_ca: list[object], pep_ca: list[object], box_vecs: object, np: object
-    ) -> float:
-        """Compute min PBC-corrected distance between two sets of positions."""
-        rec_arr = np.array(rec_ca)  # type: ignore[union-attr]
-        pep_arr = np.array(pep_ca)  # type: ignore[union-attr]
-        diffs = rec_arr[:, None, :] - pep_arr[None, :, :]
-        diffs = OpenMMRunner._pbc_correct(diffs, box_vecs, np)
-        dists = np.sqrt((np.square(diffs)).sum(axis=-1))  # type: ignore[union-attr]
-        return float(dists.min())
+        (output_dir / FileNames.EQUILIBRATION_METADATA_JSON).write_text(
+            json.dumps(eq_meta, indent=2)
+        )
 
     def _run_production_loop(
         self,
         *,
         simulation: object,
         config: OpenMMConfig,
+        start_step: int,
         remaining_steps: int,
-        state_xml_path: str,
         output_dir: Path,
         enable_early_abort: bool,
         abort_thresh: float,
@@ -844,13 +978,22 @@ class OpenMMRunner:
     ) -> tuple[int, str]:
         """Run the production MD loop with early-abort checks and checkpointing.
 
+        ``start_step`` is the ABSOLUTE step the simulation is at when
+        the loop starts (``total_equil_steps`` for fresh runs, the
+        saved step for resumed runs). The atomic save helper writes
+        ``start_step + steps_done`` to the manifest, so the v6
+        silent-shortening bug cannot recur.
+
         Returns:
-            (steps_done, abort_reason) — abort_reason is "" if no early abort.
+            (steps_done, abort_reason) — ``steps_done`` is the
+            INVOCATION-LOCAL count (not absolute). The caller adds
+            ``start_step`` to get the absolute step. ``abort_reason``
+            is ``""`` if no early abort.
         """
         last_ckpt_step = 0
         abort_reason = ""
         steps_box = [0]
-        self._install_sigterm_handler(simulation, state_xml_path, steps_box, config)
+        self._install_sigterm_handler(simulation, output_dir, start_step, steps_box, config)
 
         # OralBiome-AMP task #10: the early-abort gate is an offline mdtraj
         # evaluation of the partial trajectory.dcd, not an inside-OpenMM
@@ -875,8 +1018,8 @@ class OpenMMRunner:
             if gates_active and not gate_polling_done:
                 gate_polling_done, abort_reason = self._poll_offline_gate(
                     simulation=simulation,
-                    state_xml_path=state_xml_path,
                     output_dir=output_dir,
+                    start_step=start_step,
                     abort_thresh=abort_thresh,
                     config=config,
                     steps_done=steps_done,
@@ -886,7 +1029,8 @@ class OpenMMRunner:
 
             last_ckpt_step = self._maybe_checkpoint(
                 simulation,
-                state_xml_path,
+                output_dir,
+                start_step,
                 steps_done,
                 last_ckpt_step,
                 remaining_steps,
@@ -900,8 +1044,8 @@ class OpenMMRunner:
     def _poll_offline_gate(
         *,
         simulation: object,
-        state_xml_path: str,
         output_dir: Path,
+        start_step: int,
         abort_thresh: float,
         config: OpenMMConfig,
         steps_done: int,
@@ -915,10 +1059,9 @@ class OpenMMRunner:
         ``gate_verdict_{current_ns}ns.json`` file next to the trajectory
         so orchestrators + SIGTERM teardown can see the latest state.
 
-        On ``abort=True``, saves ``state.xml`` (via ``saveState``, per
-        expert caveat #1 in ``project_md_gate_architecture.md`` — NOT
-        ``saveCheckpoint``) and writes an ``early_abort.json`` with the
-        reason.
+        On ``abort=True``, atomically saves the state + manifest with
+        the absolute step (``start_step + steps_done``) so the next
+        non-forced invocation can resume from a consistent step.
 
         Returns:
             ``(polling_done, abort_reason)``. ``polling_done`` is True
@@ -957,10 +1100,54 @@ class OpenMMRunner:
         )
 
         if verdict.abort:
-            simulation.saveState(state_xml_path)  # type: ignore[union-attr]
-            OpenMMRunner._write_abort_metadata(
-                verdict, output_dir, abort_thresh, config, steps_done, ns_at_check
+            # v10 BLOCKER #2: terminal status commits atomically
+            # with the checkpoint via the manifest's ``terminal``
+            # payload. The atomic save (single os.replace on the
+            # manifest) is the single commit point — the
+            # ``early_abort.json`` file is a derived write that
+            # happens AFTER for downstream consumers (see
+            # _write_abort_metadata).
+            absolute_step = start_step + steps_done
+            # v10 BLOCKER #3: ns reported downstream is
+            # PRODUCTION ns (absolute - equil), not absolute ns.
+            # The equilibration steps are protocol setup, not
+            # scientific progress — they should never show up in
+            # ``result.total_ns`` or ``abort_ns``.
+            prod_steps = max(0, absolute_step - config.total_equil_steps)
+            production_ns_value = prod_steps * config.timestep_fs / 1e6
+            terminal_payload: dict[str, object] = {
+                "step": absolute_step,
+                "type": "early_abort",
+                "reason": verdict.reason,
+                "production_ns": production_ns_value,
+            }
+            _atomic_save_checkpoint(
+                simulation, output_dir, absolute_step, terminal=terminal_payload
             )
+            # v11 BLOCKER #2: the derived ``early_abort.json`` is
+            # NOT authoritative — the manifest has already
+            # committed the terminal decision. A failure to write
+            # the derived file (full disk, permission denied,
+            # etc.) must NOT crash an already-committed terminal
+            # run. The runner's caller still needs a coherent
+            # SimulationResult (with early_abort=True).
+            try:
+                OpenMMRunner._write_abort_metadata(
+                    verdict,
+                    output_dir,
+                    abort_thresh,
+                    config,
+                    absolute_step=absolute_step,
+                    production_ns=production_ns_value,
+                )
+            except OSError as exc:
+                logger.warning(
+                    "Terminal checkpoint committed, but early_abort.json "
+                    "could not be written: %s. The manifest's terminal "
+                    "payload is authoritative; downstream consumers may "
+                    "miss the derived marker until the next invocation.",
+                    exc,
+                )
             return True, verdict.reason
 
         # Past the 10 ns checkpoint and no abort fired → gate has made its
@@ -970,76 +1157,108 @@ class OpenMMRunner:
 
     @staticmethod
     def _write_abort_metadata(
-        verdict: object,
+        verdict: GateVerdict,
         output_dir: Path,
         abort_thresh: float,
         config: OpenMMConfig,
-        steps_done: int,
-        ns_at_check: float,
+        *,
+        absolute_step: int,
+        production_ns: float,
     ) -> None:
-        """Build and write early_abort.json for a gate abort verdict."""
+        """Build and write ``early_abort.json`` (derived compat file).
+
+        ``absolute_step`` is the OpenMM step at the moment the gate
+        fired — the same value the atomic save just committed to
+        the manifest. ``production_ns`` is the COMPLETED PRODUCTION
+        ns (v10 BLOCKER #3: ``max(0, absolute_step -
+        total_equil_steps) * timestep_fs / 1e6``).
+
+        v10 BLOCKER #2: this file is a *derived* file written
+        AFTER the atomic save. The manifest's ``terminal`` payload
+        is authoritative for terminal classification; this file
+        exists for downstream consumers
+        (``oral_amp.cloud.openmm_cloud``) and is moved by the
+        ``force=True`` quarantine together with the manifest so a
+        stale marker cannot mis-classify a subsequent fresh run.
+        """
         # Schema matches the pre-task-#10 inside-OpenMM abort contract
         # consumed by ``oral_amp.cloud.openmm_cloud``.
         primary_rmsd = (
-            verdict.rmsd_5ns  # type: ignore[union-attr]
-            if verdict.reason == "early_dissociation" and verdict.rmsd_5ns is not None  # type: ignore[union-attr]
-            else verdict.rmsd_10ns  # type: ignore[union-attr]
-            if verdict.rmsd_10ns is not None  # type: ignore[union-attr]
-            else verdict.max_rmsd  # type: ignore[union-attr]
+            verdict.rmsd_5ns
+            if verdict.reason == "early_dissociation" and verdict.rmsd_5ns is not None
+            else verdict.rmsd_10ns
+            if verdict.rmsd_10ns is not None
+            else verdict.max_rmsd
         )
         abort_meta = {
             "aborted": True,
-            "abort_reason": verdict.reason,  # type: ignore[union-attr]
-            "abort_step": steps_done,
-            "abort_ns": round(ns_at_check, 2),
+            "abort_reason": verdict.reason,
+            "abort_step": absolute_step,
+            # v10 BLOCKER #3: abort_ns is PRODUCTION ns (absolute -
+            # equil), not absolute ns. The schema name stays
+            # ``abort_ns`` for downstream compat; the value is
+            # production progress, the thing the user actually
+            # cares about.
+            "abort_ns": round(production_ns, 2),
             "peptide_ca_rmsd_A": round(primary_rmsd, 2),
             "peptide_ca_rmsd_5ns_A": (
-                round(verdict.rmsd_5ns, 2) if verdict.rmsd_5ns is not None else None  # type: ignore[union-attr]
+                round(verdict.rmsd_5ns, 2) if verdict.rmsd_5ns is not None else None
             ),
             "peptide_ca_rmsd_10ns_A": (
-                round(verdict.rmsd_10ns, 2) if verdict.rmsd_10ns is not None else None  # type: ignore[union-attr]
+                round(verdict.rmsd_10ns, 2) if verdict.rmsd_10ns is not None else None
             ),
             "slope_A_per_ns": (
-                round(verdict.slope_a_per_ns, 4)  # type: ignore[union-attr]
-                if verdict.slope_a_per_ns is not None  # type: ignore[union-attr]
-                else None
+                round(verdict.slope_a_per_ns, 4) if verdict.slope_a_per_ns is not None else None
             ),
-            "max_rmsd_A": round(verdict.max_rmsd, 2),  # type: ignore[union-attr]
+            "max_rmsd_A": round(verdict.max_rmsd, 2),
             "abort_threshold_A": round(abort_thresh, 2),
-            "receptor_fit_residual_A": round(verdict.receptor_fit_residual, 2),  # type: ignore[union-attr]
+            "receptor_fit_residual_A": round(verdict.receptor_fit_residual, 2),
             "gate": "offline_mdtraj",
             "target": config.target,
             "peptide_id": config.peptide_id,
         }
-        (output_dir / "early_abort.json").write_text(json.dumps(abort_meta, indent=2))
+        (output_dir / FileNames.EARLY_ABORT_JSON).write_text(json.dumps(abort_meta, indent=2))
         logger.warning(
-            "EARLY ABORT (%s): RMSD 5ns=%s 10ns=%s max=%.2f Å @ %.1f ns",
-            verdict.reason,  # type: ignore[union-attr]
-            f"{verdict.rmsd_5ns:.2f}" if verdict.rmsd_5ns is not None else "n/a",  # type: ignore[union-attr]
-            f"{verdict.rmsd_10ns:.2f}" if verdict.rmsd_10ns is not None else "n/a",  # type: ignore[union-attr]
-            verdict.max_rmsd,  # type: ignore[union-attr]
-            ns_at_check,
+            "EARLY ABORT (%s): RMSD 5ns=%s 10ns=%s max=%.2f Å @ step %d (%.2f production ns)",
+            verdict.reason,
+            f"{verdict.rmsd_5ns:.2f}" if verdict.rmsd_5ns is not None else "n/a",
+            f"{verdict.rmsd_10ns:.2f}" if verdict.rmsd_10ns is not None else "n/a",
+            verdict.max_rmsd,
+            absolute_step,
+            production_ns,
         )
 
     @staticmethod
     def _install_sigterm_handler(
         simulation: object,
-        state_xml_path: str,
+        output_dir: Path,
+        start_step: int,
         steps_box: list[int],
         config: OpenMMConfig,
     ) -> None:
-        """Install a SIGTERM handler that saves state using the current step count."""
+        """Install a SIGTERM handler that atomically saves state + manifest.
+
+        Writes the absolute step (``start_step + steps_box[0]``) to
+        the manifest so the next invocation can resume from the
+        correct step. The atomic save (single ``os.replace`` on
+        ``checkpoint.json``) ensures that a SIGTERM mid-save cannot
+        leave a stale state paired with the wrong manifest step. If
+        the save itself fails (e.g. disk full), the canonical
+        manifest is unchanged and the runner sees the previous
+        (coherent) checkpoint on the next invocation.
+        """
 
         def handle_sigterm(signum: int, frame: object) -> None:  # noqa: ARG001
             steps_done = steps_box[0]
-            ns_done = steps_done * config.timestep_fs / 1e6
+            absolute_step = start_step + steps_done
+            ns_done = absolute_step * config.timestep_fs / 1e6
             logger.warning(
-                "SIGTERM received at step %d (%.2f ns) — saving state",
-                steps_done,
+                "SIGTERM received at absolute step %d (%.2f ns) — saving state",
+                absolute_step,
                 ns_done,
             )
             try:
-                simulation.saveState(state_xml_path)  # type: ignore[union-attr]
+                _atomic_save_checkpoint(simulation, output_dir, absolute_step)
             except Exception as exc:
                 logger.error("Failed to save state on SIGTERM: %s", exc)
             sys.exit(0)
@@ -1049,20 +1268,31 @@ class OpenMMRunner:
     @staticmethod
     def _maybe_checkpoint(
         simulation: object,
-        state_xml_path: str,
+        output_dir: Path,
+        start_step: int,
         steps_done: int,
         last_ckpt_step: int,
         remaining_steps: int,
         config: OpenMMConfig,
         t0: float,
     ) -> int:
-        """Write a checkpoint if interval elapsed. Returns the (possibly updated) last_ckpt_step."""
+        """Write a checkpoint if interval elapsed. Returns the (possibly updated) last_ckpt_step.
+
+        The save is atomic (the manifest rename is the single commit
+        point via :func:`_atomic_save_checkpoint`) so that a crash
+        mid-save cannot leave a stale state whose step does not match
+        the manifest. The manifest records the absolute step
+        (``start_step + steps_done``), not the invocation-local
+        counter — the v6 protocol wrote the local counter and
+        silently shortened resumed runs.
+        """
         since_ckpt = steps_done - last_ckpt_step
         if since_ckpt < config.checkpoint_every_steps and steps_done < remaining_steps:
             return last_ckpt_step
-        simulation.saveState(state_xml_path)  # type: ignore[union-attr]
+        absolute_step = start_step + steps_done
+        _atomic_save_checkpoint(simulation, output_dir, absolute_step)
         elapsed = time.time() - t0
-        ns_done = steps_done * config.timestep_fs / 1e6
+        ns_done = absolute_step * config.timestep_fs / 1e6
         ns_per_day = (ns_done / elapsed) * 86400 if elapsed > 0 else 0
         logger.info(
             "Checkpoint: %d/%d steps (%.2f ns, %.0f ns/day)",

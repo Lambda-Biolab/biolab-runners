@@ -23,7 +23,7 @@ import pytest
 
 pytest.importorskip("mdtraj", reason="offline_gate requires mdtraj")
 
-from biolab_runners.openmm.offline_gate import (  # noqa: E402
+from biolab_runners.openmm.offline_gate import (
     GateVerdict,
     _decide,
     _frame_interval_ns,
