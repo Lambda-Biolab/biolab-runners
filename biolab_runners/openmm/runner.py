@@ -457,8 +457,10 @@ class OpenMMRunner:
         """Branch when a valid manifest exists.
 
         Either classify the run as terminal (return None + populate
-        the result) or return the resume tuple ``(start_step,
-        remaining_steps, resume_xml)``.
+        the result), or return the resume tuple ``(start_step,
+        remaining_steps, resume_xml)``, or fail fast on a malformed
+        terminal payload (v13 BLOCKER — present but invalid must
+        NOT fall through to resume or normal completion).
         """
         target_step = config.total_equil_steps + config.total_steps
         complete, reason = is_run_complete(output_dir, config)
@@ -475,6 +477,27 @@ class OpenMMRunner:
                 result.error = skip_error
                 logger.error(result.error)
                 return None
+            return None
+        # v13 BLOCKER: a malformed terminal payload at the target
+        # step is reported by ``is_run_complete`` as
+        # ``(False, "invalid_terminal_...")`` — the manifest is in
+        # an ambiguous state and the runner must fail loudly rather
+        # than fall through to a resume that would either
+        # reclassify the run as normal completion (overwriting the
+        # bad terminal) or commit a new terminal without addressing
+        # the schema error. The user must investigate via
+        # ``force=True`` (which quarantines the malformed manifest
+        # alongside the other resumable files).
+        if reason.startswith("invalid_terminal_"):
+            result.error = (
+                f"Manifest carries a malformed terminal payload at "
+                f"step {manifest_step} (reason={reason!r}). The "
+                f"user attempted to record a terminal decision but "
+                f"the schema is wrong; the run is in an ambiguous "
+                f"state. Re-run with force=True to quarantine the "
+                f"manifest and start fresh."
+            )
+            logger.error(result.error)
             return None
         logger.info(
             "Resuming from checkpoint at step %d (%.2f ns of %d needed)",

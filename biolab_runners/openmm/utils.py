@@ -519,7 +519,17 @@ def is_run_complete(output_dir: Path, config: OpenMMConfig) -> tuple[bool, str]:
         terminal cases; ``reason`` is a human-readable explanation
         (e.g. ``"normal_completion_step_50_200_000"``,
         ``"manifest_terminal_early_abort_step_5_000_000"``,
-        ``"in_progress"``).
+        ``"in_progress"``,
+        ``"invalid_terminal_<field>"``).
+
+        v13 BLOCKER: when the manifest has a malformed
+        ``terminal`` payload (the field is present but doesn't
+        validate), the function returns
+        ``(False, "invalid_terminal_<reason>")`` and does NOT fall
+        back to the inferred normal-completion heuristic. The
+        previous behaviour accepted a malformed terminal at the
+        target step as normal completion, contradicting the v11
+        terminal-schema contract.
     """
     parsed = load_checkpoint_full(output_dir)
     if parsed is None:
@@ -530,22 +540,28 @@ def is_run_complete(output_dir: Path, config: OpenMMConfig) -> tuple[bool, str]:
     if manifest_step <= 0:
         return False, "in_progress"
 
-    # v12 BLOCKER: the explicit terminal payload MUST be checked
-    # BEFORE the inferred normal completion. The two signals can
-    # coexist at the same absolute step (the offline-mdtraj gate
-    # fires on the final production chunk, so the manifest's step
-    # lands at exactly ``total_equil_steps + total_steps`` at the
-    # moment of an end-of-run abort). Returning normal completion
-    # first would skip ``_reconstruct_terminal_result``, leaving a
-    # reused result reporting ``early_abort=False`` despite the
-    # manifest carrying a valid ``terminal`` payload — and the
-    # live invocation would have set ``early_abort=True``. The
-    # two result shapes would disagree. The explicit payload is
-    # the user's stated intent; inferring completion from the
-    # step alone is a heuristic and must defer to it.
-    terminal = _check_manifest_terminal(manifest_step, last_record)
-    if terminal is not None:
-        return terminal
+    # v13 BLOCKER: tri-state terminal check. Distinguish ABSENT
+    # (no terminal field) from INVALID (terminal field present but
+    # fails schema). The previous implementation collapsed both
+    # into a single ``None`` return, which let a malformed
+    # terminal at the target step fall through to the inferred
+    # normal-completion heuristic — silently reclassifying an
+    # ambiguous/corrupt terminal as a successful run.
+    terminal_state, terminal_value = _check_manifest_terminal(manifest_step, last_record)
+    if terminal_state == "valid":
+        return terminal_value  # (True, "manifest_terminal_..._step_...")
+    if terminal_state == "invalid":
+        # The terminal field is present but malformed. The v11
+        # contract says treat as in-progress. Crucially, do NOT
+        # fall back to the normal-completion heuristic below —
+        # the user attempted to record a terminal decision and
+        # got the schema wrong; the run is in an ambiguous
+        # state and the runner must fail loudly, not silently
+        # succeed.
+        invalid_complete, invalid_reason = terminal_value
+        return invalid_complete, invalid_reason
+    # terminal_state == "absent" — no terminal field; fall back
+    # to the inferred normal completion.
     normal = _check_normal_completion(manifest_step, config)
     if normal is not None:
         return normal
@@ -562,30 +578,43 @@ def _check_normal_completion(manifest_step: int, config: OpenMMConfig) -> tuple[
 
 def _check_manifest_terminal(
     manifest_step: int, last_record: dict[str, object]
-) -> tuple[bool, str] | None:
-    r"""Return ``(True, "manifest_terminal_<type>_step_<step>")`` if payload valid.
+) -> tuple[str, tuple[bool, str]]:
+    r"""Tri-state terminal check.
 
-    v10 BLOCKER #2: the manifest's ``terminal`` payload MUST have
-    ``step == manifest.step`` (the binding is enforced here). A
-    missing, zero, malformed, or mismatched step is logged as a
-    warning and treated as "no terminal payload → in progress".
+    Returns ``(state, value)``:
 
-    v11 BLOCKER #3: the COMPLETE terminal schema must validate.
-    The terminal record MUST have:
-      - ``step``: a positive ``int`` (NOT str / bool / None).
-      - ``type``: the literal string ``"early_abort"``. Any other
-        value (missing, unknown, or unsupported type) is logged
-        as a warning and treated as non-terminal — accepting an
-        unknown type as terminal would skip result reconstruction
-        (``_reconstruct_terminal_result`` only knows how to fill
-        in fields for ``early_abort``), leaving the result
-        reporting ``early_abort=False`` despite the manifest
-        claiming terminal status.
-      - ``reason``: a non-empty ``str``.
+    - ``("absent", (False, "in_progress"))`` — the manifest does
+      not have a ``terminal`` field. No terminal decision was
+      recorded; the caller may fall back to the inferred
+      normal-completion heuristic.
+
+    - ``("valid", (True, "manifest_terminal_<type>_step_<step>"))``
+      — the manifest has a ``terminal`` field and it validates
+      against the v11 schema. The caller MUST treat the run as
+      terminal (v12 BLOCKER precedence).
+
+    - ``("invalid", (False, "invalid_terminal_<reason>"))`` — the
+      manifest has a ``terminal`` field but it fails the schema
+      (missing/empty reason, unknown type, non-int step, step
+      mismatch, etc.). The caller MUST NOT fall back to the
+      normal-completion heuristic — the user attempted to record
+      a terminal decision and got the schema wrong; the run is
+      in an ambiguous state. v13 BLOCKER.
+
+    v10 BLOCKER #2: ``step == manifest.step`` binding.
+    v11 BLOCKER #3: strict int step, ``type == "early_abort"``,
+    non-empty ``reason``.
     """
+    if "terminal" not in last_record:
+        return "absent", (False, "in_progress")
     terminal = last_record.get("terminal")
     if not isinstance(terminal, dict):
-        return None
+        logger.warning(
+            "Manifest has terminal field but it is not a dict; "
+            "treating as invalid terminal payload (NOT as "
+            "normal completion)"
+        )
+        return "invalid", (False, "invalid_terminal_not_dict")
     # v11 BLOCKER #3: step must be a strict positive int (no
     # string coercion). JSON int → Python int; JSON str or bool
     # is rejected so a forged manifest with ``"step": "5000000"``
@@ -596,32 +625,42 @@ def _check_manifest_terminal(
         or isinstance(raw_terminal_step, bool)
         or raw_terminal_step <= 0
     ):
-        return None
+        logger.warning(
+            "Manifest terminal.step is not a positive int "
+            "(got %r); treating as invalid terminal payload",
+            raw_terminal_step,
+        )
+        return "invalid", (False, "invalid_terminal_step_invalid_type")
     if raw_terminal_step != manifest_step:
         logger.warning(
             "Manifest has terminal.step=%d but record step=%d; "
-            "treating as in_progress (binding mismatch)",
+            "treating as invalid terminal payload (NOT as "
+            "normal completion)",
             raw_terminal_step,
             manifest_step,
         )
-        return None
+        return "invalid", (False, "invalid_terminal_step_mismatch")
     # v11 BLOCKER #3: type must be the literal ``early_abort``.
-    # No ``str(...)`` coercion — anything other than the exact
-    # string is logged + treated as non-terminal.
     terminal_type = terminal.get("type")
     if terminal_type != "early_abort":
         logger.warning(
             "Manifest terminal.type=%r is not supported "
-            "(only 'early_abort' is implemented); treating as in_progress",
+            "(only 'early_abort' is implemented); treating as "
+            "invalid terminal payload",
             terminal_type,
         )
-        return None
+        return "invalid", (False, "invalid_terminal_type_unsupported")
     # v11 BLOCKER #3: reason must be a non-empty string.
     reason = terminal.get("reason")
     if not isinstance(reason, str) or not reason:
-        logger.warning("Manifest terminal.reason is missing or empty; treating as in_progress")
-        return None
-    return True, f"manifest_terminal_{terminal_type}_step_{raw_terminal_step}"
+        logger.warning(
+            "Manifest terminal.reason is missing or empty; treating as invalid terminal payload"
+        )
+        return "invalid", (False, "invalid_terminal_reason_empty")
+    return "valid", (
+        True,
+        f"manifest_terminal_{terminal_type}_step_{raw_terminal_step}",
+    )
 
 
 def load_terminal_payload(output_dir: Path, config: OpenMMConfig) -> dict[str, object] | None:

@@ -436,14 +436,14 @@ class TestIsRunComplete:
         assert reason.startswith("manifest_terminal_early_abort_step_")
 
     def test_early_abort_with_unknown_type_is_not_terminal(self, tmp_path: Path) -> None:
-        """v11 BLOCKER #3: a manifest with a terminal.type that isn't
-        the literal ``early_abort`` is NOT terminal — accepting an
-        unknown type as terminal would skip result reconstruction
-        (the reconstruction only knows how to fill in fields for
-        early_abort), leaving the result reporting
-        ``early_abort=False`` despite the manifest claiming
-        terminal status. Logged as a warning + treated as
-        in_progress."""
+        """v11 BLOCKER #3 / v13 BLOCKER: a manifest with a
+        terminal.type that isn't the literal ``early_abort`` is
+        NOT terminal. v13: the reason is the explicit
+        ``invalid_terminal_*`` marker (NOT ``in_progress``) so the
+        runner can distinguish "absent" from "present but invalid"
+        and refuse to fall back to normal completion at the target
+        step.
+        """
         from biolab_runners.openmm.utils import is_run_complete
 
         config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
@@ -469,13 +469,11 @@ class TestIsRunComplete:
         )
         complete, reason = is_run_complete(tmp_path, config)
         assert complete is False
-        assert reason == "in_progress"
+        assert reason == "invalid_terminal_type_unsupported"
 
     def test_early_abort_with_missing_type_is_not_terminal(self, tmp_path: Path) -> None:
-        """v11 BLOCKER #3: terminal payload without a ``type``
-        field is NOT terminal (only ``early_abort`` is supported).
-        A missing type previously slipped through with a coerced
-        string default."""
+        """v11/v13: terminal payload without a ``type`` field is
+        invalid (not in_progress)."""
         from biolab_runners.openmm.utils import is_run_complete
 
         config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
@@ -497,13 +495,11 @@ class TestIsRunComplete:
         )
         complete, reason = is_run_complete(tmp_path, config)
         assert complete is False
-        assert reason == "in_progress"
+        assert reason == "invalid_terminal_type_unsupported"
 
     def test_early_abort_with_string_step_is_not_terminal(self, tmp_path: Path) -> None:
-        """v11 BLOCKER #3: a terminal.step that is a JSON string
-        (e.g. \"5000000\") must not be silently coerced to int —
-        that would let a forged manifest pass the schema check.
-        Strict-int validation rejects it."""
+        """v11/v13: a terminal.step that is a JSON string is
+        invalid (strict-int validation rejects it)."""
         from biolab_runners.openmm.utils import is_run_complete
 
         config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
@@ -528,11 +524,10 @@ class TestIsRunComplete:
         )
         complete, reason = is_run_complete(tmp_path, config)
         assert complete is False
-        assert reason == "in_progress"
+        assert reason == "invalid_terminal_step_invalid_type"
 
     def test_early_abort_with_boolean_step_is_not_terminal(self, tmp_path: Path) -> None:
-        """v11 BLOCKER #3: ``True`` is a bool-int in Python — the
-        validator must reject it explicitly."""
+        """v11/v13: ``True`` is a bool-int — the validator rejects it."""
         from biolab_runners.openmm.utils import is_run_complete
 
         config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
@@ -557,10 +552,10 @@ class TestIsRunComplete:
         )
         complete, reason = is_run_complete(tmp_path, config)
         assert complete is False
-        assert reason == "in_progress"
+        assert reason == "invalid_terminal_step_invalid_type"
 
     def test_early_abort_with_empty_reason_is_not_terminal(self, tmp_path: Path) -> None:
-        """v11 BLOCKER #3: ``reason`` must be a non-empty string."""
+        """v11/v13: empty reason is invalid (not in_progress)."""
         from biolab_runners.openmm.utils import is_run_complete
 
         config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
@@ -585,7 +580,7 @@ class TestIsRunComplete:
         )
         complete, reason = is_run_complete(tmp_path, config)
         assert complete is False
-        assert reason == "in_progress"
+        assert reason == "invalid_terminal_reason_empty"
 
     def test_legacy_marker_alone_is_not_terminal(self, tmp_path: Path) -> None:
         """v10 BLOCKER #2 regression: a bare ``early_abort.json``
@@ -612,10 +607,12 @@ class TestIsRunComplete:
         assert reason == "in_progress"
 
     def test_terminal_step_must_equal_manifest_step(self, tmp_path: Path) -> None:
-        """v10 BLOCKER #2 binding: a terminal payload's ``step``
-        MUST equal the manifest's ``step``. A mismatch indicates
-        data corruption and the run is treated as in-progress
-        (logged as a warning)."""
+        """v10 BLOCKER #2 / v13 BLOCKER: a terminal payload's
+        ``step`` MUST equal the manifest's ``step``. A mismatch
+        indicates data corruption; v13 reports the specific
+        ``invalid_terminal_step_mismatch`` reason so the runner
+        can fail loudly rather than fall back to normal
+        completion."""
         from biolab_runners.openmm.utils import is_run_complete
 
         config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
@@ -641,7 +638,7 @@ class TestIsRunComplete:
         )
         complete, reason = is_run_complete(tmp_path, config)
         assert complete is False
-        assert reason == "in_progress"
+        assert reason == "invalid_terminal_step_mismatch"
 
     def test_large_trajectory_does_not_make_run_complete(self, tmp_path: Path) -> None:
         """A large trajectory + many energy rows WITHOUT a manifest at
@@ -2204,17 +2201,17 @@ class TestIsRunCompleteValidatesTerminalPayload:
         (out / "checkpoint.json").write_text(json.dumps(manifest))
 
     def test_terminal_step_zero_is_not_terminal(self, tmp_path: Path) -> None:
-        """terminal.step=0 → not terminal."""
+        """terminal.step=0 → invalid terminal payload (v13 reason)."""
         from biolab_runners.openmm.utils import is_run_complete
 
         config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
         self._write_manifest_with_terminal(tmp_path, terminal_step=0)
         complete, reason = is_run_complete(tmp_path, config)
         assert complete is False
-        assert reason == "in_progress"
+        assert reason == "invalid_terminal_step_invalid_type"
 
     def test_terminal_step_missing_is_not_terminal(self, tmp_path: Path) -> None:
-        """terminal field missing step → not terminal."""
+        """terminal field missing step → invalid terminal (v13)."""
         from biolab_runners.openmm.utils import is_run_complete
 
         config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
@@ -2235,37 +2232,37 @@ class TestIsRunCompleteValidatesTerminalPayload:
         )
         complete, reason = is_run_complete(tmp_path, config)
         assert complete is False
-        assert reason == "in_progress"
+        assert reason == "invalid_terminal_step_invalid_type"
 
     def test_terminal_step_invalid_type_does_not_raise(self, tmp_path: Path) -> None:
-        """terminal.step="not_a_number" must not raise; not terminal."""
+        """terminal.step="not_a_number" must not raise; invalid (v13)."""
         from biolab_runners.openmm.utils import is_run_complete
 
         config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
         self._write_manifest_with_terminal(tmp_path, terminal_step="not_a_number")
         complete, reason = is_run_complete(tmp_path, config)
         assert complete is False
-        assert reason == "in_progress"
+        assert reason == "invalid_terminal_step_invalid_type"
 
     def test_terminal_step_list_does_not_raise(self, tmp_path: Path) -> None:
-        """terminal.step=[1,2,3] must not raise."""
+        """terminal.step=[1,2,3] must not raise; invalid (v13)."""
         from biolab_runners.openmm.utils import is_run_complete
 
         config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
         self._write_manifest_with_terminal(tmp_path, terminal_step=[1, 2, 3])
         complete, reason = is_run_complete(tmp_path, config)
         assert complete is False
-        assert reason == "in_progress"
+        assert reason == "invalid_terminal_step_invalid_type"
 
     def test_terminal_step_null_does_not_raise(self, tmp_path: Path) -> None:
-        """terminal.step=null must not raise; not terminal."""
+        """terminal.step=null must not raise; invalid (v13)."""
         from biolab_runners.openmm.utils import is_run_complete
 
         config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
         self._write_manifest_with_terminal(tmp_path, terminal_step=None)
         complete, reason = is_run_complete(tmp_path, config)
         assert complete is False
-        assert reason == "in_progress"
+        assert reason == "invalid_terminal_step_invalid_type"
 
     def test_terminal_step_positive_and_equal_to_manifest_step_is_terminal(
         self, tmp_path: Path
@@ -3182,3 +3179,264 @@ class TestTerminalPayloadPrecedesNormalCompletion:
         )
         assert result.abort_reason == "early_dissociation"
         assert result.total_ns == 5.0
+
+
+class TestMalformedTerminalAtTargetIsNotNormalCompletion:
+    """v13 BLOCKER regression: a manifest carrying a malformed
+    ``terminal`` payload (the field is present but fails schema
+    validation) MUST NOT silently fall through to the inferred
+    normal-completion heuristic when the manifest step has reached
+    the configured target.
+
+    The previous implementation returned ``None`` from
+    ``_check_manifest_terminal`` for both ABSENT and INVALID
+    payloads. A malformed terminal at the target step then fell
+    through to ``_check_normal_completion`` and was reclassified
+    as a successful normal completion, contradicting the v11
+    terminal-schema contract.
+
+    Fix: ``_check_manifest_terminal`` returns a tri-state result;
+    an INVALID payload reports ``(False,
+    "invalid_terminal_<reason>")`` and ``is_run_complete`` does
+    NOT fall back to normal completion. The runner treats the
+    invalid payload as an error — the user must investigate via
+    ``force=True`` (which quarantines the malformed manifest).
+    """
+
+    def _write_manifest_at_target(self, out: Path, *, terminal: dict[str, object] | None) -> int:
+        """Write a manifest at the configured target step. Returns target."""
+        config = OpenMMConfig(output_dir=str(out), production_ns=5.0, timestep_fs=2.0)
+        target = config.total_equil_steps + config.total_steps
+        state_basename = f"state.{target}_1_1.xml"
+        (out / state_basename).write_text("<State/>")
+        record: dict[str, object] = {"step": target, "file": state_basename}
+        if terminal is not None:
+            record["terminal"] = terminal
+        (out / "checkpoint.json").write_text(json.dumps({"records": [record]}))
+        return target
+
+    def test_empty_reason_at_target_does_not_become_normal(self, tmp_path: Path) -> None:
+        """Manifest at target step + terminal with empty reason
+        → ``is_run_complete`` returns ``(False,
+        "invalid_terminal_reason_empty")``, NOT
+        ``normal_completion_step_...``."""
+        from biolab_runners.openmm.utils import is_run_complete
+
+        out = tmp_path / "output"
+        out.mkdir()
+        target = self._write_manifest_at_target(
+            out,
+            terminal={
+                "type": "early_abort",
+                "step": None,  # will overwrite
+                "reason": "",
+            },
+        )
+        # Patch the step now that we know the target.
+        manifest = json.loads((out / "checkpoint.json").read_text())
+        manifest["records"][-1]["terminal"]["step"] = target
+        (out / "checkpoint.json").write_text(json.dumps(manifest))
+
+        config = OpenMMConfig(output_dir=str(out), production_ns=5.0, timestep_fs=2.0)
+        complete, reason = is_run_complete(out, config)
+        assert complete is False
+        assert reason == "invalid_terminal_reason_empty", (
+            f"malformed terminal at target must NOT be reclassified as "
+            f"normal completion; got reason={reason!r}"
+        )
+
+    def test_unknown_type_at_target_does_not_become_normal(self, tmp_path: Path) -> None:
+        """Manifest at target + terminal.type='other' → invalid."""
+        from biolab_runners.openmm.utils import is_run_complete
+
+        out = tmp_path / "output"
+        out.mkdir()
+        config = OpenMMConfig(output_dir=str(out), production_ns=5.0, timestep_fs=2.0)
+        target = config.total_equil_steps + config.total_steps
+        state_basename = f"state.{target}_1_1.xml"
+        (out / state_basename).write_text("<State/>")
+        (out / "checkpoint.json").write_text(
+            json.dumps(
+                {
+                    "records": [
+                        {
+                            "step": target,
+                            "file": state_basename,
+                            "terminal": {
+                                "type": "other",
+                                "step": target,
+                                "reason": "x",
+                            },
+                        }
+                    ]
+                }
+            )
+        )
+
+        complete, reason = is_run_complete(out, config)
+        assert complete is False
+        assert reason == "invalid_terminal_type_unsupported"
+
+    def test_string_step_at_target_does_not_become_normal(self, tmp_path: Path) -> None:
+        """Manifest at target + terminal.step='5000000' (string) → invalid."""
+        from biolab_runners.openmm.utils import is_run_complete
+
+        out = tmp_path / "output"
+        out.mkdir()
+        config = OpenMMConfig(output_dir=str(out), production_ns=5.0, timestep_fs=2.0)
+        target = config.total_equil_steps + config.total_steps
+        state_basename = f"state.{target}_1_1.xml"
+        (out / state_basename).write_text("<State/>")
+        (out / "checkpoint.json").write_text(
+            json.dumps(
+                {
+                    "records": [
+                        {
+                            "step": target,
+                            "file": state_basename,
+                            "terminal": {
+                                "type": "early_abort",
+                                "step": "5000000",
+                                "reason": "x",
+                            },
+                        }
+                    ]
+                }
+            )
+        )
+
+        complete, reason = is_run_complete(out, config)
+        assert complete is False
+        assert reason == "invalid_terminal_step_invalid_type"
+
+    def test_bool_step_at_target_does_not_become_normal(self, tmp_path: Path) -> None:
+        """Manifest at target + terminal.step=True (bool) → invalid."""
+        from biolab_runners.openmm.utils import is_run_complete
+
+        out = tmp_path / "output"
+        out.mkdir()
+        config = OpenMMConfig(output_dir=str(out), production_ns=5.0, timestep_fs=2.0)
+        target = config.total_equil_steps + config.total_steps
+        state_basename = f"state.{target}_1_1.xml"
+        (out / state_basename).write_text("<State/>")
+        (out / "checkpoint.json").write_text(
+            json.dumps(
+                {
+                    "records": [
+                        {
+                            "step": target,
+                            "file": state_basename,
+                            "terminal": {
+                                "type": "early_abort",
+                                "step": True,
+                                "reason": "x",
+                            },
+                        }
+                    ]
+                }
+            )
+        )
+
+        complete, reason = is_run_complete(out, config)
+        assert complete is False
+        assert reason == "invalid_terminal_step_invalid_type"
+
+    def test_step_mismatch_at_target_does_not_become_normal(self, tmp_path: Path) -> None:
+        """Manifest at target + terminal.step != manifest.step → invalid."""
+        from biolab_runners.openmm.utils import is_run_complete
+
+        out = tmp_path / "output"
+        out.mkdir()
+        config = OpenMMConfig(output_dir=str(out), production_ns=5.0, timestep_fs=2.0)
+        target = config.total_equil_steps + config.total_steps
+        state_basename = f"state.{target}_1_1.xml"
+        (out / state_basename).write_text("<State/>")
+        (out / "checkpoint.json").write_text(
+            json.dumps(
+                {
+                    "records": [
+                        {
+                            "step": target,
+                            "file": state_basename,
+                            "terminal": {
+                                "type": "early_abort",
+                                "step": target - 1,
+                                "reason": "x",
+                            },
+                        }
+                    ]
+                }
+            )
+        )
+
+        complete, reason = is_run_complete(out, config)
+        assert complete is False
+        assert reason == "invalid_terminal_step_mismatch"
+
+    def test_runner_fails_fast_on_malformed_terminal_at_target(self, tmp_path: Path) -> None:
+        """End-to-end: ``runner.run()`` on a directory with
+        manifest-at-target + malformed terminal returns
+        ``result.error`` set, NOT a successful normal completion."""
+        out = tmp_path / "output"
+        out.mkdir()
+        config = OpenMMConfig(output_dir=str(out), production_ns=5.0, timestep_fs=2.0)
+        target = config.total_equil_steps + config.total_steps
+        state_basename = f"state.{target}_1_1.xml"
+        (out / state_basename).write_text("<State/>")
+        (out / "trajectory.dcd").write_bytes(b"\x00" * 20_000_000)
+        (out / "energy.csv").write_text("#step,time\n" + "1,1\n" * 100)
+        (out / "topology.pdb").write_bytes(b"ATOM\n" * 1000)
+        (out / "checkpoint.json").write_text(
+            json.dumps(
+                {
+                    "records": [
+                        {
+                            "step": target,
+                            "file": state_basename,
+                            "terminal": {
+                                "type": "early_abort",
+                                "step": target,
+                                "reason": "",  # malformed: empty reason
+                            },
+                        }
+                    ]
+                }
+            )
+        )
+
+        runner = OpenMMRunner(config)
+        result = runner.run()
+        # The malformed terminal at the target step must NOT
+        # produce a successful normal completion. The runner
+        # surfaces the error and does not run the production
+        # loop (which would commit a non-terminal manifest,
+        # overwriting the user's malformed intent).
+        assert result.error != "", (
+            f"malformed terminal at target must surface result.error, got {result.error!r}"
+        )
+        assert "force=True" in result.error, (
+            f"the error must guide the user to force=True; got {result.error!r}"
+        )
+
+    def test_no_terminal_field_at_target_is_normal_completion(self, tmp_path: Path) -> None:
+        """Sanity: when the terminal field is ABSENT, the
+        normal-completion fallback IS allowed (legacy manifests
+        predate the terminal schema). The tri-state check
+        distinguishes "absent" from "present but invalid"."""
+        from biolab_runners.openmm.utils import is_run_complete
+
+        out = tmp_path / "output"
+        out.mkdir()
+        config = OpenMMConfig(output_dir=str(out), production_ns=5.0, timestep_fs=2.0)
+        target = config.total_equil_steps + config.total_steps
+        state_basename = f"state.{target}_1_1.xml"
+        (out / state_basename).write_text("<State/>")
+        # No "terminal" field at all.
+        (out / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": target, "file": state_basename}]})
+        )
+
+        complete, reason = is_run_complete(out, config)
+        # Absent terminal → normal completion fallback is allowed.
+        assert complete is True
+        assert reason.startswith("normal_completion_step_")
