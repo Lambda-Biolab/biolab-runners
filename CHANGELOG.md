@@ -4,9 +4,120 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — 2026-07-25
+## [Unreleased]
 
-### Changed
+- **Architecture (run-state machine extraction, v15, revised twice)**: Extracted the
+  pre-run decision tree and skip-population logic from `OpenMMRunner`
+  into a new `biolab_runners.openmm.run_state` deep module. The nine
+  private decision-tree methods (`_resolve_skip_or_resume`,
+  `_handle_manifest_branch`, `_populate_skip_result`, etc.) are gone.
+  The question "given the on-disk checkpoint state, what should the
+  runner do?" now has a single public interface:
+  `decide(output_dir, config, force) -> RunPlan` returns a tagged-union
+  `RunPlan` (`FreshPlan` | `ResumePlan` | `SkipPlan` | `FailurePlan`)
+  so invalid constructions (a `FreshPlan` carrying a `resume_xml`, a
+  `FailurePlan` carrying a `start_step`) are unrepresentable. The
+  `SkipPlan` carries the fully-populated artifact paths, `total_ns`,
+  and early-abort fields — the runner just copies them into
+  `SimulationResult`. There is no second public call: `populate_skip_result`
+  is gone. The `CompletionStatus` enum (`IN_PROGRESS`,
+  `NORMAL_COMPLETE`, `EARLY_ABORT`, `INVALID_TERMINAL`) is the
+  cross-module protocol for terminal classification, replacing the
+  previous string-prefix leak. `biolab_runners.openmm.checkpoint.inspect_checkpoint(output_dir, config)`
+  reads the manifest once and returns a fully-classified
+  `CheckpointSnapshot`; the previous multi-call pattern
+  (`load_checkpoint` + `is_run_complete` + `load_terminal_payload`)
+  could combine generation A's state metadata with generation B's
+  terminal classification if a concurrent commit landed between
+  reads — `inspect_checkpoint` fixes that race.
+
+  Runner shrinks from 1304 → ~933 LOC. Tests rewritten at the new
+  public interface (per DEEPENING.md) — `tests/test_run_state.py`
+  (~60 tests) covers all four plan types, all `CompletionStatus`
+  variants, all plan invariant checks (action non-overridable,
+  required fields, cross-field invariants), the invalid-terminal
+  schema variants, and the artifact-corruption matrix; the 19
+  private-API tests in `test_openmm_runner.py` are deleted. New
+  `tests/test_openmm_runner.py::TestRunnerDispatch` (5 tests)
+  verifies at the public `run()` interface that `SKIP` and
+  `FAIL_FAST` never call `_prepare_simulation`, that artifact
+  errors propagate to `result.error`, and that invalid terminal
+  payloads always fail fast.
+
+  Behavior change: `load_terminal_payload` is now strict (returns
+  `None` for empty reason, wrong type, step mismatch, etc.) — the
+  previous lenient behavior was a documented seam leak. Callers
+  that need raw access to a possibly-malformed payload should use
+  `inspect_checkpoint` directly and read `snapshot.terminal_payload`.
+
+  Behavior change: when `decide` returns `FailurePlan` for an
+  `InvalidCheckpointError`, the error message now appends
+  "The checkpoint is in an unrecoverable state; re-run with force=True
+  to discard it." to the original `InvalidCheckpointError` text. The
+  previous implementation copied `str(exc)` directly.
+
+  Plan type contract tightened: `action` is now a `ClassVar` (cannot
+  be overridden via constructor — `FreshPlan(action=Action.SKIP)` is
+  a `TypeError`), required fields have no defaults (`ResumePlan()` is
+  a `TypeError`), and `__post_init__` validates domain invariants
+  (negative steps, empty paths, early-abort-without-reason).
+  Invalid constructions are now unrepresentable.
+
+  Bug fix: `inspect_checkpoint` now distinguishes "key absent"
+  from `"terminal": null`. Previously, `last_record.get("terminal")`
+  returned `None` for both, so a `terminal: null` manifest at the
+  target step was silently accepted as normal completion — exactly
+  the failure mode the invalid-terminal rule is intended to prevent.
+  The new behavior classifies `terminal: null` as `INVALID_TERMINAL`
+  with reason `invalid_terminal_null`, which `run_state.decide()`
+  converts to `FailurePlan`.
+
+  Behavior restored: normal-completion `total_ns` is now `round(_, 2)`
+  — matches the original skip-population path. The intermediate
+  implementation dropped the rounding, which would have leaked
+  floating-point artifacts for float `timestep_fs` values. The new
+  behavior preserves the exact-value contract the runner had before
+  this refactor. Test `test_normal_completion_total_ns_rounded_for_float_timestep`
+  uses `production_ns=1.5678` so the unrounded result (`1.5678`)
+  differs from the rounded (`1.57`) — the test would fail if
+  `round()` were removed again.
+
+  Bug fix: `SkipPlan.abort_reason` is now typed `str` (not
+  `Optional[str]`). The previous `None` value silently serialised
+  as `"abort_reason": null` in `md_result.json`, breaking the
+  long-standing contract that downstream consumers
+  (`oral_amp.cloud`) rely on. Normal completions now serialise as
+  `"abort_reason": ""`. New runner-level test
+  `test_normal_skip_serializes_abort_reason_as_empty_string`
+  asserts both `result.abort_reason == ""` AND
+  `result.to_dict()["abort_reason"] == ""`.
+
+  Cross-field invariants tightened: the reviewer flagged that
+  semantically-contradictory plans still constructed. Added:
+  - `ResumePlan.start_step == manifest_step` (refuse mismatched
+    step accounting).
+  - `Path(resume_xml).name == state_file_basename` (refuse
+    manifest/loader path disagreement).
+  - `SkipPlan.completion` ∈ {`NORMAL_COMPLETE`, `EARLY_ABORT`}
+    (refuse `IN_PROGRESS` or `INVALID_TERMINAL` — those flow
+    through `FreshPlan` / `ResumePlan` / `FailurePlan` upstream).
+  - `EARLY_ABORT` requires `early_abort=True` and a non-empty
+    `abort_reason`.
+  - `NORMAL_COMPLETE` requires `early_abort=False` and
+    `abort_reason=""`.
+
+  Bug fix: `_artifact_validation_error` now treats directory-
+  disguised-as-file (`trajectory.dcd/`), binary-corrupted
+  `energy.csv`, and `OSError` from `stat()` as `FailurePlan`
+  causes rather than letting them leak out of `decide()` as
+  unhandled exceptions. The previous behaviour inherited from
+  the runner's `_validate_terminal_artifacts` would crash the
+  process on a partial disk failure during the original run.
+  New tests `test_directory_disguised_as_trajectory_yields_failure`,
+  `test_directory_disguised_as_energy_yields_failure`, and
+  `test_binary_corrupted_energy_yields_failure` exercise the
+  hardening.
+
 - **Architecture (checkpoint extraction, v14)**: Extracted the entire
   checkpoint domain — manifest read/validate, atomic save, orphan GC,
   quarantine, terminal classification, production step math — from

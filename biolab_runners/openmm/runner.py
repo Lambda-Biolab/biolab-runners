@@ -38,11 +38,8 @@ from pathlib import Path
 from biolab_runners.openmm.checkpoint import (
     InvalidCheckpointError,
     atomic_save_checkpoint,
-    is_run_complete,
     load_checkpoint,
-    load_terminal_payload,
     production_ns,
-    quarantine_stale_checkpoint,
 )
 from biolab_runners.openmm.config import OpenMMConfig, SimulationResult
 from biolab_runners.openmm.geometry import (
@@ -56,6 +53,12 @@ from biolab_runners.openmm.offline_gate import (
     write_verdict_file,
 )
 from biolab_runners.openmm.paths import FileNames
+from biolab_runners.openmm.run_state import (
+    FailurePlan,
+    ResumePlan,
+    SkipPlan,
+    decide,
+)
 from biolab_runners.openmm.system_builder import (
     SimulationContext,
     prepare_simulation,
@@ -131,18 +134,27 @@ class OpenMMRunner:
         """Run the full MD simulation pipeline.
 
         Pipeline stages:
-        1. Build/load solvated system (PDBFixer + solvation)
-        2. Energy minimization (fresh start only)
-        3. Multi-stage equilibration (NVT -> NPT restrained -> NPT free)
-        4. Production NPT with checkpointing
+        1. Decide (fresh / resume / skip / fail-fast) by inspecting
+           the on-disk checkpoint state. The decision lives in
+           :mod:`biolab_runners.openmm.run_state`; this runner is a
+           thin dispatcher.
+        2. Build/load solvated system (PDBFixer + solvation).
+        3. Energy minimization (fresh start only).
+        4. Multi-stage equilibration (NVT -> NPT restrained -> NPT free).
+        5. Production NPT with checkpointing.
 
         Args:
             force: Re-run even if production is already complete.
+                Quarantines the existing manifest, energy log, and
+                state files into ``.stale/<UTC>/`` before deciding.
             dry_run: Validate configuration without running the simulation.
             enable_early_abort: Enable 5 ns / 10 ns RMSD early abort checks.
 
         Returns:
-            SimulationResult with trajectory/energy paths and performance metrics.
+            SimulationResult with trajectory/energy paths and
+            performance metrics. On SKIP, the result is populated
+            from the on-disk checkpoint (idempotent re-run). On
+            FAIL_FAST, ``result.error`` is set and no MD runs.
         """
         config = self.config
         output_dir = Path(config.output_dir)
@@ -153,18 +165,34 @@ class OpenMMRunner:
         if dry_run:
             return self._dry_run(result)
 
-        resume_state = self._resolve_skip_or_resume(force, output_dir, config, result)
-        if resume_state is None:
+        plan = decide(output_dir, config, force)
+
+        if isinstance(plan, FailurePlan):
+            result.error = plan.error
+            logger.error(result.error)
             return result
+
+        if isinstance(plan, SkipPlan):
+            # The plan carries all populated fields — artifact paths,
+            # total_ns, early-abort fields. The runner just copies.
+            result.trajectory_path = plan.trajectory_path
+            result.energy_path = plan.energy_path
+            result.topology_path = plan.topology_path
+            result.state_xml_path = plan.state_xml_path
+            result.total_ns = plan.total_ns
+            result.early_abort = plan.early_abort
+            result.abort_reason = plan.abort_reason
+            return result
+
+        # FreshPlan or ResumePlan — the simulation needs to run.
         # ``start_step`` is the ABSOLUTE step the simulation will be at
-        # when the production loop starts. For a fresh run, equil runs
+        # when the production loop starts. For FreshPlan, equil runs
         # inside _prepare_simulation, so the simulation is at
-        # total_equil_steps when the loop starts. For a resumed run,
+        # total_equil_steps when the loop starts. For ResumePlan,
         # loadState sets the simulation to the saved step. The
         # production loop computes its absolute step as
         # ``start_step + steps_done`` (local).
-        start_step, remaining_steps, resume_xml = resume_state
-
+        resume_xml = plan.resume_xml if isinstance(plan, ResumePlan) else ""
         ctx = self._prepare_simulation(config, output_dir, resume_xml, result)
         if ctx is None:
             return result
@@ -174,12 +202,12 @@ class OpenMMRunner:
         traj_path = str(output_dir / FileNames.TRAJECTORY)
         energy_path = str(output_dir / FileNames.ENERGY)
 
-        energy_fh = self._setup_reporters(ctx, config, traj_path, energy_path, remaining_steps)
+        energy_fh = self._setup_reporters(ctx, config, traj_path, energy_path, plan.remaining_steps)
 
         logger.info(
             "Starting production: %d steps (%.1f ns), checkpoint every %d steps",
-            remaining_steps,
-            remaining_steps * config.timestep_fs / 1e6,
+            plan.remaining_steps,
+            plan.remaining_steps * config.timestep_fs / 1e6,
             config.checkpoint_every_steps,
         )
 
@@ -187,8 +215,8 @@ class OpenMMRunner:
         steps_done, abort_reason = self._run_production_loop(
             simulation=ctx.simulation,
             config=config,
-            start_step=start_step,
-            remaining_steps=remaining_steps,
+            start_step=plan.start_step,
+            remaining_steps=plan.remaining_steps,
             output_dir=output_dir,
             enable_early_abort=enable_early_abort,
             abort_thresh=abort_thresh,
@@ -204,407 +232,12 @@ class OpenMMRunner:
             energy_fh=energy_fh,
             traj_path=traj_path,
             energy_path=energy_path,
-            start_step=start_step,
+            start_step=plan.start_step,
             steps_done=steps_done,
             t0=t0,
             output_dir=output_dir,
         )
         return result
-
-    def _resolve_skip_or_resume(
-        self,
-        force: bool,
-        output_dir: Path,
-        config: OpenMMConfig,
-        result: SimulationResult,
-    ) -> tuple[int, int, str] | None:
-        """Handle idempotency + checkpoint resolution.
-
-        Decision tree (in order):
-
-        1. ``force=True`` ⇒ quarantine all resumable files, then
-           proceed to a fresh build. The quarantine moves the
-           manifest, the energy log, every state file
-           (``state*.xml``), AND the generation-scoped terminal
-           marker ``early_abort.json`` (if present) into
-           ``output_dir/.stale/<UTC>/`` BEFORE we return — so the
-           next non-forced invocation (or this one, if interrupted
-           mid-build) cannot pair a stale state with a fresh
-           topology, AND a stale abort marker cannot mis-classify
-           a mid-production checkpoint as terminal (v9 BLOCKER #1).
-
-        2. Read the manifest via :func:`load_checkpoint`. The
-           function validates the referenced state file (basename,
-           expected name pattern, exists, non-empty); an invalid
-           reference raises :class:`InvalidCheckpointError` which
-           we convert into ``result.error`` and abort. The earlier
-           "verify_production_outputs(...) → complete=True" gate
-           was removed because a mid-production checkpoint can
-           produce a large trajectory and many energy rows WITHOUT
-           the run being complete — file presence does not imply
-           completion.
-
-        3. If the manifest is valid (step > 0, state file valid),
-           call :func:`is_run_complete`: a run is terminal when
-           ``manifest_step >= total_equil_steps + total_steps``
-           (normal completion) OR ``early_abort.json`` exists with
-           ``aborted=True`` (intentional early termination). If
-           complete, populate the result (including
-           ``state_xml_path`` from the manifest) and return None.
-
-        4. Otherwise, return the resume tuple ``(start_step,
-           remaining_steps, resume_xml)``. ``start_step`` is the
-           absolute step the simulation will be at when the
-           production loop starts (the manifest's step for resumes,
-           ``total_equil_steps`` for fresh runs).
-
-        5. If no manifest exists but state files (legacy or v7)
-           are on disk, the checkpoint is orphaned — fail fast
-           with ``force=True`` guidance. Pairing an orphan state
-           with a freshly-built System would re-introduce the
-           incompatibility the "Resume safety" / "Atomic
-           checkpoint" rules exist to avoid.
-
-        Returns None if the simulation is already complete (result
-        populated) or the checkpoint is orphaned / invalid (result
-        error set); otherwise (start_step, remaining_steps,
-        resume_xml).
-
-        ``start_step`` is the ABSOLUTE step the simulation will be at
-        when the production loop starts:
-        - Fresh run: ``config.total_equil_steps`` (equil runs inside
-          ``_prepare_simulation`` before the loop).
-        - Resumed run: the absolute step from the manifest (the
-          ``loadState`` in ``prepare_simulation`` sets the simulator
-          to this step).
-        """
-        if force:
-            moved = quarantine_stale_checkpoint(output_dir)
-            if moved:
-                logger.info(
-                    "force=True: quarantined %d stale checkpoint file(s) to %s",
-                    len(moved),
-                    moved[0].parent,
-                )
-
-        # Read the manifest. ``load_checkpoint`` validates the
-        # referenced state file (basename, pattern, exists, size,
-        # and v10 BLOCKER #1: embedded-step equality) —
-        # InvalidCheckpointError surfaces a dangling or unsafe
-        # reference immediately.
-        manifest_step, state_file = OpenMMRunner._read_manifest_or_set_error(output_dir, result)
-        if result.error:
-            return None
-
-        if manifest_step > 0:
-            return OpenMMRunner._handle_manifest_branch(
-                result, output_dir, config, manifest_step, state_file
-            )
-
-        orphan_error = OpenMMRunner._check_orphan_state_files(output_dir)
-        if orphan_error is not None:
-            result.error = orphan_error
-            logger.error(result.error)
-            return None
-
-        return OpenMMRunner._build_fresh_resume_tuple(config)
-
-    @staticmethod
-    def _reconstruct_terminal_result(
-        result: SimulationResult,
-        output_dir: Path,
-        config: OpenMMConfig,
-        reason: str,
-    ) -> None:
-        """Populate ``result`` from the manifest's terminal payload.
-
-        v10 BLOCKER #2: terminal status is part of the manifest's
-        ``terminal`` payload (committed atomically with the state
-        file via :func:`biolab_runners.openmm.checkpoint.atomic_save_checkpoint`).
-        Reconstructed values come from
-        :func:`biolab_runners.openmm.utils.load_terminal_payload`,
-        which reads the validated manifest record and computes
-        ``production_ns`` from the v10 BLOCKER #3 invariant
-        (``absolute_step - total_equil_steps``).
-
-        For normal-completion terminals (no abort marker) the
-        function is a no-op — the result's artifact paths and
-        ``state_xml_path`` are already populated by the caller.
-        For manifest-terminal payloads (early_abort type), the
-        function populates ``early_abort=True``, ``abort_reason``,
-        and ``total_ns`` from the payload.
-        """
-        if not reason.startswith("manifest_terminal_"):
-            # Normal completion — caller already set the artifact
-            # paths. No-op.
-            return
-        payload = load_terminal_payload(output_dir, config)
-        if payload is None:
-            # The manifest claims terminal but the payload failed
-            # to validate. Log and leave result.early_abort=False
-            # so the caller notices the inconsistency.
-            logger.warning(
-                "Run classified as terminal via manifest payload "
-                "(reason=%s) but the payload failed to re-validate; "
-                "result.early_abort is left False",
-                reason,
-            )
-            return
-        if payload.get("type") == "early_abort":
-            result.early_abort = True
-            result.abort_reason = str(payload.get("reason", ""))
-            # v10 BLOCKER #3: production_ns is the canonical
-            # value (computed from absolute_step - total_equil_steps).
-            try:
-                result.total_ns = float(str(payload.get("production_ns", 0.0)))  # type: ignore[arg-type]
-            except (TypeError, ValueError):
-                result.total_ns = 0.0
-            logger.info(
-                "Reconstructing early-abort result: reason=%r production_ns=%.2f",
-                result.abort_reason,
-                result.total_ns,
-            )
-
-    @staticmethod
-    def _populate_skip_result(
-        result: SimulationResult,
-        output_dir: Path,
-        config: OpenMMConfig,
-        manifest_step: int,
-        state_file: str,
-        reason: str,
-    ) -> str | None:
-        """Populate ``result`` for an idempotent skip + return artifact error.
-
-        v10 BLOCKER #4: terminal classification is from the manifest,
-        but the SCIENTIFIC outputs (trajectory, energy, topology) must
-        also be present and usable. Returns the artifact error message
-        if validation fails, or ``None`` after populating the result
-        fields on success.
-
-        Also populates ``result.total_ns`` from the v10 BLOCKER #3
-        invariant (production ns = max(0, absolute_step -
-        total_equil_steps) * timestep_fs / 1e6) and the
-        ``_reconstruct_terminal_result`` payload (manifest's
-        ``terminal`` field, v10 BLOCKER #2).
-        """
-        artifact_error = OpenMMRunner._validate_terminal_artifacts(output_dir)
-        if artifact_error is not None:
-            return artifact_error
-        result.trajectory_path = str(output_dir / FileNames.TRAJECTORY)
-        result.energy_path = str(output_dir / FileNames.ENERGY)
-        result.topology_path = str(output_dir / FileNames.TOPOLOGY)
-        result.state_xml_path = str(output_dir / state_file)
-        # v10 BLOCKER #3: total_ns is PRODUCTION ns.
-        if reason.startswith("normal_completion_step_"):
-            result.total_ns = round(production_ns(manifest_step, config), 2)
-        OpenMMRunner._reconstruct_terminal_result(result, output_dir, config, reason)
-        return None
-
-    @staticmethod
-    def _populate_defensive_skip(
-        output_dir: Path,
-        config: OpenMMConfig,
-        manifest_step: int,
-        state_file: str,
-        result: SimulationResult,
-    ) -> bool:
-        """Defensive skip when remaining_steps=0 but no terminal classification.
-
-        ``is_run_complete`` should have classified this case as
-        terminal before we got here. If it didn't (e.g. config
-        changed mid-run, or the manifest predates the
-        ``terminal`` field), populate the artifact paths and
-        return True so the caller returns None (skip).
-        """
-        logger.info(
-            "No remaining steps — manifest at step %d, target %d",
-            manifest_step,
-            config.total_equil_steps + config.total_steps,
-        )
-        if state_file:
-            result.trajectory_path = str(output_dir / FileNames.TRAJECTORY)
-            result.energy_path = str(output_dir / FileNames.ENERGY)
-            result.topology_path = str(output_dir / FileNames.TOPOLOGY)
-            result.state_xml_path = str(output_dir / state_file)
-        return True
-
-    @staticmethod
-    def _build_fresh_resume_tuple(
-        config: OpenMMConfig,
-    ) -> tuple[int, int, str]:
-        """Build the resume tuple for a fresh run (no manifest, no orphan).
-
-        For a fresh run, equil runs inside ``_prepare_simulation``,
-        so ``start_step = config.total_equil_steps`` and
-        ``remaining_steps = config.total_steps``.
-        """
-        start_step = config.total_equil_steps
-        production_steps_done = max(0, start_step - config.total_equil_steps)
-        remaining_steps = max(0, config.total_steps - production_steps_done)
-        return start_step, remaining_steps, ""
-
-    @staticmethod
-    def _handle_manifest_branch(
-        result: SimulationResult,
-        output_dir: Path,
-        config: OpenMMConfig,
-        manifest_step: int,
-        state_file: str,
-    ) -> tuple[int, int, str] | None:
-        """Branch when a valid manifest exists.
-
-        Either classify the run as terminal (return None + populate
-        the result), or return the resume tuple ``(start_step,
-        remaining_steps, resume_xml)``, or fail fast on a malformed
-        terminal payload (v13 BLOCKER — present but invalid must
-        NOT fall through to resume or normal completion).
-        """
-        target_step = config.total_equil_steps + config.total_steps
-        complete, reason = is_run_complete(output_dir, config)
-        if complete:
-            logger.info(
-                "Skipping MD — run is already terminal (%s) at step %d",
-                reason,
-                manifest_step,
-            )
-            skip_error = OpenMMRunner._populate_skip_result(
-                result, output_dir, config, manifest_step, state_file, reason
-            )
-            if skip_error is not None:
-                result.error = skip_error
-                logger.error(result.error)
-                return None
-            return None
-        # v13 BLOCKER: a malformed terminal payload at the target
-        # step is reported by ``is_run_complete`` as
-        # ``(False, "invalid_terminal_...")`` — the manifest is in
-        # an ambiguous state and the runner must fail loudly rather
-        # than fall through to a resume that would either
-        # reclassify the run as normal completion (overwriting the
-        # bad terminal) or commit a new terminal without addressing
-        # the schema error. The user must investigate via
-        # ``force=True`` (which quarantines the malformed manifest
-        # alongside the other resumable files).
-        if reason.startswith("invalid_terminal_"):
-            result.error = (
-                f"Manifest carries a malformed terminal payload at "
-                f"step {manifest_step} (reason={reason!r}). The "
-                f"user attempted to record a terminal decision but "
-                f"the schema is wrong; the run is in an ambiguous "
-                f"state. Re-run with force=True to quarantine the "
-                f"manifest and start fresh."
-            )
-            logger.error(result.error)
-            return None
-        logger.info(
-            "Resuming from checkpoint at step %d (%.2f ns of %d needed)",
-            manifest_step,
-            manifest_step * config.timestep_fs / 1e6,
-            target_step,
-        )
-        resume_xml = str(output_dir / state_file)
-        start_step = manifest_step
-        production_steps_done = max(0, start_step - config.total_equil_steps)
-        remaining_steps = max(0, config.total_steps - production_steps_done)
-        return start_step, remaining_steps, resume_xml
-
-    @staticmethod
-    def _read_manifest_or_set_error(output_dir: Path, result: SimulationResult) -> tuple[int, str]:
-        r"""Read the manifest; on failure, set result.error and return (0, "").
-
-        Returns (manifest_step, state_file_basename). On
-        ``InvalidCheckpointError`` (e.g. v10 BLOCKER #1 step
-        mismatch, dangling state file), sets ``result.error`` and
-        returns (0, "").
-        """
-        try:
-            checkpoint = load_checkpoint(output_dir)
-        except InvalidCheckpointError as exc:
-            result.error = str(exc)
-            logger.error(result.error)
-            return 0, ""
-        return checkpoint.absolute_step, checkpoint.state_file_basename
-
-    @staticmethod
-    def _check_orphan_state_files(output_dir: Path) -> str | None:
-        """Detect orphaned state files when no manifest is present.
-
-        No valid manifest + state files on disk (legacy ``state.xml``
-        from a v6 run or v7 ``state.<gen>.xml`` from an interrupted
-        save that landed before the manifest rename) is an orphan
-        condition. Pairing the orphan state with a freshly-built
-        System would re-introduce the incompatibility the "Resume
-        safety" rule exists to avoid.
-
-        Returns:
-            The error message string if orphan files are detected,
-            ``None`` if the directory is clean (no state files
-            without a manifest).
-        """
-        leftover_states = list(output_dir.glob("state*.xml"))
-        if not leftover_states:
-            return None
-        return (
-            f"State file(s) exist at {leftover_states} but "
-            f"the manifest {FileNames.CHECKPOINT_JSON} is "
-            f"missing or invalid — the saved state's step is "
-            f"unknown. Pairing it with a freshly-built System "
-            f"would re-introduce the incompatibility this rule "
-            f"exists to avoid. Re-run with force=True to "
-            f"discard the orphaned checkpoint."
-        )
-
-    @staticmethod
-    def _validate_terminal_artifacts(output_dir: Path) -> str | None:
-        """Verify that a terminal run has its promised outputs.
-
-        v10 BLOCKER #4: ``is_run_complete`` returns true based on
-        the manifest's terminal decision, but a terminal run also
-        needs the scientific outputs (trajectory, energy log,
-        topology) to be present and usable. A terminal manifest
-        plus state file but no trajectory / energy returns a
-        result with ``error=""`` and paths pointing to
-        nonexistent files — silently misleading downstream
-        consumers.
-
-        Returns:
-            ``None`` if all required artifacts are present and
-            usable. Otherwise, a human-readable error message
-            naming the first missing or unusable artifact.
-
-        Validation:
-        - trajectory.dcd must exist and be > 0 bytes.
-        - energy.csv must exist and have ≥1 data row.
-        - topology.pdb must exist and be > 0 bytes.
-        """
-        traj = output_dir / FileNames.TRAJECTORY
-        energy = output_dir / FileNames.ENERGY
-        topo = output_dir / FileNames.TOPOLOGY
-        missing: list[str] = []
-        empty: list[str] = []
-        for label, path in (("trajectory", traj), ("energy", energy), ("topology", topo)):
-            if not path.exists():
-                missing.append(label)
-            elif path.stat().st_size == 0:
-                empty.append(label)
-        # Energy.csv is text — a 1-byte file is header only and
-        # counts as empty for the purpose of scientific output.
-        if energy.exists() and energy.stat().st_size > 0:
-            data_rows = max(0, len(energy.read_text().strip().splitlines()) - 1)
-            if data_rows == 0:
-                empty.append("energy (header-only, no data rows)")
-        if missing or empty:
-            problems = [f"missing {n}" for n in missing] + [f"empty {n}" for n in empty]
-            return (
-                "Terminal run is missing required artifacts: "
-                + ", ".join(problems)
-                + ". The checkpoint recorded completion but the "
-                "scientific outputs are not usable; the user must "
-                "investigate the prior run (e.g. disk full during "
-                "trajectory write) and re-run with force=True."
-            )
-        return None
 
     def _prepare_simulation(
         self,
