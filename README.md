@@ -4,6 +4,7 @@
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Tests](https://github.com/Lambda-Biolab/biolab-runners/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Lambda-Biolab/biolab-runners/actions/workflows/ci.yml)
 [![Dependabot Updates](https://github.com/Lambda-Biolab/biolab-runners/actions/workflows/dependabot/dependabot-updates/badge.svg?branch=main)](https://github.com/Lambda-Biolab/biolab-runners/actions/workflows/dependabot/dependabot-updates)
+[![CodeQL](https://github.com/Lambda-Biolab/biolab-runners/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/Lambda-Biolab/biolab-runners/actions/workflows/codeql.yml)
 [![CodeFactor](https://www.codefactor.io/repository/github/lambda-biolab/biolab-runners/badge/main)](https://www.codefactor.io/repository/github/lambda-biolab/biolab-runners)
 
 Standalone, modular Python runners for **Boltz-2 structure prediction** and **OpenMM molecular dynamics simulations**.
