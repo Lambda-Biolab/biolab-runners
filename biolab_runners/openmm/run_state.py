@@ -363,10 +363,24 @@ def decide(
         runner matches on either the type or the ``action`` field.
 
     Raises:
-        Nothing — all error modes are encoded in ``FailurePlan``.
-        This is deliberate: the runner's decision should never
-        raise; corruption surfaces as ``result.error``, never as
-        an unhandled exception.
+        The classification path (steps 2-4) raises nothing — every
+        error mode is encoded in ``FailurePlan``. This is
+        deliberate: the runner's classification step never raises;
+        corruption surfaces as ``result.error``, never as an
+        unhandled exception.
+
+        The ``force=True`` quarantine step (step 1) is the one
+        exception. ``quarantine_stale_checkpoint`` calls
+        ``shutil.move`` and ``os.replace`` on the user's filesystem,
+        and an ``OSError`` from a permission error, full disk,
+        vanished entry, etc. propagates out of ``decide()``. This
+        is intentional — a failure to safely quarantine is a
+        pre-condition failure (the user asked to discard state and
+        the filesystem refused), and silently returning a
+        ``FailurePlan`` here would mask the problem and let the
+        runner pair a freshly-built System with stale files. The
+        runner catches this at the public ``run()`` boundary if it
+        needs to convert it to a result-level error.
     """
     if force:
         moved = quarantine_stale_checkpoint(output_dir)
