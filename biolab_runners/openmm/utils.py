@@ -499,15 +499,21 @@ def is_run_complete(output_dir: Path, config: OpenMMConfig) -> tuple[bool, str]:
        counts.
 
     2. **Manifest terminal payload**: the manifest's last record
-       contains a ``terminal`` dict with ``step == manifest.step``.
-       The ``step`` field of the terminal payload MUST equal the
-       manifest's ``step`` (v10 BLOCKER #2 binding) — a mismatch
-       indicates data corruption and is logged as a warning; the
-       run is treated as in_progress so a fresh loadCheckpoint
-       can resume.
+       contains a ``terminal`` dict with the validated schema
+       (``type == "early_abort"``, ``step == manifest.step`` as a
+       strict positive ``int``, ``reason`` non-empty). A valid
+       payload marks the run terminal; an INVALID payload (present
+       but failing any of these checks) returns
+       ``invalid_terminal_<reason>`` and the runner fails fast
+       with ``force=True`` guidance (v13 BLOCKER). A binding
+       mismatch between ``terminal.step`` and ``manifest.step``
+       indicates data corruption; the runner surfaces this as
+       an error rather than reclassifying the run as in-progress.
 
-    Otherwise the run is in progress (or interrupted) and the
-    caller should resume.
+    3. **Normal completion** (fallback): when no ``terminal``
+       field is present, ``manifest_step >= total_equil_steps +
+       total_steps`` is treated as normal completion (legacy
+       manifests predate the terminal schema).
 
     Args:
         output_dir: MD output directory.
