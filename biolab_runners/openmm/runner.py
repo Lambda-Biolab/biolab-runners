@@ -54,9 +54,10 @@ from biolab_runners.openmm.offline_gate import (
 )
 from biolab_runners.openmm.paths import FileNames
 from biolab_runners.openmm.run_state import (
-    Action,
+    FailurePlan,
+    ResumePlan,
+    SkipPlan,
     decide,
-    populate_skip_result,
 )
 from biolab_runners.openmm.system_builder import (
     SimulationContext,
@@ -166,27 +167,33 @@ class OpenMMRunner:
 
         plan = decide(output_dir, config, force)
 
-        if plan.action == Action.FAIL_FAST:
+        if isinstance(plan, FailurePlan):
             result.error = plan.error
             logger.error(result.error)
             return result
 
-        if plan.action == Action.SKIP:
-            skip_error = populate_skip_result(plan, output_dir, config, result)
-            if skip_error is not None:
-                result.error = skip_error
-                logger.error(result.error)
+        if isinstance(plan, SkipPlan):
+            # The plan carries all populated fields — artifact paths,
+            # total_ns, early-abort fields. The runner just copies.
+            result.trajectory_path = plan.trajectory_path
+            result.energy_path = plan.energy_path
+            result.topology_path = plan.topology_path
+            result.state_xml_path = plan.state_xml_path
+            result.total_ns = plan.total_ns
+            result.early_abort = plan.early_abort
+            result.abort_reason = plan.abort_reason
             return result
 
-        # FRESH or RESUME: the simulation needs to run.
+        # FreshPlan or ResumePlan — the simulation needs to run.
         # ``start_step`` is the ABSOLUTE step the simulation will be at
-        # when the production loop starts. For FRESH, equil runs
+        # when the production loop starts. For FreshPlan, equil runs
         # inside _prepare_simulation, so the simulation is at
-        # total_equil_steps when the loop starts. For RESUME,
+        # total_equil_steps when the loop starts. For ResumePlan,
         # loadState sets the simulation to the saved step. The
         # production loop computes its absolute step as
         # ``start_step + steps_done`` (local).
-        ctx = self._prepare_simulation(config, output_dir, plan.resume_xml, result)
+        resume_xml = plan.resume_xml if isinstance(plan, ResumePlan) else ""
+        ctx = self._prepare_simulation(config, output_dir, resume_xml, result)
         if ctx is None:
             return result
 

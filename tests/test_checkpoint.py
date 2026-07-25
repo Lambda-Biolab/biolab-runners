@@ -718,13 +718,20 @@ class TestLoadTerminalPayload:
 
         assert load_terminal_payload(tmp_path, config) is None
 
-    def test_returns_payload_with_empty_reason_when_present(self, tmp_path: Path) -> None:
-        """``load_terminal_payload`` is intentionally lenient: it only
-        validates ``step`` (strict-int equal to manifest step) and
-        returns whatever the manifest's ``terminal`` field contains
-        otherwise. The runner caller checks ``type == "early_abort"``
-        and ``reason`` non-empty — that's :func:`is_run_complete`'s
-        job. An empty reason here is NOT a None return."""
+    def test_returns_none_when_terminal_invalid(self, tmp_path: Path) -> None:
+        """v11 contract: an invalid terminal payload (empty reason,
+        wrong type, step mismatch, non-int step) is treated as
+        invalid and ``load_terminal_payload`` returns ``None``.
+
+        This is a deliberate tightening from the previous
+        "lenient parse, caller re-validates" behavior — the new
+        ``inspect_checkpoint`` does the full schema validation
+        once, and ``load_terminal_payload`` (its thin wrapper)
+        inherits that strictness. Callers that need raw access
+        to a possibly-malformed payload should use
+        :func:`inspect_checkpoint` directly and read
+        ``snapshot.terminal_payload``.
+        """
         config = OpenMMConfig(production_ns=10.0, timestep_fs=2.0)
         state = tmp_path / "state.5000000_1_1.xml"
         state.write_text("<State/>")
@@ -735,12 +742,7 @@ class TestLoadTerminalPayload:
             terminal={"type": "early_abort", "step": 5_000_000, "reason": ""},
         )
 
-        payload = load_terminal_payload(tmp_path, config)
-
-        assert payload is not None
-        assert payload["reason"] == ""  # passes through as-is
-        assert payload["type"] == "early_abort"
-        assert payload["step"] == 5_000_000
+        assert load_terminal_payload(tmp_path, config) is None
 
     def test_returns_none_when_step_mismatch(self, tmp_path: Path) -> None:
         config = OpenMMConfig(production_ns=10.0, timestep_fs=2.0)

@@ -33,11 +33,18 @@ This module owns the entire checkpoint lifecycle of an OpenMM MD run:
 
 The seam between this module and the runner is the public interface.
 Internal helpers (``_parse_manifest``, ``_validate_state_file_reference``,
-``_parse_state_filename_step``, ``_gc_orphan_states``, ``_check_normal_completion``,
-``_check_manifest_terminal``, ``_production_steps``) are part of the
-module's **internal seam** — they exist so this module's own tests can
-exercise specific failure modes without resorting to setup that goes
-past the public interface. They are NOT exported.
+``_parse_state_filename_step``, ``_gc_orphan_states``,
+``_validate_terminal_payload``, ``_production_steps``) are part of
+the module's **internal seam** — they exist so this module's own
+tests can exercise specific failure modes without resorting to
+setup that goes past the public interface. They are NOT exported.
+
+The structured :class:`CompletionStatus` enum is the cross-module
+terminal-classification protocol — downstream code branches on the
+enum value, not on string-prefixes of the ``reason`` field. The old
+string-prefix protocol (``reason.startswith("normal_completion_")``
+etc.) was a documented seam leak; this version surfaces the
+classification as a stable enum.
 
 The AGENTS.md invariants around checkpoint / manifest / terminal /
 quarantine / orphan GC / resume safety all describe this module.
@@ -53,6 +60,7 @@ import shutil
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -103,6 +111,74 @@ class LoadedCheckpoint:
     last_record: dict[str, Any] = field(default_factory=dict)
     is_terminal: bool = False
     terminal_reason: str | None = None
+
+
+class CompletionStatus(StrEnum):
+    """Structured terminal classification returned by :func:`is_run_complete`.
+
+    Surfaced via :class:`CheckpointSnapshot` so callers branch on
+    a stable enum rather than parsing reason-string prefixes.
+
+    Reading the manifest once and producing one of these values lets
+    downstream code branch on a stable enum rather than parsing
+    reason-string prefixes (which were the previous cross-module
+    protocol and a documented seam leak).
+    """
+
+    IN_PROGRESS = "in_progress"
+    """The run is not yet terminal. ``resume_xml`` is the file to load."""
+    NORMAL_COMPLETE = "normal_complete"
+    """The manifest reached the target step without a terminal payload."""
+    EARLY_ABORT = "early_abort"
+    """The manifest carries a valid ``terminal`` payload (early abort)."""
+    INVALID_TERMINAL = "invalid_terminal"
+    """The manifest has a present-but-invalid ``terminal`` field.
+
+    Per the v11 contract, treat as in-progress with a specific
+    failure reason. The runner MUST NOT fall back to the
+    normal-completion heuristic. Today the runner converts this
+    to FAIL_FAST — the run is in an ambiguous state and the user
+    must investigate via ``force=True``.
+    """
+
+
+@dataclass(frozen=True)
+class CheckpointSnapshot:
+    """Coherent result of inspecting the on-disk checkpoint state.
+
+    Single read of the manifest + state file. The completion
+    classification, terminal payload, and produce-tolerant fields
+    are all derived from a single manifest snapshot — no race
+    window between fresh builds of the same plan.
+
+    Use :func:`inspect_checkpoint` as the canonical entry point.
+    A default snapshot (``IN_PROGRESS`` with empty fields) is
+    returned when no manifest exists.
+
+    Fields:
+        absolute_step: The absolute OpenMM step the saved state is at,
+            or 0 if no manifest exists.
+        state_file_basename: The basename of the referenced state file.
+        last_record: The last record dict from the manifest, exposed
+            for callers that need to inspect arbitrary fields.
+        completion: The structured terminal classification.
+        completion_reason: Human-readable reason for the completion
+            classification (e.g. ``"normal_completion_step_50_200_000"``,
+            ``"manifest_terminal_early_abort_step_5000000"``,
+            ``"in_progress"``, ``"invalid_terminal_<reason>"``).
+        terminal_payload: The validated manifest terminal payload
+            dict, populated only when ``completion == EARLY_ABORT``.
+            Structured fields: ``step``, ``type``, ``reason``,
+            ``production_ns``, plus optional ``gate``, ``target``,
+            ``peptide_id`` when well-typed.
+    """
+
+    absolute_step: int = 0
+    state_file_basename: str = ""
+    last_record: dict[str, Any] = field(default_factory=dict)
+    completion: CompletionStatus = CompletionStatus.IN_PROGRESS
+    completion_reason: str = "in_progress"
+    terminal_payload: dict[str, Any] | None = None
 
 
 class InvalidCheckpointError(Exception):
@@ -448,6 +524,185 @@ def load_checkpoint(output_dir: Path) -> LoadedCheckpoint:
     )
 
 
+def inspect_checkpoint(output_dir: Path, config: OpenMMConfig) -> CheckpointSnapshot:
+    """Read the manifest ONCE and return a fully-classified snapshot.
+
+    Replaces the multi-call pattern of
+    ``load_checkpoint() + is_run_complete() + load_terminal_payload()``
+    with a single coherent read. Callers that build a decision
+    plan from the on-disk state should use this — multiple reads
+    race against a concurrent commit that lands between them.
+
+    The snapshot's ``completion`` is one of four
+    :class:`CompletionStatus` values, matching the cross-module
+    contract (the previous string-prefix protocol was a noted
+    seam leak).
+
+    Decision tree on the snapshot:
+
+    - No manifest → ``IN_PROGRESS`` with empty fields.
+    - Manifest step ≥ target → ``NORMAL_COMPLETE``.
+    - Manifest has a valid ``terminal`` payload → ``EARLY_ABORT``,
+      with the validated payload in ``terminal_payload``.
+    - Manifest has a present-but-invalid ``terminal`` payload →
+      ``INVALID_TERMINAL``. The runner converts this to FAIL_FAST
+      (the v11 contract — never resume, never fall back to normal
+      completion).
+    - Otherwise → ``IN_PROGRESS``.
+
+    Args:
+        output_dir: MD output directory.
+        config: OpenMMConfig (used for the target step in normal
+            completion comparison and the production_ns computation
+            in the terminal payload).
+
+    Returns:
+        A :class:`CheckpointSnapshot`. The default snapshot
+        (``IN_PROGRESS`` with empty fields) is returned when no
+        manifest exists.
+
+    Raises:
+        InvalidCheckpointError: If the manifest references a
+            dangling / unsafe / step-mismatched state file.
+    """
+    checkpoint = load_checkpoint(output_dir)
+    if checkpoint.absolute_step <= 0:
+        return CheckpointSnapshot(
+            absolute_step=0,
+            state_file_basename="",
+            last_record={},
+            completion=CompletionStatus.IN_PROGRESS,
+            completion_reason="in_progress",
+            terminal_payload=None,
+        )
+
+    manifest_step = checkpoint.absolute_step
+    last_record = checkpoint.last_record
+
+    # Manifest terminal payload — three-way terminal classification.
+    # ABSENT (no terminal key) → IN_PROGRESS, caller falls back to
+    # normal completion. INVALID (present but fails schema) →
+    # INVALID_TERMINAL with a specific reason. VALID → EARLY_ABORT.
+    raw_terminal = last_record.get("terminal")
+    if raw_terminal is not None:
+        return _classify_manifest_terminal(
+            raw_terminal=raw_terminal,
+            manifest_step=manifest_step,
+            state_file_basename=checkpoint.state_file_basename,
+            last_record=last_record,
+            config=config,
+        )
+
+    # No terminal field — fall back to normal completion heuristic.
+    target_step = config.total_equil_steps + config.total_steps
+    if manifest_step >= target_step:
+        return CheckpointSnapshot(
+            absolute_step=manifest_step,
+            state_file_basename=checkpoint.state_file_basename,
+            last_record=last_record,
+            completion=CompletionStatus.NORMAL_COMPLETE,
+            completion_reason=f"normal_completion_step_{manifest_step}_of_{target_step}",
+            terminal_payload=None,
+        )
+    return CheckpointSnapshot(
+        absolute_step=manifest_step,
+        state_file_basename=checkpoint.state_file_basename,
+        last_record=last_record,
+        completion=CompletionStatus.IN_PROGRESS,
+        completion_reason="in_progress",
+        terminal_payload=None,
+    )
+
+
+def _classify_manifest_terminal(
+    *,
+    raw_terminal: dict[str, Any] | str | int | float | bool | None,
+    manifest_step: int,
+    state_file_basename: str,
+    last_record: dict[str, Any],
+    config: OpenMMConfig,
+) -> CheckpointSnapshot:
+    """Classify a manifest's ``terminal`` field into a snapshot.
+
+    Helper for :func:`inspect_checkpoint`. Returns either a
+    snapshot with ``completion == INVALID_TERMINAL`` and a
+    specific ``completion_reason``, or a snapshot with
+    ``completion == EARLY_ABORT`` and the validated payload.
+
+    The v11 contract: ABSENT → IN_PROGRESS (caller falls back to
+    normal completion); INVALID → INVALID_TERMINAL (caller MUST
+    NOT fall back to normal completion); VALID → EARLY_ABORT.
+    """
+    if not isinstance(raw_terminal, dict):
+        return CheckpointSnapshot(
+            absolute_step=manifest_step,
+            state_file_basename=state_file_basename,
+            last_record=last_record,
+            completion=CompletionStatus.INVALID_TERMINAL,
+            completion_reason="invalid_terminal_not_dict",
+            terminal_payload=None,
+        )
+    raw_step = raw_terminal.get("step")
+    if not isinstance(raw_step, int) or isinstance(raw_step, bool) or raw_step <= 0:
+        return CheckpointSnapshot(
+            absolute_step=manifest_step,
+            state_file_basename=state_file_basename,
+            last_record=last_record,
+            completion=CompletionStatus.INVALID_TERMINAL,
+            completion_reason="invalid_terminal_step_invalid_type",
+            terminal_payload=None,
+        )
+    if raw_step != manifest_step:
+        return CheckpointSnapshot(
+            absolute_step=manifest_step,
+            state_file_basename=state_file_basename,
+            last_record=last_record,
+            completion=CompletionStatus.INVALID_TERMINAL,
+            completion_reason="invalid_terminal_step_mismatch",
+            terminal_payload=None,
+        )
+    if raw_terminal.get("type") != "early_abort":
+        return CheckpointSnapshot(
+            absolute_step=manifest_step,
+            state_file_basename=state_file_basename,
+            last_record=last_record,
+            completion=CompletionStatus.INVALID_TERMINAL,
+            completion_reason="invalid_terminal_type_unsupported",
+            terminal_payload=None,
+        )
+    reason = raw_terminal.get("reason")
+    if not isinstance(reason, str) or not reason:
+        return CheckpointSnapshot(
+            absolute_step=manifest_step,
+            state_file_basename=state_file_basename,
+            last_record=last_record,
+            completion=CompletionStatus.INVALID_TERMINAL,
+            completion_reason="invalid_terminal_reason_empty",
+            terminal_payload=None,
+        )
+    # Valid terminal payload — build the normalised payload.
+    payload: dict[str, Any] = {
+        "step": raw_step,
+        "type": str(raw_terminal.get("type", "unknown")),
+        "reason": str(raw_terminal.get("reason", "")),
+        "production_ns": _production_steps(raw_step, config.total_equil_steps)
+        * config.timestep_fs
+        / 1e6,
+    }
+    for opt in ("gate", "target", "peptide_id"):
+        val = raw_terminal.get(opt)
+        if isinstance(val, str):
+            payload[opt] = val
+    return CheckpointSnapshot(
+        absolute_step=manifest_step,
+        state_file_basename=state_file_basename,
+        last_record=last_record,
+        completion=CompletionStatus.EARLY_ABORT,
+        completion_reason=f"manifest_terminal_{payload['type']}_step_{raw_step}",
+        terminal_payload=payload,
+    )
+
+
 def _validate_terminal_payload(manifest_step: int, last_record: dict[str, Any]) -> str | None:
     """Validate the manifest's terminal field; return the canonical reason on success.
 
@@ -714,142 +969,34 @@ def _parse_state_filename_step(state_file: str) -> int | None:
 def is_run_complete(output_dir: Path, config: OpenMMConfig) -> tuple[bool, str]:
     """Determine whether a production run is terminal.
 
-    v10 BLOCKER #2: terminal status is now part of the manifest
-    record itself (the ``terminal`` field) and is committed
-    atomically with the state file via the manifest rename — the
-    ``os.replace`` is the single commit point. A separate
-    ``early_abort.json`` may still exist for downstream consumers
-    (``oral_amp.cloud.openmm_cloud``), but it is a derived file
-    written AFTER the atomic save and is NOT consulted by this
-    function for terminal classification.
+    Thin wrapper around :func:`inspect_checkpoint` that returns
+    the legacy ``(complete, reason)`` tuple shape. New code
+    should use :func:`inspect_checkpoint` directly and branch on
+    the structured :class:`CompletionStatus` value.
 
-    A run is terminal when EITHER:
-
-    1. **Normal completion**: ``manifest_step >= total_equil_steps +
-       total_steps``. The manifest's step is the absolute OpenMM
-       step (``start_step + steps_done``), so this signal is
-       unambiguous — not dependent on file sizes or energy row
-       counts.
-
-    2. **Manifest terminal payload**: the manifest's last record
-       contains a ``terminal`` dict with the validated schema
-       (``type == "early_abort"``, ``step == manifest.step`` as a
-       strict positive ``int``, ``reason`` non-empty). A valid
-       payload marks the run terminal; an INVALID payload (present
-       but failing any of these checks) returns
-       ``invalid_terminal_<reason>`` and the runner fails fast
-       with ``force=True`` guidance (v13 BLOCKER). A binding
-       mismatch between ``terminal.step`` and ``manifest.step``
-       indicates data corruption; the runner surfaces this as
-       an error rather than reclassifying the run as in-progress.
-
-    3. **Normal completion** (fallback): when no ``terminal``
-       field is present, ``manifest_step >= total_equil_steps +
-       total_steps`` is treated as normal completion (legacy
-       manifests predate the terminal schema).
-
-    Args:
-        output_dir: MD output directory.
-        config: The OpenMMConfig used to compute total_equil_steps
-            and total_steps.
+    The returned ``reason`` carries the diagnostic detail for
+    logging — the runner's policy is driven by the enum, not the
+    string prefix.
 
     Returns:
-        ``(complete, reason)``. ``complete`` is True for the two
-        terminal cases; ``reason`` is a human-readable explanation
-        (e.g. ``"normal_completion_step_50_200_000"``,
-        ``"manifest_terminal_early_abort_step_5_000_000"``,
-        ``"in_progress"``,
-        ``"invalid_terminal_<field>"``).
-
-        v13 BLOCKER: when the manifest has a malformed
-        ``terminal`` payload (the field is present but doesn't
-        validate), the function returns
-        ``(False, "invalid_terminal_<reason>")`` and does NOT fall
-        back to the inferred normal-completion heuristic. The
-        previous behaviour accepted a malformed terminal at the
-        target step as normal completion, contradicting the v11
-        terminal-schema contract.
+        ``(complete, reason)`` where ``complete`` is True for
+        ``NORMAL_COMPLETE`` and ``EARLY_ABORT`` (the two terminal
+        cases). ``False`` for ``IN_PROGRESS`` and
+        ``INVALID_TERMINAL`` (the runner converts
+        ``INVALID_TERMINAL`` to FAIL_FAST — the v11 contract).
 
     Raises:
         InvalidCheckpointError: If the manifest references a
-            dangling / unsafe / step-mismatched state file. The
-            runner catches this and treats the manifest as
-            unrecoverable (force=True guidance).
+            dangling / unsafe / step-mismatched state file.
     """
-    checkpoint = load_checkpoint(output_dir)
-    if checkpoint.absolute_step <= 0:
-        return False, "in_progress"
-
-    manifest_step = checkpoint.absolute_step
-    last_record = checkpoint.last_record
-
-    # v13 BLOCKER: tri-state terminal check. Distinguish ABSENT
-    # (no terminal field) from INVALID (terminal field present but
-    # fails schema). The previous implementation collapsed both
-    # into a single ``None`` return, which let a malformed
-    # terminal at the target step fall through to the inferred
-    # normal-completion heuristic — silently reclassifying an
-    # ambiguous/corrupt terminal as a successful run.
-    terminal_reason = _validate_terminal_payload(manifest_step, last_record)
-    if terminal_reason is not None:
-        # Valid terminal payload. Per v12 BLOCKER precedence,
-        # this takes priority over inferred normal completion,
-        # even when the manifest_step has reached the target.
-        return True, terminal_reason
-    if "terminal" in last_record:
-        # terminal_reason is None AND the field was present —
-        # the terminal payload failed schema validation. Per v11,
-        # treat as in-progress with a specific failure reason.
-        # Do NOT fall back to the normal-completion heuristic.
-        # The terminal field is present but malformed. The v11
-        # contract says treat as in-progress with a specific
-        # failure reason. Crucially, do NOT fall back to the
-        # normal-completion heuristic below — the user attempted
-        # to record a terminal decision and got the schema wrong;
-        # the run is in an ambiguous state and the runner must
-        # fail loudly, not silently succeed.
-        invalid_reason = _classify_invalid_terminal(manifest_step, last_record["terminal"])
-        return False, invalid_reason
-    # terminal_state == "absent" — no terminal field; fall back
-    # to the inferred normal completion.
-    normal = _check_normal_completion(manifest_step, config)
-    if normal is not None:
-        return normal
-    return False, "in_progress"
+    snapshot = inspect_checkpoint(output_dir, config)
+    if snapshot.completion in (CompletionStatus.NORMAL_COMPLETE, CompletionStatus.EARLY_ABORT):
+        return True, snapshot.completion_reason
+    return False, snapshot.completion_reason
 
 
-def _classify_invalid_terminal(
-    manifest_step: int, terminal: dict[str, object] | str | int | float | bool | None
-) -> str:
-    """Map a malformed ``terminal`` payload to a stable ``invalid_terminal_*`` reason.
-
-    Used by :func:`is_run_complete` to surface the specific schema
-    failure to the runner (and ultimately the user). The reason
-    string is part of the runner's fail-fast error message.
-    """
-    if not isinstance(terminal, dict):
-        return "invalid_terminal_not_dict"
-    raw_step = terminal.get("step")
-    if not isinstance(raw_step, int) or isinstance(raw_step, bool) or raw_step <= 0:
-        return "invalid_terminal_step_invalid_type"
-    if raw_step != manifest_step:
-        return "invalid_terminal_step_mismatch"
-    if terminal.get("type") != "early_abort":
-        return "invalid_terminal_type_unsupported"
-    reason = terminal.get("reason")
-    if not isinstance(reason, str) or not reason:
-        return "invalid_terminal_reason_empty"
-    return "invalid_terminal_unknown"
-
-
-def _check_normal_completion(manifest_step: int, config: OpenMMConfig) -> tuple[bool, str] | None:
-    """Return ``(True, "normal_completion_..._of_<target>")`` if at/past target."""
-    target_step = config.total_equil_steps + config.total_steps
-    if manifest_step >= target_step:
-        return True, f"normal_completion_step_{manifest_step}_of_{target_step}"
-    return None
-
-
+# ---------------------------------------------------------------------------
+# Production-time math
 # ---------------------------------------------------------------------------
 # Terminal payload reconstruction
 # ---------------------------------------------------------------------------
@@ -858,54 +1005,24 @@ def _check_normal_completion(manifest_step: int, config: OpenMMConfig) -> tuple[
 def load_terminal_payload(output_dir: Path, config: OpenMMConfig) -> dict[str, Any] | None:
     """Load the validated terminal payload from the manifest.
 
-    v10: the terminal payload is the manifest's ``terminal`` field
-    on the last record. Returns the payload dict only when the
-    run is terminal via the manifest binding (terminal.step ==
-    manifest.step > 0) AND the required fields are well-typed.
-    Returns None otherwise.
-
-    Used by :meth:`OpenMMRunner._reconstruct_terminal_result` to
-    reconstruct the abort result on idempotent reuse.
-
-    Args:
-        output_dir: MD output directory.
-        config: OpenMMConfig (for production_ns computation).
+    Thin wrapper around :func:`inspect_checkpoint` that returns
+    the legacy ``dict | None`` shape. New code should use
+    :func:`inspect_checkpoint` directly and read
+    ``snapshot.terminal_payload`` (None when the manifest has
+    no terminal payload or the payload is invalid).
 
     Returns:
         The terminal payload dict (with normalised fields
         ``step``, ``type``, ``reason``, ``production_ns``), or
-        None if the run is not terminal or the payload is
-        invalid.
+        ``None`` if the run is not terminal via the manifest
+        binding.
 
     Raises:
         InvalidCheckpointError: If the manifest references a
             dangling / unsafe / step-mismatched state file.
     """
-    checkpoint = load_checkpoint(output_dir)
-    if checkpoint.absolute_step <= 0:
-        return None
-    terminal = checkpoint.last_record.get("terminal")
-    if not isinstance(terminal, dict):
-        return None
-    raw_tstep = terminal.get("step")
-    if not isinstance(raw_tstep, int) or isinstance(raw_tstep, bool) or raw_tstep <= 0:
-        return None
-    if raw_tstep != checkpoint.absolute_step:
-        return None
-    # Normalised payload — production_ns is computed from the
-    # v10 BLOCKER #3 invariant, not read from a stored field.
-    payload: dict[str, Any] = {
-        "step": raw_tstep,
-        "type": str(terminal.get("type", "unknown")),
-        "reason": str(terminal.get("reason", "")),
-        "production_ns": production_ns(raw_tstep, config),
-    }
-    # Pass through optional fields if present and well-typed.
-    for opt in ("gate", "target", "peptide_id"):
-        val = terminal.get(opt)
-        if isinstance(val, str):
-            payload[opt] = val
-    return payload
+    snapshot = inspect_checkpoint(output_dir, config)
+    return snapshot.terminal_payload
 
 
 # ---------------------------------------------------------------------------

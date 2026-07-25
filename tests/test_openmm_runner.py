@@ -1919,3 +1919,168 @@ class TestMalformedTerminalAtTargetIsNotNormalCompletion:
         # Absent terminal → normal completion fallback is allowed.
         assert complete is True
         assert reason.startswith("normal_completion_step_")
+
+
+# ---------------------------------------------------------------------------
+# Runner-dispatch coverage — verify the runner's behavior on each plan type
+# at the public run() interface.
+# ---------------------------------------------------------------------------
+
+
+class TestRunnerDispatch:
+    """The runner matches on the plan type returned by ``decide()``
+    and dispatches to the correct branch:
+
+    - ``FreshPlan`` / ``ResumePlan`` → ``_prepare_simulation`` + MD
+    - ``SkipPlan`` → populate ``SimulationResult`` and return
+      without MD
+    - ``FailurePlan`` → set ``result.error`` and return without MD
+
+    These tests verify the dispatch by spying on
+    ``_prepare_simulation`` (the gateway to MD mechanics) and
+    asserting whether it was called. This is the public-interface
+    coverage the architecture review asked for.
+    """
+
+    @staticmethod
+    def _skip_ready_dir(path: Path) -> None:
+        """Create a directory with a terminal manifest + artifacts."""
+        # (state + manifest is enough; trajectory/energy/topology
+        # are checked for non-empty)
+        (path / "trajectory.dcd").write_bytes(b"\x00" * 100)
+        (path / "energy.csv").write_text("h\nrow\n")
+        (path / "topology.pdb").write_text("H\nATOM\n" * 100)
+
+    def test_skip_plan_never_calls_prepare_simulation(self, tmp_path: Path) -> None:
+        """A SKIP plan must not enter the MD path."""
+
+        out = tmp_path / "output"
+        out.mkdir()
+        self._skip_ready_dir(out)
+        config = OpenMMConfig(output_dir=str(out), production_ns=1.0, timestep_fs=2.0)
+        target = config.total_equil_steps + config.total_steps
+        state_basename = f"state.{target}_1_1.xml"
+        (out / state_basename).write_text("<State/>")
+        (out / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": target, "file": state_basename}]})
+        )
+
+        runner = OpenMMRunner(config)
+        # Spy on the MD gateway.
+        runner._prepare_simulation = MagicMock(return_value=None)  # type: ignore[method-assign]
+
+        result = runner.run()
+
+        runner._prepare_simulation.assert_not_called()  # type: ignore[attr-defined]
+        assert result.error == ""
+        assert result.trajectory_path == str(out / "trajectory.dcd")
+        assert result.state_xml_path == str(out / state_basename)
+        # Plan was a SkipPlan — the runner copied the populated fields.
+
+    def test_failure_plan_never_calls_prepare_simulation(self, tmp_path: Path) -> None:
+        """A FAIL_FAST plan must not enter the MD path AND must set
+        ``result.error`` to the plan's error string."""
+
+        out = tmp_path / "output"
+        out.mkdir()
+        # A manifest referencing a missing state file → FAIL_FAST.
+        (out / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": 1000, "file": "state.1000_1_1.xml"}]})
+        )
+        config = OpenMMConfig(output_dir=str(out))
+
+        runner = OpenMMRunner(config)
+        runner._prepare_simulation = MagicMock(return_value=None)  # type: ignore[method-assign]
+
+        result = runner.run()
+
+        runner._prepare_simulation.assert_not_called()  # type: ignore[attr-defined]
+        assert result.error != ""
+        assert "state.1000_1_1.xml" in result.error
+        assert "force=True" in result.error
+
+    def test_failure_plan_from_orphan_files(self, tmp_path: Path) -> None:
+        """A directory with state files but no manifest is also
+        FAIL_FAST — the runner surfaces the orphan error and never
+        builds a system."""
+        out = tmp_path / "output"
+        out.mkdir()
+        (out / "state.1000_1_1.xml").write_text("<State/>")
+        config = OpenMMConfig(output_dir=str(out))
+
+        runner = OpenMMRunner(config)
+        runner._prepare_simulation = MagicMock(return_value=None)  # type: ignore[method-assign]
+
+        result = runner.run()
+
+        runner._prepare_simulation.assert_not_called()  # type: ignore[attr-defined]
+        assert result.error != ""
+        # The orphan error message points at the file and the manifest.
+        assert "state.1000_1_1.xml" in result.error
+
+    def test_skip_plan_artifact_error_copied_to_result(self, tmp_path: Path) -> None:
+        """A SKIP plan with missing artifacts must surface the
+        artifact error in ``result.error`` — not silently return
+        success with paths pointing to nonexistent files."""
+        out = tmp_path / "output"
+        out.mkdir()
+        config = OpenMMConfig(output_dir=str(out), production_ns=1.0, timestep_fs=2.0)
+        target = config.total_equil_steps + config.total_steps
+        state_basename = f"state.{target}_1_1.xml"
+        (out / state_basename).write_text("<State/>")
+        # Build manifest that classifies as terminal but is missing
+        # the trajectory.
+        (out / "energy.csv").write_text("h\nrow\n")
+        (out / "topology.pdb").write_text("H\nATOM\n" * 100)
+        # No trajectory.dcd.
+        (out / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": target, "file": state_basename}]})
+        )
+
+        runner = OpenMMRunner(config)
+        runner._prepare_simulation = MagicMock(return_value=None)  # type: ignore[method-assign]
+
+        result = runner.run()
+
+        runner._prepare_simulation.assert_not_called()  # type: ignore[attr-defined]
+        assert "missing trajectory" in result.error
+
+    def test_invalid_terminal_payload_always_fails_fast(self, tmp_path: Path) -> None:
+        """An invalid terminal payload at any step (not just at
+        the target) must surface as FAIL_FAST — never resume, never
+        fall back to normal completion."""
+        out = tmp_path / "output"
+        out.mkdir()
+        config = OpenMMConfig(output_dir=str(out), production_ns=10.0, timestep_fs=2.0)
+        # Mid-production step (well below target).
+        mid_step = config.total_equil_steps + 100
+        state_basename = f"state.{mid_step}_12345_170000000.xml"
+        (out / state_basename).write_text("<State/>")
+        # Invalid: type is unknown, not "early_abort".
+        (out / "checkpoint.json").write_text(
+            json.dumps(
+                {
+                    "records": [
+                        {
+                            "step": mid_step,
+                            "file": state_basename,
+                            "terminal": {
+                                "type": "future_marker",
+                                "step": mid_step,
+                                "reason": "experimental",
+                            },
+                        }
+                    ]
+                }
+            )
+        )
+
+        runner = OpenMMRunner(config)
+        runner._prepare_simulation = MagicMock(return_value=None)  # type: ignore[method-assign]
+
+        result = runner.run()
+
+        runner._prepare_simulation.assert_not_called()  # type: ignore[attr-defined]
+        assert result.error != ""
+        assert "malformed terminal payload" in result.error
+        assert "force=True" in result.error

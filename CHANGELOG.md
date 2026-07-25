@@ -4,25 +4,53 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-- **Architecture (run-state machine extraction, v15)**: Extracted the
+- **Architecture (run-state machine extraction, v15, revised)**: Extracted the
   pre-run decision tree and skip-population logic from `OpenMMRunner`
   into a new `biolab_runners.openmm.run_state` deep module. The nine
   private decision-tree methods (`_resolve_skip_or_resume`,
-  `_handle_manifest_branch`, `_populate_skip_result`, etc. — 20+ test
-  sites bypassed `run()` to test them directly) are gone. The
-  question "given the on-disk checkpoint state, what should the runner
-  do?" now has a single public interface: `decide(output_dir, config,
-  force) -> ResumePlan` returns a structured `ResumePlan` with one of
-  four actions (`FRESH` / `RESUME` / `SKIP` / `FAIL_FAST`). The runner
-  became a thin dispatcher: it asks `decide`, then matches on
-  `plan.action`. `populate_skip_result(plan, output_dir, config,
-  result)` handles the skip-population (artifact validation + terminal
-  reconstruction) on the SKIP branch. The runner shrinks from 1304
-  → 933 LOC. Tests were rewritten at the new public interface (per
-  DEEPENING.md: old unit tests on shallow modules become waste once
-  tests at the deepened module's interface exist) — `tests/test_run_state.py`
-  (30 tests) covers all four actions and key failure modes; the 19
-  private-API tests in `test_openmm_runner.py` are deleted.
+  `_handle_manifest_branch`, `_populate_skip_result`, etc.) are gone.
+  The question "given the on-disk checkpoint state, what should the
+  runner do?" now has a single public interface:
+  `decide(output_dir, config, force) -> RunPlan` returns a tagged-union
+  `RunPlan` (`FreshPlan` | `ResumePlan` | `SkipPlan` | `FailurePlan`)
+  so invalid constructions (a `FreshPlan` carrying a `resume_xml`, a
+  `FailurePlan` carrying a `start_step`) are unrepresentable. The
+  `SkipPlan` carries the fully-populated artifact paths, `total_ns`,
+  and early-abort fields — the runner just copies them into
+  `SimulationResult`. There is no second public call: `populate_skip_result`
+  is gone. The `CompletionStatus` enum (`IN_PROGRESS`,
+  `NORMAL_COMPLETE`, `EARLY_ABORT`, `INVALID_TERMINAL`) is the
+  cross-module protocol for terminal classification, replacing the
+  previous string-prefix leak. `biolab_runners.openmm.checkpoint.inspect_checkpoint(output_dir, config)`
+  reads the manifest once and returns a fully-classified
+  `CheckpointSnapshot`; the previous multi-call pattern
+  (`load_checkpoint` + `is_run_complete` + `load_terminal_payload`)
+  could combine generation A's state metadata with generation B's
+  terminal classification if a concurrent commit landed between
+  reads — `inspect_checkpoint` fixes that race.
+
+  Runner shrinks from 1304 → ~933 LOC. Tests rewritten at the new
+  public interface (per DEEPENING.md) — `tests/test_run_state.py`
+  (43 tests) covers all four plan types, all `CompletionStatus`
+  variants, and the invalid-terminal schema variants; the 19
+  private-API tests in `test_openmm_runner.py` are deleted. New
+  `tests/test_openmm_runner.py::TestRunnerDispatch` (5 tests)
+  verifies at the public `run()` interface that `SKIP` and
+  `FAIL_FAST` never call `_prepare_simulation`, that artifact
+  errors propagate to `result.error`, and that invalid terminal
+  payloads always fail fast.
+
+  Behavior change: `load_terminal_payload` is now strict (returns
+  `None` for empty reason, wrong type, step mismatch, etc.) — the
+  previous lenient behavior was a documented seam leak. Callers
+  that need raw access to a possibly-malformed payload should use
+  `inspect_checkpoint` directly and read `snapshot.terminal_payload`.
+
+  Behavior change: when `decide` returns `FailurePlan` for an
+  `InvalidCheckpointError`, the error message now appends
+  "The checkpoint is in an unrecoverable state; re-run with force=True
+  to discard it." to the original `InvalidCheckpointError` text. The
+  previous implementation copied `str(exc)` directly.
 
 - **Architecture (checkpoint extraction, v14)**: Extracted the entire
   checkpoint domain — manifest read/validate, atomic save, orphan GC,

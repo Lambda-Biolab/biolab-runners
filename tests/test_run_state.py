@@ -1,36 +1,47 @@
 """Tests for :mod:`biolab_runners.openmm.run_state` — the run-state decision module.
 
 These tests exercise the **public interface** (``decide``,
-``populate_skip_result``, ``Action``, ``ResumePlan``). Internal
-helpers (``_decide_with_manifest``, ``_orphan_state_error``,
-``_artifact_validation_error``, ``_reconstruct_terminal_payload``)
-are exercised through the public functions; the AGENTS.md
-invariants describe their contracts.
+:class:`RunPlan`, the four plan types, :class:`Action`). Internal
+helpers (``_populate_skip_plan_fields``, ``_orphan_state_error``,
+``_artifact_validation_error``) are exercised through the public
+functions.
 
 The decision tree under test:
 
 - ``force=True`` ⇒ quarantine stale files, then proceed.
-- Missing manifest + orphan state file ⇒ FAIL_FAST.
-- Missing manifest + no orphan ⇒ FRESH.
-- Manifest with valid terminal payload or past target step ⇒ SKIP.
-- Manifest with malformed terminal payload ⇒ FAIL_FAST.
-- Manifest in-progress ⇒ RESUME.
+- Missing manifest + orphan state file ⇒ ``FailurePlan``.
+- Missing manifest + no orphan ⇒ ``FreshPlan``.
+- Manifest with valid terminal payload or past target step ⇒ ``SkipPlan``.
+- Manifest with malformed terminal payload ⇒ ``FailurePlan``.
+- Manifest in-progress ⇒ ``ResumePlan``.
 - Manifest references a dangling / unsafe / step-mismatched
-  state file ⇒ FAIL_FAST.
+  state file ⇒ ``FailurePlan``.
+
+Each plan is one of four distinct frozen dataclasses; the runner
+matches on either the type or ``plan.action``. Invalid constructions
+are unrepresentable (a ``FreshPlan`` cannot carry a ``resume_xml``,
+a ``FailurePlan`` cannot carry a ``start_step``).
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import MagicMock
 
-from biolab_runners.openmm.checkpoint import atomic_save_checkpoint, load_checkpoint
-from biolab_runners.openmm.config import OpenMMConfig, SimulationResult
+from biolab_runners.openmm.checkpoint import (
+    CompletionStatus,
+    atomic_save_checkpoint,
+)
+from biolab_runners.openmm.config import OpenMMConfig
 from biolab_runners.openmm.paths import FileNames
 from biolab_runners.openmm.run_state import (
     Action,
+    FailurePlan,
+    FreshPlan,
+    ResumePlan,
+    SkipPlan,
     decide,
-    populate_skip_result,
 )
 
 logger = __import__("logging").getLogger(__name__)
@@ -64,20 +75,24 @@ def _config(production_ns: float = 10.0, timestep_fs: float = 2.0) -> OpenMMConf
 
 
 class TestDecideFresh:
-    """``Action.FRESH``: no manifest exists and no orphan state file."""
+    """``FreshPlan``: no manifest exists and no orphan state file."""
 
     def test_no_manifest_no_state_files(self, tmp_path: Path) -> None:
-        plan = decide(tmp_path, _config(), force=False)
+        config = _config()
+        plan = decide(tmp_path, config, force=False)
 
+        assert isinstance(plan, FreshPlan)
         assert plan.action == Action.FRESH
-        assert plan.start_step == plan.start_step  # non-zero placeholder check
-        assert plan.remaining_steps > 0
-        assert plan.resume_xml == ""
-        assert plan.error == ""
+        # Exact values — a tautological test (e.g. ``plan.start_step ==
+        # plan.start_step``) would not catch a regression where the
+        # equil offset is wrong.
+        assert plan.start_step == config.total_equil_steps
+        assert plan.remaining_steps == config.total_steps
 
     def test_empty_output_dir(self, tmp_path: Path) -> None:
         plan = decide(tmp_path, _config(), force=False)
 
+        assert isinstance(plan, FreshPlan)
         assert plan.action == Action.FRESH
 
 
@@ -87,7 +102,7 @@ class TestDecideFresh:
 
 
 class TestDecideFailFastInvalidManifest:
-    """``Action.FAIL_FAST``: manifest references a missing / empty /
+    """``FailurePlan``: manifest references a missing / empty /
     path-traversal / step-mismatched state file."""
 
     def test_manifest_references_missing_state_file(self, tmp_path: Path) -> None:
@@ -96,6 +111,7 @@ class TestDecideFailFastInvalidManifest:
 
         plan = decide(tmp_path, _config(), force=False)
 
+        assert isinstance(plan, FailurePlan)
         assert plan.action == Action.FAIL_FAST
         assert "does not exist" in plan.error
 
@@ -105,7 +121,7 @@ class TestDecideFailFastInvalidManifest:
 
         plan = decide(tmp_path, _config(), force=False)
 
-        assert plan.action == Action.FAIL_FAST
+        assert isinstance(plan, FailurePlan)
         assert "empty" in plan.error
 
     def test_manifest_references_path_traversal_state_file(self, tmp_path: Path) -> None:
@@ -113,7 +129,7 @@ class TestDecideFailFastInvalidManifest:
 
         plan = decide(tmp_path, _config(), force=False)
 
-        assert plan.action == Action.FAIL_FAST
+        assert isinstance(plan, FailurePlan)
         assert "not a basename" in plan.error
 
     def test_manifest_step_mismatch_with_state_filename(self, tmp_path: Path) -> None:
@@ -122,7 +138,7 @@ class TestDecideFailFastInvalidManifest:
 
         plan = decide(tmp_path, _config(), force=False)
 
-        assert plan.action == Action.FAIL_FAST
+        assert isinstance(plan, FailurePlan)
         assert "does not match" in plan.error
 
 
@@ -132,14 +148,14 @@ class TestDecideFailFastInvalidManifest:
 
 
 class TestDecideFailFastOrphan:
-    """``Action.FAIL_FAST``: state files exist without a manifest."""
+    """``FailurePlan``: state files exist without a manifest."""
 
     def test_legacy_state_xml_with_no_manifest(self, tmp_path: Path) -> None:
         (tmp_path / "state.xml").write_text("<State/>")
 
         plan = decide(tmp_path, _config(), force=False)
 
-        assert plan.action == Action.FAIL_FAST
+        assert isinstance(plan, FailurePlan)
         assert "orphan" in plan.error.lower() or "exist at" in plan.error
 
     def test_v7_state_with_no_manifest(self, tmp_path: Path) -> None:
@@ -147,7 +163,7 @@ class TestDecideFailFastOrphan:
 
         plan = decide(tmp_path, _config(), force=False)
 
-        assert plan.action == Action.FAIL_FAST
+        assert isinstance(plan, FailurePlan)
 
     def test_corrupt_manifest_with_state_files(self, tmp_path: Path) -> None:
         (tmp_path / "state.1000_12345_170000000.xml").write_text("<State/>")
@@ -158,7 +174,7 @@ class TestDecideFailFastOrphan:
         plan = decide(tmp_path, _config(), force=False)
 
         # Corrupt manifest: treated as no manifest, then orphan detected.
-        assert plan.action == Action.FAIL_FAST
+        assert isinstance(plan, FailurePlan)
 
     def test_orphan_recovered_by_force(self, tmp_path: Path) -> None:
         """``force=True`` quarantines the orphan, allowing a fresh build."""
@@ -166,8 +182,8 @@ class TestDecideFailFastOrphan:
 
         plan = decide(tmp_path, _config(), force=True)
 
-        # After quarantine, no orphan remains → FRESH.
-        assert plan.action == Action.FRESH
+        # After quarantine, no orphan remains → FreshPlan.
+        assert isinstance(plan, FreshPlan)
         # The state file is in .stale/<UTC>/
         stale_dirs = list((tmp_path / ".stale").iterdir())
         assert len(stale_dirs) == 1
@@ -195,7 +211,7 @@ class TestDecideForceQuarantine:
         # quarantined, then we decide fresh.
         plan = decide(tmp_path, config, force=True)
 
-        assert plan.action == Action.FRESH
+        assert isinstance(plan, FreshPlan)
         # All three files moved into .stale/<UTC>/
         stale_dirs = list((tmp_path / ".stale").iterdir())
         assert len(stale_dirs) == 1
@@ -207,7 +223,7 @@ class TestDecideForceQuarantine:
     def test_force_with_no_existing_checkpoint_is_a_no_op(self, tmp_path: Path) -> None:
         plan = decide(tmp_path, _config(), force=True)
 
-        assert plan.action == Action.FRESH
+        assert isinstance(plan, FreshPlan)
         # No stale directory created (nothing to quarantine).
         assert not (tmp_path / ".stale").exists()
 
@@ -225,13 +241,13 @@ class TestDecideForceQuarantine:
 
         # force=True quarantines and decides fresh.
         plan1 = decide(tmp_path, config, force=True)
-        assert plan1.action == Action.FRESH
+        assert isinstance(plan1, FreshPlan)
         # No manifest on disk anymore.
         assert not (tmp_path / FileNames.CHECKPOINT_JSON).exists()
 
         # Non-forced: still fresh.
         plan2 = decide(tmp_path, config, force=False)
-        assert plan2.action == Action.FRESH
+        assert isinstance(plan2, FreshPlan)
 
     def test_force_quarantines_early_abort_marker(self, tmp_path: Path) -> None:
         """``force=True`` also moves the early-abort marker into .stale/."""
@@ -246,7 +262,7 @@ class TestDecideForceQuarantine:
 
         plan = decide(tmp_path, _config(), force=True)
 
-        assert plan.action == Action.FRESH
+        assert isinstance(plan, FreshPlan)
         stale = next((tmp_path / ".stale").iterdir())
         assert (stale / FileNames.EARLY_ABORT_JSON).exists()
 
@@ -257,7 +273,7 @@ class TestDecideForceQuarantine:
 
         plan = decide(tmp_path, _config(), force=True)
 
-        assert plan.action == Action.FRESH
+        assert isinstance(plan, FreshPlan)
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +282,7 @@ class TestDecideForceQuarantine:
 
 
 class TestDecideResume:
-    """``Action.RESUME``: valid manifest, run is in progress."""
+    """``ResumePlan``: valid manifest, run is in progress."""
 
     def test_intermediate_checkpoint_resumes(self, tmp_path: Path) -> None:
         config = _config(production_ns=10.0, timestep_fs=2.0)
@@ -276,6 +292,7 @@ class TestDecideResume:
 
         plan = decide(tmp_path, config, force=False)
 
+        assert isinstance(plan, ResumePlan)
         assert plan.action == Action.RESUME
         assert plan.start_step == 10_000
         assert plan.remaining_steps > 0
@@ -296,7 +313,7 @@ class TestDecideResume:
 
         plan = decide(tmp_path, config, force=False)
 
-        assert plan.action == Action.RESUME
+        assert isinstance(plan, ResumePlan)
         assert plan.start_step == manifest_step
         assert plan.remaining_steps == config.total_steps - 100
 
@@ -314,7 +331,7 @@ class TestDecideResume:
 
         plan = decide(tmp_path, config, force=False)
 
-        assert plan.action == Action.RESUME
+        assert isinstance(plan, ResumePlan)
         assert plan.remaining_steps == config.total_steps
 
     def test_multi_resume_step_is_cumulative_and_monotonic(self, tmp_path: Path) -> None:
@@ -326,7 +343,7 @@ class TestDecideResume:
         _write_manifest(tmp_path, step=500, state_file="state.500_12345_170000000.xml")
 
         plan = decide(tmp_path, config, force=False)
-        assert plan.action == Action.RESUME
+        assert isinstance(plan, ResumePlan)
         first_step = plan.start_step
 
         # Simulate a save at a higher step (the runner wrote a new
@@ -337,7 +354,7 @@ class TestDecideResume:
         _write_manifest(tmp_path, step=1500, state_file="state.1500_12345_180000000.xml")
 
         plan2 = decide(tmp_path, config, force=False)
-        assert plan2.action == Action.RESUME
+        assert isinstance(plan2, ResumePlan)
         assert plan2.start_step > first_step
 
 
@@ -347,25 +364,41 @@ class TestDecideResume:
 
 
 class TestDecideSkip:
-    """``Action.SKIP``: run is terminal (manifest payload or normal completion)."""
+    """``SkipPlan``: run is terminal (manifest payload or normal completion)."""
 
     def test_normal_completion_at_target(self, tmp_path: Path) -> None:
         config = _config(production_ns=1.0, timestep_fs=2.0)
         target = config.total_equil_steps + config.total_steps
         state = tmp_path / f"state.{target}_1_1.xml"
         state.write_text("<State/>")
+        # All artifacts present.
+        (tmp_path / FileNames.TRAJECTORY).write_bytes(b"\x00" * 100)
+        (tmp_path / FileNames.ENERGY).write_text("header\nrow\n")
+        (tmp_path / FileNames.TOPOLOGY).write_text("HEADER\nATOM\n" * 100)
         _write_manifest(tmp_path, step=target, state_file=f"state.{target}_1_1.xml")
 
         plan = decide(tmp_path, config, force=False)
 
-        assert plan.action == Action.SKIP
+        assert isinstance(plan, SkipPlan)
+        assert plan.completion == CompletionStatus.NORMAL_COMPLETE
         assert plan.manifest_step == target
-        assert plan.skip_reason.startswith("normal_completion_step_")
+        assert plan.completion_reason.startswith("normal_completion_step_")
+        # Artifact paths populated; total_ns from v10 BLOCKER #3 invariant.
+        assert plan.trajectory_path == str(tmp_path / FileNames.TRAJECTORY)
+        assert plan.energy_path == str(tmp_path / FileNames.ENERGY)
+        assert plan.topology_path == str(tmp_path / FileNames.TOPOLOGY)
+        assert plan.state_xml_path == str(tmp_path / f"state.{target}_1_1.xml")
+        assert plan.total_ns > 0
+        assert plan.early_abort is False
+        assert plan.abort_reason is None
 
     def test_valid_terminal_payload(self, tmp_path: Path) -> None:
         config = _config(production_ns=10.0, timestep_fs=2.0)
         state = tmp_path / "state.5000000_1_1.xml"
         state.write_text("<State/>")
+        (tmp_path / FileNames.TRAJECTORY).write_bytes(b"\x00" * 100)
+        (tmp_path / FileNames.ENERGY).write_text("header\nrow\n")
+        (tmp_path / FileNames.TOPOLOGY).write_text("HEADER\nATOM\n" * 100)
         _write_manifest(
             tmp_path,
             step=5_000_000,
@@ -380,21 +413,52 @@ class TestDecideSkip:
 
         plan = decide(tmp_path, config, force=False)
 
-        assert plan.action == Action.SKIP
-        assert plan.skip_reason.startswith("manifest_terminal_early_abort_")
+        assert isinstance(plan, SkipPlan)
+        assert plan.completion == CompletionStatus.EARLY_ABORT
+        assert plan.completion_reason.startswith("manifest_terminal_early_abort_")
+        assert plan.early_abort is True
+        assert plan.abort_reason == "5ns gate tripped"
+
+    def test_explicit_terminal_payload_at_normal_target(self, tmp_path: Path) -> None:
+        """v12 BLOCKER: explicit terminal at the normal target wins
+        over inferred normal completion."""
+        config = _config(production_ns=1.0, timestep_fs=2.0)
+        target = config.total_equil_steps + config.total_steps
+        state = tmp_path / f"state.{target}_1_1.xml"
+        state.write_text("<State/>")
+        (tmp_path / FileNames.TRAJECTORY).write_bytes(b"\x00" * 100)
+        (tmp_path / FileNames.ENERGY).write_text("h\nrow\n")
+        (tmp_path / FileNames.TOPOLOGY).write_text("H\nATOM\n" * 100)
+        _write_manifest(
+            tmp_path,
+            step=target,
+            state_file=f"state.{target}_1_1.xml",
+            terminal={
+                "type": "early_abort",
+                "step": target,
+                "reason": "10ns gate tripped",
+                "production_ns": 10.0,
+            },
+        )
+
+        plan = decide(tmp_path, config, force=False)
+
+        assert isinstance(plan, SkipPlan)
+        assert plan.completion == CompletionStatus.EARLY_ABORT  # NOT normal
+        assert plan.early_abort is True
 
     def test_load_step_ignores_energy_csv(self, tmp_path: Path) -> None:
         """energy.csv alone no longer yields a step.
 
-        A manifest-less directory with only energy.csv is decided as
-        FRESH (no manifest, no orphan state file). This is the
-        "decide() ignores energy.csv" guarantee — the step never
-        comes from the energy log."""
+        A manifest-less directory with only energy.csv is decided
+        as FreshPlan (no manifest, no orphan state file). This is
+        the "decide() ignores energy.csv" guarantee — the step
+        never comes from the energy log."""
         (tmp_path / FileNames.ENERGY).write_text("#step,time\n5000,10\n10000,20\n15000,30\n")
 
         plan = decide(tmp_path, _config(), force=False)
 
-        assert plan.action == Action.FRESH
+        assert isinstance(plan, FreshPlan)
 
 
 # ---------------------------------------------------------------------------
@@ -403,10 +467,11 @@ class TestDecideSkip:
 
 
 class TestDecideFailFastInvalidTerminal:
-    """``Action.FAIL_FAST``: manifest has a present-but-invalid
-    ``terminal`` payload (v13 BLOCKER tri-state)."""
+    """``FailurePlan``: manifest has a present-but-invalid
+    ``terminal`` payload. Per the v11 contract, this must fail fast
+    — never resume, never fall back to normal completion."""
 
-    def test_invalid_terminal_payload_fails_fast_not_skip(self, tmp_path: Path) -> None:
+    def test_invalid_terminal_payload_at_normal_target(self, tmp_path: Path) -> None:
         config = _config(production_ns=1.0, timestep_fs=2.0)
         target = config.total_equil_steps + config.total_steps
         state = tmp_path / f"state.{target}_1_1.xml"
@@ -420,190 +485,270 @@ class TestDecideFailFastInvalidTerminal:
 
         plan = decide(tmp_path, config, force=False)
 
-        assert plan.action == Action.FAIL_FAST
+        assert isinstance(plan, FailurePlan)
         assert "malformed terminal payload" in plan.error
         assert "force=True" in plan.error
 
+    def test_invalid_terminal_below_target_also_fails_fast(self, tmp_path: Path) -> None:
+        """A malformed terminal at any step — not just at the target
+        — must fail fast. The previous implementation's "treat as
+        in-progress with invalid_terminal_<reason>" was incorrect
+        for a target-step manifest (silently reclassifying). Below
+        the target it would also be incorrect because the v11
+        contract says treat as in-progress with a specific reason."""
+        config = _config(production_ns=10.0, timestep_fs=2.0)
+        # Mid-production step, well below the target.
+        mid_step = config.total_equil_steps + 100
+        state = tmp_path / f"state.{mid_step}_12345_170000000.xml"
+        state.write_text("<State/>")
+        _write_manifest(
+            tmp_path,
+            step=mid_step,
+            state_file=f"state.{mid_step}_12345_170000000.xml",
+            terminal={"type": "future_marker", "step": mid_step, "reason": "x"},
+        )
+
+        plan = decide(tmp_path, config, force=False)
+
+        assert isinstance(plan, FailurePlan)
+        assert "malformed terminal payload" in plan.error
+
+    def test_invalid_terminal_not_a_dict(self, tmp_path: Path) -> None:
+        config = _config(production_ns=10.0, timestep_fs=2.0)
+        state = tmp_path / "state.5000000_1_1.xml"
+        state.write_text("<State/>")
+        _write_manifest(
+            tmp_path,
+            step=5_000_000,
+            state_file="state.5000000_1_1.xml",
+            terminal="not a dict",  # type: ignore[arg-type]
+        )
+
+        plan = decide(tmp_path, config, force=False)
+
+        assert isinstance(plan, FailurePlan)
+        assert "invalid_terminal_not_dict" in plan.error
+
+    def test_invalid_terminal_step_string(self, tmp_path: Path) -> None:
+        config = _config(production_ns=10.0, timestep_fs=2.0)
+        state = tmp_path / "state.5000000_1_1.xml"
+        state.write_text("<State/>")
+        _write_manifest(
+            tmp_path,
+            step=5_000_000,
+            state_file="state.5000000_1_1.xml",
+            terminal={"type": "early_abort", "step": "5000000", "reason": "x"},
+        )
+
+        plan = decide(tmp_path, config, force=False)
+
+        assert isinstance(plan, FailurePlan)
+        assert "invalid_terminal_step_invalid_type" in plan.error
+
+    def test_invalid_terminal_step_mismatch(self, tmp_path: Path) -> None:
+        config = _config(production_ns=10.0, timestep_fs=2.0)
+        state = tmp_path / "state.5000000_1_1.xml"
+        state.write_text("<State/>")
+        _write_manifest(
+            tmp_path,
+            step=5_000_000,
+            state_file="state.5000000_1_1.xml",
+            terminal={"type": "early_abort", "step": 9_999_999, "reason": "x"},
+        )
+
+        plan = decide(tmp_path, config, force=False)
+
+        assert isinstance(plan, FailurePlan)
+        assert "invalid_terminal_step_mismatch" in plan.error
+
+    def test_invalid_terminal_empty_reason(self, tmp_path: Path) -> None:
+        config = _config(production_ns=10.0, timestep_fs=2.0)
+        state = tmp_path / "state.5000000_1_1.xml"
+        state.write_text("<State/>")
+        _write_manifest(
+            tmp_path,
+            step=5_000_000,
+            state_file="state.5000000_1_1.xml",
+            terminal={"type": "early_abort", "step": 5_000_000, "reason": ""},
+        )
+
+        plan = decide(tmp_path, config, force=False)
+
+        assert isinstance(plan, FailurePlan)
+        assert "invalid_terminal_reason_empty" in plan.error
+
+    def test_invalid_terminal_unknown_type(self, tmp_path: Path) -> None:
+        config = _config(production_ns=10.0, timestep_fs=2.0)
+        state = tmp_path / "state.5000000_1_1.xml"
+        state.write_text("<State/>")
+        _write_manifest(
+            tmp_path,
+            step=5_000_000,
+            state_file="state.5000000_1_1.xml",
+            terminal={"type": "future_marker", "step": 5_000_000, "reason": "x"},
+        )
+
+        plan = decide(tmp_path, config, force=False)
+
+        assert isinstance(plan, FailurePlan)
+        assert "invalid_terminal_type_unsupported" in plan.error
+
 
 # ---------------------------------------------------------------------------
-# populate_skip_result
+# Skip plan artifact validation
 # ---------------------------------------------------------------------------
 
 
-class TestPopulateSkipResult:
-    """``populate_skip_result``: populate result fields on SKIP."""
+class TestSkipPlanArtifactValidation:
+    """``SkipPlan`` with a missing or empty artifact surfaces as
+    ``FailurePlan`` (not ``SkipPlan`` with truncated paths)."""
 
-    def test_populates_artifact_paths_and_state_xml(self, tmp_path: Path) -> None:
+    def _setup_skip_ready(self, tmp_path: Path) -> tuple[Path, int]:
         config = _config(production_ns=1.0, timestep_fs=2.0)
         target = config.total_equil_steps + config.total_steps
         state_basename = f"state.{target}_1_1.xml"
-        # Build the on-disk artifacts.
         (tmp_path / state_basename).write_text("<State/>")
         (tmp_path / FileNames.TRAJECTORY).write_bytes(b"\x00" * 100)
         (tmp_path / FileNames.ENERGY).write_text("header\nrow1\nrow2\n")
         (tmp_path / FileNames.TOPOLOGY).write_text("HEADER\nATOM 1\n" * 100)
         _write_manifest(tmp_path, step=target, state_file=state_basename)
+        return tmp_path, target
 
-        result = SimulationResult(config=config)
-        plan = decide(tmp_path, config, force=False)
-        assert plan.action == Action.SKIP
+    def test_all_artifacts_present_yields_skip(self, tmp_path: Path) -> None:
+        self._setup_skip_ready(tmp_path)
+        plan = decide(tmp_path, _config(production_ns=1.0), force=False)
+        assert isinstance(plan, SkipPlan)
+        assert plan.early_abort is False
 
-        skip_error = populate_skip_result(plan, tmp_path, config, result)
+    def test_missing_trajectory_yields_failure(self, tmp_path: Path) -> None:
+        self._setup_skip_ready(tmp_path)
+        (tmp_path / FileNames.TRAJECTORY).unlink()
+        plan = decide(tmp_path, _config(production_ns=1.0), force=False)
+        assert isinstance(plan, FailurePlan)
+        assert "missing trajectory" in plan.error
 
-        assert skip_error is None
-        assert result.trajectory_path == str(tmp_path / FileNames.TRAJECTORY)
-        assert result.energy_path == str(tmp_path / FileNames.ENERGY)
-        assert result.topology_path == str(tmp_path / FileNames.TOPOLOGY)
-        assert result.state_xml_path == str(tmp_path / state_basename)
-        # Normal completion → total_ns from v10 BLOCKER #3 invariant.
-        assert result.total_ns > 0
-
-    def test_missing_trajectory_returns_artifact_error(self, tmp_path: Path) -> None:
-        config = _config(production_ns=1.0, timestep_fs=2.0)
-        target = config.total_equil_steps + config.total_steps
-        state_basename = f"state.{target}_1_1.xml"
-        (tmp_path / state_basename).write_text("<State/>")
-        # No trajectory.dcd.
-        (tmp_path / FileNames.ENERGY).write_text("header\nrow\n")
-        (tmp_path / FileNames.TOPOLOGY).write_text("HEADER\nATOM\n" * 100)
-        _write_manifest(tmp_path, step=target, state_file=state_basename)
-
-        plan = decide(tmp_path, config, force=False)
-        assert plan.action == Action.SKIP
-
-        result = SimulationResult(config=config)
-        skip_error = populate_skip_result(plan, tmp_path, config, result)
-
-        assert skip_error is not None
-        assert "missing trajectory" in skip_error
-        # Result.error is NOT set here — the caller copies the error.
-
-    def test_empty_trajectory_returns_artifact_error(self, tmp_path: Path) -> None:
-        config = _config(production_ns=1.0, timestep_fs=2.0)
-        target = config.total_equil_steps + config.total_steps
-        state_basename = f"state.{target}_1_1.xml"
-        (tmp_path / state_basename).write_text("<State/>")
+    def test_empty_trajectory_yields_failure(self, tmp_path: Path) -> None:
+        self._setup_skip_ready(tmp_path)
         (tmp_path / FileNames.TRAJECTORY).write_bytes(b"")
-        (tmp_path / FileNames.ENERGY).write_text("header\nrow\n")
-        (tmp_path / FileNames.TOPOLOGY).write_text("HEADER\nATOM\n" * 100)
-        _write_manifest(tmp_path, step=target, state_file=state_basename)
+        plan = decide(tmp_path, _config(production_ns=1.0), force=False)
+        assert isinstance(plan, FailurePlan)
+        assert "empty trajectory" in plan.error
 
-        plan = decide(tmp_path, config, force=False)
-        assert plan.action == Action.SKIP
+    def test_missing_topology_yields_failure(self, tmp_path: Path) -> None:
+        self._setup_skip_ready(tmp_path)
+        (tmp_path / FileNames.TOPOLOGY).unlink()
+        plan = decide(tmp_path, _config(production_ns=1.0), force=False)
+        assert isinstance(plan, FailurePlan)
+        assert "missing topology" in plan.error
 
-        result = SimulationResult(config=config)
-        skip_error = populate_skip_result(plan, tmp_path, config, result)
+    def test_empty_topology_yields_failure(self, tmp_path: Path) -> None:
+        self._setup_skip_ready(tmp_path)
+        (tmp_path / FileNames.TOPOLOGY).write_text("")
+        plan = decide(tmp_path, _config(production_ns=1.0), force=False)
+        assert isinstance(plan, FailurePlan)
+        assert "empty topology" in plan.error
 
-        assert skip_error is not None
-        assert "empty trajectory" in skip_error
+    def test_missing_energy_yields_failure(self, tmp_path: Path) -> None:
+        self._setup_skip_ready(tmp_path)
+        (tmp_path / FileNames.ENERGY).unlink()
+        plan = decide(tmp_path, _config(production_ns=1.0), force=False)
+        assert isinstance(plan, FailurePlan)
+        assert "missing energy" in plan.error
 
-    def test_header_only_energy_returns_artifact_error(self, tmp_path: Path) -> None:
-        config = _config(production_ns=1.0, timestep_fs=2.0)
-        target = config.total_equil_steps + config.total_steps
-        state_basename = f"state.{target}_1_1.xml"
-        (tmp_path / state_basename).write_text("<State/>")
-        (tmp_path / FileNames.TRAJECTORY).write_bytes(b"\x00" * 100)
-        # Energy has header but no data rows.
+    def test_empty_energy_yields_failure(self, tmp_path: Path) -> None:
+        self._setup_skip_ready(tmp_path)
+        (tmp_path / FileNames.ENERGY).write_text("")
+        plan = decide(tmp_path, _config(production_ns=1.0), force=False)
+        assert isinstance(plan, FailurePlan)
+        assert "empty energy" in plan.error
+
+    def test_header_only_energy_yields_failure(self, tmp_path: Path) -> None:
+        self._setup_skip_ready(tmp_path)
         (tmp_path / FileNames.ENERGY).write_text("header_only\n")
-        (tmp_path / FileNames.TOPOLOGY).write_text("HEADER\nATOM\n" * 100)
-        _write_manifest(tmp_path, step=target, state_file=state_basename)
-
-        plan = decide(tmp_path, config, force=False)
-        assert plan.action == Action.SKIP
-
-        result = SimulationResult(config=config)
-        skip_error = populate_skip_result(plan, tmp_path, config, result)
-
-        assert skip_error is not None
-        assert "energy" in skip_error
-        assert "header-only" in skip_error or "no data" in skip_error
-
-    def test_early_abort_terminal_payload_populates_early_abort_fields(
-        self, tmp_path: Path
-    ) -> None:
-        config = _config(production_ns=10.0, timestep_fs=2.0)
-        state_basename = "state.5000000_1_1.xml"
-        (tmp_path / state_basename).write_text("<State/>")
-        (tmp_path / FileNames.TRAJECTORY).write_bytes(b"\x00" * 100)
-        (tmp_path / FileNames.ENERGY).write_text("header\nrow\n")
-        (tmp_path / FileNames.TOPOLOGY).write_text("HEADER\nATOM\n" * 100)
-        _write_manifest(
-            tmp_path,
-            step=5_000_000,
-            state_file=state_basename,
-            terminal={
-                "type": "early_abort",
-                "step": 5_000_000,
-                "reason": "5ns gate tripped",
-                "production_ns": 5.0,
-            },
-        )
-
-        plan = decide(tmp_path, config, force=False)
-        assert plan.action == Action.SKIP
-
-        result = SimulationResult(config=config)
-        skip_error = populate_skip_result(plan, tmp_path, config, result)
-
-        assert skip_error is None
-        assert result.early_abort is True
-        assert result.abort_reason == "5ns gate tripped"
-        # v10 BLOCKER #3: total_ns is the canonical value
-        # (computed from absolute_step - total_equil_steps), not
-        # read from the stored payload field. The stored value
-        # is a hint / context for downstream consumers only.
-        from biolab_runners.openmm.checkpoint import production_ns
-
-        assert result.total_ns == production_ns(5_000_000, config)
+        plan = decide(tmp_path, _config(production_ns=1.0), force=False)
+        assert isinstance(plan, FailurePlan)
+        assert "energy" in plan.error
+        assert "header-only" in plan.error or "no data" in plan.error
 
 
 # ---------------------------------------------------------------------------
-# End-to-end: decide() + populate_skip_result() roundtrip
+# End-to-end: decide() roundtrip with atomic_save_checkpoint
 # ---------------------------------------------------------------------------
 
 
-class TestDecideAndPopulateRoundtrip:
-    """End-to-end: a SKIP plan followed by populate_skip_result
-    produces a populated result. Mirrors what the runner does."""
-
-    def test_skip_populated_result_matches_manifest(self, tmp_path: Path) -> None:
-        config = _config(production_ns=1.0, timestep_fs=2.0)
-        target = config.total_equil_steps + config.total_steps
-        state_basename = f"state.{target}_1_1.xml"
-        (tmp_path / state_basename).write_text("<State/>")
-        (tmp_path / FileNames.TRAJECTORY).write_bytes(b"\x00" * 100)
-        (tmp_path / FileNames.ENERGY).write_text("h\nrow\n")
-        (tmp_path / FileNames.TOPOLOGY).write_text("H\nATOM\n" * 100)
-        _write_manifest(tmp_path, step=target, state_file=state_basename)
-
-        # Decide.
-        plan = decide(tmp_path, config, force=False)
-        assert plan.action == Action.SKIP
-
-        # Populate.
-        result = SimulationResult(config=config)
-        skip_error = populate_skip_result(plan, tmp_path, config, result)
-        assert skip_error is None
-
-        # Manifest step matches checkpoint step (loaded from disk).
-        checkpoint = load_checkpoint(tmp_path)
-        assert checkpoint.absolute_step == target
-        assert checkpoint.state_file_basename == state_basename
-        assert result.state_xml_path == str(tmp_path / state_basename)
+class TestDecideAndAtomicSaveRoundtrip:
+    """End-to-end: atomic_save_checkpoint commits a manifest, then
+    decide() correctly identifies the run as terminal (when at the
+    target step) and produces a fully populated SkipPlan."""
 
     def test_atomic_save_then_decide_yields_skip_at_target(self, tmp_path: Path) -> None:
-        """End-to-end: atomic_save_checkpoint commits a manifest, then
-        decide() correctly identifies the run as terminal (when at the
-        target step)."""
-        from unittest.mock import MagicMock
-
         config = _config(production_ns=1.0, timestep_fs=2.0)
         target = config.total_equil_steps + config.total_steps
         sim = MagicMock()
         sim.saveState = MagicMock(side_effect=lambda path: Path(path).write_text("<State/>"))
+        # Build the on-disk artifacts (atomic_save writes state + manifest
+        # but not the trajectory / energy / topology — those are written
+        # by the runner during production).
+        (tmp_path / FileNames.TRAJECTORY).write_bytes(b"\x00" * 100)
+        (tmp_path / FileNames.ENERGY).write_text("h\nrow\n")
+        (tmp_path / FileNames.TOPOLOGY).write_text("H\nATOM\n" * 100)
 
         atomic_save_checkpoint(sim, tmp_path, absolute_step=target)
 
         plan = decide(tmp_path, config, force=False)
-        assert plan.action == Action.SKIP
+
+        assert isinstance(plan, SkipPlan)
         assert plan.manifest_step == target
+        assert plan.completion == CompletionStatus.NORMAL_COMPLETE
+
+
+# ---------------------------------------------------------------------------
+# Plan type contract
+# ---------------------------------------------------------------------------
+
+
+class TestRunPlanTypeContract:
+    """The plan types are distinct — each carries only the fields
+    relevant to its action, so invalid states are unrepresentable."""
+
+    def test_fresh_plan_carries_no_resume_xml(self) -> None:
+        plan = FreshPlan(start_step=200_000, remaining_steps=50_000_000)
+        assert not hasattr(plan, "resume_xml")
+        assert not hasattr(plan, "manifest_step")
+        assert not hasattr(plan, "error")
+
+    def test_resume_plan_carries_resume_xml(self) -> None:
+        plan = ResumePlan(
+            start_step=10_000,
+            remaining_steps=49_990_000,
+            resume_xml="/tmp/state.10000_1_1.xml",
+            manifest_step=10_000,
+            state_file_basename="state.10000_1_1.xml",
+        )
+        assert plan.resume_xml == "/tmp/state.10000_1_1.xml"
+        assert not hasattr(plan, "error")
+
+    def test_skip_plan_carries_all_result_fields(self) -> None:
+        plan = SkipPlan(
+            completion=CompletionStatus.EARLY_ABORT,
+            completion_reason="manifest_terminal_early_abort_step_5000000",
+            manifest_step=5_000_000,
+            state_file_basename="state.5000000_1_1.xml",
+            trajectory_path="/tmp/trajectory.dcd",
+            energy_path="/tmp/energy.csv",
+            topology_path="/tmp/topology.pdb",
+            state_xml_path="/tmp/state.5000000_1_1.xml",
+            total_ns=5.0,
+            early_abort=True,
+            abort_reason="5ns gate tripped",
+        )
+        assert plan.early_abort is True
+        assert plan.abort_reason == "5ns gate tripped"
+        assert plan.total_ns == 5.0
+
+    def test_failure_plan_carries_only_error(self) -> None:
+        plan = FailurePlan(error="state file does not exist")
+        assert not hasattr(plan, "start_step")
+        assert not hasattr(plan, "resume_xml")
+        assert not hasattr(plan, "manifest_step")
+        assert plan.error == "state file does not exist"
