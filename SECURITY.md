@@ -14,7 +14,7 @@ version receives security fixes.
 
 **Do not** open a public GitHub issue for security vulnerabilities.
 
-Email **antonio@sp2tx.com** with:
+Email **antonio@lambconsulting.bio** with:
 
 1. A description of the vulnerability and its impact
 2. Steps to reproduce, ideally with a minimal code snippet
