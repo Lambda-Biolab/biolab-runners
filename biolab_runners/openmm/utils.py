@@ -530,12 +530,25 @@ def is_run_complete(output_dir: Path, config: OpenMMConfig) -> tuple[bool, str]:
     if manifest_step <= 0:
         return False, "in_progress"
 
-    normal = _check_normal_completion(manifest_step, config)
-    if normal is not None:
-        return normal
+    # v12 BLOCKER: the explicit terminal payload MUST be checked
+    # BEFORE the inferred normal completion. The two signals can
+    # coexist at the same absolute step (the offline-mdtraj gate
+    # fires on the final production chunk, so the manifest's step
+    # lands at exactly ``total_equil_steps + total_steps`` at the
+    # moment of an end-of-run abort). Returning normal completion
+    # first would skip ``_reconstruct_terminal_result``, leaving a
+    # reused result reporting ``early_abort=False`` despite the
+    # manifest carrying a valid ``terminal`` payload — and the
+    # live invocation would have set ``early_abort=True``. The
+    # two result shapes would disagree. The explicit payload is
+    # the user's stated intent; inferring completion from the
+    # step alone is a heuristic and must defer to it.
     terminal = _check_manifest_terminal(manifest_step, last_record)
     if terminal is not None:
         return terminal
+    normal = _check_normal_completion(manifest_step, config)
+    if normal is not None:
+        return normal
     return False, "in_progress"
 
 

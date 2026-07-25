@@ -3071,3 +3071,114 @@ class TestDerivedMarkerFailureDoesNotCrashTerminalRun:
             assert manifest["records"][-1]["terminal"]["type"] == "early_abort"
         finally:
             OpenMMRunner._write_abort_metadata = original  # type: ignore[method-assign]
+
+
+class TestTerminalPayloadPrecedesNormalCompletion:
+    """v12 BLOCKER regression: when the manifest step is at/past
+    the configured target AND the manifest carries a valid
+    ``terminal`` payload, the explicit terminal decision MUST take
+    precedence over the inferred normal completion.
+
+    Without this precedence, ``_check_normal_completion`` returns
+    first, ``_reconstruct_terminal_result`` is skipped (the reason
+    starts with ``normal_completion_step_``), and the reused result
+    reports ``early_abort=False`` despite the manifest carrying a
+    valid early-abort payload. The live invocation correctly sets
+    ``early_abort=True`` from ``abort_reason``, so live and
+    reconstructed results would disagree.
+
+    This scenario occurs naturally when the offline-mdtraj gate
+    fires on the final production chunk — the manifest step lands
+    at exactly ``total_equil_steps + total_steps`` at the moment
+    of an end-of-run abort.
+    """
+
+    def test_end_of_run_abort_takes_precedence_over_normal_completion(self, tmp_path: Path) -> None:
+        """Manifest step at ``target_step`` + valid early_abort payload
+        → ``is_run_complete`` returns ``manifest_terminal_...`` reason
+        (not ``normal_completion_step_...``).
+        """
+        from biolab_runners.openmm.utils import is_run_complete
+
+        out = tmp_path / "output"
+        out.mkdir()
+        config = OpenMMConfig(output_dir=str(out), production_ns=5.0, timestep_fs=2.0)
+        target_step = config.total_equil_steps + config.total_steps
+
+        # The end-of-run scenario: the offline gate fires on the
+        # final chunk, so the absolute step is exactly the target.
+        state_basename = f"state.{target_step}_12345_1700000000.xml"
+        (out / state_basename).write_text("<State/>")
+        (out / "checkpoint.json").write_text(
+            json.dumps(
+                {
+                    "records": [
+                        {
+                            "step": target_step,
+                            "file": state_basename,
+                            "terminal": {
+                                "type": "early_abort",
+                                "step": target_step,
+                                "reason": "early_dissociation",
+                                "production_ns": 5.0,
+                            },
+                        }
+                    ]
+                }
+            )
+        )
+        (out / "trajectory.dcd").write_bytes(b"\x00" * 20_000_000)
+        (out / "energy.csv").write_text("#step,time\n" + "1,1\n" * 100)
+        (out / "topology.pdb").write_bytes(b"ATOM\n" * 1000)
+
+        # Manifest terminal payload MUST take precedence.
+        complete, reason = is_run_complete(out, config)
+        assert complete is True
+        assert reason.startswith("manifest_terminal_early_abort_step_"), (
+            f"valid early_abort payload at the target step must take "
+            f"precedence over normal completion; got reason={reason!r}"
+        )
+
+    def test_runner_reconstructs_early_abort_when_manifest_at_target(self, tmp_path: Path) -> None:
+        """``runner.run()`` on a directory with manifest-step=target AND
+        a valid early_abort payload must return a result with
+        ``early_abort=True`` and the abort metadata reconstructed.
+        """
+        out = tmp_path / "output"
+        out.mkdir()
+        config = OpenMMConfig(output_dir=str(out), production_ns=5.0, timestep_fs=2.0)
+        target_step = config.total_equil_steps + config.total_steps
+        state_basename = f"state.{target_step}_12345_1700000000.xml"
+        (out / state_basename).write_text("<State/>")
+        (out / "checkpoint.json").write_text(
+            json.dumps(
+                {
+                    "records": [
+                        {
+                            "step": target_step,
+                            "file": state_basename,
+                            "terminal": {
+                                "type": "early_abort",
+                                "step": target_step,
+                                "reason": "early_dissociation",
+                                "production_ns": 5.0,
+                            },
+                        }
+                    ]
+                }
+            )
+        )
+        (out / "trajectory.dcd").write_bytes(b"\x00" * 20_000_000)
+        (out / "energy.csv").write_text("#step,time\n" + "1,1\n" * 100)
+        (out / "topology.pdb").write_bytes(b"ATOM\n" * 1000)
+
+        runner = OpenMMRunner(config)
+        result = runner.run()
+        assert result.error == ""
+        # The skip path reconstructed early_abort (NOT normal completion).
+        assert result.early_abort is True, (
+            f"valid early_abort payload must reconstruct to early_abort=True; "
+            f"got {result.early_abort}"
+        )
+        assert result.abort_reason == "early_dissociation"
+        assert result.total_ns == 5.0
