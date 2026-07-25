@@ -24,11 +24,14 @@ biolab_runners/
     ├── config.py         # OpenMMConfig, SimulationResult
     ├── runner.py         # OpenMMRunner class (orchestrate pipeline, run production)
     ├── system_builder.py # ForceField, Modeller, System, Integrator, Cα restraint, prepare_simulation
+    ├── checkpoint.py     # Manifest, atomic save, orphan GC, quarantine, terminal classification (deep module — owns the entire checkpoint lifecycle)
     ├── geometry.py       # Pure-numpy PBC math (pbc_correct, min_pbc_distance)
     ├── offline_gate.py   # Offline mdtraj gate + verdict I/O
     ├── paths.py          # Centralized filenames (FileNames)
-    └── utils.py          # Output verification, checkpoint loading, availability check
+    └── utils.py          # Availability checks (openmm_available, pdbfixer_available) + diagnostic reporter (verify_production_outputs)
 ```
+
+The checkpoint invariants (atomic save, manifest binding, terminal schema, force=True quarantine) all describe `biolab_runners.openmm.checkpoint` — that module is the single source of truth for the checkpoint protocol. `system_builder.py` does the system construction only; it does NOT touch the manifest. `runner.py` orchestrates by calling into `checkpoint.py` and `system_builder.py`.
 
 ## Domain Rules
 

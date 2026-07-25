@@ -35,6 +35,15 @@ import sys
 import time
 from pathlib import Path
 
+from biolab_runners.openmm.checkpoint import (
+    InvalidCheckpointError,
+    atomic_save_checkpoint,
+    is_run_complete,
+    load_checkpoint,
+    load_terminal_payload,
+    production_ns,
+    quarantine_stale_checkpoint,
+)
 from biolab_runners.openmm.config import OpenMMConfig, SimulationResult
 from biolab_runners.openmm.geometry import (
     collect_chain_ca_positions,
@@ -49,18 +58,7 @@ from biolab_runners.openmm.offline_gate import (
 from biolab_runners.openmm.paths import FileNames
 from biolab_runners.openmm.system_builder import (
     SimulationContext,
-    _atomic_save_checkpoint,
     prepare_simulation,
-    quarantine_stale_checkpoint,
-)
-from biolab_runners.openmm.utils import (
-    InvalidCheckpointError,
-    is_run_complete,
-    load_checkpoint,
-    load_terminal_payload,
-)
-from biolab_runners.openmm.utils import (
-    production_ns as _production_ns,
 )
 
 logger = logging.getLogger(__name__)
@@ -322,7 +320,7 @@ class OpenMMRunner:
 
         v10 BLOCKER #2: terminal status is part of the manifest's
         ``terminal`` payload (committed atomically with the state
-        file via :func:`biolab_runners.openmm.system_builder._atomic_save_checkpoint`).
+        file via :func:`biolab_runners.openmm.checkpoint.atomic_save_checkpoint`).
         Reconstructed values come from
         :func:`biolab_runners.openmm.utils.load_terminal_payload`,
         which reads the validated manifest record and computes
@@ -399,7 +397,7 @@ class OpenMMRunner:
         result.state_xml_path = str(output_dir / state_file)
         # v10 BLOCKER #3: total_ns is PRODUCTION ns.
         if reason.startswith("normal_completion_step_"):
-            result.total_ns = round(_production_ns(manifest_step, config), 2)
+            result.total_ns = round(production_ns(manifest_step, config), 2)
         OpenMMRunner._reconstruct_terminal_result(result, output_dir, config, reason)
         return None
 
@@ -521,11 +519,12 @@ class OpenMMRunner:
         returns (0, "").
         """
         try:
-            return load_checkpoint(output_dir)
+            checkpoint = load_checkpoint(output_dir)
         except InvalidCheckpointError as exc:
             result.error = str(exc)
             logger.error(result.error)
             return 0, ""
+        return checkpoint.absolute_step, checkpoint.state_file_basename
 
     @staticmethod
     def _check_orphan_state_files(output_dir: Path) -> str | None:
@@ -699,7 +698,7 @@ class OpenMMRunner:
     ) -> None:
         """Save final state atomically (or skip if already saved), close reporters, populate result.
 
-        The final state save goes through ``_atomic_save_checkpoint``
+        The final state save goes through ``atomic_save_checkpoint``
         so the manifest is updated together with the state file. The
         ``absolute_step`` written to the manifest is ``start_step +
         steps_done`` — the ABSOLUTE OpenMM step the simulation is at
@@ -718,7 +717,7 @@ class OpenMMRunner:
         rename is fast (~KB), so the extra read is cheap.
 
         ``result.state_xml_path`` is set from the committed state
-        file (the basename returned by ``_atomic_save_checkpoint``
+        file (the basename returned by ``atomic_save_checkpoint``
         when a save happens, or read from the manifest when the
         save is skipped, or read from the manifest for the
         no-resumed-step case). The runner contract is that the
@@ -752,7 +751,7 @@ class OpenMMRunner:
         elapsed = time.time() - t0
         absolute_step = start_step + steps_done
         # v10 BLOCKER #3: production ns = absolute_step - total_equil_steps.
-        total_ns_value = _production_ns(absolute_step, config)
+        total_ns_value = production_ns(absolute_step, config)
         # v11 BLOCKER #1: ns_per_day is invocation-local throughput.
         # We can't mix cumulative production with invocation-local
         # wall time — the result would be inflated on every
@@ -763,7 +762,11 @@ class OpenMMRunner:
 
         state_basename = ""
         try:
-            existing_step, existing_file = load_checkpoint(output_dir)
+            existing_checkpoint = load_checkpoint(output_dir)
+            existing_step, existing_file = (
+                existing_checkpoint.absolute_step,
+                existing_checkpoint.state_file_basename,
+            )
         except InvalidCheckpointError:
             # The manifest is in an odd state (e.g. empty state file)
             # — fall through and force a fresh save. The
@@ -782,7 +785,7 @@ class OpenMMRunner:
             )
             state_basename = existing_file
         else:
-            state_basename = _atomic_save_checkpoint(ctx.simulation, output_dir, absolute_step)
+            state_basename = atomic_save_checkpoint(ctx.simulation, output_dir, absolute_step)
 
         energy_fh.close()  # type: ignore[union-attr]
 
@@ -1121,9 +1124,7 @@ class OpenMMRunner:
                 "reason": verdict.reason,
                 "production_ns": production_ns_value,
             }
-            _atomic_save_checkpoint(
-                simulation, output_dir, absolute_step, terminal=terminal_payload
-            )
+            atomic_save_checkpoint(simulation, output_dir, absolute_step, terminal=terminal_payload)
             # v11 BLOCKER #2: the derived ``early_abort.json`` is
             # NOT authoritative — the manifest has already
             # committed the terminal decision. A failure to write
@@ -1258,7 +1259,7 @@ class OpenMMRunner:
                 ns_done,
             )
             try:
-                _atomic_save_checkpoint(simulation, output_dir, absolute_step)
+                atomic_save_checkpoint(simulation, output_dir, absolute_step)
             except Exception as exc:
                 logger.error("Failed to save state on SIGTERM: %s", exc)
             sys.exit(0)
@@ -1279,7 +1280,7 @@ class OpenMMRunner:
         """Write a checkpoint if interval elapsed. Returns the (possibly updated) last_ckpt_step.
 
         The save is atomic (the manifest rename is the single commit
-        point via :func:`_atomic_save_checkpoint`) so that a crash
+        point via :func:`atomic_save_checkpoint`) so that a crash
         mid-save cannot leave a stale state whose step does not match
         the manifest. The manifest records the absolute step
         (``start_step + steps_done``), not the invocation-local
@@ -1290,7 +1291,7 @@ class OpenMMRunner:
         if since_ckpt < config.checkpoint_every_steps and steps_done < remaining_steps:
             return last_ckpt_step
         absolute_step = start_step + steps_done
-        _atomic_save_checkpoint(simulation, output_dir, absolute_step)
+        atomic_save_checkpoint(simulation, output_dir, absolute_step)
         elapsed = time.time() - t0
         ns_done = absolute_step * config.timestep_fs / 1e6
         ns_per_day = (ns_done / elapsed) * 86400 if elapsed > 0 else 0
