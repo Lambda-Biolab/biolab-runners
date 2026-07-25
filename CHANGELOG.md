@@ -7,12 +7,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased] — 2026-07-25
 
 ### Changed
+- **Architecture (checkpoint extraction, v14)**: Extracted the entire
+  checkpoint domain — manifest read/validate, atomic save, orphan GC,
+  quarantine, terminal classification, production step math — from
+  `system_builder.py` and `utils.py` into a new
+  `biolab_runners.openmm.checkpoint` module. The `_atomic_save_checkpoint`
+  function (private by name only — 4 production call sites + 10 test
+  sites imported it) is now public `atomic_save_checkpoint` and lives
+  alongside the manifest parser, terminal schema validator, and
+  quarantine. `load_checkpoint` returns a structured `LoadedCheckpoint`
+  dataclass instead of a `(step, file)` tuple, collapsing the previous
+  trio of `load_checkpoint` / `load_checkpoint_step` /
+  `load_checkpoint_full` into one entry point. `system_builder.py`
+  shrinks to a single domain (system / force field / solvation) with
+  69% coverage; `utils.py` shrinks to availability checks + a
+  diagnostic reporter (re-export of `InvalidCheckpointError` preserved
+  for back-compat). `runner.py` imports drop from 14 names across two
+  private modules to 7 names from one public module.
 - **Architecture (god-module split)**: Extracted PBC geometry helpers
   (`pbc_correct`, `min_pbc_distance`, `collect_chain_ca_positions`) from
   `OpenMMRunner` into a new `biolab_runners.openmm.geometry` module.
   Extracted the system/forcefield/topology/integrator builder family
   (8 methods) into a new `biolab_runners.openmm.system_builder` module.
-  `OpenMMRunner` shrank from 1074 → 763 LOC.
+  `OpenMMRunner` shrank from 1074 → 763 LOC at v8; v9–v13 then added
+  back ~540 LOC of new helpers (skip/resume/manifest/terminal/
+  orphan-checks) bringing it to 1304 LOC. The v14 extraction does NOT
+  shrink the runner further — the helpers are tightly coupled to the
+  orchestration context and belong on the runner; what changes is that
+  the **seam** the runner crosses for checkpoint operations is now
+  public (one module, named functions) instead of private (two modules,
+  underscore-prefixed imports).
 - **Lint (ruff)**: Enabled `RUF`, `ANN`, `PT` rule families; moved `S101`
   to per-file ignores for `tests/**`. RUF001/002/003 (ambiguous unicode)
   are globally ignored because Greek letters, ×, − are correct domain
@@ -57,6 +81,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `tests/_helpers.py`: shared `FakeAtom`, `FakeChain`, `FakeApp`,
   `RecordingForceField`, `dodecahedron_box` (deduped across 3 test
   files).
+- `tests/test_checkpoint.py` (40 tests): public-interface tests for the
+  new `checkpoint` module — atomic save with crash semantics,
+  quarantine with timestamp uniqueness, manifest parsing with all
+  malformed variants (string step, negative step, missing records,
+  dangling state file, empty state file, path traversal, invalid
+  filename pattern), the tri-state terminal classification (absent /
+  valid / invalid), terminal payload reconstruction, and production_ns
+  math. Replaces the previous 6 test classes in `test_openmm_runner.py`
+  and 1 test class in `test_system_builder.py` that imported the
+  private `_atomic_save_checkpoint` and the tuple-unpacking
+  `load_checkpoint`/`load_checkpoint_step`/`load_checkpoint_full`
+  trio; per DEEPENING.md, old unit tests on shallow modules become
+  waste once tests at the deepened module's interface exist.
+- `biolab_runners/openmm/checkpoint.py`: deep module owning the
+  entire checkpoint lifecycle. Public interface —
+  `atomic_save_checkpoint`, `quarantine_stale_checkpoint`,
+  `load_checkpoint` (returning `LoadedCheckpoint`), `is_run_complete`,
+  `load_terminal_payload`, `production_ns`, `InvalidCheckpointError`.
+  Internal seam (private helpers for the module's own tests):
+  `_parse_manifest`, `_validate_state_file_reference`,
+  `_parse_state_filename_step`, `_gc_orphan_states`,
+  `_check_normal_completion`, `_validate_terminal_payload`,
+  `_classify_invalid_terminal`, `_production_steps`. The AGENTS.md
+  invariants around checkpoint / manifest / terminal / quarantine /
+  orphan GC / resume safety all describe this module.
 - `CHANGELOG.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`.
 
 ## [0.1.0] — 2024
