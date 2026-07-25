@@ -1015,6 +1015,40 @@ class TestFinalizeResultStateXmlPath:
         # The skip path populated state_xml_path from the manifest.
         assert result.state_xml_path == str(out / state_basename)
 
+    def test_normal_skip_serializes_abort_reason_as_empty_string(self, tmp_path: Path) -> None:
+        """A normal-completion skip must serialise ``abort_reason`` as
+        ``""`` (empty string), NOT ``null``. ``SimulationResult.abort_reason``
+        is typed ``str`` defaulting to ``""``, and ``to_dict()``
+        emits the value unchanged — a ``None`` here would round-trip
+        as ``"abort_reason": null`` in ``md_result.json``, breaking
+        the long-standing JSON contract that downstream consumers
+        (oral_amp.cloud) rely on.
+        """
+        out = tmp_path / "output"
+        out.mkdir()
+        config = OpenMMConfig(output_dir=str(out))
+        target = config.total_equil_steps + config.total_steps
+        state_basename = f"state.{target}_1_1.xml"
+        (out / state_basename).write_text("<State/>")
+        (out / "trajectory.dcd").write_bytes(b"\x00" * 20_000_000)
+        (out / "energy.csv").write_text("#step,time\n" + "1,1\n" * 100)
+        (out / "topology.pdb").write_bytes(b"ATOM\n" * 5000)
+        (out / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": target, "file": state_basename}]})
+        )
+
+        runner = OpenMMRunner(config)
+        result = runner.run()
+
+        assert result.error == ""
+        assert result.early_abort is False
+        # Both the field and the JSON serialisation must be the
+        # empty string, never None / null.
+        assert result.abort_reason == ""
+        serialised = result.to_dict()
+        assert serialised["abort_reason"] == ""
+        assert serialised["abort_reason"] is not None
+
 
 class TestEarlyAbortResultReconstruction:
     """v10 BLOCKER #2 regression: an early-aborted run reused

@@ -4,7 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-- **Architecture (run-state machine extraction, v15, revised)**: Extracted the
+## [Unreleased]
+
+- **Architecture (run-state machine extraction, v15, revised twice)**: Extracted the
   pre-run decision tree and skip-population logic from `OpenMMRunner`
   into a new `biolab_runners.openmm.run_state` deep module. The nine
   private decision-tree methods (`_resolve_skip_or_resume`,
@@ -31,8 +33,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   Runner shrinks from 1304 → ~933 LOC. Tests rewritten at the new
   public interface (per DEEPENING.md) — `tests/test_run_state.py`
-  (43 tests) covers all four plan types, all `CompletionStatus`
-  variants, and the invalid-terminal schema variants; the 19
+  (~60 tests) covers all four plan types, all `CompletionStatus`
+  variants, all plan invariant checks (action non-overridable,
+  required fields, cross-field invariants), the invalid-terminal
+  schema variants, and the artifact-corruption matrix; the 19
   private-API tests in `test_openmm_runner.py` are deleted. New
   `tests/test_openmm_runner.py::TestRunnerDispatch` (5 tests)
   verifies at the public `run()` interface that `SKIP` and
@@ -73,7 +77,46 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   implementation dropped the rounding, which would have leaked
   floating-point artifacts for float `timestep_fs` values. The new
   behavior preserves the exact-value contract the runner had before
-  this refactor.
+  this refactor. Test `test_normal_completion_total_ns_rounded_for_float_timestep`
+  uses `production_ns=1.5678` so the unrounded result (`1.5678`)
+  differs from the rounded (`1.57`) — the test would fail if
+  `round()` were removed again.
+
+  Bug fix: `SkipPlan.abort_reason` is now typed `str` (not
+  `Optional[str]`). The previous `None` value silently serialised
+  as `"abort_reason": null` in `md_result.json`, breaking the
+  long-standing contract that downstream consumers
+  (`oral_amp.cloud`) rely on. Normal completions now serialise as
+  `"abort_reason": ""`. New runner-level test
+  `test_normal_skip_serializes_abort_reason_as_empty_string`
+  asserts both `result.abort_reason == ""` AND
+  `result.to_dict()["abort_reason"] == ""`.
+
+  Cross-field invariants tightened: the reviewer flagged that
+  semantically-contradictory plans still constructed. Added:
+  - `ResumePlan.start_step == manifest_step` (refuse mismatched
+    step accounting).
+  - `Path(resume_xml).name == state_file_basename` (refuse
+    manifest/loader path disagreement).
+  - `SkipPlan.completion` ∈ {`NORMAL_COMPLETE`, `EARLY_ABORT`}
+    (refuse `IN_PROGRESS` or `INVALID_TERMINAL` — those flow
+    through `FreshPlan` / `ResumePlan` / `FailurePlan` upstream).
+  - `EARLY_ABORT` requires `early_abort=True` and a non-empty
+    `abort_reason`.
+  - `NORMAL_COMPLETE` requires `early_abort=False` and
+    `abort_reason=""`.
+
+  Bug fix: `_artifact_validation_error` now treats directory-
+  disguised-as-file (`trajectory.dcd/`), binary-corrupted
+  `energy.csv`, and `OSError` from `stat()` as `FailurePlan`
+  causes rather than letting them leak out of `decide()` as
+  unhandled exceptions. The previous behaviour inherited from
+  the runner's `_validate_terminal_artifacts` would crash the
+  process on a partial disk failure during the original run.
+  New tests `test_directory_disguised_as_trajectory_yields_failure`,
+  `test_directory_disguised_as_energy_yields_failure`, and
+  `test_binary_corrupted_energy_yields_failure` exercise the
+  hardening.
 
 - **Architecture (checkpoint extraction, v14)**: Extracted the entire
   checkpoint domain — manifest read/validate, atomic save, orphan GC,

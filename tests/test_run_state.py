@@ -407,19 +407,25 @@ class TestDecideSkip:
         # the test should verify the rounding contract.
         assert plan.total_ns == round(config.total_steps * config.timestep_fs / 1e6, 2)
         assert plan.early_abort is False
-        assert plan.abort_reason is None
+        # ``abort_reason`` is typed ``str`` (not ``Optional[str]``)
+        # so the runner can copy it into ``SimulationResult.abort_reason``
+        # (also typed ``str`` defaulting to ``""``) without changing
+        # the JSON shape. A normal completion serialises as
+        # ``"abort_reason": ""`` — never ``null``.
+        assert plan.abort_reason == ""
 
     def test_normal_completion_total_ns_rounded_for_float_timestep(self, tmp_path: Path) -> None:
-        """Float timestep: total_ns is the exact-rounded value (2 dp),
-        not the raw float. Without ``round()``, floating-point artifacts
-        in the multiplication would leak through.
+        """Float timestep: total_ns is rounded to 2 dp.
 
-        With production_ns=2.5 and timestep_fs=2.5, total_steps is
-        computed as ``int(2.5 * 1000 * (1000/2.5)) = 1_000_000`` and
-        ``total_ns = 1_000_000 * 2.5 / 1e6 = 2.5``. After ``round(_, 2)``
-        the value is exactly ``2.5`` — the rounding contract holds.
+        ``production_ns=1.5678`` with ``timestep_fs=1.0`` yields
+        ``total_steps = 1_567_800`` and
+        ``total_ns = 1_567_800 * 1.0 / 1e6 = 1.5678`` (unrounded).
+        After ``round(_, 2)`` the value is exactly ``1.57`` — this
+        is a test the unrounded implementation would FAIL on
+        (asserting equality to 1.57 against the raw 1.5678), so it
+        genuinely guards the rounding contract.
         """
-        config = OpenMMConfig(production_ns=2.5, timestep_fs=2.5)
+        config = OpenMMConfig(production_ns=1.5678, timestep_fs=1.0)
         target = config.total_equil_steps + config.total_steps
         state = tmp_path / f"state.{target}_1_1.xml"
         state.write_text("<State/>")
@@ -432,11 +438,7 @@ class TestDecideSkip:
 
         assert isinstance(plan, SkipPlan)
         assert plan.completion == CompletionStatus.NORMAL_COMPLETE
-        # 1_000_000 steps × 2.5 fs = 2.5 ns. The round(_, 2) is a
-        # no-op for this exact value, but the assertion verifies the
-        # public surface emits a 2-decimal value.
-        assert plan.total_ns == round(config.total_steps * config.timestep_fs / 1e6, 2)
-        assert plan.total_ns == 2.5
+        assert plan.total_ns == 1.57
 
     def test_valid_terminal_payload(self, tmp_path: Path) -> None:
         config = _config(production_ns=10.0, timestep_fs=2.0)
@@ -764,6 +766,41 @@ class TestSkipPlanArtifactValidation:
         assert "energy" in plan.error
         assert "header-only" in plan.error or "no data" in plan.error
 
+    def test_directory_disguised_as_trajectory_yields_failure(self, tmp_path: Path) -> None:
+        """A ``trajectory.dcd`` that is a directory (not a regular file)
+        is rejected by ``is_file()`` rather than passing the
+        ``exists()`` + non-zero-size check.
+        """
+        self._setup_skip_ready(tmp_path)
+        (tmp_path / FileNames.TRAJECTORY).unlink()
+        (tmp_path / FileNames.TRAJECTORY).mkdir()
+        plan = decide(tmp_path, _config(production_ns=1.0), force=False)
+        assert isinstance(plan, FailurePlan)
+        assert "trajectory" in plan.error
+
+    def test_directory_disguised_as_energy_yields_failure(self, tmp_path: Path) -> None:
+        """``energy.csv`` as a directory: ``read_text()`` would raise
+        ``IsADirectoryError``; ``is_file()`` rejects it first."""
+        self._setup_skip_ready(tmp_path)
+        (tmp_path / FileNames.ENERGY).unlink()
+        (tmp_path / FileNames.ENERGY).mkdir()
+        plan = decide(tmp_path, _config(production_ns=1.0), force=False)
+        assert isinstance(plan, FailurePlan)
+        assert "energy" in plan.error
+
+    def test_binary_corrupted_energy_yields_failure(self, tmp_path: Path) -> None:
+        """Binary content in ``energy.csv`` raises ``UnicodeDecodeError``
+        on ``read_text(encoding="utf-8")``. Must surface as a
+        ``FailurePlan`` rather than crashing the runner.
+        """
+        self._setup_skip_ready(tmp_path)
+        # 0xFF 0xFE are invalid UTF-8 start bytes — decode raises.
+        (tmp_path / FileNames.ENERGY).write_bytes(b"\xff\xfe\x00\x01garbage")
+        plan = decide(tmp_path, _config(production_ns=1.0), force=False)
+        assert isinstance(plan, FailurePlan)
+        assert "energy" in plan.error
+        assert "undecodable" in plan.error or "unreadable" in plan.error
+
 
 # ---------------------------------------------------------------------------
 # End-to-end: decide() roundtrip with atomic_save_checkpoint
@@ -893,7 +930,7 @@ class TestRunPlanInvariants:
                 state_xml_path="build/state.1_1_1.xml",
                 total_ns=0.0,
                 early_abort=False,
-                abort_reason=None,
+                abort_reason="",
             )
 
     def test_failure_plan_action_cannot_be_overridden(self) -> None:
@@ -936,5 +973,126 @@ class TestRunPlanInvariants:
                 state_xml_path="build/state.1_1_1.xml",
                 total_ns=0.0,
                 early_abort=True,
-                abort_reason=None,
+                abort_reason="",
             )
+
+    def test_skip_plan_early_abort_completion_requires_early_abort_flag(self) -> None:
+        """Cross-field invariant: ``completion=EARLY_ABORT`` requires ``early_abort=True``."""
+        with pytest.raises(ValueError, match="early_abort=True"):
+            SkipPlan(
+                completion=CompletionStatus.EARLY_ABORT,
+                completion_reason="x",
+                manifest_step=1,
+                state_file_basename="state.1_1_1.xml",
+                trajectory_path="build/traj.dcd",
+                energy_path="build/energy.csv",
+                topology_path="build/top.pdb",
+                state_xml_path="build/state.1_1_1.xml",
+                total_ns=0.0,
+                early_abort=False,
+                abort_reason="reason given",
+            )
+
+    def test_skip_plan_normal_completion_rejects_early_abort_flag(self) -> None:
+        """Cross-field invariant: ``completion=NORMAL_COMPLETE`` requires ``early_abort=False``."""
+        with pytest.raises(ValueError, match="early_abort=False"):
+            SkipPlan(
+                completion=CompletionStatus.NORMAL_COMPLETE,
+                completion_reason="normal_completion_step_0_of_0",
+                manifest_step=1,
+                state_file_basename="state.1_1_1.xml",
+                trajectory_path="build/traj.dcd",
+                energy_path="build/energy.csv",
+                topology_path="build/top.pdb",
+                state_xml_path="build/state.1_1_1.xml",
+                total_ns=0.0,
+                early_abort=True,
+                abort_reason="",
+            )
+
+    def test_skip_plan_normal_completion_rejects_nonempty_abort_reason(self) -> None:
+        """Cross-field invariant: ``completion=NORMAL_COMPLETE`` requires ``abort_reason=""``."""
+        with pytest.raises(ValueError, match="abort_reason"):
+            SkipPlan(
+                completion=CompletionStatus.NORMAL_COMPLETE,
+                completion_reason="normal_completion_step_0_of_0",
+                manifest_step=1,
+                state_file_basename="state.1_1_1.xml",
+                trajectory_path="build/traj.dcd",
+                energy_path="build/energy.csv",
+                topology_path="build/top.pdb",
+                state_xml_path="build/state.1_1_1.xml",
+                total_ns=0.0,
+                early_abort=False,
+                abort_reason="reason",
+            )
+
+    def test_skip_plan_rejects_in_progress_completion(self) -> None:
+        """``completion`` must be terminal — IN_PROGRESS is handled by FreshPlan/ResumePlan."""
+        with pytest.raises(ValueError, match="NORMAL_COMPLETE or EARLY_ABORT"):
+            SkipPlan(
+                completion=CompletionStatus.IN_PROGRESS,
+                completion_reason="x",
+                manifest_step=1,
+                state_file_basename="state.1_1_1.xml",
+                trajectory_path="build/traj.dcd",
+                energy_path="build/energy.csv",
+                topology_path="build/top.pdb",
+                state_xml_path="build/state.1_1_1.xml",
+                total_ns=0.0,
+                early_abort=False,
+                abort_reason="",
+            )
+
+    def test_skip_plan_rejects_invalid_terminal_completion(self) -> None:
+        """``completion=INVALID_TERMINAL`` is converted to ``FailurePlan``
+        upstream — must not appear here."""
+        with pytest.raises(ValueError, match="NORMAL_COMPLETE or EARLY_ABORT"):
+            SkipPlan(
+                completion=CompletionStatus.INVALID_TERMINAL,
+                completion_reason="x",
+                manifest_step=1,
+                state_file_basename="state.1_1_1.xml",
+                trajectory_path="build/traj.dcd",
+                energy_path="build/energy.csv",
+                topology_path="build/top.pdb",
+                state_xml_path="build/state.1_1_1.xml",
+                total_ns=0.0,
+                early_abort=False,
+                abort_reason="",
+            )
+
+    def test_resume_plan_rejects_step_mismatch(self) -> None:
+        """Cross-field invariant: ``start_step`` must equal ``manifest_step``."""
+        with pytest.raises(ValueError, match="must equal"):
+            ResumePlan(
+                start_step=100,
+                remaining_steps=50,
+                resume_xml="state.200_1_1.xml",
+                manifest_step=200,
+                state_file_basename="state.200_1_1.xml",
+            )
+
+    def test_resume_plan_rejects_basename_mismatch(self) -> None:
+        """Cross-field invariant: ``Path(resume_xml).name`` must equal ``state_file_basename``."""
+        with pytest.raises(ValueError, match="basename"):
+            ResumePlan(
+                start_step=100,
+                remaining_steps=50,
+                resume_xml="state.100_1_1.xml",
+                manifest_step=100,
+                state_file_basename="state.200_1_1.xml",
+            )
+
+    def test_resume_plan_accepts_consistent_construction(self) -> None:
+        """Sanity: a consistent construction succeeds (no false positives)."""
+        plan = ResumePlan(
+            start_step=100,
+            remaining_steps=50,
+            resume_xml="build/state.100_1_1.xml",
+            manifest_step=100,
+            state_file_basename="state.100_1_1.xml",
+        )
+        assert plan.start_step == 100
+        assert plan.manifest_step == 100
+        assert plan.state_file_basename == "state.100_1_1.xml"
