@@ -53,6 +53,7 @@ biolab_runners/
   defaults are physiological PBS-like (150 mM NaCl, pH 7.4, 310 K).
 - **Early abort:** 5 ns / 10 ns checkpoint — if peptide dissociates (PBC-corrected Cα RMSD > 2 × `config.target_irmsd_threshold_a`), abort. Threshold is per-system and defaults to 3.5 Å — override for tighter/looser gating
 - **Resume safety:** Always load original topology.pdb — re-solvating produces different water counts
+- **Force=True quarantine:** `runner.run(force=True)` moves the resumable files (`state.xml`, `checkpoint.json`, `energy.csv`) into a timestamped `output_dir/.stale/<UTC>/` subdirectory BEFORE any fresh build. This ensures an interrupted forced run cannot leave the directory with a stale `state.xml` that a subsequent non-forced run would pair with a freshly-built topology. Discarding the checkpoint is opt-in via `force=True` and must be atomic w.r.t. the fresh build.
 - **Restraint force on resume:** Must add restraint force (k=0) to system even on resume, or loadState() fails
 - **PBC correction:** All RMSD checks use minimum image convention — without it, RMSD can be ~100A
 - **SIGTERM handler:** Clean shutdown on cloud preemption (writes checkpoint before exit)

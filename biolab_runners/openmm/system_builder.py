@@ -16,7 +16,9 @@ installed.
 from __future__ import annotations
 
 import logging
+import shutil
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -52,6 +54,64 @@ class SimulationContext:
     np_mod: object = None
     platform: object = None
     is_resuming: bool = False
+
+
+# Files that together describe a resumable run. ``load_checkpoint_step``
+# reads ``checkpoint.json`` then falls back to ``energy.csv`` (see
+# ``biolab_runners.openmm.utils``); ``simulation.loadState`` reads
+# ``state.xml``. All three must be moved together when the user
+# invokes ``runner.run(force=True)`` — leaving any one behind means
+# the next non-forced run could re-derive a stale step from it.
+RESUMABLE_FILES: tuple[str, ...] = (
+    FileNames.STATE_XML,
+    FileNames.CHECKPOINT_JSON,
+    FileNames.ENERGY,
+)
+
+
+def quarantine_stale_checkpoint(output_dir: Path) -> list[Path]:
+    """Move resumable files into a timestamped ``.stale/`` subdirectory.
+
+    Used by ``runner.run(force=True)`` to ensure the next non-forced
+    invocation cannot pair a stale ``state.xml`` with a freshly-built
+    topology. ``load_checkpoint_step`` reads both ``checkpoint.json``
+    AND ``energy.csv`` (see ``utils.load_checkpoint_step``), so all
+    three must be moved together — leaving any one behind means the
+    next non-forced run could re-derive a stale step from it and
+    trigger an incompatible ``loadState`` call.
+
+    Returns the list of files actually moved (those that existed).
+    An empty output dir produces an empty list and no ``.stale/``
+    directory is created — there's nothing to quarantine.
+
+    Args:
+        output_dir: Directory holding the stale checkpoint files.
+
+    Returns:
+        List of paths (inside the new ``.stale/<timestamp>/``
+        directory) for the files that were moved.
+    """
+    moved: list[Path] = []
+    existing = [name for name in RESUMABLE_FILES if (output_dir / name).exists()]
+    if not existing:
+        return moved
+
+    # Use UTC + second-resolution to avoid filename collisions if
+    # ``force=True`` is invoked twice in the same second. The
+    # timestamp suffix is informational — the quarantine contract
+    # is "files are out of ``output_dir``", not uniqueness.
+    ts = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
+    stale_dir = output_dir / ".stale" / ts
+    stale_dir.mkdir(parents=True, exist_ok=False)
+
+    for name in existing:
+        src = output_dir / name
+        dst = stale_dir / name
+        shutil.move(str(src), str(dst))
+        moved.append(dst)
+        logger.info("Quarantined stale checkpoint file: %s -> %s", src, dst)
+
+    return moved
 
 
 def build_forcefield(config: OpenMMConfig, app: object) -> object:
@@ -174,21 +234,26 @@ def build_or_load_modeller(
 ) -> tuple[object | None, bool]:
     """Build a fresh solvated modeller or load one from a prior run.
 
+    The resume-without-topology corruption case is NOT handled here:
+    when ``is_resuming=True`` but the on-disk ``topology.pdb`` is
+    missing or truncated, ``prepare_simulation`` fails fast BEFORE
+    calling this function (see the "Resume safety" rule in AGENTS.md).
+    That avoids the expensive PDBFixer / ``addSolvent`` work that would
+    otherwise be wasted on an unrecoverable checkpoint. By the time
+    this function is reached, ``is_resuming=True`` implies an intact
+    topology is present.
+
     Returns:
         ``(modeller, loaded_existing_topology)``. The second element is
         True when an existing ``topology.pdb`` was loaded from disk
         (the fresh-run path that was just constructed does NOT set it).
         Callers use this to decide whether the on-disk topology.pdb
-        is already in sync with the returned modeller — if it isn't,
-        the caller must persist the freshly-built topology before any
-        ``simulation.loadState(...)`` call. Otherwise a checkpoint
-        ``state.xml`` from a prior run could be loaded onto a
-        modeller whose topology is incompatible with the saved state.
-
-        The decision is NOT keyed on ``is_resuming``: a state.xml may
-        exist (so is_resuming=True) without an intact topology.pdb
-        (e.g. corrupted output dir). The fresh-build path is the only
-        correct outcome in that case — and it must be persisted.
+        is already in sync with the returned modeller — the caller's
+        next step is to write the new topology (or skip the write,
+        when the on-disk one was just loaded) and then call
+        ``simulation.loadState`` only when the modeller came from the
+        on-disk file. A freshly-built modeller is by definition
+        incompatible with the saved ``state.xml``.
     """
     topo_path = output_dir / FileNames.TOPOLOGY
     existing_topo = topo_path if topo_path.exists() and topo_path.stat().st_size > 100_000 else None
@@ -308,6 +373,13 @@ def prepare_simulation(
 
     Equilibration is deliberately NOT performed here; that lives in
     the runner so system_builder stays free of equilibration policy.
+
+    Resume-integrity check happens BEFORE any expensive PDBFixer /
+    addSolvent work: a corrupted checkpoint (state.xml present but
+    topology.pdb missing/truncated) cannot be recovered by re-solvating
+    (different water count → incompatible System), so we fail fast
+    with a clear error pointing the user at ``force=True`` rather than
+    building a System we'd just throw away.
     """
     try:
         import numpy as np  # noqa: I001
@@ -329,24 +401,19 @@ def prepare_simulation(
         logger.error(result.error)
         return None
 
-    forcefield = build_forcefield(config, app)
     is_resuming_known = bool(resume_xml and Path(resume_xml).exists())
-    modeller, loaded_existing_topology = build_or_load_modeller(
-        config, output_dir, app, forcefield, is_resuming_known, result, unit
-    )
-    if modeller is None:
-        return None
 
-    # Fail fast when a checkpoint exists but the original topology is
-    # missing or truncated. The saved state.xml was produced with a
-    # System whose particle count, mass, and force parameters are
-    # encoded at save time — a freshly-built System (different water
-    # count, different atom order from re-solvation) cannot safely
-    # accept that state via simulation.loadState(). The original
-    # AGENTS.md "Resume safety" rule is the source of this
-    # constraint. To discard the corrupted checkpoint, the user
-    # must invoke runner.run(force=True).
-    if is_resuming_known and not loaded_existing_topology:
+    # Fail-fast BEFORE the fresh build: a checkpoint without an intact
+    # topology.pdb cannot be recovered by re-solvating — the saved
+    # System's particle count, masses, and force parameters are encoded
+    # in state.xml at save time, and a freshly-built System will not
+    # match (different water counts, different atom order). The original
+    # AGENTS.md "Resume safety" rule is the source of this constraint.
+    # The user must invoke runner.run(force=True) to discard the
+    # checkpoint; the runner quarantines the stale files at that point
+    # so an interrupted forced run cannot leave the directory in a
+    # corrupt state either.
+    if is_resuming_known and not _topology_intact(output_dir):
         result.error = (
             f"Checkpoint {resume_xml} exists but the original "
             f"{FileNames.TOPOLOGY} is missing or truncated — the "
@@ -356,10 +423,15 @@ def prepare_simulation(
         logger.error(result.error)
         return None
 
+    forcefield = build_forcefield(config, app)
+    modeller, loaded_existing_topology = build_or_load_modeller(
+        config, output_dir, app, forcefield, is_resuming_known, result, unit
+    )
+    if modeller is None:
+        return None
+
     # When the original topology was loaded from disk, persist the
     # metadata but skip the PDB write (the file is already in sync).
-    # The fresh-build path doesn't reach here (the fail-fast branch
-    # above handles it).
     write_topology(modeller, output_dir, app, result, write_file=not loaded_existing_topology)
 
     is_resuming = is_resuming_known and loaded_existing_topology
@@ -388,3 +460,22 @@ def prepare_simulation(
         platform=platform,
         is_resuming=is_resuming,
     )
+
+
+# Threshold matches the one used in ``build_or_load_modeller`` — keep
+# both in sync so the pre-build integrity check and the load-or-build
+# decision agree on what "intact" means.
+_TOPOLOGY_MIN_BYTES = 100_000
+
+
+def _topology_intact(output_dir: Path) -> bool:
+    """True when ``output_dir/topology.pdb`` exists and is large enough to be real.
+
+    Used by :func:`prepare_simulation` to short-circuit the corrupted-
+    checkpoint case before running PDBFixer / ``addSolvent``. The
+    size threshold matches the one in :func:`build_or_load_modeller`
+    — a solvated protein/peptide topology is well over 100 KB, so a
+    smaller file indicates truncation.
+    """
+    topo_path = output_dir / FileNames.TOPOLOGY
+    return topo_path.exists() and topo_path.stat().st_size > _TOPOLOGY_MIN_BYTES

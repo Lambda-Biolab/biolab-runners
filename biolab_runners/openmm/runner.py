@@ -50,6 +50,7 @@ from biolab_runners.openmm.paths import FileNames
 from biolab_runners.openmm.system_builder import (
     SimulationContext,
     prepare_simulation,
+    quarantine_stale_checkpoint,
 )
 from biolab_runners.openmm.utils import (
     load_checkpoint_step,
@@ -209,10 +210,27 @@ class OpenMMRunner:
     ) -> tuple[int, int, str] | None:
         """Handle idempotency + checkpoint resolution.
 
+        When ``force=True`` and a prior checkpoint exists, the
+        resumable files (``state.xml`` + ``checkpoint.json`` +
+        ``energy.csv``) are moved into a timestamped
+        ``output_dir/.stale/<UTC>/`` directory BEFORE this method
+        returns. This guarantees the next non-forced invocation cannot
+        pair a stale ``state.xml`` with a freshly-built topology, even
+        if the forced run is interrupted before producing a new
+        ``state.xml`` of its own.
+
         Returns None if the simulation is already complete (result populated),
         otherwise (start_step, remaining_steps, resume_xml).
         """
-        if not force:
+        if force:
+            moved = quarantine_stale_checkpoint(output_dir)
+            if moved:
+                logger.info(
+                    "force=True: quarantined %d stale checkpoint file(s) to %s",
+                    len(moved),
+                    moved[0].parent,
+                )
+        else:
             verification = verify_production_outputs(output_dir)
             if verification["complete"]:
                 logger.info(
@@ -228,6 +246,10 @@ class OpenMMRunner:
         start_step = 0
         resume_xml = ""
         state_xml = output_dir / FileNames.STATE_XML
+        # After a force=True quarantine, state_xml no longer exists on
+        # disk (it was moved to .stale/) — the resume branch is naturally
+        # skipped, and the fresh build proceeds without a stale state
+        # to pair against.
         if not force and state_xml.exists() and state_xml.stat().st_size > 0:
             start_step = load_checkpoint_step(output_dir)
             if start_step > 0:

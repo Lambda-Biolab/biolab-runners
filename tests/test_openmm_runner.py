@@ -449,6 +449,127 @@ class TestResumeAccounting:
         assert remaining_steps == config.total_steps
 
 
+class TestForceTrueQuarantine:
+    """Regression test for the v5 BLOCKER: ``runner.run(force=True)`` must
+    actually retire the stale checkpoint files (state.xml +
+    checkpoint.json + energy.csv) before the fresh build, so an
+    interrupted forced run cannot leave the directory in a state
+    where a subsequent non-forced invocation re-derives a stale step
+    from the leftover energy.csv / checkpoint.json and pairs it with
+    a freshly-built topology.
+
+    The previous fix simply skipped reading state.xml — that did
+    NOT remove it. If the forced run was interrupted mid-build
+    (before the new state.xml was written), the next non-forced
+    invocation could still load the old state onto a fresh System.
+    """
+
+    def _populate_stale_checkpoint(self, out: Path, step: int) -> None:
+        """Pre-populate state.xml + checkpoint.json + energy.csv."""
+        (out / "state.xml").write_text("<State/>")
+        (out / "checkpoint.json").write_text(json.dumps({"records": [{"step": step}]}))
+        (out / "energy.csv").write_text(f"#step,time\n{step},{step}\n")
+
+    def test_force_true_quarantines_all_three_files(self, tmp_path: Path) -> None:
+        """force=True moves state.xml + checkpoint.json + energy.csv to .stale/<UTC>/."""
+        out = tmp_path / "output"
+        out.mkdir()
+
+        self._populate_stale_checkpoint(out, step=10_000)
+
+        config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
+        runner = OpenMMRunner(config)
+        resume = runner._resolve_skip_or_resume(
+            force=True, output_dir=out, config=config, result=SimulationResult(config=config)
+        )
+
+        # .stale/<UTC>/ directory exists with all three files
+        stale_parents = list((out / ".stale").iterdir())
+        assert len(stale_parents) == 1, f"expected one stale dir, got {stale_parents}"
+        stale_dir = stale_parents[0]
+        assert (stale_dir / "state.xml").exists()
+        assert (stale_dir / "checkpoint.json").exists()
+        assert (stale_dir / "energy.csv").exists()
+
+        # The original resumable files are GONE from output_dir —
+        # that's the contract that makes a subsequent non-forced run
+        # unable to re-derive a stale step.
+        assert not (out / "state.xml").exists()
+        assert not (out / "checkpoint.json").exists()
+        assert not (out / "energy.csv").exists()
+
+        # resume_xml must be empty so prepare_simulation does NOT
+        # try to loadState a (no-longer-existing) checkpoint.
+        assert resume is not None
+        _, _, resume_xml = resume
+        assert resume_xml == "", f"resume_xml must be empty after quarantine, got {resume_xml!r}"
+
+    def test_force_true_with_no_existing_checkpoint_is_a_no_op(self, tmp_path: Path) -> None:
+        """force=True with no prior checkpoint must not create .stale/."""
+        out = tmp_path / "output"
+        out.mkdir()
+
+        config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
+        runner = OpenMMRunner(config)
+        resume = runner._resolve_skip_or_resume(
+            force=True, output_dir=out, config=config, result=SimulationResult(config=config)
+        )
+
+        # No .stale directory should have been created
+        assert not (out / ".stale").exists()
+        # Resume proceeds normally with empty resume_xml
+        assert resume is not None
+        _, _, resume_xml = resume
+        assert resume_xml == ""
+
+    def test_force_true_then_interrupted_then_non_force_yields_empty_resume(
+        self, tmp_path: Path
+    ) -> None:
+        """The v5 BLOCKER scenario end-to-end.
+
+        1. Stale checkpoint files exist.
+        2. force=True invocation quarantines them.
+        3. Run is interrupted AFTER quarantine but BEFORE a new
+           state.xml is written (simulated by writing a fresh
+           topology.pdb to mimic an interrupted-during-equilibration
+           outcome).
+        4. A subsequent non-force invocation must NOT see a non-empty
+           resume_xml — there is no checkpoint left to load.
+        """
+        out = tmp_path / "output"
+        out.mkdir()
+        self._populate_stale_checkpoint(out, step=10_000)
+
+        config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
+        runner = OpenMMRunner(config)
+
+        # Step 2: forced run quarantines the checkpoint
+        resume = runner._resolve_skip_or_resume(
+            force=True, output_dir=out, config=config, result=SimulationResult(config=config)
+        )
+        assert resume is not None
+        _, _, resume_xml = resume
+        assert resume_xml == ""
+
+        # Step 3: simulate interruption by writing a fresh topology.pdb
+        # (the forced run had time to overwrite topology.pdb but did
+        # NOT survive long enough to write a new state.xml)
+        (out / "topology.pdb").write_bytes(b"X" * 150_000)
+
+        # Step 4: subsequent non-forced invocation — must not see a
+        # checkpoint. resume_xml must be empty.
+        result = SimulationResult(config=config)
+        resume2 = runner._resolve_skip_or_resume(
+            force=False, output_dir=out, config=config, result=result
+        )
+        assert resume2 is not None
+        _, _, resume_xml2 = resume2
+        assert resume_xml2 == "", (
+            f"subsequent non-force invocation must not see a stale checkpoint; "
+            f"got resume_xml={resume_xml2!r}"
+        )
+
+
 class TestIrmsdThreshold:
     """Tests for the per-config iRMSD early-abort threshold."""
 

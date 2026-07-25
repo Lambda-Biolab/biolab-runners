@@ -483,11 +483,11 @@ class TestPrepareSimulationMissingOpenMM:
 
     Previous tests (e.g. ``test_missing_openmm_returns_error`` in
     test_openmm_runner.py) mocked ``prepare_simulation`` itself, which
-    means the import branch was untested. This test installs a real
-    import blocker via ``sys.meta_path`` — a custom finder that raises
-    ImportError for any ``openmm.*`` module — and runs the real
-    ``prepare_simulation`` function against a valid config. The
-    result must surface a clear ``OpenMM not installed: ...`` error
+    means the import branch was untested. This test installs an
+    in-process import blocker via ``sys.meta_path`` — a custom finder
+    that raises ``ImportError`` for any ``openmm.*`` module — and runs
+    the real ``prepare_simulation`` function against a valid config.
+    The result must surface a clear ``OpenMM not installed: ...`` error
     in ``result.error`` and return ``None``.
     """
 
@@ -556,6 +556,8 @@ class TestPrepareSimulationMissingOpenMM:
             with contextlib.suppress(ValueError):
                 sys.meta_path.remove(blocker)
 
+
+class TestPrepareSimulationResumeTopologyGuard:
     """Resume-safety regression: the saved state.xml must be paired
     with the exact topology it was serialized from. Re-solvation
     produces different water counts and atom ordering, so a freshly
@@ -570,10 +572,13 @@ class TestPrepareSimulationMissingOpenMM:
         (set result.error, return None). The user must re-run with
         force=True to discard the checkpoint.
 
-    The previous BLOCKER fix wrote the fresh modeller to topology.pdb
-    in the corruption case — that hides the incompatibility rather
-    than surfacing it. This class pins the fail-fast path and asserts
-    ``loadState`` is never called on a freshly-built modeller.
+    The integrity check runs BEFORE the expensive PDBFixer /
+    ``addSolvent`` work — re-solvating cannot recover a corrupt
+    checkpoint (the saved System's water count is baked into the
+    state.xml), and surfacing the error early prevents wasted
+    build work. The companion runner-level quarantine of the stale
+    files on ``force=True`` lives in
+    ``TestForceTrueQuarantine`` (test_openmm_runner.py).
     """
 
     def test_state_xml_without_topology_pdb_fails_fast(
@@ -581,10 +586,11 @@ class TestPrepareSimulationMissingOpenMM:
     ) -> None:
         """state.xml exists, but topology.pdb is missing.
 
-        ``build_or_load_modeller`` falls back to building a new
-        modeller. ``prepare_simulation`` must refuse to proceed —
-        the saved state.xml is incompatible with a freshly-built
-        System. ``simulation.loadState`` must not run.
+        ``prepare_simulation`` must refuse to proceed BEFORE calling
+        ``build_or_load_modeller`` — the saved state.xml is
+        incompatible with a freshly-built System and ``simulation
+        .loadState`` must not run. Verified by ``build_or_load_modeller
+        `` not being called at all (a spy on it shows zero invocations).
         """
         import biolab_runners.openmm.system_builder as sb
 
@@ -594,9 +600,17 @@ class TestPrepareSimulationMissingOpenMM:
         sentinel_chains = [object(), object()]
         fake_modeller = _make_fake_modeller(sentinel_chains, num_atoms=12)
         _stub_openmm(monkeypatch)
-        # loaded_existing_topology=False: the on-disk topology was
-        # missing, so build_or_load_modeller returns a fresh modeller.
-        _stub_system_builder(monkeypatch, sb, fake_modeller, loaded_existing_topology=False)
+        # Spy on build_or_load_modeller so we can assert the cheap
+        # integrity check short-circuited BEFORE the expensive
+        # solvate/PDBFixer work. The spy returns a fresh modeller
+        # if it ever does run; the test asserts the call count is 0.
+        build_calls = {"n": 0}
+
+        def _spy_build(*args: object, **kw: object) -> tuple[object, bool]:
+            build_calls["n"] += 1
+            return fake_modeller, False
+
+        monkeypatch.setattr(sb, "build_or_load_modeller", _spy_build)
 
         config = OpenMMConfig(
             receptor_pdb="receptor.pdb",
@@ -616,6 +630,12 @@ class TestPrepareSimulationMissingOpenMM:
         # never created in this branch).
         assert ctx is None, "prepare_simulation must return None on corrupt checkpoint"
         assert "topology" in result.error.lower() or "checkpoint" in result.error.lower()
+        # SUGGESTION from v5 review: the integrity check must run
+        # BEFORE build_or_load_modeller, so the expensive solvation
+        # work is skipped on a corrupt checkpoint.
+        assert build_calls["n"] == 0, (
+            "build_or_load_modeller must NOT be called when resume is corrupt"
+        )
 
     def test_state_xml_with_undersized_topology_pdb_fails_fast(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
