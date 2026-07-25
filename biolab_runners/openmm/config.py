@@ -249,11 +249,13 @@ class OpenMMConfig:
     def saliva(cls, **overrides: Any) -> OpenMMConfig:  # noqa: ANN401
         """Saliva-like buffer: 140 mM NaCl, pH 6.2, 310 K.
 
-        Literature reference values for unstimulated whole saliva. The
-        runner currently models only NaCl ionic strength — Ca2+ and
-        KH2PO4 from the original saliva composition are documented in
-        AGENT_LEARNINGS.md as future work; for now only NaCl is
-        applied to ``addSolvent(ionicStrength=…)``.
+        Literature reference for unstimulated whole saliva reports
+        140 mM NaCl + 1.4 mM CaCl2 + 0.5 mM KH2PO4 at pH 6.2. The
+        runner currently models only NaCl ionic strength — the
+        Ca²⁺ and KH₂PO₄ contributions are documented here as
+        unmodelled context, not applied to
+        ``addSolvent(ionicStrength=…)``. Multi-ion modeling is
+        future work.
         """
         return cls(
             **_preset(

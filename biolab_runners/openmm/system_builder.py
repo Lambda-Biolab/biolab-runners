@@ -171,8 +171,25 @@ def build_or_load_modeller(
     is_resuming: bool,
     result: SimulationResult,
     unit: object | None = None,  # openmm.unit module; forwarded to build_solvated_complex
-) -> object | None:
-    """Build a fresh solvated modeller or load one from a prior run."""
+) -> tuple[object | None, bool]:
+    """Build a fresh solvated modeller or load one from a prior run.
+
+    Returns:
+        ``(modeller, loaded_existing_topology)``. The second element is
+        True when an existing ``topology.pdb`` was loaded from disk
+        (the fresh-run path that was just constructed does NOT set it).
+        Callers use this to decide whether the on-disk topology.pdb
+        is already in sync with the returned modeller — if it isn't,
+        the caller must persist the freshly-built topology before any
+        ``simulation.loadState(...)`` call. Otherwise a checkpoint
+        ``state.xml`` from a prior run could be loaded onto a
+        modeller whose topology is incompatible with the saved state.
+
+        The decision is NOT keyed on ``is_resuming``: a state.xml may
+        exist (so is_resuming=True) without an intact topology.pdb
+        (e.g. corrupted output dir). The fresh-build path is the only
+        correct outcome in that case — and it must be persisted.
+    """
     topo_path = output_dir / FileNames.TOPOLOGY
     existing_topo = topo_path if topo_path.exists() and topo_path.stat().st_size > 100_000 else None
 
@@ -181,14 +198,14 @@ def build_or_load_modeller(
         topo_pdb = app.PDBFile(str(existing_topo))  # type: ignore[union-attr]
         modeller = app.Modeller(topo_pdb.topology, topo_pdb.positions)  # type: ignore[union-attr]
         logger.info("Loaded solvated system: %d atoms", modeller.topology.getNumAtoms())
-        return modeller
+        return modeller, True
 
     receptor_pdb = resolve_pdb(config.receptor_pdb, FileNames.RECEPTOR_PDB, output_dir)
     peptide_pdb = resolve_pdb(config.peptide_pdb, FileNames.PEPTIDE_PDB, output_dir)
     modeller = build_solvated_complex(receptor_pdb, peptide_pdb, config, app, forcefield, unit)
     if modeller is None:
         result.error = "Failed to build system — no valid PDB files"
-    return modeller
+    return modeller, False
 
 
 def write_topology(
@@ -315,18 +332,19 @@ def prepare_simulation(
     forcefield = build_forcefield(config, app)
     is_resuming = bool(resume_xml and Path(resume_xml).exists())
 
-    modeller = build_or_load_modeller(
+    modeller, loaded_existing_topology = build_or_load_modeller(
         config, output_dir, app, forcefield, is_resuming, result, unit
     )
     if modeller is None:
         return None
 
-    # write_topology handles both the file write AND the metadata
-    # assignments. On resume the existing topology.pdb was just read
-    # by build_or_load_modeller, so re-writing it is wasted I/O. The
-    # metadata assignments still run via ``write_file=False`` so
-    # callers see a populated SimulationResult.
-    write_topology(modeller, output_dir, app, result, write_file=not is_resuming)
+    # Persist the modeller to topology.pdb only when we *constructed*
+    # one (not when we loaded an existing one from disk). Note the
+    # decision is NOT keyed on ``is_resuming``: a state.xml may
+    # exist without an intact topology.pdb, in which case
+    # build_or_load_modeller just built a fresh modeller and we
+    # MUST persist it before any loadState() call.
+    write_topology(modeller, output_dir, app, result, write_file=not loaded_existing_topology)
 
     system, integrator = assemble_system(forcefield, modeller, config, openmm, app, unit)
     chains = list(modeller.topology.chains())  # type: ignore[union-attr]
