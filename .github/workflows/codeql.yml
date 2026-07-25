@@ -17,17 +17,50 @@ jobs:
       contents: read
       security-events: write
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
       - uses: github/codeql-action/init@7188fc363630916deb702c7fdcf4e481b751f97a # v4
         with:
+          # `build-mode: none` is the canonical mode for interpreted
+          # languages (Python, Ruby, JavaScript/TypeScript) —
+          # CodeQL parses the source files directly and builds the
+          # call graph without executing or compiling anything.
+          # See https://docs.github.com/en/code-security/code-scanning/automatically-scanning-your-code-for-vulnerabilities-and-errors/customizing-code-scanning
+          # § "Specifying directories to scan".
+          #
+          # The previous workflow used the legacy
+          # `github/codeql-action/autobuild` step, which failed in
+          # two ways for this project:
+          #
+          #   1. VERSION MISMATCH — Dependabot PRs #61 and #63/#96
+          #      bumped `init` to 4.37.1 ahead of `autobuild`'s
+          #      bump. The `init` action wrote a 4.37.1 manifest
+          #      while the autobuild step at SHA 8aad20d1 ships a
+          #      4.36.2 CLI that refused to honour a newer
+          #      manifest ("Loaded a configuration file for
+          #      version '4.37.1', but running version '4.36.2'").
+          #
+          #   2. AUTO-DETECT FAILURE — on uv-managed Python
+          #      projects, the autobuild heuristics didn't
+          #      recognise `uv.lock` + `pyproject.toml` and emitted
+          #      "We were unable to automatically build your code.
+          #      Please replace the call to the autobuild action
+          #      with your custom build steps."
+          #
+          # Per the docs (same page, § "Specifying directories to
+          # scan"), the recommended config for interpreted languages
+          # is `build-mode: none`. CodeQL scans the source tree
+          # directly — pure-Python project, no native build step.
           languages: python
-      - uses: github/codeql-action/autobuild@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
+          build-mode: none
+
       - name: Perform CodeQL Analysis
         id: analyze
-        uses: github/codeql-action/analyze@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4
+        uses: github/codeql-action/analyze@7188fc363630916deb702c7fdcf4e481b751f97a # v4
         with:
           output: sarif-results
-      - uses: advanced-security/dismiss-alerts@046d6b48d2e43cf563f96f67332c47c432eff83e # v2.0.2
+
+      - uses: advanced-security/dismiss-alerts@046d6b48d2e43cf563f96f67332c47c432eff83e # v2.0.3
         with:
           sarif-id: ${{ steps.analyze.outputs.sarif-id }}
           sarif-file: sarif-results
