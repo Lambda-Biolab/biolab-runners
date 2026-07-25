@@ -15,8 +15,40 @@ jobs:
   generate-sbom:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - uses: qte77/gha-sbom-action@cd873b1278a6793a99cfe199c01d603d72cca717 # v0.1.1
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      # v0.1.1 of the upstream action uses `continue-on-error: true` on
+      # the `gh api dependency-graph/sbom` step and pipes stdout to
+      # disk — so a 4xx envelope ends up committed as the SBOM
+      # (qte77/gha-sbom-action#16). Until the upstream fix lands,
+      # validate the artifact and replace it with a placeholder SPDX
+      # so the committed file is always valid SPDX.
+      # See https://github.com/Lambda-Biolab/biolab-runners/issues/50
+      - name: Validate GitHub Dependency Graph SBOM
+        env:
+          SBOM_PATH: docs/SBOM/github-depgraph.spdx.json
+        run: |
+          # A valid SPDX 2.3 document has a top-level "spdxVersion"
+          # key. A 4xx envelope has "message"/"status" instead.
+          if ! jq -e '.spdxVersion' "$SBOM_PATH" >/dev/null 2>&1; then
+            echo "::warning::GitHub Dependency Graph SBOM endpoint returned non-SPDX content; writing placeholder."
+            cat > "$SBOM_PATH" <<'EOF'
+          {
+            "spdxVersion": "SPDX-2.3",
+            "dataLicense": "CC0-1.0",
+            "SPDXID": "SPDXRef-DOCUMENT",
+            "name": "biolab-runners-github-depgraph",
+            "documentNamespace": "https://github.com/Lambda-Biolab/biolab-runners/spdx/github-depgraph",
+            "creationInfo": {
+              "created": "2026-07-25T00:00:00Z",
+              "creators": ["Tool: biolab-runners-ci-fallback"],
+              "comment": "Placeholder SPDX — GitHub Dependency Graph SBOM endpoint returned 4xx; see https://github.com/Lambda-Biolab/biolab-runners/issues/50. The Syft-generated SBOM at docs/SBOM/syft-scan.spdx.json is the canonical inventory until qte77/gha-sbom-action#16 ships the exit-code validation fix and Dependency Graph is enabled in Settings → Code security."
+            },
+            "packages": []
+          }
+          EOF
+          fi
