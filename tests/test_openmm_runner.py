@@ -377,12 +377,13 @@ class TestOpenMMRunner:
     def test_missing_openmm_returns_error(self, tmp_path: Path) -> None:
         """Missing OpenMM should return error, not crash.
 
-        We can't rely on patching sys.modules / __import__ here because
-        Python 3.12's import machinery interacts with the patch
-        differently than 3.11, causing the test to be environmentally
-        fragile. Instead, mock prepare_simulation to simulate the
-        missing-OpenMM branch (set result.error and return None),
-        then verify the runner surfaces the error to the caller.
+        The runner-level test mocks prepare_simulation to verify
+        that the runner surfaces a missing-OpenMM error to the
+        caller. The actual ``try: import openmm ... except
+        ImportError`` code path in system_builder.prepare_simulation
+        is covered by ``test_prepare_simulation_missing_openmm`` in
+        test_system_builder.py (subprocess-based for Python-version
+        independence).
         """
         from biolab_runners.openmm import runner as runner_mod
 

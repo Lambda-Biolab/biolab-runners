@@ -477,7 +477,85 @@ class TestPrepareSimulationPopulatesContext:
         assert result.topology_path == str(tmp_path / "topology.pdb")
 
 
-class TestPrepareSimulationResumeTopologyGuard:
+class TestPrepareSimulationMissingOpenMM:
+    """Exercise the actual ``try: import openmm ... except ImportError``
+    code path in ``system_builder.prepare_simulation``.
+
+    Previous tests (e.g. ``test_missing_openmm_returns_error`` in
+    test_openmm_runner.py) mocked ``prepare_simulation`` itself, which
+    means the import branch was untested. This test installs a real
+    import blocker via ``sys.meta_path`` — a custom finder that raises
+    ImportError for any ``openmm.*`` module — and runs the real
+    ``prepare_simulation`` function against a valid config. The
+    result must surface a clear ``OpenMM not installed: ...`` error
+    in ``result.error`` and return ``None``.
+    """
+
+    def test_import_blocker_surfaces_clear_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Real prepare_simulation + real import blocker = result.error set.
+
+        The blocker rejects any openmm.* import with ImportError.
+        prepare_simulation's ``try: import openmm ... except
+        ImportError`` catches it and sets ``result.error``. The runner's
+        behavior on top of this is covered separately in
+        test_openmm_runner.py::test_missing_openmm_returns_error.
+        """
+        import importlib
+        import importlib.abc
+        import importlib.machinery
+
+        from biolab_runners.openmm import system_builder as sb
+        from biolab_runners.openmm.config import SimulationResult
+
+        class _OpenMMImportBlocker(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+            """Custom finder that raises ImportError for openmm.* modules."""
+
+            def find_spec(self, fullname, path, target=None):  # type: ignore[override]
+                if fullname == "openmm" or fullname.startswith("openmm."):
+                    raise ImportError(f"No module named '{fullname}'")
+                return None
+
+            def create_module(self, spec):  # type: ignore[override]
+                return None
+
+            def exec_module(self, module):  # type: ignore[override]
+                pass
+
+        # Uninstall the cached openmm modules so the import has to
+        # actually go through sys.meta_path again. (We deliberately
+        # don't unimport the biolab_runners modules that depend on
+        # openmm, since those are import-side-effect-free.)
+        for name in list(sys.modules):
+            if name == "openmm" or name.startswith("openmm."):
+                monkeypatch.delitem(sys.modules, name)
+
+        blocker = _OpenMMImportBlocker()
+        sys.meta_path.insert(0, blocker)
+        try:
+            # Even after openmm is uninstalled, the module object
+            # may still be in sys.modules via previously-imported names.
+            # We re-check after the monkeypatch delitem above.
+
+            config = OpenMMConfig(
+                receptor_pdb="receptor.pdb",
+                peptide_pdb="peptide.pdb",
+                output_dir=str(tmp_path),
+                openmm_platform="CPU",
+            )
+            result = SimulationResult(config=config)
+            ctx = sb.prepare_simulation(config, tmp_path, "", result)
+
+            assert ctx is None, "prepare_simulation must return None when openmm is missing"
+            assert "OpenMM not installed" in result.error
+            assert "openmm" in result.error.lower()
+        finally:
+            import contextlib
+
+            with contextlib.suppress(ValueError):
+                sys.meta_path.remove(blocker)
+
     """Resume-safety regression: the saved state.xml must be paired
     with the exact topology it was serialized from. Re-solvation
     produces different water counts and atom ordering, so a freshly
@@ -531,7 +609,11 @@ class TestPrepareSimulationResumeTopologyGuard:
 
         ctx = sb.prepare_simulation(config, tmp_path, state_xml, result)
 
-        # The function must refuse to proceed.
+        # The function must refuse to proceed. ctx is None means
+        # prepare_simulation returned before the simulation was
+        # constructed, so loadState could not have been called —
+        # we don't need to assert on sim.loaded_state (the sim was
+        # never created in this branch).
         assert ctx is None, "prepare_simulation must return None on corrupt checkpoint"
         assert "topology" in result.error.lower() or "checkpoint" in result.error.lower()
 
@@ -565,6 +647,7 @@ class TestPrepareSimulationResumeTopologyGuard:
 
         ctx = sb.prepare_simulation(config, tmp_path, state_xml, result)
 
+        # Same fail-fast: ctx is None before the simulation is built.
         assert ctx is None
         assert "topology" in result.error.lower() or "checkpoint" in result.error.lower()
 
@@ -609,6 +692,13 @@ class TestPrepareSimulationResumeTopologyGuard:
         # metadata still populated
         assert result.num_atoms == 99
         assert result.topology_path == str(tmp_path / "topology.pdb")
+        # loadState is the dangerous call — pin that it IS called
+        # here (the inverse of the fail-fast tests above). Without
+        # this assertion, a regression that silently skips loadState
+        # would slip through.
+        sim = sys.modules["openmm.app"].Simulation.last_instance
+        assert sim is not None
+        assert sim.loaded_state == state_xml
         # The file should not have been touched (the stub doesn't
         # call writeFile, but the size check confirms the stub's
         # write_file=False branch was taken).
@@ -793,74 +883,3 @@ def _stub_system_builder(
     )
     monkeypatch.setattr(sb, "assemble_system", lambda *a, **kw: (MagicMock(), MagicMock()))
     monkeypatch.setattr(sb, "add_ca_restraint", lambda *a, **kw: (MagicMock(), []))
-
-
-# ---------------------------------------------------------------------------
-# Missing-OpenMM import path (direct test of system_builder.prepare_simulation)
-# ---------------------------------------------------------------------------
-
-
-class TestPrepareSimulationMissingOpenMM:
-    """Regression: the import-blocker branch in
-    ``system_builder.prepare_simulation`` must set result.error and
-    return None. Test the production code path directly rather than
-    mocking prepare_simulation at the runner layer.
-    """
-
-    def test_missing_openmm_sets_error_and_returns_none(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The import-blocker branch in ``system_builder.prepare_simulation``
-        must set ``result.error`` and return None. We test the
-        production path by removing ``openmm`` and ``openmm.app`` from
-        ``sys.modules`` so the local ``import openmm`` and
-        ``import openmm.app as app`` inside ``prepare_simulation`` both
-        raise ImportError.
-        """
-
-        # Make every openmm.* lookup raise ImportError. Use a sentinel
-        # module whose __getattr__ raises. openmm has no submodule "app"
-        # attribute, so Python falls back to sys.modules['openmm.app']
-        # which we also replace with the sentinel.
-        class _Missing(types.ModuleType):
-            def __getattr__(self, name: str) -> object:  # type: ignore[no-untyped-def]
-                raise ImportError(
-                    "No module named 'openmm' (test simulation for "
-                    "system_builder.prepare_simulation import branch)"
-                )
-
-        for name in list(sys.modules):
-            if name == "openmm" or name.startswith("openmm."):
-                monkeypatch.delitem(sys.modules, name, raising=False)
-
-        import importlib
-
-        missing = _Missing("openmm")
-        missing_app = _Missing("openmm.app")
-        missing_internal = _Missing("openmm.app.internal")
-        missing_internal.pdbstructure = _Missing("openmm.app.internal.pdbstructure")
-        monkeypatch.setitem(sys.modules, "openmm", missing)
-        monkeypatch.setitem(sys.modules, "openmm.app", missing_app)
-        monkeypatch.setitem(sys.modules, "openmm.app.internal", missing_internal)
-        monkeypatch.setitem(
-            sys.modules, "openmm.app.internal.pdbstructure", missing_internal.pdbstructure
-        )
-
-        # Force a fresh import of the system_builder so the next
-        # prepare_simulation call sees the missing modules.
-        if "biolab_runners.openmm.system_builder" in sys.modules:
-            monkeypatch.delitem(sys.modules, "biolab_runners.openmm.system_builder", raising=False)
-        sb = importlib.import_module("biolab_runners.openmm.system_builder")
-
-        config = OpenMMConfig(
-            receptor_pdb="receptor.pdb",
-            peptide_pdb="peptide.pdb",
-            output_dir=str(tmp_path),
-            openmm_platform="CPU",
-        )
-        result = SimulationResult(config=config)
-        ctx = sb.prepare_simulation(config, tmp_path, None, result)
-
-        assert ctx is None
-        assert "not installed" in result.error
-        assert "openmm" in result.error.lower()
