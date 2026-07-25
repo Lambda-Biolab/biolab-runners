@@ -63,12 +63,21 @@ class SimulationContext:
 # (``checkpoint.json``) is the source of truth for the saved step
 # and the state file to load. ``energy.csv`` is also kept in the
 # quarantine because it carries the per-step reporter rows and the
-# user may want to inspect a stale trajectory step-by-step. The
-# state files are generation-versioned (``state.<step>_<pid>_<nanos>.xml``)
-# and are glogbed in the quarantine (see :func:`quarantine_stale_checkpoint`).
+# user may want to inspect a stale trajectory step-by-step.
+#
+# ``early_abort.json`` is the generation-scoped terminal marker
+# written when the offline-mdtraj gate fires (see
+# :func:`OpenMMRunner._write_abort_metadata`). v9: a forced fresh
+# run must retire this marker together with the rest, otherwise a
+# stale marker from a previous abort run will be re-read by
+# :func:`biolab_runners.openmm.utils.is_run_complete` and
+# mis-classify a mid-production checkpoint as terminal. The marker
+# is generation-scoped by the manifest step — see the
+# ``force=True quarantine`` rule in AGENTS.md.
 RESUMABLE_FILES: tuple[str, ...] = (
     FileNames.CHECKPOINT_JSON,
     FileNames.ENERGY,
+    FileNames.EARLY_ABORT_JSON,
 )
 # Glob pattern for state files. Matches both legacy ``state.xml``
 # (from pre-v7 runs) and the v7 ``state.<step>_<pid>_<nanos>.xml``.

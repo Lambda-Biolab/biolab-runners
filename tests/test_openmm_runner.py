@@ -1792,3 +1792,350 @@ class TestFinalizeResultStateXmlPath:
         assert result.error == ""
         # The skip path populated state_xml_path from the manifest.
         assert result.state_xml_path == str(out / state_basename)
+
+
+class TestForceTrueQuarantinesEarlyAbortMarker:
+    """v9 BLOCKER #1 regression: ``runner.run(force=True)`` must
+    retire the ``early_abort.json`` marker together with the
+    manifest, the energy log, and every state file. A stale marker
+    would otherwise be re-read by :func:`is_run_complete` and
+    mis-classify a subsequent fresh run's intermediate checkpoint
+    as terminal.
+
+    The scenario from the reviewer:
+
+    1. Run A terminates via the early-abort gate and writes
+       ``early_abort.json``.
+    2. The user invokes ``force=True``.
+    3. Run B starts fresh and writes an intermediate checkpoint.
+    4. Run B is interrupted.
+    5. The next non-forced invocation reads Run B's valid
+       intermediate manifest AND Run A's stale ``early_abort.json``
+       and incorrectly skips Run B as terminal.
+
+    The fix is quarantine: ``force=True`` moves the marker to
+    ``.stale/<UTC>/early_abort.json`` BEFORE the fresh build, so
+    Run B can never see it.
+    """
+
+    def _populate_early_aborted_run(self, out: Path, abort_step: int) -> str:
+        """Set up a directory representing an early-aborted run.
+
+        Returns the state basename (so tests can reference it)."""
+        state_basename = f"state.{abort_step}_12345_1700000000000.xml"
+        (out / state_basename).write_text("<STATE/>")
+        (out / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": abort_step, "file": state_basename}]})
+        )
+        (out / "energy.csv").write_text(f"#step,time\n{abort_step},{abort_step}\n")
+        abort_meta = {
+            "aborted": True,
+            "abort_reason": "early_dissociation",
+            "abort_step": abort_step,
+            "abort_ns": round(abort_step * 2.0 / 1e6, 2),
+            "gate": "offline_mdtraj",
+        }
+        (out / "early_abort.json").write_text(json.dumps(abort_meta))
+        return state_basename
+
+    def test_force_true_quarantines_early_abort_marker(self, tmp_path: Path) -> None:
+        """force=True moves early_abort.json to .stale/<UTC>/."""
+        out = tmp_path / "output"
+        out.mkdir()
+        self._populate_early_aborted_run(out, abort_step=5_000_000)
+
+        config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
+        runner = OpenMMRunner(config)
+        resume = runner._resolve_skip_or_resume(
+            force=True, output_dir=out, config=config, result=SimulationResult(config=config)
+        )
+        assert resume is not None
+
+        # early_abort.json is gone from the output dir.
+        assert not (out / "early_abort.json").exists()
+        # And it lives in the .stale/<UTC>/ directory.
+        stale_dirs = list((out / ".stale").iterdir())
+        assert len(stale_dirs) == 1
+        stale_dir = stale_dirs[0]
+        assert (stale_dir / "early_abort.json").exists()
+        assert (stale_dir / "checkpoint.json").exists()
+        assert (stale_dir / "energy.csv").exists()
+
+    def test_force_true_then_intermediate_checkpoint_resumes(self, tmp_path: Path) -> None:
+        """The full BLOCKER #1 scenario end-to-end:
+
+        1. Run A aborts, leaves early_abort.json.
+        2. force=True → marker quarantined.
+        3. Run B writes an intermediate checkpoint (manifest at
+           step 5_000_000, below the 50_200_000 target).
+        4. A subsequent non-forced invocation must RESUME (not
+           skip as terminal) because the stale marker was moved
+           out by force=True.
+        """
+        out = tmp_path / "output"
+        out.mkdir()
+        self._populate_early_aborted_run(out, abort_step=5_000_000)
+
+        config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
+        runner = OpenMMRunner(config)
+
+        # Step 2: forced run quarantines everything.
+        runner._resolve_skip_or_resume(
+            force=True,
+            output_dir=out,
+            config=config,
+            result=SimulationResult(config=config),
+        )
+        assert not (out / "early_abort.json").exists()
+
+        # Step 3: simulate Run B writing an intermediate checkpoint.
+        # v9 binding: the new manifest's step and the (would-be)
+        # abort step are absolute. Run B started fresh, so it would
+        # reach the 200_000-equil endpoint before any production.
+        intermediate_step = config.total_equil_steps + 1_000_000
+        state_basename = f"state.{intermediate_step}_1_1.xml"
+        (out / state_basename).write_text("<NEW_STATE/>")
+        (out / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": intermediate_step, "file": state_basename}]})
+        )
+        (out / "energy.csv").write_text(f"#step,time\n{intermediate_step},{intermediate_step}\n")
+
+        # Step 4: a non-forced invocation must RESUME, not skip.
+        result = SimulationResult(config=config)
+        resume = runner._resolve_skip_or_resume(
+            force=False, output_dir=out, config=config, result=result
+        )
+        assert resume is not None, (
+            f"After force=True quarantined the abort marker, a subsequent "
+            f"intermediate checkpoint must resume; got result.error={result.error!r}"
+        )
+        start_step, remaining_steps, resume_xml = resume
+        assert start_step == intermediate_step
+        # remaining = total_steps - production_done
+        production_done = intermediate_step - config.total_equil_steps
+        assert remaining_steps == config.total_steps - production_done
+        assert resume_xml == str(out / state_basename)
+
+    def test_successful_forced_rerun_leaves_no_stale_marker(self, tmp_path: Path) -> None:
+        """After force=True, a successful fresh run that completes
+        normally must not leave any trace of the previous abort
+        marker. A downstream consumer looking at ``early_abort.json``
+        must see "no marker"."""
+        out = tmp_path / "output"
+        out.mkdir()
+        self._populate_early_aborted_run(out, abort_step=5_000_000)
+
+        config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
+        runner = OpenMMRunner(config)
+        # force=True quarantines the marker.
+        runner._resolve_skip_or_resume(
+            force=True,
+            output_dir=out,
+            config=config,
+            result=SimulationResult(config=config),
+        )
+        # Simulate a normal completion: manifest at the END step.
+        target = config.total_equil_steps + config.total_steps
+        state_basename = f"state.{target}_1_1.xml"
+        (out / state_basename).write_text("<FINAL_STATE/>")
+        (out / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": target, "file": state_basename}]})
+        )
+
+        # No early_abort.json should be present (the successful
+        # run did not abort; the stale marker was moved to .stale/).
+        assert not (out / "early_abort.json").exists()
+        # The is_run_complete check should classify this as
+        # "normal completion", not early_abort.
+        from biolab_runners.openmm.utils import is_run_complete
+
+        complete, reason = is_run_complete(out, config)
+        assert complete is True
+        assert reason.startswith("normal_completion_step_"), (
+            f"successful forced rerun must not be classified as early_abort; got {reason!r}"
+        )
+
+
+class TestIsRunCompleteValidatesAbortStep:
+    """v9 SUGGESTION regression: ``is_run_complete`` must safely
+    validate ``abort_step`` — reject zero, missing, or
+    non-integer-convertible values."""
+
+    def test_abort_step_zero_is_not_terminal(self, tmp_path: Path) -> None:
+        """abort_step=0 means the marker has no meaningful step —
+        treat as in_progress, not terminal."""
+        from biolab_runners.openmm.utils import is_run_complete
+
+        config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
+        (tmp_path / "early_abort.json").write_text(
+            json.dumps({"aborted": True, "abort_reason": "x", "abort_step": 0})
+        )
+        complete, reason = is_run_complete(tmp_path, config)
+        assert complete is False
+        assert reason == "in_progress"
+
+    def test_abort_step_missing_is_not_terminal(self, tmp_path: Path) -> None:
+        """abort_step field missing → not terminal."""
+        from biolab_runners.openmm.utils import is_run_complete
+
+        config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
+        (tmp_path / "early_abort.json").write_text(json.dumps({"aborted": True}))
+        complete, reason = is_run_complete(tmp_path, config)
+        assert complete is False
+        assert reason == "in_progress"
+
+    def test_abort_step_invalid_type_does_not_raise(self, tmp_path: Path) -> None:
+        """abort_step="not_a_number" must not raise TypeError/ValueError;
+        the marker is invalid → not terminal."""
+        from biolab_runners.openmm.utils import is_run_complete
+
+        config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
+        (tmp_path / "early_abort.json").write_text(
+            json.dumps({"aborted": True, "abort_step": "not_a_number"})
+        )
+        # Must not raise.
+        complete, reason = is_run_complete(tmp_path, config)
+        assert complete is False
+        assert reason == "in_progress"
+
+    def test_abort_step_list_does_not_raise(self, tmp_path: Path) -> None:
+        """abort_step as a list (or any non-int) must not raise."""
+        from biolab_runners.openmm.utils import is_run_complete
+
+        config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
+        (tmp_path / "early_abort.json").write_text(
+            json.dumps({"aborted": True, "abort_step": [1, 2, 3]})
+        )
+        complete, reason = is_run_complete(tmp_path, config)
+        assert complete is False
+        assert reason == "in_progress"
+
+    def test_abort_step_positive_is_terminal(self, tmp_path: Path) -> None:
+        """abort_step > 0 + aborted=True → terminal."""
+        from biolab_runners.openmm.utils import is_run_complete
+
+        config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
+        (tmp_path / "early_abort.json").write_text(
+            json.dumps({"aborted": True, "abort_step": 5_000_000})
+        )
+        complete, reason = is_run_complete(tmp_path, config)
+        assert complete is True
+        assert reason == "early_abort_step_5000000"
+
+
+class TestEarlyAbortResultReconstruction:
+    """v9 BLOCKER #2 regression: an early-aborted run reused
+    idempotently must return a result with ``early_abort=True``,
+    ``abort_reason``, and ``total_ns`` populated from the validated
+    abort metadata. Without this fix, a downstream consumer
+    reading ``md_result.json`` would interpret the run as normal
+    completion (default ``early_abort=False``,
+    ``abort_reason=""``, ``total_ns=0.0``).
+    """
+
+    def _setup_early_aborted_dir(self, out: Path) -> tuple[int, float, str]:
+        """Create an early-aborted run directory.
+
+        Returns (absolute_step, abort_ns, state_basename)."""
+        config_path = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
+        absolute_step = config_path.total_equil_steps + 5_000_000  # mid-production abort
+        absolute_ns = round(absolute_step * 2.0 / 1e6, 2)
+        state_basename = f"state.{absolute_step}_1_1.xml"
+        (out / state_basename).write_text("<STATE/>")
+        (out / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": absolute_step, "file": state_basename}]})
+        )
+        (out / "energy.csv").write_text(f"#step,time\n{absolute_step},{absolute_ns}\n")
+        abort_meta = {
+            "aborted": True,
+            "abort_reason": "early_dissociation",
+            "abort_step": absolute_step,
+            "abort_ns": absolute_ns,
+            "gate": "offline_mdtraj",
+        }
+        (out / "early_abort.json").write_text(json.dumps(abort_meta))
+        return absolute_step, absolute_ns, state_basename
+
+    def test_skip_path_reconstructs_early_abort_result(self, tmp_path: Path) -> None:
+        """runner.run() on an early-aborted directory must return
+        a result with ``early_abort=True``, ``abort_reason`` set,
+        and ``total_ns`` matching the marker."""
+        out = tmp_path / "output"
+        out.mkdir()
+        _step, absolute_ns, state_basename = self._setup_early_aborted_dir(out)
+
+        config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
+        runner = OpenMMRunner(config)
+        result = runner.run()
+        assert result.error == ""
+        # The skip path populated early_abort from the marker.
+        assert result.early_abort is True, (
+            f"early_aborted run must report early_abort=True; got {result.early_abort}"
+        )
+        assert result.abort_reason == "early_dissociation"
+        assert result.total_ns == absolute_ns
+        # Artifact paths still set.
+        assert result.state_xml_path == str(out / state_basename)
+
+    def test_skip_path_reconstructs_with_default_ns_if_marker_missing(self, tmp_path: Path) -> None:
+        """If the marker is missing or invalid, the reconstruction
+        leaves early_abort=False (the run is not classified as a
+        terminal early abort). The reviewer wants this surfaced —
+        don't silently fall back to early_abort=True."""
+        from biolab_runners.openmm.utils import is_run_complete
+
+        out = tmp_path / "output"
+        out.mkdir()
+        self._setup_early_aborted_dir(out)
+        # Corrupt the marker.
+        (out / "early_abort.json").write_text("not json {{{")
+
+        config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
+        # is_run_complete returns in_progress (corrupt marker).
+        complete, _reason = is_run_complete(out, config)
+        assert complete is False
+        # Resume rather than skip.
+        runner = OpenMMRunner(config)
+        result = runner.run()
+        # The run wasn't classified as terminal → not idempotent skip.
+        # Either resumed (and got errored due to no OpenMM) or set up
+        # the result state; either way, the test only asserts that
+        # early_abort stays False (the default).
+        assert result.early_abort is False
+
+
+class TestAbortMarkerBoundToAbsoluteStep:
+    """v9 binding: the ``abort_step`` field in ``early_abort.json``
+    must be the ABSOLUTE OpenMM step (same as the manifest's step),
+    not the invocation-local ``steps_done``. The marker is the
+    self-consistent record of "the gate fired at absolute step X"
+    — binding it to the local counter would let a resumed run
+    record a different abort_step than the manifest's step."""
+
+    def test_write_abort_metadata_uses_absolute_step(self, tmp_path: Path) -> None:
+        """The metadata written by ``_write_abort_metadata`` records
+        the absolute step passed in (not the local step)."""
+        from biolab_runners.openmm.runner import OpenMMRunner
+
+        verdict = MagicMock()
+        verdict.reason = "early_dissociation"
+        verdict.rmsd_5ns = 5.0
+        verdict.rmsd_10ns = 6.0
+        verdict.max_rmsd = 7.0
+        verdict.slope_a_per_ns = 0.5
+        verdict.receptor_fit_residual = 1.2
+
+        OpenMMRunner._write_abort_metadata(
+            verdict,
+            tmp_path,
+            abort_thresh=5.0,
+            config=OpenMMConfig(target="demo", peptide_id="PEP001"),
+            absolute_step=2_345_678,
+            absolute_ns=round(2_345_678 * 2.0 / 1e6, 2),
+        )
+        meta = json.loads((tmp_path / "early_abort.json").read_text())
+        assert meta["abort_step"] == 2_345_678
+        assert meta["abort_reason"] == "early_dissociation"
+        assert meta["gate"] == "offline_mdtraj"
+        assert meta["target"] == "demo"
+        assert meta["peptide_id"] == "PEP001"

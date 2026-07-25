@@ -56,6 +56,7 @@ from biolab_runners.openmm.system_builder import (
 from biolab_runners.openmm.utils import (
     InvalidCheckpointError,
     is_run_complete,
+    load_abort_metadata,
     load_checkpoint,
 )
 
@@ -222,11 +223,14 @@ class OpenMMRunner:
 
         1. ``force=True`` ⇒ quarantine all resumable files, then
            proceed to a fresh build. The quarantine moves the
-           manifest, the energy log, and every state file
-           (``state*.xml``) into ``output_dir/.stale/<UTC>/`` BEFORE
-           we return — so the next non-forced invocation (or this
-           one, if interrupted mid-build) cannot pair a stale
-           state with a fresh topology.
+           manifest, the energy log, every state file
+           (``state*.xml``), AND the generation-scoped terminal
+           marker ``early_abort.json`` (if present) into
+           ``output_dir/.stale/<UTC>/`` BEFORE we return — so the
+           next non-forced invocation (or this one, if interrupted
+           mid-build) cannot pair a stale state with a fresh
+           topology, AND a stale abort marker cannot mis-classify
+           a mid-production checkpoint as terminal (v9 BLOCKER #1).
 
         2. Read the manifest via :func:`load_checkpoint`. The
            function validates the referenced state file (basename,
@@ -318,6 +322,7 @@ class OpenMMRunner:
                 result.energy_path = str(output_dir / FileNames.ENERGY)
                 result.topology_path = str(output_dir / FileNames.TOPOLOGY)
                 result.state_xml_path = str(output_dir / state_file)
+                self._reconstruct_terminal_result(result, output_dir, reason)
                 return None
 
             resume_xml = str(output_dir / state_file)
@@ -376,6 +381,55 @@ class OpenMMRunner:
             return None
 
         return start_step, remaining_steps, resume_xml
+
+    @staticmethod
+    def _reconstruct_terminal_result(
+        result: SimulationResult, output_dir: Path, reason: str
+    ) -> None:
+        """Populate ``result`` from the validated abort metadata.
+
+        Called from :meth:`_resolve_skip_or_resume` when the run is
+        classified as terminal via an ``early_abort.json`` marker.
+        Without this, a downstream consumer reading
+        ``md_result.json`` would see a normal-completion result
+        (the dataclass defaults: ``early_abort=False``,
+        ``abort_reason=""``, ``total_ns=0.0``) and miss the
+        intentional early termination. The marker is bound to the
+        same absolute step as the manifest (v9 absolute-step
+        binding) so the reconstruction is self-consistent.
+
+        For normal-completion terminals (no abort marker) the
+        function is a no-op — the result's artifact paths and
+        ``state_xml_path`` are already populated by the caller.
+        """
+        if not reason.startswith("early_abort_step_"):
+            # Normal completion — caller already set the artifact
+            # paths. No-op.
+            return
+        abort_meta = load_abort_metadata(output_dir)
+        if abort_meta is None:
+            # Marker was classified as terminal but cannot be
+            # re-parsed. Log and leave result.early_abort=False so
+            # the caller notices the inconsistency.
+            logger.warning(
+                "Run classified as terminal via early-abort marker "
+                "(reason=%s) but the marker failed to re-parse; "
+                "result.early_abort is left False",
+                reason,
+            )
+            return
+        result.early_abort = True
+        result.abort_reason = str(abort_meta.get("abort_reason", ""))
+        try:
+            abort_ns_raw = abort_meta.get("abort_ns", 0.0)
+            result.total_ns = float(str(abort_ns_raw))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            result.total_ns = 0.0
+        logger.info(
+            "Reconstructing early-abort result: reason=%r ns=%.2f",
+            result.abort_reason,
+            result.total_ns,
+        )
 
     def _prepare_simulation(
         self,
@@ -842,10 +896,18 @@ class OpenMMRunner:
             # Atomic save: state file + manifest committed together.
             # The manifest's step is the absolute OpenMM step
             # (``start_step + steps_done``), not the local counter.
+            # The abort metadata is bound to the SAME absolute step
+            # so the marker and the manifest are self-consistent.
             absolute_step = start_step + steps_done
+            absolute_ns = absolute_step * config.timestep_fs / 1e6
             _atomic_save_checkpoint(simulation, output_dir, absolute_step)
             OpenMMRunner._write_abort_metadata(
-                verdict, output_dir, abort_thresh, config, steps_done, ns_at_check
+                verdict,
+                output_dir,
+                abort_thresh,
+                config,
+                absolute_step=absolute_step,
+                absolute_ns=absolute_ns,
             )
             return True, verdict.reason
 
@@ -860,10 +922,21 @@ class OpenMMRunner:
         output_dir: Path,
         abort_thresh: float,
         config: OpenMMConfig,
-        steps_done: int,
-        ns_at_check: float,
+        *,
+        absolute_step: int,
+        absolute_ns: float,
     ) -> None:
-        """Build and write early_abort.json for a gate abort verdict."""
+        """Build and write early_abort.json for a gate abort verdict.
+
+        ``absolute_step`` and ``absolute_ns`` are the OpenMM step
+        and corresponding ns at the moment the gate fired. They are
+        the SAME values the atomic save just committed to the
+        manifest, so the abort marker and the manifest are
+        self-consistent. v9: an inconsistency between the two would
+        let a forced rerun leave a stale abort marker that is
+        misinterpreted by downstream consumers (see the
+        ``force=True quarantine`` rule in AGENTS.md).
+        """
         # Schema matches the pre-task-#10 inside-OpenMM abort contract
         # consumed by ``oral_amp.cloud.openmm_cloud``.
         primary_rmsd = (
@@ -876,8 +949,8 @@ class OpenMMRunner:
         abort_meta = {
             "aborted": True,
             "abort_reason": verdict.reason,
-            "abort_step": steps_done,
-            "abort_ns": round(ns_at_check, 2),
+            "abort_step": absolute_step,
+            "abort_ns": round(absolute_ns, 2),
             "peptide_ca_rmsd_A": round(primary_rmsd, 2),
             "peptide_ca_rmsd_5ns_A": (
                 round(verdict.rmsd_5ns, 2) if verdict.rmsd_5ns is not None else None
@@ -897,12 +970,13 @@ class OpenMMRunner:
         }
         (output_dir / FileNames.EARLY_ABORT_JSON).write_text(json.dumps(abort_meta, indent=2))
         logger.warning(
-            "EARLY ABORT (%s): RMSD 5ns=%s 10ns=%s max=%.2f Å @ %.1f ns",
+            "EARLY ABORT (%s): RMSD 5ns=%s 10ns=%s max=%.2f Å @ step %d (%.2f ns)",
             verdict.reason,
             f"{verdict.rmsd_5ns:.2f}" if verdict.rmsd_5ns is not None else "n/a",
             f"{verdict.rmsd_10ns:.2f}" if verdict.rmsd_10ns is not None else "n/a",
             verdict.max_rmsd,
-            ns_at_check,
+            absolute_step,
+            absolute_ns,
         )
 
     @staticmethod

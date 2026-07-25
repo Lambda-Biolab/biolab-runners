@@ -158,9 +158,16 @@ def is_run_complete(output_dir: Path, config: OpenMMConfig) -> tuple[bool, str]:
        counts.
 
     2. **Intentional early termination**: ``early_abort.json`` exists
-       with ``aborted=True`` and a positive ``abort_step``. The
-       atomically-committed abort metadata is the explicit terminal
-       marker for the offline-mdtraj gate.
+       with ``aborted=True`` AND a positive integer ``abort_step``.
+       The atomically-committed abort metadata is the explicit
+       terminal marker for the offline-mdtraj gate. v9: the
+       ``abort_step`` field is required and must parse as a
+       positive integer — a missing, zero, or malformed step is
+       treated as "marker invalid → run is in progress" rather
+       than terminal. The marker is generation-scoped (bound to the
+       manifest step in :func:`OpenMMRunner._write_abort_metadata`)
+       and is moved by ``force=True`` quarantine so a fresh run
+       cannot be mis-classified by a stale marker.
 
     Otherwise the run is in progress (or interrupted) and the
     caller should resume.
@@ -173,8 +180,8 @@ def is_run_complete(output_dir: Path, config: OpenMMConfig) -> tuple[bool, str]:
     Returns:
         ``(complete, reason)``. ``complete`` is True for the two
         terminal cases; ``reason`` is a human-readable explanation
-        (e.g. ``"normal_completion_50_200_000"``,
-        ``"early_abort_aborted"`` or ``"in_progress"``).
+        (e.g. ``"normal_completion_step_50_200_000"``,
+        ``"early_abort_step_5_000_000"`` or ``"in_progress"``).
     """
     manifest_step, _ = load_checkpoint(output_dir)
     if manifest_step > 0:
@@ -189,10 +196,55 @@ def is_run_complete(output_dir: Path, config: OpenMMConfig) -> tuple[bool, str]:
         except (json.JSONDecodeError, OSError):
             abort_meta = {}
         if abort_meta.get("aborted") is True:
-            abort_step = int(abort_meta.get("abort_step", 0))
-            return True, f"early_abort_step_{abort_step}"
+            # Safely validate abort_step — must be a positive
+            # integer. The previous behaviour passed through
+            # ``abort_step=0`` (missing field default) or raised
+            # ``TypeError``/``ValueError`` on non-int-convertible
+            # strings. Both cases are now treated as "marker
+            # invalid" rather than terminal.
+            try:
+                abort_step = int(abort_meta.get("abort_step", 0))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                abort_step = 0
+            if abort_step > 0:
+                return True, f"early_abort_step_{abort_step}"
 
     return False, "in_progress"
+
+
+def load_abort_metadata(output_dir: Path) -> dict[str, object] | None:
+    """Load and validate ``early_abort.json`` if it is a terminal marker.
+
+    Returns the parsed JSON dict when ``aborted is True`` AND
+    ``abort_step`` parses as a positive integer. Returns ``None``
+    otherwise (missing file, malformed JSON, invalid marker).
+    The validation gates match :func:`is_run_complete` so a
+    terminal classification is always paired with metadata that
+    reconstructs the abort result.
+
+    Args:
+        output_dir: MD output directory.
+
+    Returns:
+        The parsed abort metadata dict, or ``None`` if the marker
+        is missing or invalid.
+    """
+    abort_path = output_dir / FileNames.EARLY_ABORT_JSON
+    if not abort_path.exists():
+        return None
+    try:
+        abort_meta = json.loads(abort_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    if abort_meta.get("aborted") is not True:
+        return None
+    try:
+        abort_step = int(abort_meta.get("abort_step", 0))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if abort_step <= 0:
+        return None
+    return abort_meta
 
 
 def _validate_state_file_reference(output_dir: Path, state_file: str) -> Path:
