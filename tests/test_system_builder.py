@@ -7,12 +7,13 @@ smoke_test/run_smoke.py driver (requires real OpenMM + GPU).
 
 from __future__ import annotations
 
+import json
 import sys
 import types
 from pathlib import Path
 from unittest.mock import MagicMock
 
-import pytest  # noqa: TC002  # used in helper annotations only
+import pytest  # used in helper annotations only
 from biolab_runners.openmm.config import OpenMMConfig, SimulationResult
 from biolab_runners.openmm.system_builder import (
     SimulationContext,
@@ -723,6 +724,84 @@ class TestPrepareSimulationResumeTopologyGuard:
         # call writeFile, but the size check confirms the stub's
         # write_file=False branch was taken).
         assert (tmp_path / "topology.pdb").stat().st_size == original_size
+
+
+class TestAtomicSaveCheckpoint:
+    """Regression tests for the v6 BLOCKER: ``_atomic_save_checkpoint``
+    must commit ``state.xml`` and the step manifest together, so
+    that a crash mid-save cannot leave a stale state whose step
+    does not match the manifest.
+
+    The previous protocol saved only ``state.xml`` and derived the
+    saved step from the last row of ``energy.csv``. That was unsafe:
+    the two files advance at very different cadences.
+    """
+
+    def test_writes_state_and_manifest_atomically(self, tmp_path: Path) -> None:
+        """Both files are present after the call, and the manifest's
+        step matches the value passed in."""
+        from biolab_runners.openmm.system_builder import _atomic_save_checkpoint
+
+        sim = MagicMock()
+        sim.saveState = MagicMock(side_effect=lambda path: Path(path).write_text("<State/>"))
+
+        state_path = tmp_path / "state.xml"
+        _atomic_save_checkpoint(sim, str(state_path), tmp_path, step=42_000)
+
+        assert state_path.exists()
+        manifest_path = tmp_path / "checkpoint.json"
+        assert manifest_path.exists()
+        manifest = json.loads(manifest_path.read_text())
+        assert manifest["records"][-1]["step"] == 42_000
+
+    def test_interrupted_save_leaves_no_inconsistent_pair(self, tmp_path: Path) -> None:
+        """If simulation.saveState raises mid-save, neither canonical
+        file is touched. The runner sees no checkpoint on the next
+        invocation and proceeds fresh — no possibility of pairing
+        a stale state with the wrong manifest step."""
+        from biolab_runners.openmm.system_builder import _atomic_save_checkpoint
+
+        def exploding_save_state(path: str) -> None:
+            # Simulate a crash mid-save: leave the temp file but raise
+            # before the atomic rename. The canonical files must
+            # remain untouched.
+            Path(path).write_text("<State/>")
+            raise RuntimeError("simulated disk-full interrupt")
+
+        sim = MagicMock()
+        sim.saveState = MagicMock(side_effect=exploding_save_state)
+
+        state_path = tmp_path / "state.xml"
+        manifest_path = tmp_path / "checkpoint.json"
+        # Pre-create stale canonical files to prove the interrupt
+        # did NOT clobber them.
+        state_path.write_text("<OLD_STATE/>")
+        manifest_path.write_text(json.dumps({"records": [{"step": 1}]}))
+
+        with pytest.raises(RuntimeError, match="simulated"):
+            _atomic_save_checkpoint(sim, str(state_path), tmp_path, step=99_999)
+
+        # Canonical files are untouched — the old state and manifest
+        # are still there. The runner would see a valid (old) pair
+        # and resume from it, or fail-fast if the manifest doesn't
+        # match, but never a fresh state with no manifest.
+        assert state_path.read_text() == "<OLD_STATE/>"
+        assert json.loads(manifest_path.read_text())["records"][-1]["step"] == 1
+
+    def test_overwrites_previous_checkpoint(self, tmp_path: Path) -> None:
+        """A second atomic save replaces the canonical files. The
+        manifest's step matches the latest call."""
+        from biolab_runners.openmm.system_builder import _atomic_save_checkpoint
+
+        sim = MagicMock()
+        sim.saveState = MagicMock(side_effect=lambda path: Path(path).write_text("<State/>"))
+
+        state_path = tmp_path / "state.xml"
+        _atomic_save_checkpoint(sim, str(state_path), tmp_path, step=10_000)
+        _atomic_save_checkpoint(sim, str(state_path), tmp_path, step=20_000)
+
+        manifest = json.loads((tmp_path / "checkpoint.json").read_text())
+        assert manifest["records"][-1]["step"] == 20_000
 
 
 def _make_fake_modeller(chains: list[object], num_atoms: int) -> object:

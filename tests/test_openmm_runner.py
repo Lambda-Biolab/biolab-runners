@@ -330,9 +330,23 @@ class TestLoadCheckpointStep:
         (tmp_path / "checkpoint.json").write_text(json.dumps(ckpt))
         assert load_checkpoint_step(tmp_path) == 2000000
 
-    def test_energy_csv_fallback(self, tmp_path: Path) -> None:
+    def test_no_manifest_returns_zero(self, tmp_path: Path) -> None:
+        """Only checkpoint.json is the authoritative source now.
+
+        The previous energy.csv fallback was removed because energy.csv
+        advances at save_every_steps while state.xml saves at
+        checkpoint_every_steps — they can be many hours of steps
+        apart, and using the energy row would silently shorten the
+        run. The runner's fail-fast for orphaned state.xml is
+        covered in ``TestOrphanedStateFailsFast``.
+        """
         (tmp_path / "energy.csv").write_text("#step,time\n5000,10\n10000,20\n15000,30\n")
-        assert load_checkpoint_step(tmp_path) == 15000
+        assert load_checkpoint_step(tmp_path) == 0
+
+    def test_malformed_manifest_returns_zero(self, tmp_path: Path) -> None:
+        """A manifest that won't parse returns 0 — same as missing."""
+        (tmp_path / "checkpoint.json").write_text("not json {{{")
+        assert load_checkpoint_step(tmp_path) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -381,9 +395,9 @@ class TestOpenMMRunner:
         that the runner surfaces a missing-OpenMM error to the
         caller. The actual ``try: import openmm ... except
         ImportError`` code path in system_builder.prepare_simulation
-        is covered by ``test_prepare_simulation_missing_openmm`` in
-        test_system_builder.py (subprocess-based for Python-version
-        independence).
+        is covered by ``TestPrepareSimulationMissingOpenMM`` in
+        test_system_builder.py, which uses an in-process
+        ``sys.meta_path`` import blocker (Python-version-independent).
         """
         from biolab_runners.openmm import runner as runner_mod
 
@@ -418,7 +432,9 @@ class TestResumeAccounting:
         config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
         # Simulate checkpoint after full equil (200k steps) + 1 ns production (500k steps)
         checkpoint_step = config.total_equil_steps + 500_000
-        (out / "energy.csv").write_text(f"#step,time\n{checkpoint_step},{checkpoint_step}\n")
+        # The atomic-save manifest is the authoritative source for the
+        # saved step — energy.csv is no longer consulted for resume.
+        (out / "checkpoint.json").write_text(json.dumps({"records": [{"step": checkpoint_step}]}))
         (out / "state.xml").write_text("<State/>")
 
         runner = OpenMMRunner(config)
@@ -437,7 +453,7 @@ class TestResumeAccounting:
 
         config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
         checkpoint_step = config.total_equil_steps  # just finished equilibration
-        (out / "energy.csv").write_text(f"#step,time\n{checkpoint_step},{checkpoint_step}\n")
+        (out / "checkpoint.json").write_text(json.dumps({"records": [{"step": checkpoint_step}]}))
         (out / "state.xml").write_text("<State/>")
 
         runner = OpenMMRunner(config)
@@ -570,6 +586,174 @@ class TestForceTrueQuarantine:
         )
 
 
+class TestOrphanedStateFailsFast:
+    """Regression tests for the v6 BLOCKER: a non-empty ``state.xml``
+    without a matching ``checkpoint.json`` manifest is treated as
+    orphaned and rejected.
+
+    The previous load_checkpoint_step fell back to ``energy.csv``'s
+    last row when the manifest was missing, which silently shortened
+    resumed runs (energy.csv advances at save_every_steps while
+    state.xml saves at checkpoint_every_steps — a 4-orders-of-
+    magnitude cadence difference). The v6 fix makes the manifest
+    the only authoritative source for the saved step and fails fast
+    when the state/manifest pair is broken.
+    """
+
+    def test_state_with_no_manifest_fails_fast(self, tmp_path: Path) -> None:
+        """state.xml exists, checkpoint.json missing → no resume, error set."""
+        out = tmp_path / "output"
+        out.mkdir()
+        (out / "state.xml").write_text("<State/>")
+        # No checkpoint.json — orphaned state.
+
+        config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
+        runner = OpenMMRunner(config)
+        result = SimulationResult(config=config)
+        resume = runner._resolve_skip_or_resume(
+            force=False, output_dir=out, config=config, result=result
+        )
+
+        # Must NOT return a resume tuple (would proceed to fresh build
+        # and overwrite topology.pdb, re-introducing the
+        # incompatibility class).
+        assert resume is None, "orphaned state must not be resumed"
+        assert result.error != ""
+        assert "state.xml" in result.error
+        assert "checkpoint.json" in result.error
+        assert "force=True" in result.error
+
+    def test_state_with_corrupt_manifest_fails_fast(self, tmp_path: Path) -> None:
+        """state.xml exists, checkpoint.json is malformed → no resume, error set."""
+        out = tmp_path / "output"
+        out.mkdir()
+        (out / "state.xml").write_text("<State/>")
+        (out / "checkpoint.json").write_text("{this is not json")
+
+        config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
+        runner = OpenMMRunner(config)
+        result = SimulationResult(config=config)
+        resume = runner._resolve_skip_or_resume(
+            force=False, output_dir=out, config=config, result=result
+        )
+
+        assert resume is None
+        assert result.error != ""
+        assert "checkpoint.json" in result.error
+
+    def test_orphaned_state_recovered_by_force(self, tmp_path: Path) -> None:
+        """force=True on an orphaned state quarantines the state, then
+        resumes as a fresh build (no stale state to pair against)."""
+        out = tmp_path / "output"
+        out.mkdir()
+        (out / "state.xml").write_text("<State/>")
+        # No checkpoint.json.
+
+        config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
+        runner = OpenMMRunner(config)
+        result = SimulationResult(config=config)
+        # force=True → quarantine state.xml, then no resume (state is gone).
+        resume = runner._resolve_skip_or_resume(
+            force=True, output_dir=out, config=config, result=result
+        )
+
+        assert resume is not None
+        _, _, resume_xml = resume
+        assert resume_xml == ""
+        # state.xml was moved to .stale/
+        assert not (out / "state.xml").exists()
+        stale_dirs = list((out / ".stale").iterdir())
+        assert len(stale_dirs) == 1
+        assert (stale_dirs[0] / "state.xml").exists()
+
+
+class TestResumeStepUsesManifestNotEnergy:
+    """Regression tests for the v6 BLOCKER: ``load_checkpoint_step``
+    must use the manifest (checkpoint.json), not the last row of
+    energy.csv. The two files advance at very different cadences —
+    energy.csv at save_every_steps (~10 ps), state.xml at
+    checkpoint_every_steps (~2 hr) — so the energy row can be
+    hundreds of thousands of steps ahead of the saved state.
+    """
+
+    def test_state_at_step_N_energy_at_N_plus_k_uses_manifest_step(self, tmp_path: Path) -> None:
+        """Manifest says 500_000, energy.csv says 700_000 → resume from 500_000.
+
+        The previous behaviour would have read 700_000 from energy.csv
+        and computed remaining_steps = total - 700_000, then loaded
+        the 500_000 state — silently shortening the run by 200_000
+        steps.
+        """
+        out = tmp_path / "output"
+        out.mkdir()
+        manifest_step = 500_000
+        energy_step = 700_000  # 200k steps ahead of the saved state
+        (out / "checkpoint.json").write_text(json.dumps({"records": [{"step": manifest_step}]}))
+        (out / "state.xml").write_text("<State/>")
+        (out / "energy.csv").write_text(f"#step,time\n{energy_step},{energy_step}\n")
+
+        config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
+        runner = OpenMMRunner(config)
+        resume = runner._resolve_skip_or_resume(
+            force=False, output_dir=out, config=config, result=SimulationResult(config=config)
+        )
+
+        assert resume is not None
+        start_step, remaining_steps, _ = resume
+        # The start step must be the manifest step (500_000), not the
+        # energy step (700_000). Equil was 200_000 steps, so the
+        # production-done count is 500_000 - 200_000 = 300_000.
+        assert start_step == manifest_step, (
+            f"start_step must be the manifest step ({manifest_step}), "
+            f"not the energy step ({energy_step}); got {start_step}"
+        )
+        # remaining = total_steps - production done = 50_000_000 - 300_000
+        assert remaining_steps == config.total_steps - 300_000
+
+    def test_load_checkpoint_step_ignores_energy_csv(self, tmp_path: Path) -> None:
+        """energy.csv alone no longer yields a step."""
+        (tmp_path / "energy.csv").write_text("#step,time\n5000,10\n10000,20\n15000,30\n")
+        assert load_checkpoint_step(tmp_path) == 0
+
+
+class TestQuarantineTimestampUniqueness:
+    """Regression test for the v6 SUGGESTION: rapid ``force=True``
+    invocations must not collide on the quarantine timestamp.
+
+    The previous format used second-resolution (`%Y%m%dT%H%M%SZ`)
+    combined with ``mkdir(parents=True, exist_ok=False)``. Two
+    invocations within the same second would race the existence
+    check and one would raise FileExistsError, leaving the stale
+    checkpoint in place. The v6 fix uses microsecond + PID for
+    uniqueness.
+    """
+
+    def test_two_rapid_force_calls_do_not_collide(self, tmp_path: Path) -> None:
+        """Two consecutive force=True calls in the same millisecond produce
+        distinct .stale/ directories — neither raises FileExistsError."""
+        out = tmp_path / "output"
+        out.mkdir()
+        config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
+        runner = OpenMMRunner(config)
+
+        # First invocation: populates a stale checkpoint and quarantines it.
+        (out / "state.xml").write_text("<State/>")
+        (out / "checkpoint.json").write_text(json.dumps({"records": [{"step": 1}]}))
+        result1 = SimulationResult(config=config)
+        runner._resolve_skip_or_resume(force=True, output_dir=out, config=config, result=result1)
+
+        # Second invocation: must produce a NEW .stale/<ts>/ dir, not
+        # raise FileExistsError on the first one.
+        (out / "state.xml").write_text("<State/>")  # second stale batch
+        (out / "checkpoint.json").write_text(json.dumps({"records": [{"step": 2}]}))
+        result2 = SimulationResult(config=config)
+        runner._resolve_skip_or_resume(force=True, output_dir=out, config=config, result=result2)
+
+        stale_dirs = list((out / ".stale").iterdir())
+        assert len(stale_dirs) == 2, f"expected 2 distinct .stale/ dirs, got {stale_dirs}"
+        assert stale_dirs[0] != stale_dirs[1]
+
+
 class TestIrmsdThreshold:
     """Tests for the per-config iRMSD early-abort threshold."""
 
@@ -637,11 +821,12 @@ class TestInstallSigtermHandler:
     state then exits. Critical for cloud preemption: the handler must save
     state *before* the process dies, otherwise the next run cannot resume."""
 
-    def test_sigterm_handler_is_installed(self) -> None:
+    def test_sigterm_handler_is_installed(self, tmp_path: Path) -> None:
         config = OpenMMConfig()
         OpenMMRunner._install_sigterm_handler(
             simulation=MagicMock(),
-            state_xml_path="/tmp/state.xml",
+            state_xml_path=str(tmp_path / "state.xml"),
+            output_dir=tmp_path,
             steps_box=[0],
             config=config,
         )
@@ -649,13 +834,16 @@ class TestInstallSigtermHandler:
         # the test process). Just assert signal.signal was called.
         # signal.signal is reset by pytest at session end, so no cleanup needed.
 
-    def test_handler_saves_state_using_current_step(self) -> None:
-        """The handler must call saveState with the *current* step count
-        from steps_box[0], not a stale value."""
+    def test_handler_saves_state_atomic(self, tmp_path: Path) -> None:
+        """The handler must atomically save state + manifest with the
+        *current* step count from steps_box[0], not a stale value."""
         import signal
 
         config = OpenMMConfig()
         sim = MagicMock()
+        # Make saveState actually write a file (the atomic helper
+        # calls saveState on a temp path before rename).
+        sim.saveState.side_effect = lambda path: Path(path).write_text("<State/>")
         # Capture the registered handler
         captured: dict[str, object] = {}
 
@@ -665,7 +853,8 @@ class TestInstallSigtermHandler:
         with patch("biolab_runners.openmm.runner.signal.signal", side_effect=fake_signal):
             OpenMMRunner._install_sigterm_handler(
                 simulation=sim,
-                state_xml_path="/tmp/state.xml",
+                state_xml_path=str(tmp_path / "state.xml"),
+                output_dir=tmp_path,
                 steps_box=[12345],  # current step
                 config=config,
             )
@@ -675,10 +864,16 @@ class TestInstallSigtermHandler:
         # Invoke with a non-zero current step
         with patch("biolab_runners.openmm.runner.sys.exit") as mock_exit:
             handler(signal.SIGTERM, None)  # type: ignore[arg-type, misc]
-        sim.saveState.assert_called_once_with("/tmp/state.xml")
+        # Atomic save: state.xml + checkpoint.json both exist with
+        # matching step. The state.xml path is captured by saveState
+        # via MagicMock (the temp path, not the canonical one).
+        assert sim.saveState.called
+        # Manifest records the current step from steps_box.
+        manifest = json.loads((tmp_path / "checkpoint.json").read_text())
+        assert manifest["records"][-1]["step"] == 12345
         mock_exit.assert_called_once_with(0)
 
-    def test_handler_swallows_save_state_errors(self) -> None:
+    def test_handler_swallows_save_state_errors(self, tmp_path: Path) -> None:
         """If saveState throws (disk full, permissions, etc.), the handler
         must log the error and still exit cleanly — never crash with an
         unhandled exception during cloud preemption."""
@@ -695,7 +890,8 @@ class TestInstallSigtermHandler:
         with patch("biolab_runners.openmm.runner.signal.signal", side_effect=fake_signal):
             OpenMMRunner._install_sigterm_handler(
                 simulation=sim,
-                state_xml_path="/tmp/state.xml",
+                state_xml_path=str(tmp_path / "state.xml"),
+                output_dir=tmp_path,
                 steps_box=[0],
                 config=config,
             )
@@ -704,6 +900,8 @@ class TestInstallSigtermHandler:
             captured[signal.SIGTERM](signal.SIGTERM, None)  # type: ignore[arg-type, misc]
         # Still exited cleanly even though saveState failed
         mock_exit.assert_called_once_with(0)
+        # No partial state.xml was committed.
+        assert not (tmp_path / "state.xml").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -720,7 +918,7 @@ class TestMaybeCheckpoint:
     the interval in hours, not the step count.
     """
 
-    def test_no_checkpoint_when_interval_not_elapsed(self) -> None:
+    def test_no_checkpoint_when_interval_not_elapsed(self, tmp_path: Path) -> None:
         """If less than checkpoint_every_steps since last ckpt, and not
         at the end, do nothing."""
         sim = MagicMock()
@@ -729,7 +927,8 @@ class TestMaybeCheckpoint:
         # Force steps_done to be small (not yet at the end)
         result = OpenMMRunner._maybe_checkpoint(
             simulation=sim,
-            state_xml_path="/tmp/state.xml",
+            state_xml_path=str(tmp_path / "state.xml"),
+            output_dir=tmp_path,
             steps_done=500,  # only 500 since last_ckpt_step=0
             last_ckpt_step=0,
             remaining_steps=10_000_000,
@@ -739,8 +938,13 @@ class TestMaybeCheckpoint:
         assert result == 0  # unchanged
         sim.saveState.assert_not_called()
 
-    def test_checkpoint_when_interval_elapsed(self) -> None:
+    def test_checkpoint_when_interval_elapsed(self, tmp_path: Path) -> None:
+        """Interval elapsed → atomic save writes state.xml + checkpoint.json."""
         sim = MagicMock()
+        # The atomic save helper calls saveState on a temp path then
+        # renames. Wire a side_effect so the temp file actually
+        # exists at rename time.
+        sim.saveState.side_effect = lambda path: Path(path).write_text("<State/>")
         # 1 ns @ 2.0 fs = 500 steps between checkpoints
         config = OpenMMConfig(
             timestep_fs=2.0,
@@ -748,7 +952,8 @@ class TestMaybeCheckpoint:
         )
         result = OpenMMRunner._maybe_checkpoint(
             simulation=sim,
-            state_xml_path="/tmp/state.xml",
+            state_xml_path=str(tmp_path / "state.xml"),
+            output_dir=tmp_path,
             steps_done=1500,  # > 500 since last_ckpt=0
             last_ckpt_step=0,
             remaining_steps=10_000_000,
@@ -756,19 +961,28 @@ class TestMaybeCheckpoint:
             t0=1000.0,  # fixed past time — avoids wall-clock dependency
         )
         assert result == 1500
-        sim.saveState.assert_called_once_with("/tmp/state.xml")
+        # The atomic save commits both files together.
+        assert (tmp_path / "state.xml").exists()
+        assert (tmp_path / "checkpoint.json").exists()
+        # The manifest records the exact step — load_checkpoint_step
+        # can read it back. This is the v6 BLOCKER fix: the saved
+        # step is NO LONGER inferred from energy.csv's last row.
+        manifest = json.loads((tmp_path / "checkpoint.json").read_text())
+        assert manifest["records"][-1]["step"] == 1500
 
-    def test_checkpoint_at_end_of_run(self) -> None:
+    def test_checkpoint_at_end_of_run(self, tmp_path: Path) -> None:
         """Even if the interval hasn't elapsed, checkpoint when steps_done
         reaches remaining_steps (last chunk)."""
         sim = MagicMock()
+        sim.saveState.side_effect = lambda path: Path(path).write_text("<State/>")
         config = OpenMMConfig(
             timestep_fs=2.0,
             checkpoint_interval_hours=0.1,  # 180k steps
         )
         result = OpenMMRunner._maybe_checkpoint(
             simulation=sim,
-            state_xml_path="/tmp/state.xml",
+            state_xml_path=str(tmp_path / "state.xml"),
+            output_dir=tmp_path,
             steps_done=10_000,  # at remaining_steps
             last_ckpt_step=9_500,
             remaining_steps=10_000,
@@ -776,9 +990,10 @@ class TestMaybeCheckpoint:
             t0=1000.0,  # fixed past time — avoids wall-clock dependency
         )
         assert result == 10_000
-        sim.saveState.assert_called_once()
+        assert (tmp_path / "state.xml").exists()
+        assert (tmp_path / "checkpoint.json").exists()
 
-    def test_ns_per_day_handles_zero_elapsed(self) -> None:
+    def test_ns_per_day_handles_zero_elapsed(self, tmp_path: Path) -> None:
         """If t0 == time.time() (zero elapsed), don't divide by zero.
 
         We use a t0 in the near-future so elapsed = t0 - now is negative
@@ -786,13 +1001,15 @@ class TestMaybeCheckpoint:
         the realistic case the guard must cover.
         """
         sim = MagicMock()
+        sim.saveState.side_effect = lambda path: Path(path).write_text("<State/>")
         config = OpenMMConfig(
             timestep_fs=2.0,
             checkpoint_interval_hours=500.0 / 3600.0 / 1000.0,  # 500 steps
         )
         result = OpenMMRunner._maybe_checkpoint(
             simulation=sim,
-            state_xml_path="/tmp/state.xml",
+            state_xml_path=str(tmp_path / "state.xml"),
+            output_dir=tmp_path,
             steps_done=2000,  # > 500 since last_ckpt=0 → checkpoint
             last_ckpt_step=0,
             remaining_steps=10_000_000,
@@ -801,4 +1018,5 @@ class TestMaybeCheckpoint:
         )
         # Should not raise; ns_per_day is 0 since elapsed is 0
         assert result == 2000
-        sim.saveState.assert_called_once()
+        assert (tmp_path / "state.xml").exists()
+        assert (tmp_path / "checkpoint.json").exists()

@@ -15,7 +15,9 @@ installed.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import shutil
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -57,16 +59,29 @@ class SimulationContext:
 
 
 # Files that together describe a resumable run. ``load_checkpoint_step``
-# reads ``checkpoint.json`` then falls back to ``energy.csv`` (see
+# reads ``checkpoint.json`` (the atomic-save manifest — see
 # ``biolab_runners.openmm.utils``); ``simulation.loadState`` reads
-# ``state.xml``. All three must be moved together when the user
-# invokes ``runner.run(force=True)`` — leaving any one behind means
-# the next non-forced run could re-derive a stale step from it.
+# ``state.xml``. ``energy.csv`` is also kept in the quarantine because
+# it carries the per-step reporter rows and the user may want to
+# inspect a stale trajectory step-by-step; it is no longer consulted
+# to determine the resume step (its write cadence differs from
+# state.xml saves and would silently shorten runs — see
+# ``AGENTS.md "Atomic checkpoint" rule``).
 RESUMABLE_FILES: tuple[str, ...] = (
     FileNames.STATE_XML,
     FileNames.CHECKPOINT_JSON,
     FileNames.ENERGY,
 )
+
+
+# Threshold for treating ``output_dir/topology.pdb`` as "intact"
+# enough to pair with a saved state. A solvated protein/peptide
+# topology is well over 100 KB, so a smaller file indicates
+# truncation. Used by both ``build_or_load_modeller`` (to decide
+# whether to load the on-disk topology) and ``_topology_intact`` (to
+# decide whether the resume check passes). One constant so they
+# cannot drift apart.
+_TOPOLOGY_MIN_BYTES = 100_000
 
 
 def quarantine_stale_checkpoint(output_dir: Path) -> list[Path]:
@@ -96,11 +111,14 @@ def quarantine_stale_checkpoint(output_dir: Path) -> list[Path]:
     if not existing:
         return moved
 
-    # Use UTC + second-resolution to avoid filename collisions if
-    # ``force=True`` is invoked twice in the same second. The
-    # timestamp suffix is informational — the quarantine contract
-    # is "files are out of ``output_dir``", not uniqueness.
-    ts = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
+    # Use UTC + microsecond resolution + PID to avoid filename
+    # collisions on rapid retries (e.g. a CI runner failing and
+    # immediately re-invoking force=True within the same second).
+    # The microsecond + PID combination is unique within a single
+    # host; second-resolution alone was insufficient because two
+    # concurrent invocations in the same second would race the
+    # mkdir(parents=True, exist_ok=False) below.
+    ts = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%S_%f") + f"_{os.getpid()}"
     stale_dir = output_dir / ".stale" / ts
     stale_dir.mkdir(parents=True, exist_ok=False)
 
@@ -256,7 +274,9 @@ def build_or_load_modeller(
         incompatible with the saved ``state.xml``.
     """
     topo_path = output_dir / FileNames.TOPOLOGY
-    existing_topo = topo_path if topo_path.exists() and topo_path.stat().st_size > 100_000 else None
+    existing_topo = (
+        topo_path if topo_path.exists() and topo_path.stat().st_size > _TOPOLOGY_MIN_BYTES else None
+    )
 
     if is_resuming and existing_topo:
         logger.info("Resuming: loading solvated topology from %s", existing_topo)
@@ -462,12 +482,6 @@ def prepare_simulation(
     )
 
 
-# Threshold matches the one used in ``build_or_load_modeller`` — keep
-# both in sync so the pre-build integrity check and the load-or-build
-# decision agree on what "intact" means.
-_TOPOLOGY_MIN_BYTES = 100_000
-
-
 def _topology_intact(output_dir: Path) -> bool:
     """True when ``output_dir/topology.pdb`` exists and is large enough to be real.
 
@@ -479,3 +493,72 @@ def _topology_intact(output_dir: Path) -> bool:
     """
     topo_path = output_dir / FileNames.TOPOLOGY
     return topo_path.exists() and topo_path.stat().st_size > _TOPOLOGY_MIN_BYTES
+
+
+def _atomic_save_checkpoint(
+    simulation: object,
+    state_xml_path: str | Path,
+    output_dir: Path,
+    step: int,
+) -> None:
+    """Atomically commit ``state.xml`` and the step manifest together.
+
+    Both files are first written to a per-process temp path
+    (``state.xml.tmp.<pid>.<step>`` and
+    ``checkpoint.json.tmp.<pid>.<step>``), then atomically renamed
+    to their canonical names via :func:`os.replace`. After this
+    function returns, the two files on disk are guaranteed to be in
+    sync (both present and matching, or both absent). An interrupted
+    save — SIGTERM mid-``saveState``, disk-full mid-rename, kernel
+    OOM, etc. — leaves the canonical files unchanged; the
+    ``.tmp.*`` orphans are ignored by the runner.
+
+    The previous protocol saved only ``state.xml`` and derived the
+    saved step from the last row of ``energy.csv``. That was unsafe:
+    ``energy.csv`` advances every ``save_every_steps`` (~10 ps) while
+    ``state.xml`` saves every ``checkpoint_every_steps`` (~2 hr),
+    so a crash mid-cycle would leave energy rows hundreds of thousands
+    of steps ahead of the saved state. The next run would resume from
+    the older state but compute ``remaining_steps`` from the newer
+    energy row, silently shortening the run.
+
+    Args:
+        simulation: OpenMM Simulation exposing ``saveState(path)``.
+        state_xml_path: Final destination for the saved state.
+        output_dir: Directory holding the manifest (``checkpoint.json``).
+        step: The exact step the saved state corresponds to. Written
+            into the manifest under ``{"records": [{"step": step}]}``
+            so :func:`biolab_runners.openmm.utils.load_checkpoint_step`
+            can resume from it authoritatively.
+    """
+    state_path = Path(state_xml_path)
+    manifest_path = output_dir / FileNames.CHECKPOINT_JSON
+
+    # Per-process + per-step temp suffix so two concurrent saves from
+    # the same host cannot collide (e.g. parallel CI jobs writing to
+    # the same output_dir). The step disambiguates two saves from the
+    # same process — it changes between _maybe_checkpoint calls.
+    pid = os.getpid()
+    state_tmp = state_path.with_suffix(state_path.suffix + f".tmp.{pid}.{step}")
+    manifest_tmp = manifest_path.with_suffix(manifest_path.suffix + f".tmp.{pid}.{step}")
+
+    # Write both temp files. If we crash here, neither canonical
+    # file is touched — the .tmp files are orphans and the runner
+    # sees no checkpoint on the next invocation.
+    simulation.saveState(str(state_tmp))  # type: ignore[union-attr]
+    manifest_tmp.write_text(json.dumps({"records": [{"step": step}]}))
+
+    # Atomic rename. os.replace is atomic on POSIX if src/dst are
+    # on the same filesystem (which they are here — both live in
+    # output_dir). After these two calls return, both canonical
+    # files are visible together — the resume path will find a
+    # consistent pair or no pair at all.
+    os.replace(str(state_tmp), str(state_path))
+    os.replace(str(manifest_tmp), str(manifest_path))
+
+    logger.info(
+        "Atomic checkpoint: state=%s manifest=%s step=%d",
+        state_path.name,
+        manifest_path.name,
+        step,
+    )

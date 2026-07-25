@@ -49,6 +49,7 @@ from biolab_runners.openmm.offline_gate import (
 from biolab_runners.openmm.paths import FileNames
 from biolab_runners.openmm.system_builder import (
     SimulationContext,
+    _atomic_save_checkpoint,
     prepare_simulation,
     quarantine_stale_checkpoint,
 )
@@ -219,7 +220,16 @@ class OpenMMRunner:
         if the forced run is interrupted before producing a new
         ``state.xml`` of its own.
 
-        Returns None if the simulation is already complete (result populated),
+        When a non-forced invocation finds ``state.xml`` but no valid
+        manifest (``checkpoint.json``), the saved state's step is
+        unknown — falling back to a fresh build would overwrite the
+        topology and re-introduce the incompatibility class the
+        "Resume safety" / "Atomic checkpoint" rules exist to avoid.
+        We fail fast instead, and require the user to invoke
+        ``runner.run(force=True)`` to discard the orphaned state.
+
+        Returns None if the simulation is already complete (result populated)
+        or the checkpoint is orphaned (result.error set),
         otherwise (start_step, remaining_steps, resume_xml).
         """
         if force:
@@ -251,6 +261,10 @@ class OpenMMRunner:
         # skipped, and the fresh build proceeds without a stale state
         # to pair against.
         if not force and state_xml.exists() and state_xml.stat().st_size > 0:
+            # load_checkpoint_step reads ONLY the atomic-save manifest
+            # (see biolab_runners.openmm.utils). It does NOT fall back
+            # to energy.csv — the cadences differ and a stale step
+            # there would silently shorten the run on resume.
             start_step = load_checkpoint_step(output_dir)
             if start_step > 0:
                 resume_xml = str(state_xml)
@@ -259,6 +273,23 @@ class OpenMMRunner:
                     start_step,
                     start_step * config.timestep_fs / 1e6,
                 )
+            else:
+                # Orphaned state: state.xml exists but the manifest
+                # (checkpoint.json) is missing or invalid. We cannot
+                # determine what step the saved state corresponds to,
+                # so we cannot safely loadState it. Returning None
+                # with a clear error forces the user to discard via
+                # runner.run(force=True), which quarantines the state.
+                result.error = (
+                    f"state.xml exists at {state_xml} but the manifest "
+                    f"{FileNames.CHECKPOINT_JSON} is missing or empty — "
+                    f"the saved state's step is unknown. Pairing it with "
+                    f"a freshly-built System would re-introduce the "
+                    f"incompatibility this rule exists to avoid. Re-run "
+                    f"with force=True to discard the orphaned checkpoint."
+                )
+                logger.error(result.error)
+                return None
 
         production_steps_done = max(0, start_step - config.total_equil_steps)
         remaining_steps = max(0, config.total_steps - production_steps_done)
@@ -565,7 +596,7 @@ class OpenMMRunner:
         last_ckpt_step = 0
         abort_reason = ""
         steps_box = [0]
-        self._install_sigterm_handler(simulation, state_xml_path, steps_box, config)
+        self._install_sigterm_handler(simulation, state_xml_path, output_dir, steps_box, config)
 
         # OralBiome-AMP task #10: the early-abort gate is an offline mdtraj
         # evaluation of the partial trajectory.dcd, not an inside-OpenMM
@@ -602,6 +633,7 @@ class OpenMMRunner:
             last_ckpt_step = self._maybe_checkpoint(
                 simulation,
                 state_xml_path,
+                output_dir,
                 steps_done,
                 last_ckpt_step,
                 remaining_steps,
@@ -672,7 +704,10 @@ class OpenMMRunner:
         )
 
         if verdict.abort:
-            simulation.saveState(state_xml_path)  # type: ignore[union-attr]
+            # Atomic save: state.xml + checkpoint.json committed together
+            # so the next non-forced invocation can resume from a
+            # consistent step (or fail fast if the manifest is missing).
+            _atomic_save_checkpoint(simulation, state_xml_path, output_dir, steps_done)
             OpenMMRunner._write_abort_metadata(
                 verdict, output_dir, abort_thresh, config, steps_done, ns_at_check
             )
@@ -738,10 +773,19 @@ class OpenMMRunner:
     def _install_sigterm_handler(
         simulation: object,
         state_xml_path: str,
+        output_dir: Path,
         steps_box: list[int],
         config: OpenMMConfig,
     ) -> None:
-        """Install a SIGTERM handler that saves state using the current step count."""
+        """Install a SIGTERM handler that atomically saves state + manifest.
+
+        The atomic save (state.xml + checkpoint.json committed together)
+        ensures that a SIGTERM mid-save cannot leave a stale state
+        paired with the wrong manifest step. If the save itself fails
+        (e.g. disk full), the canonical files are unchanged and the
+        runner sees no checkpoint on the next invocation — fresh
+        build proceeds, no incompatibility risk.
+        """
 
         def handle_sigterm(signum: int, frame: object) -> None:  # noqa: ARG001
             steps_done = steps_box[0]
@@ -752,7 +796,12 @@ class OpenMMRunner:
                 ns_done,
             )
             try:
-                simulation.saveState(state_xml_path)  # type: ignore[union-attr]
+                _atomic_save_checkpoint(
+                    simulation,
+                    state_xml_path,
+                    output_dir,
+                    steps_done,
+                )
             except Exception as exc:
                 logger.error("Failed to save state on SIGTERM: %s", exc)
             sys.exit(0)
@@ -763,17 +812,24 @@ class OpenMMRunner:
     def _maybe_checkpoint(
         simulation: object,
         state_xml_path: str,
+        output_dir: Path,
         steps_done: int,
         last_ckpt_step: int,
         remaining_steps: int,
         config: OpenMMConfig,
         t0: float,
     ) -> int:
-        """Write a checkpoint if interval elapsed. Returns the (possibly updated) last_ckpt_step."""
+        """Write a checkpoint if interval elapsed. Returns the (possibly updated) last_ckpt_step.
+
+        The save is atomic (state.xml + checkpoint.json committed
+        together via :func:`_atomic_save_checkpoint`) so that a crash
+        mid-save cannot leave a stale state whose step does not match
+        the manifest. See AGENTS.md "Atomic checkpoint" rule.
+        """
         since_ckpt = steps_done - last_ckpt_step
         if since_ckpt < config.checkpoint_every_steps and steps_done < remaining_steps:
             return last_ckpt_step
-        simulation.saveState(state_xml_path)  # type: ignore[union-attr]
+        _atomic_save_checkpoint(simulation, state_xml_path, output_dir, steps_done)
         elapsed = time.time() - t0
         ns_done = steps_done * config.timestep_fs / 1e6
         ns_per_day = (ns_done / elapsed) * 86400 if elapsed > 0 else 0
