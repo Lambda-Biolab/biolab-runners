@@ -1,17 +1,12 @@
-"""Utility functions for OpenMM MD simulations.
+"""Non-checkpoint helpers for OpenMM MD simulations.
 
-After the v14 checkpoint extraction this module only carries the
-non-checkpoint helpers: dependency availability checks
-(:func:`openmm_available`, :func:`pdbfixer_available`) and a
-diagnostic reporter (:func:`verify_production_outputs`).
+Carries the dependency availability checks (:func:`openmm_available`,
+:func:`pdbfixer_available`) and a diagnostic reporter
+(:func:`verify_production_outputs`).
 
 The checkpoint / manifest / state-file domain — atomic save,
 quarantine, manifest parsing, terminal classification, production
 step math — lives in :mod:`biolab_runners.openmm.checkpoint`.
-:class:`InvalidCheckpointError` is re-exported here so existing
-callers that imported the exception from this module keep
-working; new code should import it from
-:mod:`biolab_runners.openmm.checkpoint` directly.
 """
 
 from __future__ import annotations
@@ -20,7 +15,6 @@ import logging
 import subprocess
 from typing import TYPE_CHECKING
 
-from biolab_runners.openmm.checkpoint import InvalidCheckpointError  # noqa: F401
 from biolab_runners.openmm.paths import FileNames
 
 if TYPE_CHECKING:

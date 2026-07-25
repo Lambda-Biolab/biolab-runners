@@ -305,9 +305,10 @@ class TestQuarantineStaleCheckpoint:
 class TestLoadCheckpoint:
     """Public-interface tests for ``load_checkpoint``.
 
-    Replaces the previous ``load_checkpoint`` (returns tuple),
-    ``load_checkpoint_step``, and ``load_checkpoint_full`` trio
-    with a single function returning :class:`LoadedCheckpoint`.
+    The single ``load_checkpoint`` entry point returns a
+    :class:`LoadedCheckpoint` with named fields for the saved
+    step, state file basename, last manifest record, and any
+    validated terminal payload.
     """
 
     def test_returns_structured_result_for_v7_manifest(self, tmp_path: Path) -> None:

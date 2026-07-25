@@ -24,19 +24,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   diagnostic reporter (re-export of `InvalidCheckpointError` preserved
   for back-compat). `runner.py` imports drop from 14 names across two
   private modules to 7 names from one public module.
-- **Architecture (god-module split)**: Extracted PBC geometry helpers
+- **Architecture (god-module split, v8)**: Extracted PBC geometry helpers
   (`pbc_correct`, `min_pbc_distance`, `collect_chain_ca_positions`) from
   `OpenMMRunner` into a new `biolab_runners.openmm.geometry` module.
   Extracted the system/forcefield/topology/integrator builder family
   (8 methods) into a new `biolab_runners.openmm.system_builder` module.
-  `OpenMMRunner` shrank from 1074 → 763 LOC at v8; v9–v13 then added
-  back ~540 LOC of new helpers (skip/resume/manifest/terminal/
-  orphan-checks) bringing it to 1304 LOC. The v14 extraction does NOT
-  shrink the runner further — the helpers are tightly coupled to the
-  orchestration context and belong on the runner; what changes is that
-  the **seam** the runner crosses for checkpoint operations is now
-  public (one module, named functions) instead of private (two modules,
-  underscore-prefixed imports).
+  At v8 this shrank `OpenMMRunner` from 1074 → 763 LOC.
 - **Lint (ruff)**: Enabled `RUF`, `ANN`, `PT` rule families; moved `S101`
   to per-file ignores for `tests/**`. RUF001/002/003 (ambiguous unicode)
   are globally ignored because Greek letters, ×, − are correct domain

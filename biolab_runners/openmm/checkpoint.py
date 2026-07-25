@@ -74,10 +74,7 @@ class LoadedCheckpoint:
     """The parsed manifest plus the validated state-file reference.
 
     The single entry point for "what is the saved state of this run?"
-    Replaces the previous ``load_checkpoint`` (returns ``(step, file)``),
-    ``load_checkpoint_step`` (returns ``int``), and ``load_checkpoint_full``
-    (returns ``(step, record, file)``) trio — callers read named fields
-    instead of picking the right wrapper.
+    Callers read named fields instead of unpacking tuples.
 
     Fields:
         absolute_step: The absolute OpenMM step the saved state is at
@@ -441,53 +438,50 @@ def load_checkpoint(output_dir: Path) -> LoadedCheckpoint:
     if parsed is None:
         return LoadedCheckpoint()
     step, last_record, state_file = parsed
-    is_terminal, terminal_reason = _validate_terminal_payload(step, last_record)
+    terminal_reason = _validate_terminal_payload(step, last_record)
     return LoadedCheckpoint(
         absolute_step=step,
         state_file_basename=state_file,
         last_record=last_record,
-        is_terminal=is_terminal,
+        is_terminal=terminal_reason is not None,
         terminal_reason=terminal_reason,
     )
 
 
-def _validate_terminal_payload(
-    manifest_step: int, last_record: dict[str, Any]
-) -> tuple[bool, str | None]:
-    """Return ``(is_valid_terminal, reason)`` for the manifest's terminal field.
+def _validate_terminal_payload(manifest_step: int, last_record: dict[str, Any]) -> str | None:
+    """Validate the manifest's terminal field; return the canonical reason on success.
 
-    ABSENT (no ``terminal`` key) returns ``(False, None)`` — the run
-    is in-progress (or normal-completed, which ``is_run_complete``
-    determines separately).
+    Returns:
+        ``"manifest_terminal_<type>_step_<step>"`` when the manifest
+        has a ``terminal`` field that validates against the v11 schema
+        (``type == "early_abort"``, strict-positive-int ``step`` equal
+        to ``manifest_step``, non-empty ``reason``).
 
-    A present-but-malformed ``terminal`` returns ``(False, None)`` —
-    the v11 schema is strict (positive-int step equal to
-    ``manifest_step``, ``type == "early_abort"``, non-empty ``reason``).
-    The runner must NOT classify such a run as terminal; it must
-    fail fast via the ``invalid_terminal_*`` reason from
-    :func:`is_run_complete`.
+        ``None`` for ABSENT (no ``terminal`` key) — the run is
+        in-progress (or normal-completed, which :func:`is_run_complete`
+        determines separately).
 
-    VALID returns ``(True, "manifest_terminal_<type>_step_<step>")``.
+        ``None`` for INVALID (present but failing any schema check) —
+        the v11 contract says treat as in-progress. The runner
+        surfaces the specific failure reason separately via
+        :func:`is_run_complete`'s ``invalid_terminal_<field>`` return.
+        Callers that need to distinguish absent from invalid check
+        ``"terminal" in last_record``.
 
     Args:
         manifest_step: The step recorded on the manifest's last record.
         last_record: The last record dict from the manifest.
-
-    Returns:
-        ``(is_valid_terminal, reason)`` — reason is the canonical
-        string used by :func:`is_run_complete` to surface the
-        terminal classification to log lines and the result.
     """
     terminal = last_record.get("terminal")
     if terminal is None:
-        return False, None
+        return None
     if not isinstance(terminal, dict):
         logger.warning(
             "Manifest has terminal field but it is not a dict; "
             "treating as invalid terminal payload (NOT as "
             "normal completion)"
         )
-        return False, None
+        return None
     raw_terminal_step = terminal.get("step")
     if (
         not isinstance(raw_terminal_step, int)
@@ -499,7 +493,7 @@ def _validate_terminal_payload(
             "(got %r); treating as invalid terminal payload",
             raw_terminal_step,
         )
-        return False, None
+        return None
     if raw_terminal_step != manifest_step:
         logger.warning(
             "Manifest has terminal.step=%d but record step=%d; "
@@ -508,7 +502,7 @@ def _validate_terminal_payload(
             raw_terminal_step,
             manifest_step,
         )
-        return False, None
+        return None
     terminal_type = terminal.get("type")
     if terminal_type != "early_abort":
         logger.warning(
@@ -517,14 +511,14 @@ def _validate_terminal_payload(
             "invalid terminal payload",
             terminal_type,
         )
-        return False, None
+        return None
     reason = terminal.get("reason")
     if not isinstance(reason, str) or not reason:
         logger.warning(
             "Manifest terminal.reason is missing or empty; treating as invalid terminal payload"
         )
-        return False, None
-    return True, f"manifest_terminal_{terminal_type}_step_{raw_terminal_step}"
+        return None
+    return f"manifest_terminal_{terminal_type}_step_{raw_terminal_step}"
 
 
 def _parse_manifest(
@@ -796,13 +790,17 @@ def is_run_complete(output_dir: Path, config: OpenMMConfig) -> tuple[bool, str]:
     # terminal at the target step fall through to the inferred
     # normal-completion heuristic — silently reclassifying an
     # ambiguous/corrupt terminal as a successful run.
-    _is_valid_terminal, terminal_reason = _validate_terminal_payload(manifest_step, last_record)
-    if checkpoint.is_terminal and terminal_reason is not None:
+    terminal_reason = _validate_terminal_payload(manifest_step, last_record)
+    if terminal_reason is not None:
         # Valid terminal payload. Per v12 BLOCKER precedence,
         # this takes priority over inferred normal completion,
         # even when the manifest_step has reached the target.
         return True, terminal_reason
-    if "terminal" in last_record and terminal_reason is None:
+    if "terminal" in last_record:
+        # terminal_reason is None AND the field was present —
+        # the terminal payload failed schema validation. Per v11,
+        # treat as in-progress with a specific failure reason.
+        # Do NOT fall back to the normal-completion heuristic.
         # The terminal field is present but malformed. The v11
         # contract says treat as in-progress with a specific
         # failure reason. Crucially, do NOT fall back to the
