@@ -25,6 +25,12 @@ logger = logging.getLogger(__name__)
 # into loading a non-state file or escaping the output directory.
 _STATE_FILENAME_RE = re.compile(r"^state(\.xml|\.\d+_\d+_\d+\.xml)$")
 
+# Pattern for the embedded step in a v7 state filename. The step is
+# the FIRST digit group; the pid and nanos follow. Captured by
+# :func:`_parse_state_filename_step` for the manifest-step ↔
+# state-filename equality check (v10 BLOCKER #1).
+_V7_STATE_STEP_RE = re.compile(r"^state\.(\d+)_\d+_\d+\.xml$")
+
 
 class InvalidCheckpointError(Exception):
     """Raised when ``checkpoint.json`` references a state file that is invalid.
@@ -92,7 +98,7 @@ def verify_production_outputs(output_dir: Path) -> dict[str, object]:
     This is a pure diagnostic helper — it reports per-file size and
     row counts but does NOT decide whether a run is complete.
     Completion is determined by :func:`is_run_complete` (which uses
-    the manifest's absolute step + early-abort metadata), not by
+    the manifest's absolute step + terminal payload), not by
     ``"files exist + size > threshold"``. The earlier "complete"
     field was removed because a mid-production checkpoint can
     produce a large trajectory and many energy rows while the run
@@ -146,105 +152,118 @@ def verify_production_outputs(output_dir: Path) -> dict[str, object]:
     return report
 
 
-def is_run_complete(output_dir: Path, config: OpenMMConfig) -> tuple[bool, str]:
-    """Determine whether a production run is terminal.
+def _parse_state_filename_step(state_file: str) -> int | None:
+    """Parse the absolute step encoded in a v7 state filename.
 
-    A run is terminal when EITHER:
+    The v7 format is ``state.<step>_<pid>_<nanos>.xml`` — the step
+    is the first digit group. Returns the integer step, or None for
+    the legacy ``state.xml`` (which carries no step encoding and
+    therefore cannot be cross-validated against the manifest's
+    ``step`` field).
 
-    1. **Normal completion**: ``manifest_step >= total_equil_steps +
-       total_steps``. The manifest's step is the absolute OpenMM
-       step (``start_step + steps_done``), so this signal is
-       unambiguous — not dependent on file sizes or energy row
-       counts.
-
-    2. **Intentional early termination**: ``early_abort.json`` exists
-       with ``aborted=True`` AND a positive integer ``abort_step``.
-       The atomically-committed abort metadata is the explicit
-       terminal marker for the offline-mdtraj gate. v9: the
-       ``abort_step`` field is required and must parse as a
-       positive integer — a missing, zero, or malformed step is
-       treated as "marker invalid → run is in progress" rather
-       than terminal. The marker is generation-scoped (bound to the
-       manifest step in :func:`OpenMMRunner._write_abort_metadata`)
-       and is moved by ``force=True`` quarantine so a fresh run
-       cannot be mis-classified by a stale marker.
-
-    Otherwise the run is in progress (or interrupted) and the
-    caller should resume.
+    Used by :func:`load_checkpoint` to enforce v10 BLOCKER #1:
+    the manifest's ``step`` MUST equal the step encoded in the v7
+    state filename. A mismatch indicates a corrupt or forged
+    checkpoint and must fail fast.
 
     Args:
-        output_dir: MD output directory.
-        config: The OpenMMConfig used to compute total_equil_steps
-            and total_steps.
+        state_file: The basename from the manifest record.
 
     Returns:
-        ``(complete, reason)``. ``complete`` is True for the two
-        terminal cases; ``reason`` is a human-readable explanation
-        (e.g. ``"normal_completion_step_50_200_000"``,
-        ``"early_abort_step_5_000_000"`` or ``"in_progress"``).
+        The embedded step as int, or None if the filename is
+        legacy / unparseable.
     """
-    manifest_step, _ = load_checkpoint(output_dir)
-    if manifest_step > 0:
-        target_step = config.total_equil_steps + config.total_steps
-        if manifest_step >= target_step:
-            return True, f"normal_completion_step_{manifest_step}_of_{target_step}"
-
-    abort_path = output_dir / FileNames.EARLY_ABORT_JSON
-    if abort_path.exists():
-        try:
-            abort_meta = json.loads(abort_path.read_text())
-        except (json.JSONDecodeError, OSError):
-            abort_meta = {}
-        if abort_meta.get("aborted") is True:
-            # Safely validate abort_step — must be a positive
-            # integer. The previous behaviour passed through
-            # ``abort_step=0`` (missing field default) or raised
-            # ``TypeError``/``ValueError`` on non-int-convertible
-            # strings. Both cases are now treated as "marker
-            # invalid" rather than terminal.
-            try:
-                abort_step = int(abort_meta.get("abort_step", 0))  # type: ignore[arg-type]
-            except (TypeError, ValueError):
-                abort_step = 0
-            if abort_step > 0:
-                return True, f"early_abort_step_{abort_step}"
-
-    return False, "in_progress"
+    m = _V7_STATE_STEP_RE.match(state_file)
+    if m is None:
+        return None
+    return int(m.group(1))
 
 
-def load_abort_metadata(output_dir: Path) -> dict[str, object] | None:
-    """Load and validate ``early_abort.json`` if it is a terminal marker.
-
-    Returns the parsed JSON dict when ``aborted is True`` AND
-    ``abort_step`` parses as a positive integer. Returns ``None``
-    otherwise (missing file, malformed JSON, invalid marker).
-    The validation gates match :func:`is_run_complete` so a
-    terminal classification is always paired with metadata that
-    reconstructs the abort result.
-
-    Args:
-        output_dir: MD output directory.
+def _parse_manifest(
+    output_dir: Path,
+) -> tuple[int, dict[str, object], str] | None:
+    """Internal helper: parse ``checkpoint.json`` with strict validation.
 
     Returns:
-        The parsed abort metadata dict, or ``None`` if the marker
-        is missing or invalid.
+        ``(step, last_record, state_file)`` on success, ``None`` if
+        the manifest is missing or structurally invalid. The
+        ``last_record`` is the manifest record dict (so callers can
+        inspect the optional ``terminal`` payload).
+
+    Structural validation (v10 SUGGESTION):
+    - Root must be a JSON object (mapping).
+    - ``records`` must be a non-empty list.
+    - Final record must be a JSON object.
+    - ``step`` must be a positive int.
+    - ``file`` must be a non-empty string.
+
+    A structurally invalid manifest returns ``None`` rather than
+    raising — callers (the resume path) treat that as "no
+    resumable checkpoint" and fail fast on orphan state files.
+
+    Raises:
+        InvalidCheckpointError: if the manifest is structurally
+            valid BUT the referenced state file fails the path /
+            existence / size / step-equality checks. The caller
+            catches this and surfaces it as a user-facing error.
     """
-    abort_path = output_dir / FileNames.EARLY_ABORT_JSON
-    if not abort_path.exists():
+    manifest_path = output_dir / FileNames.CHECKPOINT_JSON
+    if not manifest_path.exists():
         return None
     try:
-        abort_meta = json.loads(abort_path.read_text())
+        data = json.loads(manifest_path.read_text())
     except (json.JSONDecodeError, OSError):
         return None
-    if abort_meta.get("aborted") is not True:
+
+    # Structural validation (v10 SUGGESTION).
+    if not isinstance(data, dict):
         return None
-    try:
-        abort_step = int(abort_meta.get("abort_step", 0))  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    records = data.get("records")
+    if not isinstance(records, list) or not records:
         return None
-    if abort_step <= 0:
+    last = records[-1]
+    if not isinstance(last, dict):
         return None
-    return abort_meta
+
+    # Field-type validation — ``step`` must be a positive int and
+    # ``file`` must be a non-empty string.
+    raw_step = last.get("step")
+    raw_file = last.get("file")
+    if not isinstance(raw_step, int) or isinstance(raw_step, bool) or raw_step <= 0:
+        return None
+    if not isinstance(raw_file, str) or not raw_file:
+        return None
+
+    # Path / pattern / existence / size validation. The runner
+    # catches InvalidCheckpointError and surfaces it.
+    _validate_state_file_reference(output_dir, raw_file)
+
+    # v10 BLOCKER #1: manifest step MUST equal the step encoded
+    # in the v7 state filename. Legacy ``state.xml`` has no
+    # embedded step — for legacy compatibility we skip the
+    # equality check (the legacy file can only have been written
+    # by a pre-v7 run; pairing a legacy state with a manifest is
+    # accepted but logged as a compatibility shim).
+    embedded = _parse_state_filename_step(raw_file)
+    if embedded is not None and embedded != raw_step:
+        raise InvalidCheckpointError(
+            f"The manifest step {raw_step} does not match the step "
+            f"encoded in {raw_file!r} ({embedded}). The state file was "
+            f"saved at step {embedded}; pairing it with a manifest step "
+            f"of {raw_step} would silently mismatch the System. Re-run "
+            f"with force=True to discard the checkpoint."
+        )
+    if embedded is None:
+        # Legacy state.xml — no embedded step to cross-validate.
+        # Log a notice so the user can decide to migrate.
+        logger.info(
+            "Manifest references legacy state.xml — the filename carries no "
+            "embedded step, so the manifest step (%d) is trusted as-is. "
+            "Future runs will produce generation-versioned filenames.",
+            raw_step,
+        )
+
+    return raw_step, last, raw_file
 
 
 def _validate_state_file_reference(output_dir: Path, state_file: str) -> Path:
@@ -351,6 +370,15 @@ def load_checkpoint(output_dir: Path) -> tuple[int, str]:
     (:attr:`biolab_runners.openmm.config.OpenMMConfig` "Resume
     safety" rule).
 
+    v10 BLOCKER #1: the manifest's ``step`` MUST equal the step
+    encoded in the v7 state filename. A mismatch raises
+    :class:`InvalidCheckpointError`.
+
+    v10 SUGGESTION: malformed manifests (root is a list, records
+    is missing/empty, last record is not a mapping, ``step`` is
+    ``null``, ``file`` is missing) are tolerated as "no resumable
+    checkpoint" — they do NOT crash the runner.
+
     Args:
         output_dir: MD output directory.
 
@@ -365,35 +393,35 @@ def load_checkpoint(output_dir: Path) -> tuple[int, str]:
     Raises:
         InvalidCheckpointError: If the manifest references a state
             file that is not a basename, doesn't match the expected
-            pattern, doesn't exist, or is empty. The runner catches
-            this and surfaces it as a user-facing error.
+            pattern, doesn't exist, or is empty. Also raised when
+            the manifest's step doesn't match the step encoded in
+            the v7 state filename (v10 BLOCKER #1). The runner
+            catches this and surfaces it as a user-facing error.
     """
-    manifest_path = output_dir / FileNames.CHECKPOINT_JSON
-    if not manifest_path.exists():
+    parsed = _parse_manifest(output_dir)
+    if parsed is None:
         return 0, ""
-    try:
-        data = json.loads(manifest_path.read_text())
-        records = data.get("records", [])
-        if not records:
-            return 0, ""
-        last = records[-1]
-        step = int(last.get("step", 0))
-        file = str(last.get("file", ""))
-        if step > 0 and file:
-            # Validate the referenced state file. The runner catches
-            # InvalidCheckpointError and surfaces the message to the
-            # user — the resume path cannot proceed with a dangling
-            # or unsafe reference.
-            _validate_state_file_reference(output_dir, file)
-            return step, file
-    except (json.JSONDecodeError, KeyError, IndexError, OSError, ValueError):
-        pass
-    except InvalidCheckpointError:
-        # Re-raise so the runner can convert it to a result.error.
-        # (The bare ``except`` above would otherwise swallow our
-        # own exception class.)
-        raise
-    return 0, ""
+    step, _record, file = parsed
+    return step, file
+
+
+def load_checkpoint_full(
+    output_dir: Path,
+) -> tuple[int, dict[str, object], str] | None:
+    """Like :func:`load_checkpoint` but returns the full last record.
+
+    Used by :func:`is_run_complete` and
+    :meth:`OpenMMRunner._reconstruct_terminal_result` to inspect
+    the optional ``terminal`` payload (the v10 atomic terminal
+    classification).
+
+    Returns:
+        ``(absolute_step, last_record, state_file)`` on success,
+        ``None`` if no manifest or manifest is structurally
+        invalid. The caller is responsible for handling
+        ``InvalidCheckpointError`` from the state-file validation.
+    """
+    return _parse_manifest(output_dir)
 
 
 def load_checkpoint_step(output_dir: Path) -> int:
@@ -415,3 +443,194 @@ def load_checkpoint_step(output_dir: Path) -> int:
     except InvalidCheckpointError:
         return 0
     return step
+
+
+def _production_steps(absolute_step: int, total_equil_steps: int) -> int:
+    """Return the completed production steps for an absolute step.
+
+    Centralises the v10 BLOCKER #3 invariant: every ns reported
+    to downstream consumers (``abort_ns``, ``result.total_ns``,
+    ``md_summary.json``, the reconstructed result) is computed
+    from the COMPLETED PRODUCTION steps (``absolute_step -
+    total_equil_steps``), not the absolute OpenMM step. The
+    equilibration steps are not simulation progress in the
+    scientific sense — they're the protocol's setup.
+
+    Args:
+        absolute_step: The absolute OpenMM step the simulator is
+            at (or the saved state corresponds to).
+        total_equil_steps: The equilibration length in steps
+            (``config.total_equil_steps``).
+
+    Returns:
+        The number of completed production steps (>= 0).
+    """
+    return max(0, absolute_step - total_equil_steps)
+
+
+def production_ns(absolute_step: int, config: OpenMMConfig) -> float:
+    """Convenience: completed production ns for an absolute step.
+
+    Same invariant as :func:`_production_steps`. Returns ns as a
+    float (no rounding) — callers that need a particular precision
+    round at the boundary.
+    """
+    return _production_steps(absolute_step, config.total_equil_steps) * config.timestep_fs / 1e6
+
+
+def is_run_complete(output_dir: Path, config: OpenMMConfig) -> tuple[bool, str]:
+    """Determine whether a production run is terminal.
+
+    v10 BLOCKER #2: terminal status is now part of the manifest
+    record itself (the ``terminal`` field) and is committed
+    atomically with the state file via the manifest rename — the
+    ``os.replace`` is the single commit point. A separate
+    ``early_abort.json`` may still exist for downstream consumers
+    (``oral_amp.cloud.openmm_cloud``), but it is a derived file
+    written AFTER the atomic save and is NOT consulted by this
+    function for terminal classification.
+
+    A run is terminal when EITHER:
+
+    1. **Normal completion**: ``manifest_step >= total_equil_steps +
+       total_steps``. The manifest's step is the absolute OpenMM
+       step (``start_step + steps_done``), so this signal is
+       unambiguous — not dependent on file sizes or energy row
+       counts.
+
+    2. **Manifest terminal payload**: the manifest's last record
+       contains a ``terminal`` dict with ``step == manifest.step``.
+       The ``step`` field of the terminal payload MUST equal the
+       manifest's ``step`` (v10 BLOCKER #2 binding) — a mismatch
+       indicates data corruption and is logged as a warning; the
+       run is treated as in_progress so a fresh loadCheckpoint
+       can resume.
+
+    Otherwise the run is in progress (or interrupted) and the
+    caller should resume.
+
+    Args:
+        output_dir: MD output directory.
+        config: The OpenMMConfig used to compute total_equil_steps
+            and total_steps.
+
+    Returns:
+        ``(complete, reason)``. ``complete`` is True for the two
+        terminal cases; ``reason`` is a human-readable explanation
+        (e.g. ``"normal_completion_step_50_200_000"``,
+        ``"manifest_terminal_early_abort_step_5_000_000"``,
+        ``"in_progress"``).
+    """
+    parsed = load_checkpoint_full(output_dir)
+    if parsed is None:
+        # No manifest or structurally invalid manifest. The
+        # runner handles orphaned state files separately.
+        return False, "in_progress"
+    manifest_step, last_record, _state_file = parsed
+    if manifest_step <= 0:
+        return False, "in_progress"
+
+    normal = _check_normal_completion(manifest_step, config)
+    if normal is not None:
+        return normal
+    terminal = _check_manifest_terminal(manifest_step, last_record)
+    if terminal is not None:
+        return terminal
+    return False, "in_progress"
+
+
+def _check_normal_completion(manifest_step: int, config: OpenMMConfig) -> tuple[bool, str] | None:
+    r"""Return ``(True, "normal_completion_..._of_<target>")`` if at/past target."""
+    target_step = config.total_equil_steps + config.total_steps
+    if manifest_step >= target_step:
+        return True, f"normal_completion_step_{manifest_step}_of_{target_step}"
+    return None
+
+
+def _check_manifest_terminal(
+    manifest_step: int, last_record: dict[str, object]
+) -> tuple[bool, str] | None:
+    r"""Return ``(True, "manifest_terminal_<type>_step_<step>")`` if payload valid.
+
+    v10 BLOCKER #2: the manifest's ``terminal`` payload MUST have
+    ``step == manifest.step`` (the binding is enforced here). A
+    missing, zero, malformed, or mismatched step is logged as a
+    warning and treated as "no terminal payload → in progress".
+    """
+    terminal = last_record.get("terminal")
+    if not isinstance(terminal, dict):
+        return None
+    raw_terminal_step = terminal.get("step")
+    try:
+        terminal_step = (
+            int(str(raw_terminal_step))
+            if raw_terminal_step is not None and not isinstance(raw_terminal_step, bool)
+            else 0
+        )
+    except (TypeError, ValueError):
+        terminal_step = 0
+    if terminal_step == manifest_step and terminal_step > 0:
+        terminal_type = str(terminal.get("type", "unknown"))
+        return True, f"manifest_terminal_{terminal_type}_step_{terminal_step}"
+    if terminal_step > 0:
+        logger.warning(
+            "Manifest has terminal.step=%d but record step=%d; "
+            "treating as in_progress (binding mismatch)",
+            terminal_step,
+            manifest_step,
+        )
+    return None
+
+
+def load_terminal_payload(output_dir: Path, config: OpenMMConfig) -> dict[str, object] | None:
+    """Load the validated terminal payload from the manifest.
+
+    v10: the terminal payload is the manifest's ``terminal`` field
+    on the last record. Returns the payload dict only when the
+    run is terminal via the manifest binding (terminal.step ==
+    manifest.step > 0) AND the required fields are well-typed.
+    Returns None otherwise.
+
+    Used by :meth:`OpenMMRunner._reconstruct_terminal_result` to
+    reconstruct the abort result on idempotent reuse.
+
+    Args:
+        output_dir: MD output directory.
+        config: OpenMMConfig (for production_ns computation).
+
+    Returns:
+        The terminal payload dict (with normalised fields
+        ``step``, ``type``, ``reason``, ``production_ns``), or
+        None if the run is not terminal or the payload is
+        invalid.
+    """
+    parsed = load_checkpoint_full(output_dir)
+    if parsed is None:
+        return None
+    manifest_step, last_record, _state_file = parsed
+    terminal = last_record.get("terminal")
+    if not isinstance(terminal, dict):
+        return None
+    raw_tstep = terminal.get("step")
+    try:
+        terminal_step = (
+            int(str(raw_tstep)) if raw_tstep is not None and not isinstance(raw_tstep, bool) else 0
+        )
+    except (TypeError, ValueError):
+        return None
+    if terminal_step != manifest_step or terminal_step <= 0:
+        return None
+    # Normalised payload — production_ns is computed from the
+    # v10 BLOCKER #3 invariant, not read from a stored field.
+    payload: dict[str, object] = {
+        "step": terminal_step,
+        "type": str(terminal.get("type", "unknown")),
+        "reason": str(terminal.get("reason", "")),
+        "production_ns": production_ns(terminal_step, config),
+    }
+    # Pass through optional fields if present and well-typed.
+    for opt in ("gate", "target", "peptide_id"):
+        val = terminal.get(opt)
+        if isinstance(val, str):
+            payload[opt] = val
+    return payload

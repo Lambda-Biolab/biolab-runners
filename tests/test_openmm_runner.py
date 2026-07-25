@@ -399,28 +399,119 @@ class TestIsRunComplete:
         assert str(target) in reason
 
     def test_early_abort_returns_complete(self, tmp_path: Path) -> None:
-        """early_abort.json with aborted=True → terminal, even at low step."""
+        """v10: terminal status comes from the manifest's ``terminal``
+        payload (committed atomically with the checkpoint). A
+        manifest with ``terminal.type == \"early_abort\"`` and
+        ``terminal.step == manifest.step`` is terminal."""
         from biolab_runners.openmm.utils import is_run_complete
 
         config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
-        # No manifest at all; only the early_abort marker exists.
-        (tmp_path / "early_abort.json").write_text(
+        # Manifest with the v10 terminal payload.
+        state_basename = "state.5000000_1_1.xml"
+        (tmp_path / state_basename).write_text("<State/>")
+        (tmp_path / "checkpoint.json").write_text(
             json.dumps(
-                {"aborted": True, "abort_reason": "early_dissociation", "abort_step": 5_000_000}
+                {
+                    "records": [
+                        {
+                            "step": 5_000_000,
+                            "file": state_basename,
+                            "terminal": {
+                                "type": "early_abort",
+                                "step": 5_000_000,
+                                "reason": "early_dissociation",
+                                "production_ns": 4.8,
+                            },
+                        }
+                    ]
+                }
             )
         )
 
         complete, reason = is_run_complete(tmp_path, config)
         assert complete is True
-        assert reason.startswith("early_abort_step_")
+        assert reason.startswith("manifest_terminal_early_abort_step_")
 
     def test_early_abort_with_aborted_false_does_not_count(self, tmp_path: Path) -> None:
-        """early_abort.json with aborted=False → not terminal."""
+        """v10: a manifest whose terminal.type is not ``early_abort``
+        does not count as early-aborted (treated as in-progress for
+        the purpose of result reconstruction)."""
         from biolab_runners.openmm.utils import is_run_complete
 
         config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
-        (tmp_path / "early_abort.json").write_text(json.dumps({"aborted": False}))
+        state_basename = "state.5000000_1_1.xml"
+        (tmp_path / state_basename).write_text("<State/>")
+        # terminal.type != "early_abort" — the manifest is
+        # terminal but NOT an early abort.
+        (tmp_path / "checkpoint.json").write_text(
+            json.dumps(
+                {
+                    "records": [
+                        {
+                            "step": 5_000_000,
+                            "file": state_basename,
+                            "terminal": {"type": "other", "step": 5_000_000},
+                        }
+                    ]
+                }
+            )
+        )
+        complete, reason = is_run_complete(tmp_path, config)
+        assert complete is True
+        assert reason.startswith("manifest_terminal_other_step_")
 
+    def test_legacy_marker_alone_is_not_terminal(self, tmp_path: Path) -> None:
+        """v10 BLOCKER #2 regression: a bare ``early_abort.json``
+        WITHOUT a manifest is NOT terminal. The marker is a
+        derived file written after the atomic save; the manifest
+        is authoritative. Without a manifest, we cannot prove
+        which generation the marker belongs to — treating it as
+        terminal would risk mis-classifying a fresh run as
+        aborted."""
+        from biolab_runners.openmm.utils import is_run_complete
+
+        config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
+        (tmp_path / "early_abort.json").write_text(
+            json.dumps(
+                {
+                    "aborted": True,
+                    "abort_reason": "early_dissociation",
+                    "abort_step": 5_000_000,
+                }
+            )
+        )
+        complete, reason = is_run_complete(tmp_path, config)
+        assert complete is False
+        assert reason == "in_progress"
+
+    def test_terminal_step_must_equal_manifest_step(self, tmp_path: Path) -> None:
+        """v10 BLOCKER #2 binding: a terminal payload's ``step``
+        MUST equal the manifest's ``step``. A mismatch indicates
+        data corruption and the run is treated as in-progress
+        (logged as a warning)."""
+        from biolab_runners.openmm.utils import is_run_complete
+
+        config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
+        state_basename = "state.5000000_1_1.xml"
+        (tmp_path / state_basename).write_text("<State/>")
+        # terminal.step (4_000_000) != manifest.step (5_000_000) — bad.
+        (tmp_path / "checkpoint.json").write_text(
+            json.dumps(
+                {
+                    "records": [
+                        {
+                            "step": 5_000_000,
+                            "file": state_basename,
+                            "terminal": {
+                                "type": "early_abort",
+                                "step": 4_000_000,
+                                "reason": "early_dissociation",
+                            },
+                        }
+                    ]
+                }
+            )
+        )
         complete, reason = is_run_complete(tmp_path, config)
         assert complete is False
         assert reason == "in_progress"
@@ -694,20 +785,10 @@ class TestOpenMMRunner:
     def test_idempotent_skip(self, tmp_path: Path) -> None:
         """Existing complete output should be reused.
 
-        v8 change: the skip path is gated by the manifest's step
-        crossing ``total_equil_steps + total_steps`` (normal
-        completion) OR a valid ``early_abort.json``. The earlier
-        version of this test populated a manifest at step 100_000
-        (below the default 200_000-equil endpoint) and no early
-        abort marker — that pinned the buggy behaviour where file
-        size alone made the run look complete. This test now sets
-        the manifest to the END step so the run is genuinely
-        terminal, and the trajectory/energy files are present as a
-        realistic artifact.
-
-        The v8 BLOCKER #1 regression is covered by
-        ``TestIsRunComplete.test_large_trajectory_does_not_make_run_complete``
-        and ``TestIntermediateCheckpointResumesInsteadOfSkips``.
+        v10 BLOCKER #4: the skip path validates that the
+        scientific outputs (trajectory, energy, topology) are
+        actually present and usable. The fixture must include all
+        three.
         """
         out = tmp_path / "output"
         out.mkdir()
@@ -723,12 +804,14 @@ class TestOpenMMRunner:
         energy_lines = ["#step,time\n"]
         energy_lines.extend(f"{i * 5000},{i * 10}\n" for i in range(20))
         (out / "energy.csv").write_text("".join(energy_lines))
+        (out / "topology.pdb").write_bytes(b"ATOM\n" * 5000)  # v10: required
         (out / "checkpoint.json").write_text(
             json.dumps({"records": [{"step": target, "file": state_basename}]})
         )
 
         runner = OpenMMRunner(config)
         result = runner.run()
+        assert result.error == ""
         assert result.trajectory_path == str(out / "trajectory.dcd")
         assert result.state_xml_path == str(out / state_basename)
         assert result.error == ""
@@ -1775,7 +1858,8 @@ class TestFinalizeResultStateXmlPath:
         """The idempotent skip path (terminal run) must populate
         ``result.state_xml_path`` from the manifest. ``md_result.json``
         records were previously missing this field — a silent break
-        of the public contract."""
+        of the public contract. v10: also requires the scientific
+        outputs to be present (BLOCKER #4)."""
         out = tmp_path / "output"
         out.mkdir()
         config = OpenMMConfig(output_dir=str(out))
@@ -1783,6 +1867,8 @@ class TestFinalizeResultStateXmlPath:
         state_basename = f"state.{target}_1_1.xml"
         (out / state_basename).write_text("<State/>")
         (out / "trajectory.dcd").write_bytes(b"\x00" * 20_000_000)
+        (out / "energy.csv").write_text("#step,time\n" + "1,1\n" * 100)
+        (out / "topology.pdb").write_bytes(b"ATOM\n" * 5000)
         (out / "checkpoint.json").write_text(
             json.dumps({"records": [{"step": target, "file": state_basename}]})
         )
@@ -1956,165 +2042,296 @@ class TestForceTrueQuarantinesEarlyAbortMarker:
         )
 
 
-class TestIsRunCompleteValidatesAbortStep:
-    """v9 SUGGESTION regression: ``is_run_complete`` must safely
-    validate ``abort_step`` — reject zero, missing, or
-    non-integer-convertible values."""
+class TestIsRunCompleteValidatesTerminalPayload:
+    """v10 BLOCKER #2 binding: ``is_run_complete`` validates the
+    manifest's ``terminal`` payload. The ``step`` field MUST be a
+    positive integer equal to the manifest's ``step`` — a missing,
+    zero, malformed, or mismatched ``terminal.step`` is treated as
+    "payload invalid → run is in progress" rather than terminal.
 
-    def test_abort_step_zero_is_not_terminal(self, tmp_path: Path) -> None:
-        """abort_step=0 means the marker has no meaningful step —
-        treat as in_progress, not terminal."""
+    The previous v9 tests pinned the marker-only behaviour, which
+    is unsafe (a stale ``early_abort.json`` from a previous run
+    could mis-classify a fresh run as terminal). v10 makes the
+    manifest authoritative; the marker is a derived file.
+    """
+
+    def _write_manifest_with_terminal(
+        self, out: Path, *, terminal_step: object, terminal_type: str = "early_abort"
+    ) -> None:
+        """Write a manifest with the given terminal payload."""
+        state_basename = "state.5000000_1_1.xml"
+        (out / state_basename).write_text("<State/>")
+        manifest: dict[str, object] = {
+            "records": [
+                {
+                    "step": 5_000_000,
+                    "file": state_basename,
+                    "terminal": {
+                        "type": terminal_type,
+                        "step": terminal_step,
+                        "reason": "early_dissociation",
+                    },
+                }
+            ]
+        }
+        (out / "checkpoint.json").write_text(json.dumps(manifest))
+
+    def test_terminal_step_zero_is_not_terminal(self, tmp_path: Path) -> None:
+        """terminal.step=0 → not terminal."""
         from biolab_runners.openmm.utils import is_run_complete
 
         config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
-        (tmp_path / "early_abort.json").write_text(
-            json.dumps({"aborted": True, "abort_reason": "x", "abort_step": 0})
+        self._write_manifest_with_terminal(tmp_path, terminal_step=0)
+        complete, reason = is_run_complete(tmp_path, config)
+        assert complete is False
+        assert reason == "in_progress"
+
+    def test_terminal_step_missing_is_not_terminal(self, tmp_path: Path) -> None:
+        """terminal field missing step → not terminal."""
+        from biolab_runners.openmm.utils import is_run_complete
+
+        config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
+        state_basename = "state.5000000_1_1.xml"
+        (tmp_path / state_basename).write_text("<State/>")
+        (tmp_path / "checkpoint.json").write_text(
+            json.dumps(
+                {
+                    "records": [
+                        {
+                            "step": 5_000_000,
+                            "file": state_basename,
+                            "terminal": {"type": "early_abort"},  # no step
+                        }
+                    ]
+                }
+            )
         )
         complete, reason = is_run_complete(tmp_path, config)
         assert complete is False
         assert reason == "in_progress"
 
-    def test_abort_step_missing_is_not_terminal(self, tmp_path: Path) -> None:
-        """abort_step field missing → not terminal."""
+    def test_terminal_step_invalid_type_does_not_raise(self, tmp_path: Path) -> None:
+        """terminal.step="not_a_number" must not raise; not terminal."""
         from biolab_runners.openmm.utils import is_run_complete
 
         config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
-        (tmp_path / "early_abort.json").write_text(json.dumps({"aborted": True}))
+        self._write_manifest_with_terminal(tmp_path, terminal_step="not_a_number")
         complete, reason = is_run_complete(tmp_path, config)
         assert complete is False
         assert reason == "in_progress"
 
-    def test_abort_step_invalid_type_does_not_raise(self, tmp_path: Path) -> None:
-        """abort_step="not_a_number" must not raise TypeError/ValueError;
-        the marker is invalid → not terminal."""
+    def test_terminal_step_list_does_not_raise(self, tmp_path: Path) -> None:
+        """terminal.step=[1,2,3] must not raise."""
         from biolab_runners.openmm.utils import is_run_complete
 
         config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
-        (tmp_path / "early_abort.json").write_text(
-            json.dumps({"aborted": True, "abort_step": "not_a_number"})
-        )
-        # Must not raise.
+        self._write_manifest_with_terminal(tmp_path, terminal_step=[1, 2, 3])
         complete, reason = is_run_complete(tmp_path, config)
         assert complete is False
         assert reason == "in_progress"
 
-    def test_abort_step_list_does_not_raise(self, tmp_path: Path) -> None:
-        """abort_step as a list (or any non-int) must not raise."""
+    def test_terminal_step_null_does_not_raise(self, tmp_path: Path) -> None:
+        """terminal.step=null must not raise; not terminal."""
         from biolab_runners.openmm.utils import is_run_complete
 
         config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
-        (tmp_path / "early_abort.json").write_text(
-            json.dumps({"aborted": True, "abort_step": [1, 2, 3]})
-        )
+        self._write_manifest_with_terminal(tmp_path, terminal_step=None)
         complete, reason = is_run_complete(tmp_path, config)
         assert complete is False
         assert reason == "in_progress"
 
-    def test_abort_step_positive_is_terminal(self, tmp_path: Path) -> None:
-        """abort_step > 0 + aborted=True → terminal."""
+    def test_terminal_step_positive_and_equal_to_manifest_step_is_terminal(
+        self, tmp_path: Path
+    ) -> None:
+        """terminal.step matches manifest.step → terminal."""
         from biolab_runners.openmm.utils import is_run_complete
 
         config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
-        (tmp_path / "early_abort.json").write_text(
-            json.dumps({"aborted": True, "abort_step": 5_000_000})
-        )
+        self._write_manifest_with_terminal(tmp_path, terminal_step=5_000_000)
         complete, reason = is_run_complete(tmp_path, config)
         assert complete is True
-        assert reason == "early_abort_step_5000000"
+        assert reason == "manifest_terminal_early_abort_step_5000000"
 
 
 class TestEarlyAbortResultReconstruction:
-    """v9 BLOCKER #2 regression: an early-aborted run reused
+    """v10 BLOCKER #2 regression: an early-aborted run reused
     idempotently must return a result with ``early_abort=True``,
-    ``abort_reason``, and ``total_ns`` populated from the validated
-    abort metadata. Without this fix, a downstream consumer
-    reading ``md_result.json`` would interpret the run as normal
-    completion (default ``early_abort=False``,
-    ``abort_reason=""``, ``total_ns=0.0``).
+    ``abort_reason``, and ``total_ns`` populated from the
+    manifest's ``terminal`` payload (the authoritative source in
+    v10). Without this fix, a downstream consumer reading
+    ``md_result.json`` would interpret the run as normal completion
+    (default ``early_abort=False``, ``abort_reason=""``,
+    ``total_ns=0.0``).
+
+    v10 BLOCKER #3: ``total_ns`` is PRODUCTION ns
+    (``absolute_step - total_equil_steps``), not absolute OpenMM
+    ns. For an early-aborted run at absolute step 5_200_000 with
+    total_equil_steps=200_000, production_ns = 10.0 ns (NOT the
+    10.4 ns you'd get from absolute_step * timestep_fs / 1e6).
     """
 
     def _setup_early_aborted_dir(self, out: Path) -> tuple[int, float, str]:
         """Create an early-aborted run directory.
 
-        Returns (absolute_step, abort_ns, state_basename)."""
+        Returns (absolute_step, production_ns, state_basename)."""
         config_path = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
-        absolute_step = config_path.total_equil_steps + 5_000_000  # mid-production abort
-        absolute_ns = round(absolute_step * 2.0 / 1e6, 2)
+        absolute_step = config_path.total_equil_steps + 5_000_000
+        production_steps = absolute_step - config_path.total_equil_steps
+        production_ns = round(production_steps * 2.0 / 1e6, 2)
         state_basename = f"state.{absolute_step}_1_1.xml"
         (out / state_basename).write_text("<STATE/>")
+        # v10: terminal status is part of the manifest record.
         (out / "checkpoint.json").write_text(
-            json.dumps({"records": [{"step": absolute_step, "file": state_basename}]})
+            json.dumps(
+                {
+                    "records": [
+                        {
+                            "step": absolute_step,
+                            "file": state_basename,
+                            "terminal": {
+                                "type": "early_abort",
+                                "step": absolute_step,
+                                "reason": "early_dissociation",
+                                "production_ns": production_ns,
+                            },
+                        }
+                    ]
+                }
+            )
         )
-        (out / "energy.csv").write_text(f"#step,time\n{absolute_step},{absolute_ns}\n")
+        (out / "energy.csv").write_text(
+            "#step,time\n" + "\n".join(f"{i},{i}" for i in range(0, 5001, 500)) + "\n"
+        )
+        (out / "trajectory.dcd").write_bytes(b"\x00" * 50_000_000)
+        (out / "topology.pdb").write_bytes(b"ATOM\n" * 1000)
+        # Derived compat file — written for downstream consumers,
+        # not authoritative. Its production_ns matches the
+        # manifest's terminal payload.
         abort_meta = {
             "aborted": True,
             "abort_reason": "early_dissociation",
             "abort_step": absolute_step,
-            "abort_ns": absolute_ns,
+            "abort_ns": production_ns,
             "gate": "offline_mdtraj",
         }
         (out / "early_abort.json").write_text(json.dumps(abort_meta))
-        return absolute_step, absolute_ns, state_basename
+        return absolute_step, production_ns, state_basename
 
     def test_skip_path_reconstructs_early_abort_result(self, tmp_path: Path) -> None:
         """runner.run() on an early-aborted directory must return
         a result with ``early_abort=True``, ``abort_reason`` set,
-        and ``total_ns`` matching the marker."""
+        and ``total_ns`` = production_ns (v10 BLOCKER #3)."""
         out = tmp_path / "output"
         out.mkdir()
-        _step, absolute_ns, state_basename = self._setup_early_aborted_dir(out)
+        _step, production_ns_value, state_basename = self._setup_early_aborted_dir(out)
 
         config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
         runner = OpenMMRunner(config)
         result = runner.run()
         assert result.error == ""
-        # The skip path populated early_abort from the marker.
+        # The skip path populated early_abort from the manifest's terminal.
         assert result.early_abort is True, (
             f"early_aborted run must report early_abort=True; got {result.early_abort}"
         )
         assert result.abort_reason == "early_dissociation"
-        assert result.total_ns == absolute_ns
+        # v10 BLOCKER #3: total_ns is PRODUCTION ns, not absolute ns.
+        assert result.total_ns == production_ns_value, (
+            f"total_ns must be production_ns ({production_ns_value}); "
+            f"got {result.total_ns} (this would be absolute_ns if the v6 "
+            "local-step semantics leaked through)"
+        )
         # Artifact paths still set.
         assert result.state_xml_path == str(out / state_basename)
 
-    def test_skip_path_reconstructs_with_default_ns_if_marker_missing(self, tmp_path: Path) -> None:
-        """If the marker is missing or invalid, the reconstruction
-        leaves early_abort=False (the run is not classified as a
-        terminal early abort). The reviewer wants this surfaced —
-        don't silently fall back to early_abort=True."""
+    def test_skip_path_reconstructs_with_default_ns_if_terminal_missing(
+        self, tmp_path: Path
+    ) -> None:
+        """If the terminal payload is missing or invalid, the
+        reconstruction leaves early_abort=False (the run is not
+        classified as terminal)."""
         from biolab_runners.openmm.utils import is_run_complete
 
         out = tmp_path / "output"
         out.mkdir()
         self._setup_early_aborted_dir(out)
-        # Corrupt the marker.
-        (out / "early_abort.json").write_text("not json {{{")
+        # Drop the terminal payload from the manifest.
+        manifest_data = json.loads((out / "checkpoint.json").read_text())
+        for record in manifest_data["records"]:
+            record.pop("terminal", None)
+        (out / "checkpoint.json").write_text(json.dumps(manifest_data))
 
         config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
-        # is_run_complete returns in_progress (corrupt marker).
         complete, _reason = is_run_complete(out, config)
         assert complete is False
         # Resume rather than skip.
         runner = OpenMMRunner(config)
         result = runner.run()
-        # The run wasn't classified as terminal → not idempotent skip.
-        # Either resumed (and got errored due to no OpenMM) or set up
-        # the result state; either way, the test only asserts that
-        # early_abort stays False (the default).
         assert result.early_abort is False
 
 
-class TestAbortMarkerBoundToAbsoluteStep:
-    """v9 binding: the ``abort_step`` field in ``early_abort.json``
-    must be the ABSOLUTE OpenMM step (same as the manifest's step),
-    not the invocation-local ``steps_done``. The marker is the
-    self-consistent record of "the gate fired at absolute step X"
-    — binding it to the local counter would let a resumed run
-    record a different abort_step than the manifest's step."""
+class TestAtomicTerminalBinding:
+    """v10 BLOCKER #2 binding: terminal status commits atomically
+    with the state file via the manifest's ``terminal`` payload.
+    The ``step`` field of the payload MUST equal the manifest's
+    ``step``. This is the binding that prevents a crash between
+    the state save and the marker write from leaving a
+    resumable-but-terminal decision un-recorded.
+    """
 
-    def test_write_abort_metadata_uses_absolute_step(self, tmp_path: Path) -> None:
-        """The metadata written by ``_write_abort_metadata`` records
-        the absolute step passed in (not the local step)."""
+    def test_atomic_save_writes_terminal_payload(self, tmp_path: Path) -> None:
+        """``_atomic_save_checkpoint`` embeds the terminal payload
+        in the manifest record on the same os.replace."""
+        from biolab_runners.openmm.system_builder import _atomic_save_checkpoint
+
+        sim = MagicMock()
+        sim.saveState.side_effect = lambda path: Path(path).write_text("<State/>")
+        terminal = {
+            "type": "early_abort",
+            "step": 2_700_000,
+            "reason": "early_dissociation",
+            "production_ns": 5.0,
+        }
+        state_basename = _atomic_save_checkpoint(
+            sim, tmp_path, absolute_step=2_700_000, terminal=terminal
+        )
+
+        # Manifest has the terminal payload.
+        manifest = json.loads((tmp_path / "checkpoint.json").read_text())
+        record = manifest["records"][-1]
+        assert record["step"] == 2_700_000
+        assert record["file"] == state_basename
+        assert record["terminal"] == terminal
+
+    def test_atomic_save_without_terminal_omits_field(self, tmp_path: Path) -> None:
+        """A normal-completion save does NOT include a terminal field."""
+        from biolab_runners.openmm.system_builder import _atomic_save_checkpoint
+
+        sim = MagicMock()
+        sim.saveState.side_effect = lambda path: Path(path).write_text("<State/>")
+        _atomic_save_checkpoint(sim, tmp_path, absolute_step=50_200_000)
+
+        manifest = json.loads((tmp_path / "checkpoint.json").read_text())
+        record = manifest["records"][-1]
+        assert record["step"] == 50_200_000
+        assert "terminal" not in record
+
+
+class TestProductionNsSemantics:
+    """v10 BLOCKER #3 regression: every ns reported to downstream
+    consumers (``abort_ns``, ``result.total_ns``, ``md_summary.json``,
+    reconstructed results) is computed from COMPLETED PRODUCTION
+    steps (``absolute_step - total_equil_steps``), not absolute
+    OpenMM step.
+
+    The previous code reported ``absolute_step * timestep_fs / 1e6``
+    for the abort metadata but ``steps_done * timestep_fs / 1e6``
+    for the live ``result.total_ns``. After a 5 ns production
+    abort the marker said 5.4 ns while the live result said 5.0
+    ns — three different meanings of ns in the same run.
+    """
+
+    def test_abort_ns_in_marker_is_production_not_absolute(self, tmp_path: Path) -> None:
+        """``early_abort.json.abort_ns`` is production ns."""
         from biolab_runners.openmm.runner import OpenMMRunner
 
         verdict = MagicMock()
@@ -2125,17 +2342,376 @@ class TestAbortMarkerBoundToAbsoluteStep:
         verdict.slope_a_per_ns = 0.5
         verdict.receptor_fit_residual = 1.2
 
+        config = OpenMMConfig(production_ns=100.0, timestep_fs=2.0)
+        total_equil = config.total_equil_steps  # 200_000 for the default
+        # absolute_step = total_equil + 5_000_000 → production_steps = 5_000_000
+        absolute_step = total_equil + 5_000_000
+        production_steps = absolute_step - total_equil
+        expected_production_ns = round(production_steps * 2.0 / 1e6, 2)
+
         OpenMMRunner._write_abort_metadata(
             verdict,
             tmp_path,
             abort_thresh=5.0,
-            config=OpenMMConfig(target="demo", peptide_id="PEP001"),
-            absolute_step=2_345_678,
-            absolute_ns=round(2_345_678 * 2.0 / 1e6, 2),
+            config=config,
+            absolute_step=absolute_step,
+            production_ns=expected_production_ns,
         )
         meta = json.loads((tmp_path / "early_abort.json").read_text())
-        assert meta["abort_step"] == 2_345_678
-        assert meta["abort_reason"] == "early_dissociation"
-        assert meta["gate"] == "offline_mdtraj"
-        assert meta["target"] == "demo"
-        assert meta["peptide_id"] == "PEP001"
+        # abort_ns is production_ns, NOT absolute_ns.
+        assert meta["abort_ns"] == expected_production_ns
+        # Sanity: production_ns != absolute_ns in this case.
+        absolute_ns = round(absolute_step * 2.0 / 1e6, 2)
+        assert expected_production_ns != absolute_ns
+
+    def test_total_ns_uses_production_steps_for_fresh_run(self, tmp_path: Path) -> None:
+        """A fresh-run finalize uses production steps for total_ns."""
+        from biolab_runners.openmm.runner import OpenMMRunner
+
+        config = OpenMMConfig(output_dir=str(tmp_path), production_ns=1.0, timestep_fs=2.0)
+        result = SimulationResult(config=config)
+        sim = MagicMock()
+        sim.saveState.side_effect = lambda path: Path(path).write_text("<State/>")
+
+        OpenMMRunner._finalize_result(
+            ctx=MagicMock(simulation=sim),
+            result=result,
+            energy_fh=MagicMock(),
+            traj_path=str(tmp_path / "trajectory.dcd"),
+            energy_path=str(tmp_path / "energy.csv"),
+            start_step=config.total_equil_steps,  # post-equil
+            steps_done=config.total_steps,  # full production
+            t0=time.time() - 60.0,
+            output_dir=tmp_path,
+        )
+        # total_ns == production_ns == config.production_ns (1.0 ns)
+        assert result.total_ns == 1.0
+
+    def test_total_ns_uses_cumulative_production_after_resume(self, tmp_path: Path) -> None:
+        """A resumed run's finalize reports cumulative production,
+        not the local steps_done."""
+        from biolab_runners.openmm.runner import OpenMMRunner
+
+        config = OpenMMConfig(output_dir=str(tmp_path), production_ns=100.0, timestep_fs=2.0)
+        result = SimulationResult(config=config)
+        sim = MagicMock()
+        sim.saveState.side_effect = lambda path: Path(path).write_text("<State/>")
+
+        # Resumed from step 1_000_000 (post-equil). Did 1_000_000
+        # more production steps this invocation.
+        start_step = 1_000_000
+        steps_done = 1_000_000
+        absolute_step = start_step + steps_done
+        # Production steps = absolute_step - total_equil_steps.
+        production_steps = absolute_step - config.total_equil_steps
+        expected_total_ns = round(production_steps * 2.0 / 1e6, 2)
+
+        OpenMMRunner._finalize_result(
+            ctx=MagicMock(simulation=sim),
+            result=result,
+            energy_fh=MagicMock(),
+            traj_path=str(tmp_path / "trajectory.dcd"),
+            energy_path=str(tmp_path / "energy.csv"),
+            start_step=start_step,
+            steps_done=steps_done,
+            t0=time.time() - 60.0,
+            output_dir=tmp_path,
+        )
+        assert result.total_ns == expected_total_ns
+        # Sanity: not the local steps_done * timestep_fs / 1e6.
+        wrong_total_ns = round(steps_done * 2.0 / 1e6, 2)
+        assert result.total_ns != wrong_total_ns
+
+
+class TestManifestStepEqualsStateFilenameStep:
+    """v10 BLOCKER #1 regression: the manifest's ``step`` MUST
+    equal the step encoded in the v7 state filename. A mismatch
+    indicates a corrupt or forged checkpoint — the resume path
+    would silently pair a state saved at step A with resume
+    accounting at step B. The runner must fail fast with
+    ``force=True`` guidance, never degrade into a fresh build.
+    """
+
+    def test_v7_step_mismatch_raises_invalid(self, tmp_path: Path) -> None:
+        """Manifest says step 1_000_000 but file encodes 500_000 → raises."""
+        from biolab_runners.openmm.utils import InvalidCheckpointError
+
+        # Filename encodes step 500_000 — manifest claims 1_000_000.
+        state_basename = "state.500000_1_1.xml"
+        (tmp_path / state_basename).write_text("<State/>")
+        (tmp_path / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": 1_000_000, "file": state_basename}]})
+        )
+
+        with pytest.raises(InvalidCheckpointError, match="does not match"):
+            load_checkpoint(tmp_path)
+
+    def test_v7_step_match_returns_step_and_file(self, tmp_path: Path) -> None:
+        """Manifest step == embedded step → returns (step, file)."""
+        state_basename = "state.1000000_1_1.xml"
+        (tmp_path / state_basename).write_text("<State/>")
+        (tmp_path / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": 1_000_000, "file": state_basename}]})
+        )
+        step, file = load_checkpoint(tmp_path)
+        assert step == 1_000_000
+        assert file == state_basename
+
+    def test_legacy_state_xml_skips_step_equality_check(self, tmp_path: Path) -> None:
+        """Legacy ``state.xml`` has no embedded step — the manifest's
+        step is trusted as-is (logged as a compatibility notice)."""
+        (tmp_path / "state.xml").write_text("<State/>")
+        (tmp_path / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": 1_000_000, "file": "state.xml"}]})
+        )
+        # No exception — legacy compat path.
+        step, file = load_checkpoint(tmp_path)
+        assert step == 1_000_000
+        assert file == "state.xml"
+
+    def test_mismatch_surfaces_to_runner(self, tmp_path: Path) -> None:
+        """Mismatch from the runner's perspective → ``result.error``."""
+        out = tmp_path / "output"
+        out.mkdir()
+        state_basename = "state.500000_1_1.xml"
+        (out / state_basename).write_text("<State/>")
+        (out / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": 1_000_000, "file": state_basename}]})
+        )
+        config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
+        runner = OpenMMRunner(config)
+        result = SimulationResult(config=config)
+        resume = runner._resolve_skip_or_resume(
+            force=False, output_dir=out, config=config, result=result
+        )
+        assert resume is None
+        assert result.error != ""
+        assert "force=True" in result.error
+
+
+class TestTerminalArtifactValidation:
+    """v10 BLOCKER #4 regression: ``is_run_complete`` returns true
+    based on the manifest's terminal decision, but a terminal run
+    also needs the scientific outputs (trajectory, energy log,
+    topology) to be present and usable. A terminal manifest plus
+    state file but no trajectory/energy returns a result with
+    ``error=""`` and paths pointing to nonexistent files — silently
+    misleading downstream consumers.
+    """
+
+    def _populate_terminal_run(
+        self, out: Path, *, terminal_payload: dict[str, object] | None = None
+    ) -> tuple[str, int]:
+        """Write a terminal manifest at the END step. Returns (state_basename, target_step)."""
+        config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
+        target = config.total_equil_steps + config.total_steps
+        state_basename = f"state.{target}_1_1.xml"
+        (out / state_basename).write_text("<State/>")
+        record: dict[str, object] = {"step": target, "file": state_basename}
+        if terminal_payload is not None:
+            record["terminal"] = terminal_payload
+        (out / "checkpoint.json").write_text(json.dumps({"records": [record]}))
+        return state_basename, target
+
+    def test_missing_trajectory_returns_error(self, tmp_path: Path) -> None:
+        out = tmp_path / "output"
+        out.mkdir()
+        self._populate_terminal_run(out)
+        # energy and topology are present, but no trajectory.
+        (out / "energy.csv").write_text("#step,time\n1,1\n")
+        (out / "topology.pdb").write_bytes(b"ATOM\n" * 1000)
+
+        config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
+        runner = OpenMMRunner(config)
+        result = runner.run()
+        assert result.error != ""
+        assert "missing trajectory" in result.error or "missing artifacts" in result.error
+        assert "force=True" in result.error
+
+    def test_empty_energy_log_returns_error(self, tmp_path: Path) -> None:
+        out = tmp_path / "output"
+        out.mkdir()
+        self._populate_terminal_run(out)
+        (out / "trajectory.dcd").write_bytes(b"\x00" * 20_000_000)
+        # Energy log exists but has only the header (no data rows).
+        (out / "energy.csv").write_text("#step,time\n")
+        (out / "topology.pdb").write_bytes(b"ATOM\n" * 1000)
+
+        config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
+        runner = OpenMMRunner(config)
+        result = runner.run()
+        assert result.error != ""
+        assert "energy" in result.error
+
+    def test_header_only_energy_returns_error(self, tmp_path: Path) -> None:
+        """Energy log with header but no data rows counts as empty."""
+        out = tmp_path / "output"
+        out.mkdir()
+        self._populate_terminal_run(out)
+        (out / "trajectory.dcd").write_bytes(b"\x00" * 20_000_000)
+        # Write enough content to be non-zero bytes but only header.
+        (out / "energy.csv").write_text("#step,time\n")
+        (out / "topology.pdb").write_bytes(b"ATOM\n" * 1000)
+
+        config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
+        runner = OpenMMRunner(config)
+        result = runner.run()
+        assert result.error != ""
+        assert "energy" in result.error
+
+    def test_missing_topology_returns_error(self, tmp_path: Path) -> None:
+        out = tmp_path / "output"
+        out.mkdir()
+        self._populate_terminal_run(out)
+        (out / "trajectory.dcd").write_bytes(b"\x00" * 20_000_000)
+        (out / "energy.csv").write_text("#step,time\n" + "1,1\n" * 100)
+        # No topology.pdb.
+
+        config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
+        runner = OpenMMRunner(config)
+        result = runner.run()
+        assert result.error != ""
+        assert "topology" in result.error
+
+    def test_early_aborted_terminal_with_missing_artifacts_returns_error(
+        self, tmp_path: Path
+    ) -> None:
+        """Early-abort terminal classification also requires artifacts."""
+        out = tmp_path / "output"
+        out.mkdir()
+        config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
+        absolute_step = config.total_equil_steps + 5_000_000
+        state_basename = f"state.{absolute_step}_1_1.xml"
+        (out / state_basename).write_text("<State/>")
+        # Manifest terminal + state file, but no trajectory/energy/topology.
+        (out / "checkpoint.json").write_text(
+            json.dumps(
+                {
+                    "records": [
+                        {
+                            "step": absolute_step,
+                            "file": state_basename,
+                            "terminal": {
+                                "type": "early_abort",
+                                "step": absolute_step,
+                                "reason": "early_dissociation",
+                                "production_ns": 10.0,
+                            },
+                        }
+                    ]
+                }
+            )
+        )
+
+        runner = OpenMMRunner(config)
+        result = runner.run()
+        assert result.error != ""
+        assert "missing" in result.error
+
+    def test_all_artifacts_present_returns_success(self, tmp_path: Path) -> None:
+        """Sanity: when all artifacts are present, skip returns success."""
+        out = tmp_path / "output"
+        out.mkdir()
+        config = OpenMMConfig(output_dir=str(out), production_ns=100.0, timestep_fs=2.0)
+        target = config.total_equil_steps + config.total_steps
+        state_basename = f"state.{target}_1_1.xml"
+        (out / state_basename).write_text("<State/>")
+        (out / "trajectory.dcd").write_bytes(b"\x00" * 20_000_000)
+        (out / "energy.csv").write_text("#step,time\n" + "1,1\n" * 100)
+        (out / "topology.pdb").write_bytes(b"ATOM\n" * 1000)
+        (out / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": target, "file": state_basename}]})
+        )
+
+        runner = OpenMMRunner(config)
+        result = runner.run()
+        assert result.error == ""
+        assert result.state_xml_path == str(out / state_basename)
+        assert result.total_ns == config.production_ns
+
+
+class TestLoadCheckpointMalformedManifest:
+    """v10 SUGGESTION regression: ``load_checkpoint`` must tolerate
+    structurally malformed manifests without raising TypeError or
+    AttributeError. Valid JSON shapes that aren't valid manifests
+    should be treated as "no checkpoint" (return (0, "")).
+    """
+
+    def test_root_is_list_returns_zero(self, tmp_path: Path) -> None:
+        """``[]`` (root is a list) — not a manifest."""
+        (tmp_path / "checkpoint.json").write_text("[]")
+        step, file = load_checkpoint(tmp_path)
+        assert step == 0
+        assert file == ""
+
+    def test_records_is_null_returns_zero(self, tmp_path: Path) -> None:
+        """``{"records": null}`` — records missing."""
+        (tmp_path / "checkpoint.json").write_text(json.dumps({"records": None}))
+        step, file = load_checkpoint(tmp_path)
+        assert step == 0
+        assert file == ""
+
+    def test_records_is_empty_returns_zero(self, tmp_path: Path) -> None:
+        """``{"records": []}`` — empty."""
+        (tmp_path / "checkpoint.json").write_text(json.dumps({"records": []}))
+        step, file = load_checkpoint(tmp_path)
+        assert step == 0
+        assert file == ""
+
+    def test_last_record_is_null_returns_zero(self, tmp_path: Path) -> None:
+        """``{"records": [null]}`` — last record not a mapping."""
+        (tmp_path / "checkpoint.json").write_text(json.dumps({"records": [None]}))
+        step, file = load_checkpoint(tmp_path)
+        assert step == 0
+        assert file == ""
+
+    def test_step_is_null_returns_zero(self, tmp_path: Path) -> None:
+        """``step: null`` — not a valid int."""
+        state_basename = "state.1_1_1.xml"
+        (tmp_path / state_basename).write_text("<State/>")
+        (tmp_path / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": None, "file": state_basename}]})
+        )
+        step, file = load_checkpoint(tmp_path)
+        assert step == 0
+        assert file == ""
+
+    def test_step_is_string_returns_zero(self, tmp_path: Path) -> None:
+        """``step: "1000"`` — must be int, not str."""
+        state_basename = "state.1000_1_1.xml"
+        (tmp_path / state_basename).write_text("<State/>")
+        (tmp_path / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": "1000", "file": state_basename}]})
+        )
+        step, file = load_checkpoint(tmp_path)
+        assert step == 0
+        assert file == ""
+
+    def test_step_is_bool_returns_zero(self, tmp_path: Path) -> None:
+        """``step: true`` — bool is not a valid step (it's truthy)."""
+        state_basename = "state.1_1_1.xml"
+        (tmp_path / state_basename).write_text("<State/>")
+        (tmp_path / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": True, "file": state_basename}]})
+        )
+        step, file = load_checkpoint(tmp_path)
+        assert step == 0
+        assert file == ""
+
+    def test_file_is_null_returns_zero(self, tmp_path: Path) -> None:
+        """``file: null`` — not a valid string."""
+        (tmp_path / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": 1000, "file": None}]})
+        )
+        step, file = load_checkpoint(tmp_path)
+        assert step == 0
+        assert file == ""
+
+    def test_file_is_int_returns_zero(self, tmp_path: Path) -> None:
+        """``file: 42`` — must be str, not int."""
+        (tmp_path / "checkpoint.json").write_text(
+            json.dumps({"records": [{"step": 1000, "file": 42}]})
+        )
+        step, file = load_checkpoint(tmp_path)
+        assert step == 0
+        assert file == ""

@@ -518,10 +518,11 @@ def _atomic_save_checkpoint(
     simulation: object,
     output_dir: Path,
     absolute_step: int,
+    terminal: dict[str, object] | None = None,
 ) -> str:
     """Atomically commit a state file plus the manifest as one transaction.
 
-    Design (v7, generation-versioned state files):
+    Design (v7, generation-versioned state files; v10 atomic terminal):
 
     1. Write a uniquely-named state file directly:
        ``state.<step>_<pid>_<nanos>.xml``. The filename is the
@@ -534,6 +535,16 @@ def _atomic_save_checkpoint(
        referencing the state file by basename, then atomically
        ``os.replace`` it to ``checkpoint.json``. THIS is the
        single atomic commit point.
+
+       v10 BLOCKER #2: if ``terminal`` is provided, it is embedded
+       into the manifest's last record under a ``terminal`` key.
+       The terminal status therefore commits together with the
+       state file in the same ``os.replace`` — a crash between
+       the two cannot leave a resumable checkpoint whose terminal
+       decision was already made. A separate ``early_abort.json``
+       is written AFTER this function returns (in
+       :meth:`OpenMMRunner._write_abort_metadata`) for downstream
+       consumers — it is a derived file, not authoritative.
 
     3. Garbage-collect any ``state.*.xml`` that is no longer
        referenced by the manifest.
@@ -569,10 +580,15 @@ def _atomic_save_checkpoint(
             fresh runs, ``manifest_step`` for resumed runs). The
             v6 protocol wrote the invocation-local ``steps_done``
             instead, which silently broke accounting on resumes.
+        terminal: Optional dict — when provided, embedded into the
+            manifest record under ``terminal``. The caller is
+            responsible for ensuring ``terminal["step"] ==
+            absolute_step`` (enforced by
+            :func:`biolab_runners.openmm.utils.is_run_complete`).
 
     Returns:
-        The basename of the saved state file. The runner does not
-        currently use this, but it is useful for tests and logs.
+        The basename of the saved state file. The runner uses
+        this to populate ``result.state_xml_path``.
     """
     pid = os.getpid()
     nanos = time.time_ns()
@@ -591,7 +607,10 @@ def _atomic_save_checkpoint(
     # previous manifest is still active. If we crash after the
     # rename, the new manifest references the just-written state.
     manifest_path = output_dir / FileNames.CHECKPOINT_JSON
-    manifest_payload = {"records": [{"step": absolute_step, "file": state_basename}]}
+    record: dict[str, object] = {"step": absolute_step, "file": state_basename}
+    if terminal is not None:
+        record["terminal"] = terminal
+    manifest_payload = {"records": [record]}
     manifest_tmp = manifest_path.with_suffix(manifest_path.suffix + f".tmp.{pid}.{absolute_step}")
     manifest_tmp.write_text(json.dumps(manifest_payload))
     os.replace(str(manifest_tmp), str(manifest_path))
@@ -601,9 +620,10 @@ def _atomic_save_checkpoint(
     _gc_orphan_states(output_dir)
 
     logger.info(
-        "Atomic checkpoint: state=%s manifest=checkpoint.json step=%d",
+        "Atomic checkpoint: state=%s manifest=checkpoint.json step=%d terminal=%s",
         state_basename,
         absolute_step,
+        "yes" if terminal is not None else "no",
     )
     return state_basename
 
