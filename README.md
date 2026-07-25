@@ -1,7 +1,7 @@
 # biolab-runners
 
 [![Version](https://img.shields.io/badge/version-0.1.0-8A2BE2)](pyproject.toml)
-[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache_2.0-blue)](LICENSE)
 [![Tests](https://github.com/Lambda-Biolab/biolab-runners/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Lambda-Biolab/biolab-runners/actions/workflows/ci.yml)
 [![Dependabot Updates](https://github.com/Lambda-Biolab/biolab-runners/actions/workflows/dependabot/dependabot-updates/badge.svg?branch=main)](https://github.com/Lambda-Biolab/biolab-runners/actions/workflows/dependabot/dependabot-updates)
 [![CodeQL](https://github.com/Lambda-Biolab/biolab-runners/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/Lambda-Biolab/biolab-runners/actions/workflows/codeql.yml)
@@ -239,4 +239,4 @@ make smoke_test
 
 ## License
 
-MIT
+[Apache License 2.0](LICENSE) — Copyright © 2026 Lambda Biolab.
