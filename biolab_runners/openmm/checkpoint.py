@@ -580,13 +580,21 @@ def inspect_checkpoint(output_dir: Path, config: OpenMMConfig) -> CheckpointSnap
     last_record = checkpoint.last_record
 
     # Manifest terminal payload — three-way terminal classification.
-    # ABSENT (no terminal key) → IN_PROGRESS, caller falls back to
-    # normal completion. INVALID (present but fails schema) →
-    # INVALID_TERMINAL with a specific reason. VALID → EARLY_ABORT.
-    raw_terminal = last_record.get("terminal")
-    if raw_terminal is not None:
+    # ABSENT (no "terminal" key) → IN_PROGRESS, caller falls back to
+    # normal completion. INVALID (key present, value fails schema —
+    # including "terminal": null) → INVALID_TERMINAL with a specific
+    # reason. VALID → EARLY_ABORT.
+    #
+    # Key presence matters: ``terminal: null`` is NOT the same as
+    # omitting the key. The former is an explicit (but invalid)
+    # terminal decision; the latter is no decision at all. Lumping
+    # them together would let a runner silently accept a malformed
+    # terminal at the target step as normal completion — exactly
+    # the failure mode the invalid-terminal rule is meant to
+    # prevent.
+    if "terminal" in last_record:
         return _classify_manifest_terminal(
-            raw_terminal=raw_terminal,
+            raw_terminal=last_record["terminal"],
             manifest_step=manifest_step,
             state_file_basename=checkpoint.state_file_basename,
             last_record=last_record,
@@ -633,6 +641,19 @@ def _classify_manifest_terminal(
     normal completion); INVALID → INVALID_TERMINAL (caller MUST
     NOT fall back to normal completion); VALID → EARLY_ABORT.
     """
+    if raw_terminal is None:
+        # ``"terminal": null`` is INVALID (an explicit terminal
+        # decision was made but the value is null) — distinct
+        # from the key being absent (which is handled by the
+        # caller's ``"terminal" in last_record`` check).
+        return CheckpointSnapshot(
+            absolute_step=manifest_step,
+            state_file_basename=state_file_basename,
+            last_record=last_record,
+            completion=CompletionStatus.INVALID_TERMINAL,
+            completion_reason="invalid_terminal_null",
+            terminal_payload=None,
+        )
     if not isinstance(raw_terminal, dict):
         return CheckpointSnapshot(
             absolute_step=manifest_step,

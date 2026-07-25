@@ -29,6 +29,7 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
 from biolab_runners.openmm.checkpoint import (
     CompletionStatus,
     atomic_save_checkpoint,
@@ -51,16 +52,29 @@ logger = __import__("logging").getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Sentinel for distinguishing "key not present" from "key present with None".
+# The manifest's ``terminal`` field may legally be absent (no decision
+# recorded) OR present-but-null (an explicit terminal decision that is
+# malformed). The reviewer flagged this distinction as a contract
+# bug — see AGENTS.md / run_state tests.
+_SENTINEL = object()
+
 
 def _write_manifest(
     output_dir: Path,
     *,
     step: int,
     state_file: str,
-    terminal: dict[str, object] | None = None,
+    terminal: dict[str, object] | None | object = _SENTINEL,
 ) -> None:
+    """Write a manifest record.
+
+    The default (``_SENTINEL``) omits the ``terminal`` key entirely.
+    Passing ``None`` explicitly writes ``"terminal": null`` — the
+    reviewer requires us to distinguish absent key from null value.
+    """
     record: dict[str, object] = {"step": step, "file": state_file}
-    if terminal is not None:
+    if terminal is not _SENTINEL:
         record["terminal"] = terminal
     (output_dir / FileNames.CHECKPOINT_JSON).write_text(json.dumps({"records": [record]}))
 
@@ -388,9 +402,41 @@ class TestDecideSkip:
         assert plan.energy_path == str(tmp_path / FileNames.ENERGY)
         assert plan.topology_path == str(tmp_path / FileNames.TOPOLOGY)
         assert plan.state_xml_path == str(tmp_path / f"state.{target}_1_1.xml")
-        assert plan.total_ns > 0
+        # Exact rounded value, not just > 0. The reviewer flagged
+        # that the previous implementation did ``round(..., 2)`` and
+        # the test should verify the rounding contract.
+        assert plan.total_ns == round(config.total_steps * config.timestep_fs / 1e6, 2)
         assert plan.early_abort is False
         assert plan.abort_reason is None
+
+    def test_normal_completion_total_ns_rounded_for_float_timestep(self, tmp_path: Path) -> None:
+        """Float timestep: total_ns is the exact-rounded value (2 dp),
+        not the raw float. Without ``round()``, floating-point artifacts
+        in the multiplication would leak through.
+
+        With production_ns=2.5 and timestep_fs=2.5, total_steps is
+        computed as ``int(2.5 * 1000 * (1000/2.5)) = 1_000_000`` and
+        ``total_ns = 1_000_000 * 2.5 / 1e6 = 2.5``. After ``round(_, 2)``
+        the value is exactly ``2.5`` — the rounding contract holds.
+        """
+        config = OpenMMConfig(production_ns=2.5, timestep_fs=2.5)
+        target = config.total_equil_steps + config.total_steps
+        state = tmp_path / f"state.{target}_1_1.xml"
+        state.write_text("<State/>")
+        (tmp_path / FileNames.TRAJECTORY).write_bytes(b"\x00" * 100)
+        (tmp_path / FileNames.ENERGY).write_text("header\nrow\n")
+        (tmp_path / FileNames.TOPOLOGY).write_text("HEADER\nATOM\n" * 100)
+        _write_manifest(tmp_path, step=target, state_file=f"state.{target}_1_1.xml")
+
+        plan = decide(tmp_path, config, force=False)
+
+        assert isinstance(plan, SkipPlan)
+        assert plan.completion == CompletionStatus.NORMAL_COMPLETE
+        # 1_000_000 steps × 2.5 fs = 2.5 ns. The round(_, 2) is a
+        # no-op for this exact value, but the assertion verifies the
+        # public surface emits a 2-decimal value.
+        assert plan.total_ns == round(config.total_steps * config.timestep_fs / 1e6, 2)
+        assert plan.total_ns == 2.5
 
     def test_valid_terminal_payload(self, tmp_path: Path) -> None:
         config = _config(production_ns=10.0, timestep_fs=2.0)
@@ -593,6 +639,54 @@ class TestDecideFailFastInvalidTerminal:
         assert isinstance(plan, FailurePlan)
         assert "invalid_terminal_type_unsupported" in plan.error
 
+    def test_terminal_null_at_target_fails_fast(self, tmp_path: Path) -> None:
+        """``"terminal": null`` is INVALID — distinct from the key
+        being absent. At the target step, the absence of the key
+        would be a valid normal completion, but the explicit null
+        value is an explicit terminal decision that fails the
+        schema. The runner must fail fast."""
+        config = _config(production_ns=1.0, timestep_fs=2.0)
+        target = config.total_equil_steps + config.total_steps
+        state = tmp_path / f"state.{target}_1_1.xml"
+        state.write_text("<State/>")
+        # Explicit ``terminal: null`` — the key is present but the
+        # value is None. This is the case the previous code got
+        # wrong: ``last_record.get("terminal")`` returned None for
+        # both the absent key and the null value, so the manifest
+        # was silently treated as normal completion.
+        _write_manifest(
+            tmp_path,
+            step=target,
+            state_file=f"state.{target}_1_1.xml",
+            terminal=None,
+        )
+
+        plan = decide(tmp_path, config, force=False)
+
+        assert isinstance(plan, FailurePlan)
+        assert "invalid_terminal_null" in plan.error
+        assert "force=True" in plan.error
+
+    def test_terminal_null_below_target_fails_fast(self, tmp_path: Path) -> None:
+        """``"terminal": null`` below the target also fails fast —
+        the rule is independent of the step, since any explicit
+        terminal decision at any step that fails schema is invalid."""
+        config = _config(production_ns=10.0, timestep_fs=2.0)
+        mid_step = config.total_equil_steps + 100
+        state = tmp_path / f"state.{mid_step}_12345_170000000.xml"
+        state.write_text("<State/>")
+        _write_manifest(
+            tmp_path,
+            step=mid_step,
+            state_file=f"state.{mid_step}_12345_170000000.xml",
+            terminal=None,
+        )
+
+        plan = decide(tmp_path, config, force=False)
+
+        assert isinstance(plan, FailurePlan)
+        assert "invalid_terminal_null" in plan.error
+
 
 # ---------------------------------------------------------------------------
 # Skip plan artifact validation
@@ -751,4 +845,96 @@ class TestRunPlanTypeContract:
         assert not hasattr(plan, "start_step")
         assert not hasattr(plan, "resume_xml")
         assert not hasattr(plan, "manifest_step")
-        assert plan.error == "state file does not exist"
+
+
+# ---------------------------------------------------------------------------
+# Plan invariant enforcement — the reviewer flagged that the plan
+# types still allowed invalid constructions. The fixes:
+#   - ``action`` is a ``ClassVar`` (cannot be set via constructor)
+#   - Required fields have no defaults (TypeError on missing)
+#   - ``__post_init__`` validates domain invariants (ValueError)
+# ---------------------------------------------------------------------------
+
+
+class TestRunPlanInvariants:
+    """The plan types refuse to construct contradictory states."""
+
+    def test_fresh_plan_action_cannot_be_overridden(self) -> None:
+        """``action`` is a ClassVar — passing it to the constructor is a TypeError."""
+        with pytest.raises(TypeError):
+            FreshPlan(  # type: ignore[call-arg]
+                action=Action.SKIP,
+                start_step=200_000,
+                remaining_steps=50_000_000,
+            )
+
+    def test_resume_plan_action_cannot_be_overridden(self) -> None:
+        with pytest.raises(TypeError):
+            ResumePlan(  # type: ignore[call-arg]
+                action=Action.FRESH,
+                start_step=10_000,
+                remaining_steps=49_990_000,
+                resume_xml="state.10000_1_1.xml",
+                manifest_step=10_000,
+                state_file_basename="state.10000_1_1.xml",
+            )
+
+    def test_skip_plan_action_cannot_be_overridden(self) -> None:
+        with pytest.raises(TypeError):
+            SkipPlan(  # type: ignore[call-arg]
+                action=Action.RESUME,
+                completion=CompletionStatus.NORMAL_COMPLETE,
+                completion_reason="normal_completion_step_0_of_0",
+                manifest_step=1,
+                state_file_basename="state.1_1_1.xml",
+                trajectory_path="build/trajectory.dcd",
+                energy_path="build/energy.csv",
+                topology_path="build/topology.pdb",
+                state_xml_path="build/state.1_1_1.xml",
+                total_ns=0.0,
+                early_abort=False,
+                abort_reason=None,
+            )
+
+    def test_failure_plan_action_cannot_be_overridden(self) -> None:
+        with pytest.raises(TypeError):
+            FailurePlan(action=Action.SKIP, error="x")  # type: ignore[call-arg]
+
+    def test_resume_plan_default_construction_fails(self) -> None:
+        """Missing required fields → TypeError (no defaults on required)."""
+        with pytest.raises(TypeError):
+            ResumePlan()  # type: ignore[call-arg]
+
+    def test_failure_plan_empty_error_rejected(self) -> None:
+        with pytest.raises(ValueError, match="error must be non-empty"):
+            FailurePlan(error="")
+
+    def test_fresh_plan_negative_steps_rejected(self) -> None:
+        with pytest.raises(ValueError, match="start_step"):
+            FreshPlan(start_step=-1, remaining_steps=0)
+
+    def test_resume_plan_empty_resume_xml_rejected(self) -> None:
+        with pytest.raises(ValueError, match="resume_xml"):
+            ResumePlan(
+                start_step=10_000,
+                remaining_steps=0,
+                resume_xml="",
+                manifest_step=10_000,
+                state_file_basename="state.10000_1_1.xml",
+            )
+
+    def test_skip_plan_early_abort_requires_reason(self) -> None:
+        with pytest.raises(ValueError, match="abort_reason"):
+            SkipPlan(
+                completion=CompletionStatus.EARLY_ABORT,
+                completion_reason="x",
+                manifest_step=1,
+                state_file_basename="state.1_1_1.xml",
+                trajectory_path="build/traj.dcd",
+                energy_path="build/energy.csv",
+                topology_path="build/top.pdb",
+                state_xml_path="build/state.1_1_1.xml",
+                total_ns=0.0,
+                early_abort=True,
+                abort_reason=None,
+            )

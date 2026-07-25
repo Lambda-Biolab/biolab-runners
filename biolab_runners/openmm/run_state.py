@@ -48,7 +48,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from biolab_runners.openmm.checkpoint import (
     CheckpointSnapshot,
@@ -89,23 +89,61 @@ class Action(StrEnum):
 
 @dataclass(frozen=True)
 class FreshPlan:
-    """The runner should build a fresh simulation from scratch."""
+    """The runner should build a fresh simulation from scratch.
 
-    action: Action = Action.FRESH
-    start_step: int = 0
-    remaining_steps: int = 0
+    The ``action`` field is a ``ClassVar`` — it cannot be set via
+    the constructor and is fixed to ``Action.FRESH``. The other
+    fields are required (no defaults): callers must commit to
+    values that actually describe a fresh run.
+    """
+
+    action: ClassVar[Action] = Action.FRESH
+    start_step: int
+    remaining_steps: int
+
+    def __post_init__(self) -> None:
+        """Validate FreshPlan invariants."""
+        if self.start_step < 0:
+            raise ValueError(f"FreshPlan.start_step must be non-negative, got {self.start_step}")
+        if self.remaining_steps < 0:
+            raise ValueError(
+                f"FreshPlan.remaining_steps must be non-negative, got {self.remaining_steps}"
+            )
 
 
 @dataclass(frozen=True)
 class ResumePlan:
-    """The runner should resume from the saved state file."""
+    """The runner should resume from the saved state file.
 
-    action: Action = Action.RESUME
-    start_step: int = 0
-    remaining_steps: int = 0
-    resume_xml: str = ""
-    manifest_step: int = 0
-    state_file_basename: str = ""
+    ``action`` is fixed to ``Action.RESUME`` and cannot be
+    overridden. All other fields are required and validated in
+    ``__post_init__``: a default ``ResumePlan()`` is a
+    ``TypeError`` (missing required fields); a
+    ``ResumePlan(..., resume_xml="", ...)`` is a ``ValueError``
+    (empty state path).
+    """
+
+    action: ClassVar[Action] = Action.RESUME
+    start_step: int
+    remaining_steps: int
+    resume_xml: str
+    manifest_step: int
+    state_file_basename: str
+
+    def __post_init__(self) -> None:
+        """Validate ResumePlan invariants."""
+        if self.start_step < 0:
+            raise ValueError(f"ResumePlan.start_step must be non-negative, got {self.start_step}")
+        if self.remaining_steps < 0:
+            raise ValueError(
+                f"ResumePlan.remaining_steps must be non-negative, got {self.remaining_steps}"
+            )
+        if not self.resume_xml:
+            raise ValueError("ResumePlan.resume_xml must be a non-empty path")
+        if not self.state_file_basename:
+            raise ValueError("ResumePlan.state_file_basename must be non-empty")
+        if self.manifest_step <= 0:
+            raise ValueError(f"ResumePlan.manifest_step must be positive, got {self.manifest_step}")
 
 
 @dataclass(frozen=True)
@@ -118,32 +156,65 @@ class SkipPlan:
     these fields and assigns them to ``SimulationResult``.
     """
 
-    action: Action = Action.SKIP
-    completion: CompletionStatus = CompletionStatus.NORMAL_COMPLETE
-    completion_reason: str = ""
-    manifest_step: int = 0
-    state_file_basename: str = ""
+    action: ClassVar[Action] = Action.SKIP
+    completion: CompletionStatus
+    completion_reason: str
+    manifest_step: int
+    state_file_basename: str
     # Populated artifact paths (runner copies into result).
-    trajectory_path: str = ""
-    energy_path: str = ""
-    topology_path: str = ""
-    state_xml_path: str = ""
-    total_ns: float = 0.0
-    early_abort: bool = False
-    abort_reason: str | None = None
+    trajectory_path: str
+    energy_path: str
+    topology_path: str
+    state_xml_path: str
+    total_ns: float
+    early_abort: bool
+    abort_reason: str | None
+
+    def __post_init__(self) -> None:
+        """Validate SkipPlan invariants."""
+        if self.manifest_step <= 0:
+            raise ValueError(f"SkipPlan.manifest_step must be positive, got {self.manifest_step}")
+        if not self.completion_reason:
+            raise ValueError("SkipPlan.completion_reason must be non-empty")
+        for name in (
+            "state_file_basename",
+            "trajectory_path",
+            "energy_path",
+            "topology_path",
+            "state_xml_path",
+        ):
+            if not getattr(self, name):
+                raise ValueError(f"SkipPlan.{name} must be a non-empty path")
+        if self.total_ns < 0:
+            raise ValueError(f"SkipPlan.total_ns must be non-negative, got {self.total_ns}")
+        if self.early_abort and not self.abort_reason:
+            raise ValueError("SkipPlan.abort_reason must be non-empty when early_abort is True")
 
 
 @dataclass(frozen=True)
 class FailurePlan:
-    """The runner should not run MD; ``result.error`` is set."""
+    """The runner should not run MD; ``result.error`` is set.
 
-    action: Action = Action.FAIL_FAST
-    error: str = ""
+    ``action`` is fixed to ``Action.FAIL_FAST``. ``error`` is
+    required and must be non-empty — a FailurePlan without an
+    error message would defeat the contract that ``result.error``
+    is always set on FAIL_FAST.
+    """
+
+    action: ClassVar[Action] = Action.FAIL_FAST
+    error: str
+
+    def __post_init__(self) -> None:
+        """Validate FailurePlan invariants."""
+        if not self.error:
+            raise ValueError("FailurePlan.error must be non-empty")
 
 
 # Tagged union — the runner matches on either the type or the
-# ``action`` field. Each plan type has the ``action`` field set
-# to the matching enum so ``match plan.action`` is sound.
+# ``action`` field. ``action`` is a ``ClassVar`` on each plan
+# type and fixed at compile time, so the runner's ``isinstance``
+# check is the source of truth (not the value of ``plan.action``,
+# which can't be set incorrectly anyway).
 RunPlan = FreshPlan | ResumePlan | SkipPlan | FailurePlan
 
 
@@ -347,37 +418,21 @@ def _normal_completion_total_ns(absolute_step: int, config: OpenMMConfig) -> flo
     Per the v10 BLOCKER #3 invariant, total_ns is the COMPLETED
     PRODUCTION ns: ``max(0, absolute_step - total_equil_steps) *
     timestep_fs / 1e6``.
+
+    Rounded to 2 decimal places to match the historical behavior
+    of the original skip-population path. ``config.timestep_fs``
+    accepts float values, so the unrounded result can carry
+    floating-point artifacts invisible at the typical 2 fs
+    integer timestep. Keeping the round() preserves the
+    behavior-preservation contract of this refactor.
     """
-    return max(0, absolute_step - config.total_equil_steps) * config.timestep_fs / 1e6
+    return round(
+        max(0, absolute_step - config.total_equil_steps) * config.timestep_fs / 1e6,
+        2,
+    )
 
 
 def _orphan_state_error(output_dir: Path) -> str | None:
-    """Detect orphaned state files when no manifest is present.
-
-    No valid manifest + state files on disk (legacy ``state.xml``
-    from a v6 run or v7 ``state.<gen>.xml`` from an interrupted
-    save that landed before the manifest rename) is an orphan
-    condition. Pairing the orphan state with a freshly-built
-    System would re-introduce the incompatibility the "Resume
-    safety" rule exists to avoid.
-
-    Returns:
-        The error message string if orphan files are detected,
-        ``None`` if the directory is clean (no state files
-        without a manifest).
-    """
-    leftover_states = list(output_dir.glob("state*.xml"))
-    if not leftover_states:
-        return None
-    return (
-        f"State file(s) exist at {leftover_states} but "
-        f"the manifest {FileNames.CHECKPOINT_JSON} is "
-        f"missing or invalid — the saved state's step is "
-        f"unknown. Pairing it with a freshly-built System "
-        f"would re-introduce the incompatibility this rule "
-        f"exists to avoid. Re-run with force=True to "
-        f"discard the orphaned checkpoint."
-    )
     """Detect orphaned state files when no manifest is present.
 
     No valid manifest + state files on disk (legacy ``state.xml``

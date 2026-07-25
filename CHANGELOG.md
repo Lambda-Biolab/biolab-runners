@@ -52,6 +52,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   to discard it." to the original `InvalidCheckpointError` text. The
   previous implementation copied `str(exc)` directly.
 
+  Plan type contract tightened: `action` is now a `ClassVar` (cannot
+  be overridden via constructor — `FreshPlan(action=Action.SKIP)` is
+  a `TypeError`), required fields have no defaults (`ResumePlan()` is
+  a `TypeError`), and `__post_init__` validates domain invariants
+  (negative steps, empty paths, early-abort-without-reason).
+  Invalid constructions are now unrepresentable.
+
+  Bug fix: `inspect_checkpoint` now distinguishes "key absent"
+  from `"terminal": null`. Previously, `last_record.get("terminal")`
+  returned `None` for both, so a `terminal: null` manifest at the
+  target step was silently accepted as normal completion — exactly
+  the failure mode the invalid-terminal rule is intended to prevent.
+  The new behavior classifies `terminal: null` as `INVALID_TERMINAL`
+  with reason `invalid_terminal_null`, which `run_state.decide()`
+  converts to `FailurePlan`.
+
+  Behavior restored: normal-completion `total_ns` is now `round(_, 2)`
+  — matches the original skip-population path. The intermediate
+  implementation dropped the rounding, which would have leaked
+  floating-point artifacts for float `timestep_fs` values. The new
+  behavior preserves the exact-value contract the runner had before
+  this refactor.
+
 - **Architecture (checkpoint extraction, v14)**: Extracted the entire
   checkpoint domain — manifest read/validate, atomic save, orphan GC,
   quarantine, terminal classification, production step math — from
