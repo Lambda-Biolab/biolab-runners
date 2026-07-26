@@ -1,15 +1,1 @@
-{
-  "spdxVersion": "SPDX-2.3",
-  "dataLicense": "CC0-1.0",
-  "SPDXID": "SPDXRef-DOCUMENT",
-  "name": "biolab-runners-github-depgraph",
-  "documentNamespace": "https://github.com/Lambda-Biolab/biolab-runners/spdx/github-depgraph",
-  "creationInfo": {
-    "created": "2026-07-25T00:00:00Z",
-    "creators": [
-      "Tool: biolab-runners-ci-fallback"
-    ],
-    "comment": "Placeholder SPDX document. GitHub's dependency-graph SBOM endpoint (GET /repos/{owner}/{repo}/dependency-graph/sbom) returned a 4xx response — see https://github.com/Lambda-Biolab/biolab-runners/issues/50. The Syft-generated SBOM at docs/SBOM/syft-scan.spdx.json remains the canonical dependency inventory until the upstream action (qte77/gha-sbom-action#16) ships the gh-api exit-code validation fix and Dependency Graph is confirmed enabled in Settings → Code security."
-  },
-  "packages": []
-}
+{"message":"Not Found","documentation_url":"https://docs.github.com/rest","status":"404"}
