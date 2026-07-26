@@ -118,6 +118,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `test_binary_corrupted_energy_yields_failure` exercise the
   hardening.
 
+- **Validation (post-v15 smoke runs, RTX 4090 + OpenCL)**: All three
+  smoke scripts (`smoke_test/run_smoke.py`, `run_resume.py`,
+  `run_true_resume.py`) ran cleanly on OpenMM 8.5.1 via OpenCL
+  against the same 50-ps peptide-protein system as the Apr-14
+  reference outputs. The post-refactor `trajectory.dcd` is
+  byte-identical to the reference (184636 bytes). Bug-fix evidence
+  worth pulling out: the pre-v15 resume was a no-op for extended
+  configs — phase 2 with `total_steps > saved_step` did not run any
+  new steps (energy.csv stayed at step 210000). The post-v15 runner
+  correctly extends 210000 → 225000 (3 new energy checkpoints); the
+  v15 `run_state.decide()` decision tree tracks `remaining_steps`
+  correctly between `ResumePlan` invocations, where the pre-v15
+  runner silently treated "manifest step exists" as terminal. The
+  true-resume scenario similarly shows the post-v15 runner respects
+  the `total_steps` override (extends to 650000); the pre-v15
+  reference ignored it (stuck at 450000). See `AGENT_LEARNINGS.md`
+  for the full validation report (DCD byte-identity signal, OpenCL
+  vs CUDA throughput gap, platform-hardcode caveat).
+
 - **Architecture (checkpoint extraction, v14)**: Extracted the entire
   checkpoint domain — manifest read/validate, atomic save, orphan GC,
   quarantine, terminal classification, production step math — from
