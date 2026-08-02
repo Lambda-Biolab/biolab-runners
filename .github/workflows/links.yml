@@ -14,7 +14,13 @@ on:
 jobs:
   check-links:
     runs-on: ubuntu-latest
+    # Default token has `contents: read`; we re-declare permissions to
+    # also grant `issues: write` for the create-issue-from-file step.
+    # Listing only `issues: write` would drop `contents: read` and
+    # the actions/checkout step would fail with a 403 — that was the
+    # cause of the long-running `startup_failure` before this fix.
     permissions:
+      contents: read
       issues: write
 
     steps:
