@@ -47,14 +47,16 @@ repos:
     hooks:
       - id: pyright
         name: pyright (src/ only)
-        entry: uv run pyright src/
+        entry: |
+          bash -c 'export PATH=\"\$HOME/.local/bin:\$PATH\"; uv run pyright src/'
         language: system
         pass_filenames: false
         types: [python]
 
       - id: complexipy
         name: complexipy (cognitive complexity <=10)
-        entry: uv run complexipy src/ --max-complexity-allowed 10
+        entry: |
+          bash -c 'export PATH=\"\$HOME/.local/bin:\$PATH\"; uv run complexipy src/ --max-complexity-allowed 10'
         language: system
         pass_filenames: false
         types: [python]

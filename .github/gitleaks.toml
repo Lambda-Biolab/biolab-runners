@@ -1,0 +1,5 @@
+# Gitleaks configuration — extends the default rule set.
+# The pre-commit and pre-push hooks also run gitleaks locally.
+
+[extend]
+useDefault = true
