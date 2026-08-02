@@ -168,6 +168,7 @@ class TestAddCaRestraint:
         openmm = _FakeOpenMM()
 
         _force, _ca = add_ca_restraint(system, modeller, chains, openmm)  # type: ignore[arg-type]
+        assert openmm.last_force is not None
 
         # addGlobalParameter is called with ("k", 0.0)
         openmm.last_force.addGlobalParameter.assert_called_once_with("k", 0.0)
@@ -185,6 +186,7 @@ class TestAddCaRestraint:
         openmm = _FakeOpenMM()
 
         _force, _ca = add_ca_restraint(system, modeller, chains, openmm)  # type: ignore[arg-type]
+        assert openmm.last_force is not None
 
         # addPerParticleParameter is called 3 times (x0, y0, z0)
         assert openmm.last_force.addPerParticleParameter.call_count == 3
@@ -203,6 +205,7 @@ class TestAddCaRestraint:
         openmm = _FakeOpenMM()
 
         _force, ca_indices = add_ca_restraint(system, modeller, chains, openmm)  # type: ignore[arg-type]
+        assert openmm.last_force is not None
 
         assert ca_indices == []
         openmm.last_force.addParticle.assert_not_called()

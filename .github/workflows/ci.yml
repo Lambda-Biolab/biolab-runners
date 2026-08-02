@@ -41,7 +41,7 @@ jobs:
           uv run ruff format --check biolab_runners/ tests/
 
       - name: Type check with pyright
-        run: uv run pyright biolab_runners/
+        run: uv run pyright biolab_runners/ tests/
 
       - name: Check complexity
         run: uv run complexipy biolab_runners/ --max-complexity-allowed 15
