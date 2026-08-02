@@ -104,9 +104,38 @@ make check_docs     # Lint markdown files
 Package:     biolab_runners (hatchling build)
 Python:      >=3.11 (3.11, 3.12 tested)
 Lint:        ruff (line-length=100, Google docstrings, C90 ≤10, RUF/ANN/PT enabled)
-Types:       pyright standard
+Types:       pyright standard (see "Pyright mode" section below)
 Complexity:  complexipy cognitive ≤15
 Tests:       pytest with mocks (no GPU/CLI needed)
+
+## Pyright mode
+
+**Current state:** `typeCheckingMode = "standard"` with tests included
+(via `[tool.pyright].include = ["biolab_runners", "tests"]`).
+
+**Target state:** `typeCheckingMode = "strict"` once a follow-up
+hardening pass fixes the residual errors.
+
+**Why standard for now:** strict mode is a hard cliff — turning it on
+will surface several hundred latent errors that the 13-phase hardening
+pass explicitly chose not to fix in a single session. The realistic
+upgrade path is:
+
+1. **Today:** stay in standard, but with `[tool.pyright].include` set
+   to include both `biolab_runners/` and `tests/` (already done).
+   `reportXxx = "error"` overrides elevate the checks that catch
+   real bugs while keeping the standard-mode leniency for
+   third-party stub noise (MDAnalysis, mdtraj, OpenMM, etc.).
+2. **Next session / dedicated hardening pass:** switch to `strict`,
+   fix the residual errors, document the strict-mode-required
+   patterns (no untyped `def`, no implicit `Any`, etc.) in this
+   file's "Domain Rules" section.
+
+**Don't widen pyright suppression** (`reportUnknown* = false`,
+`reportAttributeAccessIssue = "warning"`, etc.) without a written
+justification. Each suppression hides real bugs from a gate that
+should be catching them — the biolab-runners audit found 20 latent
+errors that were hidden because tests/ was excluded from pyright.
 CI:          .github/workflows/ci.yml (lint → type → complexity → test, Python 3.11+3.12)
 Coverage:    70% floor (ratcheting to 80%)
 ```

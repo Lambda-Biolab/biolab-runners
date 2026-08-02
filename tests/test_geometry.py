@@ -188,7 +188,7 @@ class TestPbcCorrectProperties:
             out = pbc_correct(disp.reshape(1, 3), small_box, np)
             np.testing.assert_allclose(out, 0.0, atol=1e-10)
 
-        inner()
+        inner()  # type: ignore[reportCallIssue]
 
     def test_idempotent(self, small_box: np.ndarray) -> None:
         """pbc_correct(pbc_correct(x)) == pbc_correct(x) for any x in the box."""
@@ -208,7 +208,7 @@ class TestPbcCorrectProperties:
             twice = pbc_correct(once, small_box, np)
             np.testing.assert_allclose(once, twice, atol=1e-10)
 
-        inner()
+        inner()  # type: ignore[reportCallIssue]
 
     def test_output_within_half_box(self, small_box: np.ndarray) -> None:
         """For orthorhombic cells, output components lie in [-L/2, L/2)."""
@@ -228,7 +228,7 @@ class TestPbcCorrectProperties:
             half = np.diag(small_box) / 2.0
             assert np.all(np.abs(out) <= half + 1e-10), f"out={out}, half={half}"
 
-        inner()
+        inner()  # type: ignore[reportCallIssue]
 
 
 # ---------------------------------------------------------------------------
@@ -287,3 +287,116 @@ class TestMinPbcDistance:
         box = np.diag([10.0, 10.0, 10.0])
         with pytest.raises(IndexError):
             min_pbc_distance([], [np.array([0.0, 0.0, 0.0])], box, np)
+
+
+# ---------------------------------------------------------------------------
+# Closed-form cross-checks (test-quality.md rule #3)
+# ---------------------------------------------------------------------------
+#
+# Each test asserts a specific value derived from the closed-form
+# minimum-image formula. For orthorhombic boxes (diagonal matrix Lx, Ly,
+# Lz), the inverse is diag(1/Lx, 1/Ly, 1/Lz), so the fractional coordinate
+# is diff[i]/L_i, snap-to-nearest-integer gives the [-0.5, 0.5] image,
+# and the corrected displacement is round(diff[i]/L_i - 0.5) * L_i.
+# ±1e-9 catches arithmetic mutations (sign flip, off-by-one in the
+# round-to-nearest step, transpose of the inverse-lattice multiplication).
+# ---------------------------------------------------------------------------
+
+
+class TestPbcCorrectClosedForm:
+    """Hand-derived minimum-image values for orthorhombic and triclinic boxes."""
+
+    def test_orthorhombic_half_box_boundary_stays(self) -> None:
+        """Displacement of exactly +5 in a 10-unit box → stays at +5 (boundary).
+        frac = 5/10 = 0.5 → round(0.5) = 0 (banker's rounding in numpy).
+        corrected = (0.5 - 0) * 10 = +5.0. Displacement of +5.01 wraps to -4.99.
+        """
+        box = np.diag([10.0, 10.0, 10.0])
+        diff = np.array([[5.0, 0.0, 0.0]])
+        out = pbc_correct(diff, box, np)
+        # Boundary case: numpy's banker's rounding keeps +5.0 as +5.0
+        np.testing.assert_allclose(out, [[5.0, 0.0, 0.0]], atol=1e-9)
+
+    def test_orthorhombic_just_past_half_wraps(self) -> None:
+        """Displacement of +5.01 in a 10-unit box → wraps to -4.99.
+        frac = 5.01/10 = 0.501 → round(0.501) = 1 → corrected = (0.501 - 1) * 10 = -4.99.
+        """
+        box = np.diag([10.0, 10.0, 10.0])
+        diff = np.array([[5.01, 0.0, 0.0]])
+        out = pbc_correct(diff, box, np)
+        np.testing.assert_allclose(out, [[-4.99, 0.0, 0.0]], atol=1e-9)
+
+    def test_orthorhombic_three_quarter_box_wraps(self) -> None:
+        """Displacement of +7.5 in a 10-unit box → wraps to -2.5.
+        frac = 7.5/10 = 0.75 → round(0.75) = 1 → corrected = (0.75 - 1) * 10 = -2.5.
+        """
+        box = np.diag([10.0, 10.0, 10.0])
+        diff = np.array([[7.5, 0.0, 0.0]])
+        out = pbc_correct(diff, box, np)
+        np.testing.assert_allclose(out, [[-2.5, 0.0, 0.0]], atol=1e-9)
+
+    def test_orthorhombic_full_box_wraps_to_zero(self) -> None:
+        """Displacement of exactly +10 in a 10-unit box → wraps to 0.
+        frac = 10/10 = 1.0 → round(1.0) = 1 → corrected = (1.0 - 1) * 10 = 0.
+        """
+        box = np.diag([10.0, 10.0, 10.0])
+        diff = np.array([[10.0, 0.0, 0.0]])
+        out = pbc_correct(diff, box, np)
+        np.testing.assert_allclose(out, [[0.0, 0.0, 0.0]], atol=1e-9)
+
+    def test_negative_displacement_wraps_correctly(self) -> None:
+        """Displacement of -7 in a 10-unit box → wraps to +3.
+        frac = -7/10 = -0.7 → round(-0.7) = -1 → corrected = (-0.7 - (-1)) * 10 = +3.
+        """
+        box = np.diag([10.0, 10.0, 10.0])
+        diff = np.array([[-7.0, 0.0, 0.0]])
+        out = pbc_correct(diff, box, np)
+        np.testing.assert_allclose(out, [[3.0, 0.0, 0.0]], atol=1e-9)
+
+
+class TestMinPbcDistanceClosedForm:
+    """Hand-derived min PBC distances for orthorhombic boxes."""
+
+    def test_two_atoms_3d_distance(self) -> None:
+        """Receptor at (0,0,0), peptide at (3,4,0) in a 10-unit box.
+        Minimum-image distance = sqrt(9 + 16 + 0) = 5.0.
+        """
+        box = np.diag([10.0, 10.0, 10.0])
+        rec = [np.array([0.0, 0.0, 0.0])]
+        pep = [np.array([3.0, 4.0, 0.0])]
+        assert min_pbc_distance(rec, pep, box, np) == pytest.approx(5.0, abs=1e-9)
+
+    def test_atoms_across_box_boundary(self) -> None:
+        """Receptor at (1,0,0), peptide at (9,0,0) in a 10-unit box.
+        Direct distance = 8; minimum-image distance = 2 (peptides wrap).
+        """
+        box = np.diag([10.0, 10.0, 10.0])
+        rec = [np.array([1.0, 0.0, 0.0])]
+        pep = [np.array([9.0, 0.0, 0.0])]
+        assert min_pbc_distance(rec, pep, box, np) == pytest.approx(2.0, abs=1e-9)
+
+    def test_atoms_at_box_boundary_minimum_image(self) -> None:
+        """Receptor at (0,0,0), peptide at (5,5,5) in a 10-unit box.
+        Direct distance = sqrt(75) ≈ 8.660; minimum-image distance is
+        min(sqrt(75), sqrt((-5)^2 + (-5)^2 + (-5)^2)) = sqrt(75) — both
+        images give the same distance since 5 < 10/2.
+        """
+        box = np.diag([10.0, 10.0, 10.0])
+        rec = [np.array([0.0, 0.0, 0.0])]
+        pep = [np.array([5.0, 5.0, 5.0])]
+        expected = float(np.sqrt(75))
+        assert min_pbc_distance(rec, pep, box, np) == pytest.approx(expected, abs=1e-9)
+
+    def test_min_over_multiple_pairs(self) -> None:
+        """Multiple receptor / peptide pairs — function returns the min
+        over all pairs.
+        Receptor at (0,0,0), (1,0,0).
+        Peptide at (8,0,0), (3,4,0).
+        Distances: (0,0,0)-(8,0,0) → min=2; (0,0,0)-(3,4,0) → 5;
+        (1,0,0)-(8,0,0) → min=3; (1,0,0)-(3,4,0) → sqrt(4+16)=sqrt(20).
+        Overall min = 2.0.
+        """
+        box = np.diag([10.0, 10.0, 10.0])
+        rec = [np.array([0.0, 0.0, 0.0]), np.array([1.0, 0.0, 0.0])]
+        pep = [np.array([8.0, 0.0, 0.0]), np.array([3.0, 4.0, 0.0])]
+        assert min_pbc_distance(rec, pep, box, np) == pytest.approx(2.0, abs=1e-9)

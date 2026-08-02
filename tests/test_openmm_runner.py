@@ -6,6 +6,7 @@ import json
 import logging
 import time
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest  # used in test annotations and raises
@@ -65,7 +66,7 @@ class TestOpenMMConfig:
             target="demo",
             peptide_id="PEP001",
         )
-        d = config.to_dict()
+        d = cast("dict[str, Any]", config.to_dict())
         assert d["receptor_pdb"] == "rec.pdb"
         assert d["target"] == "demo"
         assert d["ionic_conditions"]["NaCl_M"] == 0.150
@@ -107,7 +108,7 @@ class TestOpenMMConfig:
             output_dir=str(tmp_path),
             extra_forcefields=extras,
         )
-        d = config.to_dict()
+        d = cast("dict[str, Any]", config.to_dict())
         assert d["force_fields"]["extra"] == extras
 
         path = config.save()
@@ -573,7 +574,7 @@ class TestInstallSigtermHandler:
         sim = MagicMock()
         sim.saveState.side_effect = lambda path: Path(path).write_text("<State/>")
         # Capture the registered handler
-        captured: dict[str, object] = {}
+        captured: dict[int, object] = {}
 
         def fake_signal(signum: int, handler: object) -> None:
             captured[signum] = handler
@@ -611,7 +612,7 @@ class TestInstallSigtermHandler:
         sim = MagicMock()
         sim.saveState.side_effect = OSError("disk full")
         config = OpenMMConfig()
-        captured: dict[str, object] = {}
+        captured: dict[int, object] = {}
 
         def fake_signal(signum: int, handler: object) -> None:
             captured[signum] = handler

@@ -899,16 +899,16 @@ class TestRunPlanInvariants:
     def test_fresh_plan_action_cannot_be_overridden(self) -> None:
         """``action`` is a ClassVar — passing it to the constructor is a TypeError."""
         with pytest.raises(TypeError):
-            FreshPlan(  # type: ignore[call-arg]
-                action=Action.SKIP,
+            FreshPlan(  # type: ignore[reportCallIssue]
+                action=Action.SKIP,  # type: ignore[reportCallIssue]
                 start_step=200_000,
                 remaining_steps=50_000_000,
             )
 
     def test_resume_plan_action_cannot_be_overridden(self) -> None:
         with pytest.raises(TypeError):
-            ResumePlan(  # type: ignore[call-arg]
-                action=Action.FRESH,
+            ResumePlan(  # type: ignore[reportCallIssue]
+                action=Action.FRESH,  # type: ignore[reportCallIssue]
                 start_step=10_000,
                 remaining_steps=49_990_000,
                 resume_xml="state.10000_1_1.xml",
@@ -918,8 +918,8 @@ class TestRunPlanInvariants:
 
     def test_skip_plan_action_cannot_be_overridden(self) -> None:
         with pytest.raises(TypeError):
-            SkipPlan(  # type: ignore[call-arg]
-                action=Action.RESUME,
+            SkipPlan(  # type: ignore[reportCallIssue]
+                action=Action.RESUME,  # type: ignore[reportCallIssue]
                 completion=CompletionStatus.NORMAL_COMPLETE,
                 completion_reason="normal_completion_step_0_of_0",
                 manifest_step=1,
@@ -935,12 +935,12 @@ class TestRunPlanInvariants:
 
     def test_failure_plan_action_cannot_be_overridden(self) -> None:
         with pytest.raises(TypeError):
-            FailurePlan(action=Action.SKIP, error="x")  # type: ignore[call-arg]
+            FailurePlan(action=Action.SKIP, error="x")  # type: ignore[reportCallIssue]
 
     def test_resume_plan_default_construction_fails(self) -> None:
         """Missing required fields → TypeError (no defaults on required)."""
         with pytest.raises(TypeError):
-            ResumePlan()  # type: ignore[call-arg]
+            ResumePlan()  # type: ignore[reportCallIssue]
 
     def test_failure_plan_empty_error_rejected(self) -> None:
         with pytest.raises(ValueError, match="error must be non-empty"):

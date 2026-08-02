@@ -125,12 +125,15 @@ convention = "google"
 
 # --- Pyright ---
 [tool.pyright]
-# Production-only type checking. Tests are excluded because the mock
-# infrastructure (types.ModuleType, MagicMock, "object"-typed stubs)
-# generates reports that the test code intentionally accepts. CI and
-# `make check_types` both run `pyright biolab_runners/` which respects
-# this include.
-include = ["biolab_runners"]
+# Type-check both production code AND tests. Tests are first-class code:
+# they ship in the repo, they're reviewed, they have a coverage gate.
+# The "mock infrastructure noise" rationale (hypothesis decorators, etc.)
+# applies to bioml-tools' hypothesis stubs, not biolab-runners — the
+# errors that surface when tests/ is included are real type issues in
+# production code (e.g. `to_dict()` returning `object` instead of
+# `dict[str, object]`). Letting them through the gate hides real bugs.
+include = ["biolab_runners", "tests"]
+exclude = ["**/__pycache__", "**/.venv"]
 pythonVersion = "3.11"
 typeCheckingMode = "standard"
 # `mdtraj` is an optional dep under the `openmm` extra; imported lazily
@@ -139,6 +142,11 @@ typeCheckingMode = "standard"
 # diagnostic specifically.
 reportMissingImports = "warning"
 reportAttributeAccessIssue = "warning"
+# Hypothesis decorators (@given, @settings) are untyped by design; they
+# obscure the inner function's signature in pyright's strict mode. This
+# is a known third-party-stub gap, not a real type bug. Same rationale
+# as the bioml-tools config (see AGENTS.md "Pyright mode" section).
+reportUntypedFunctionDecorator = false
 
 # --- Pytest ---
 [tool.pytest.ini_options]
