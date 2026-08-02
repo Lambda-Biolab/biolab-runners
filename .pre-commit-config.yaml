@@ -36,15 +36,27 @@ repos:
       - id: mixed-line-ending
       - id: detect-private-key
 
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.8.6
-    hooks:
-      - id: ruff
-        args: [--fix]
-      - id: ruff-format
-
   - repo: local
     hooks:
+      - id: ruff
+        name: ruff (uses uv-locked version)
+        # Use `uv run` so the pre-commit hook uses the same ruff
+        # version pinned in uv.lock. Hardcoding a rev here would
+        # create a version drift between local hooks and CI.
+        entry: |
+          bash -c 'export PATH=\"\$HOME/.local/bin:\$PATH\"; uv run ruff check --fix src/'
+        language: system
+        pass_filenames: false
+        types: [python]
+
+      - id: ruff-format
+        name: ruff-format (uses uv-locked version)
+        entry: |
+          bash -c 'export PATH=\"\$HOME/.local/bin:\$PATH\"; uv run ruff format src/'
+        language: system
+        pass_filenames: false
+        types: [python]
+
       - id: pyright
         name: pyright (src/ only)
         entry: |
