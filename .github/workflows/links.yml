@@ -1,6 +1,6 @@
 name: Link Checker
 
-on:
+"on":
   workflow_dispatch:
   push:
     branches-ignore: [main]
