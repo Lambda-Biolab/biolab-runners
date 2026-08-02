@@ -100,7 +100,7 @@ jobs:
           build-mode: none
       - name: Perform CodeQL Analysis
         id: analyze
-        uses: github/codeql-action/analyze@e296a935590eb16afc0c0108289f68c87e2a89a5 # v4.30.7
+        uses: github/codeql-action/analyze@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4.37.4
         with:
           output: sarif-results
       - name: Dismiss alerts
