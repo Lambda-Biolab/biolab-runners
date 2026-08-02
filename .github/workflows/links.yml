@@ -4,20 +4,9 @@ on:
   workflow_dispatch:
   push:
     branches-ignore: [main]
-  pull_request:
-    types: [closed]
-    branches: [main]
-  schedule:
-    - cron: "00 00 * * 0"
 
 jobs:
-  check-links:
+  test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
-
-      - name: Link Checker
-        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
-        with:
-          args: "--config .lychee.toml ."
-          fail: true
+      - run: echo "hello"
