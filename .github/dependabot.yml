@@ -9,7 +9,6 @@ updates:
       prefix: "chore(deps)"
     labels:
       - "dependencies"
-      - "python"
     groups:
       python-deps:
         patterns: ["*"]
@@ -22,7 +21,7 @@ updates:
       prefix: "chore(ci)"
     labels:
       - "dependencies"
-      - "github-actions"
+      - "github_actions"
     groups:
       github-actions:
         patterns: ["*"]
@@ -33,3 +32,13 @@ updates:
   # `pre-commit` package-ecosystem. Bump them manually with
   #   uv run pre-commit autoupdate
   # and verify the new hooks pass before merging.
+
+# Grant Dependabot PRs access to the GITLEAKS_LICENSE secret so the
+# gitleaks CI scan can run on dependency bumps. Without this, the
+# `secrets.GITLEAKS_LICENSE` env on the `gitleaks/gitleaks-action`
+# step is empty on Dependabot PRs (GitHub's default is to NOT pass
+# repo secrets to Dependabot for security reasons).
+secrets:
+  GITLEAKS_LICENSE:
+    description: "Gitleaks Pro license (free for orgs, required for v3.0+ on org accounts)"
+    required: true
