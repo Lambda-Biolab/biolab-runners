@@ -1,17 +1,67 @@
-# Pre-commit hooks for biolab-runners.
-# Install: `uv run pre-commit install` (one-time, after `uv sync`).
-# Run on all files: `uv run pre-commit run --all-files`.
-# Bypass (use sparingly): `git commit --no-verify`.
+# Pre-commit gates — runs before every commit, blocks if any fail.
+# Install once per repo: `uv run pre-commit install`
+# Run manually: `uv run pre-commit run --all-files`
 #
-# This config is intentionally minimal: lint + format only. Pyright
-# and pytest are too slow for pre-commit's pre-push lifecycle and
-# are gated by CI (`.github/workflows/ci.yml`).
+# What this enforces (per the org's opencode-config standard):
+#   - ruff lint + format on all Python
+#   - pyright type-check on src/ only — tests are caught by the CI gate
+#     (see .github/workflows/ci.yml). The pre-commit hook excludes
+#     tests/ to keep the commit-time signal-to-noise ratio usable
+#     (hypothesis stubs and complex mock chains produce many
+#     "object is not iterable" warnings that are not bugs in the
+#     user's code).
+#   - complexipy cognitive complexity <=10 per function
+#     (biolab-runner's CI complexity gate is 10, the strictest
+#     in the org)
+#   - no committing giant files (>500KB)
+#   - no secrets in commits
+#   - commit messages follow Conventional Commits
+#
+# Note: The git hooks in .git/hooks/pre-commit and .git/hooks/pre-push
+# (installed by bootstrap.sh) ALSO run gitleaks + semgrep + trufflehog
+# + detect-secrets. Those are org-level secret scanners, not quality
+# gates. This file is for quality gates; both layers run in sequence.
+
 repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+        args: ['--maxkb=500']
+      - id: check-merge-conflict
+      - id: mixed-line-ending
+      - id: detect-private-key
+
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.8.6
     hooks:
-      - id: ruff-format
-        types_or: [python, pyi]
-      - id: ruff-check
-        types_or: [python, pyi]
+      - id: ruff
         args: [--fix]
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: pyright
+        name: pyright (src/ only)
+        entry: uv run pyright src/
+        language: system
+        pass_filenames: false
+        types: [python]
+
+      - id: complexipy
+        name: complexipy (cognitive complexity <=10)
+        entry: uv run complexipy src/ --max-complexity-allowed 10
+        language: system
+        pass_filenames: false
+        types: [python]
+
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v3.6.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
+        args: []
