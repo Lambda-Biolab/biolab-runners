@@ -42,3 +42,4 @@ secrets:
   GITLEAKS_LICENSE:
     description: "Gitleaks Pro license (free for orgs, required for v3.0+ on org accounts)"
     required: true
+# Trigger codeql check
