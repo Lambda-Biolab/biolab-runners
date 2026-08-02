@@ -1,52 +1,60 @@
 name: CI
 
-on:
+"on":
   push:
     branches: [main]
     tags: ["v*"]
   pull_request:
     branches: [main]
+  schedule:
+    - cron: "27 11 * * 0"
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# This is the standard Python project CI bundle, biolab-runners
+# flavor. Mirrors templates/python-repo/.github/workflows/ci.yml
+# with the biolab-runners-specific bits:
+# - python-versions matrix: ['3.11', '3.12'] (the biolab-runners
+#   supported range)
+# - extra-deps: --extra openmm (the biolab-runners runtime dep)
+# - smoke-test: self-hosted GPU runner, tag/manual only
+# - complexity-threshold: 15 (the standard; bioml-tools uses 22
+#   for the documented exception)
+
 jobs:
-  lint-and-test:
+  lint-type-test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     strategy:
       matrix:
         python-version: ["3.11", "3.12"]
-
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-
       - name: Install uv
         uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
         with:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
           cache-dependency-glob: "uv.lock"
-
       - name: Install dependencies
         # --extra openmm brings openmm + pdbfixer + numpy + mdtraj.
         # Without --all-extras we skip boltz2 (requires the boltz
         # binary on PATH and a GPU, not needed for the unit-test
         # suite, which mocks the CLI). Saves ~30 s per CI run.
         run: uv sync --frozen --extra openmm --group dev
-
-      - name: Lint with ruff
-        run: |
-          uv run ruff check biolab_runners/ tests/
-          uv run ruff format --check biolab_runners/ tests/
-
-      - name: Type check with pyright
+      - name: Format check
+        run: uv run ruff format --check biolab_runners/ tests/
+      - name: Lint
+        run: uv run ruff check biolab_runners/ tests/
+      - name: Type check
+        # Tests are first-class code.
         run: uv run pyright biolab_runners/ tests/
-
-      - name: Check complexity
+      - name: Complexity gate
         run: uv run complexipy biolab_runners/ --max-complexity-allowed 15
-
-      - name: Run tests
+      - name: Test
         run: uv run pytest tests/ -v --tb=short
 
   # Smoke test job — requires a self-hosted runner with a CUDA-capable
@@ -54,13 +62,8 @@ jobs:
   # runners). Trigger manually with `workflow_dispatch` after the lint
   # gate is green. Run on tagged releases for an end-to-end check.
   smoke-test:
-    # Triggered by tag pushes (v*) or manual dispatch — NOT on regular
-    # PRs or main-branch pushes. Requires a self-hosted runner with a
-    # CUDA-capable GPU + OpenMM built with CUDA support (not available
-    # on GitHub-hosted runners). Run ``workflow_dispatch`` from the
-    # Actions tab to invoke manually.
     runs-on: [self-hosted, gpu]
-    needs: lint-and-test
+    needs: lint-type-test
     if: |
       (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
       github.event_name == 'workflow_dispatch'
@@ -78,3 +81,73 @@ jobs:
         run: uv sync --frozen --all-extras --group dev
       - name: Run smoke test
         run: make smoke_test
+
+  codeql:
+    name: CodeQL
+    # CodeQL only runs on push to main, weekly schedule, and manual
+    # dispatch — NOT on pull_request (merge-ref SHA race).
+    if: github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: github/codeql-action/init@e296a935590eb16afc0c0108289f68c87e2a89a5 # v4.30.7
+        with:
+          languages: python
+          build-mode: none
+      - name: Perform CodeQL Analysis
+        id: analyze
+        uses: github/codeql-action/analyze@e296a935590eb16afc0c0108289f68c87e2a89a5 # v4.30.7
+        with:
+          output: sarif-results
+      - name: Dismiss alerts
+        if: always()
+        uses: advanced-security/dismiss-alerts@046d6b48d2e43cf563f96f67332c47c432eff83e # v2.0.3
+        with:
+          sarif-id: ${{ steps.analyze.outputs.sarif-id }}
+          sarif-file: sarif-results
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  mutation:
+    name: Weekly Mutation Testing
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+      - run: uv python install 3.12
+      - run: uv sync --all-groups --all-extras
+      - run: uv pip install mutmut
+      - run: uv run mutmut run --max-children=4
+
+  sbom:
+    name: Generate SBOM
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: qte77/gha-sbom-action@cd873b1278a6793a99cfe199c01d603d72cca717 # v0.1.1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+  links:
+    name: Link Checker
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: "--config .lychee.toml ."
+          fail: true
