@@ -6,6 +6,8 @@ tests use Hypothesis to assert invariants of ``pbc_correct``.
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import numpy as np
 import pytest
 from biolab_runners.openmm.geometry import (
@@ -33,10 +35,14 @@ class TestCollectChainCaPositions:
         rec, pep = collect_chain_ca_positions([chain0, chain1], positions)
         assert len(rec) == 2
         assert len(pep) == 2
-        np.testing.assert_array_equal(rec[0], [0.0, 0.0, 0.0])
-        np.testing.assert_array_equal(rec[1], [2.0, 0.0, 0.0])
-        np.testing.assert_array_equal(pep[0], [3.0, 0.0, 0.0])
-        np.testing.assert_array_equal(pep[1], [4.0, 0.0, 0.0])
+        # rec[i] and pep[i] are typed as object (the public surface accepts
+        # any array-like for compatibility with OpenMM Quantity rows). Cast
+        # to numpy arrays so assert_array_equal's ArrayLike parameter is
+        # satisfied under strict pyright mode.
+        np.testing.assert_array_equal(cast("Any", rec[0]), [0.0, 0.0, 0.0])
+        np.testing.assert_array_equal(cast("Any", rec[1]), [2.0, 0.0, 0.0])
+        np.testing.assert_array_equal(cast("Any", pep[0]), [3.0, 0.0, 0.0])
+        np.testing.assert_array_equal(cast("Any", pep[1]), [4.0, 0.0, 0.0])
 
     def test_ignores_non_ca_atoms(self) -> None:
         positions = np.array([[0.0], [1.0], [2.0]])
