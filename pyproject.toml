@@ -45,7 +45,7 @@ dev = [
     "pyright>=1.1.411",
     "pytest>=9.1.1",
     "pytest-cov",
-    "complexipy>=6.2.0",
+    "complexipy>=6.2.0",  # Pinned — Dependabot's group resolution downgrades to 0.8 (unrelated). 6.2.0 is the standard across the org.
     "pre-commit>=3.5",
     "hypothesis>=6.164.0",
     "numpy>=1.26",  # required by the OpenMM runner Kabsch-aligned RMSD tests

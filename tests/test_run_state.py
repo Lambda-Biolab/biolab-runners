@@ -65,7 +65,7 @@ def _write_manifest(
     *,
     step: int,
     state_file: str,
-    terminal: dict[str, object] | None | object = _SENTINEL,
+    terminal: dict[str, object] | object | None = _SENTINEL,
 ) -> None:
     """Write a manifest record.
 
