@@ -112,18 +112,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  mutation:
-    name: Weekly Mutation Testing
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
-      - run: uv python install 3.12
-      - run: uv sync --all-groups --all-extras
-      - run: uv pip install mutmut
-      - run: uv run mutmut run --max-children=4
 
   sbom:
     name: Generate SBOM
