@@ -1,5 +1,28 @@
 # Gitleaks configuration — extends the default rule set.
+# Used by:
+#   - .github/workflows/secrets.yml (CI scan, --redact flag)
+#   - scripts/git-hooks/pre-push -> make secrets (local scan)
 # The pre-commit and pre-push hooks also run gitleaks locally.
+#
+# The gitleaks binary version is pinned via GITLEAKS_VERSION in
+# secrets.yml (CI) and matches the install_tools Makefile target
+# (local). 8.30.1 is the current single source of truth.
+# See CONTRIBUTING.md for the gitleaks version discipline.
 
 [extend]
 useDefault = true
+
+# Allowlist (singular, since [[allowlists]] is broken in gitleaks 8.23/8.24).
+# Two patterns fire as `generic-api-key` (high-entropy hex) but are not
+# real secrets:
+# - .secrets.baseline: detect-secrets baseline (output of the scanner,
+#   not source code) - contains SHA1-like hashes.
+# - .opencode/handoffs/: internal AI-assistant handoff notes that
+#   quote UUIDs and broker keys. The "secret" pattern is a
+#   credential-broker UUID + token, not a real key.
+[allowlist]
+description = "False-positive file paths (detect-secrets baseline, handoff documents)"
+paths = [
+  '(^|.*/)\.secrets\.baseline(\.new)?$',
+  '(^|.*/)\.opencode/handoffs/.*',
+]

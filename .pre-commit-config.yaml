@@ -2,7 +2,7 @@
 # Install once per repo: `uv run pre-commit install`
 # Run manually: `uv run pre-commit run --all-files`
 #
-# What this enforces (per the org's opencode-config standard):
+# What this enforces (Andre's advice, April 2026):
 #   - ruff lint + format on all Python
 #   - pyright type-check on src/ only — tests are caught by the CI gate
 #     (see .github/workflows/ci.yml). The pre-commit hook excludes
@@ -10,14 +10,16 @@
 #     (hypothesis stubs and complex mock chains produce many
 #     "object is not iterable" warnings that are not bugs in the
 #     user's code).
-#   - complexipy cognitive complexity <=10 per function
-#     (biolab-runner's CI complexity gate is 10, the strictest
-#     in the org)
+#   - complexipy cognitive complexity <=15 per function
+#     (the threshold must match `[tool.complexipy].max-complexity-allowed`
+#     in pyproject.toml — edit the `--max-complexity-allowed` flag
+#     below if your repo uses a different value. Common variants
+#     in the org: bioml-tools=22, vastai-gpu-runner=10, biolab-runners=10)
 #   - no committing giant files (>500KB)
 #   - no secrets in commits
 #   - commit messages follow Conventional Commits
 #
-# Note: The git hooks in .git/hooks/pre-commit and .git/hooks/pre-push
+# The git hooks in .git/hooks/pre-commit and .git/hooks/pre-push
 # (installed by bootstrap.sh) ALSO run gitleaks + semgrep + trufflehog
 # + detect-secrets. Those are org-level secret scanners, not quality
 # gates. This file is for quality gates; both layers run in sequence.
@@ -41,10 +43,10 @@ repos:
       - id: ruff
         name: ruff (uses uv-locked version)
         # Use `uv run` so the pre-commit hook uses the same ruff
-        # version pinned in uv.lock. Hardcoding a rev here would
-        # create a version drift between local hooks and CI.
+        # version pinned in uv.lock. SRC_DIR is auto-detected by
+        # scripts/detect_src_dir.py (same logic as the Makefile).
         entry: |
-          bash -c 'export PATH=\"\$HOME/.local/bin:\$PATH\"; uv run ruff check --fix src/'
+          scripts/pre-commit-ruff.sh
         language: system
         pass_filenames: false
         types: [python]
@@ -52,23 +54,27 @@ repos:
       - id: ruff-format
         name: ruff-format (uses uv-locked version)
         entry: |
-          bash -c 'export PATH=\"\$HOME/.local/bin:\$PATH\"; uv run ruff format src/'
+          scripts/pre-commit-ruff-format.sh
         language: system
         pass_filenames: false
         types: [python]
 
       - id: pyright
-        name: pyright (src/ only)
+        name: pyright (SRC_DIR + tests)
+        # PATH must include ~/.local/bin so `uv` is found. The
+        # pre-commit framework doesn't source the user's shell
+        # profile, so we expand PATH inline. SRC_DIR is
+        # auto-detected by scripts/detect_src_dir.py.
         entry: |
-          bash -c 'export PATH=\"\$HOME/.local/bin:\$PATH\"; uv run pyright src/'
+          scripts/pre-commit-pyright.sh
         language: system
         pass_filenames: false
         types: [python]
 
       - id: complexipy
-        name: complexipy (cognitive complexity <=10)
+        name: complexipy (cognitive complexity, threshold auto-detected)
         entry: |
-          bash -c 'export PATH=\"\$HOME/.local/bin:\$PATH\"; uv run complexipy src/ --max-complexity-allowed 10'
+          scripts/pre-commit-complexipy.sh
         language: system
         pass_filenames: false
         types: [python]

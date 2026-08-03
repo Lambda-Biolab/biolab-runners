@@ -1,3 +1,35 @@
+# Standard Dependabot config for Python projects in the org.
+#
+# Two ecosystems:
+# - "uv" parses pyproject.toml + uv.lock. The previous "pip" entry
+#   was a no-op for uv-managed projects because dependabot's pip
+#   ecosystem only handles requirements.txt-style files.
+# - "github-actions" keeps the SHA-pinned action references in
+#   .github/workflows/ up to date with new tags.
+#
+# Both ecosystems:
+# - Run weekly (daily produces too many stale PRs)
+# - Group patches/minors together (single PR per group)
+# - Use the org's standard commit prefixes
+# - Apply the same labels
+#
+# Repo rule: all `uses:` references MUST be full commit SHAs. This
+# dependabot config keeps them current with new upstream tags.
+#
+# Required labels (Dependabot will fail to add missing ones):
+# - "dependencies" (default in most repos; create if missing)
+# - "github_actions" (note the underscore — GitHub's default; the
+#   hyphenated form `github-actions` does NOT exist by default and
+#   will trigger a "label not found" error)
+#
+# The `secrets:` block at the bottom grants Dependabot PRs access
+# to the GITLEAKS_LICENSE secret so the gitleaks CI scan can run on
+# dependency bumps. Without this, the gitleaks v3.0.0 action fails
+# to start on Dependabot PRs with "missing gitleaks license"
+# (GitHub's default is to NOT pass repo secrets to Dependabot for
+# security reasons).
+#
+# Save as: .github/dependabot.yml
 ---
 version: 2
 updates:
@@ -13,6 +45,7 @@ updates:
       python-deps:
         patterns: ["*"]
         update-types: ["minor", "patch"]
+
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
@@ -31,14 +64,18 @@ updates:
   # in .pre-commit-config.yaml: Dependabot does not have a native
   # `pre-commit` package-ecosystem. Bump them manually with
   #   uv run pre-commit autoupdate
-  # and verify the new hooks pass before merging.
+  # (the org provides a `pre-commit-autoupdate.yml` workflow that
+  # does this weekly) and verify the new hooks pass before merging.
 
-# Grant Dependabot PRs access to the GITLEAKS_LICENSE secret so the
-# gitleaks CI scan can run on dependency bumps. Without this, the
-# `secrets.GITLEAKS_LICENSE` env on the `gitleaks/gitleaks-action`
-# step is empty on Dependabot PRs (GitHub's default is to NOT pass
-# repo secrets to Dependabot for security reasons).
-secrets:
-  GITLEAKS_LICENSE:
-    description: "Gitleaks Pro license (free for orgs, required for v3.0+ on org accounts)"
-    required: true
+# Grant GITLEAKS_LICENSE to Dependabot via the GitHub UI:
+#   Settings > Secrets and variables > Dependabot > New repository secret
+# Name: GITLEAKS_LICENSE
+# Value: <the gitleaks.io license>
+#
+# The dependabot.yml `secrets:` block was tried first (see git history)
+# but Dependabot v2 schema does NOT support it — the property is
+# rejected with "The property '#/' contains additional properties
+# ['secrets'] outside of the schema when none are allowed". The
+# secret must be granted via the UI (Settings > Dependabot secrets)
+# which propagates it to all Dependabot PRs without exposing it
+# in the public config file.

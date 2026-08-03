@@ -1,6 +1,6 @@
 name: Write llms.txt
 
-on:
+"on":
   push:
     branches: [main]
     paths:

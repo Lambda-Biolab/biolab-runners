@@ -11,7 +11,7 @@ name: pre-commit autoupdate
 # Skip condition: skip if the file doesn't exist (not all repos
 # use pre-commit yet).
 
-on:
+"on":
   schedule:
     - cron: "0 6 * * 1" # Mondays 06:00 UTC
   workflow_dispatch:

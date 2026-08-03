@@ -103,4 +103,3 @@ validation. The library itself defaults to OpenCL for this reason — the
 hardcoded CUDA in the smoke scripts is for the conda-target CI
 environment. The `make smoke_test` recipe doesn't override the
 platform, so a pip-OpenMM local run will fail.
-

@@ -49,6 +49,7 @@ dev = [
     "pre-commit>=3.5",
     "hypothesis>=6.164.0",
     "numpy>=1.26",  # required by the OpenMM runner Kabsch-aligned RMSD tests
+    "bandit>=1.9.4",
 ]
 
 [build-system]
@@ -190,3 +191,14 @@ exclude_lines = [
     "if TYPE_CHECKING:",
     "if __name__ == .__main__.:",
 ]
+
+# --- Mutation testing (mutmut) ---
+# Mutation testing is local-only (pre-push hook via make mutate-changed).
+# See CONTRIBUTING.md "Mutation Testing" section for the architecture.
+# The source_paths and pytest_add_cli_args_test_selection lists are
+# what  mutates. Adding new modules here is the
+# only required setup; the Makefile target auto-detects changed files.
+[tool.mutmut]
+source_path = ["biolab_runners"]
+pytest_add_cli_args = ["--no-cov", "--tb=short", "-q"]
+pytest_add_cli_args_test_selection = ["tests"]
