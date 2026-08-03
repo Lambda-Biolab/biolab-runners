@@ -47,7 +47,7 @@ UV := uv
 .PHONY: help setup_dev install_tools lint format type_check complexity test \
         validate validate-branch quick_validate pre-push-validate \
         secrets bandit \
-        mutate mutate-changed mutate-stats mutate-score \
+        mutate mutate-changed mutate-stats mutate-score _mutate-prepare \
         propagate-makefile clean
 
 # Show the detected source layout (debug aid)
@@ -175,20 +175,45 @@ pre-push-validate: validate validate-branch mutate-changed
 # function_hashes cache is faster in the common case and only slow when
 # the tracked function actually changed (which is the case you want
 # the gate for). See mutation-testing skill in opencode-config.
+#
+# Why we mirror the full source tree to mutants/ before mutmut runs:
+# mutmut only copies files listed in [tool.mutmut].source_paths into
+# mutants/, then runs pytest in mutants/. If a test transitively
+# imports a module NOT in source_paths (e.g. test_grid_generator.py
+# imports from pocket_finder.py which isn't a mutated file), the
+# import fails and pytest can't even COLLECT tests, let alone run
+# them. We avoid that by pre-populating mutants/$(SRC) with the full
+# source tree, then running mutmut on top. The mutated files overwrite
+# the originals; the rest are unchanged. This is independent of what
+# source_paths lists — mutmut still only mutates the source_paths files.
 mutate:
-	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+	@mkdir -p mutants && rm -rf mutants/$(SRC) && cp -r $(SRC) mutants/$(SRC)
+	@find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	$(UV) run mutmut run
 
-mutate-changed:
+# Internal target: mirror the full source tree into mutants/ so
+# pytest can collect tests that transitively import non-mutated
+# modules. See mutate target docstring for the rationale.
+_mutate-prepare:
+	@mkdir -p mutants
+	@rm -rf mutants/$(SRC)
+	@mkdir -p $$(dirname mutants/$(SRC))
+	@cp -r $(SRC) mutants/$(SRC)
+	@find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
+mutate: _mutate-prepare  ## Run mutmut on the FULL critical-path scope
+	$(UV) run mutmut run
+
+mutate-changed: _mutate-prepare
 	@CHANGED=$$(git diff --name-only --diff-filter=ACMR origin/main 2>/dev/null | \
 	    grep -E '^$(SRC)/.*\.py$$' || true); \
 	if [ -z "$$CHANGED" ]; then \
 		echo "mutate-changed: no source files changed, nothing to mutate"; \
 		exit 0; \
 	fi; \
-	echo "mutate-changed: targeting $$CHANGED"; \
-	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true; \
-	$(UV) run mutmut run $$CHANGED
+	echo "mutate-changed: source files changed ($$CHANGED)"; \
+	echo "  running mutmut on full source_paths (mutmut only mutates those, not the changed files)"; \
+	$(UV) run mutmut run || true
 
 mutate-stats:
 	$(UV) run mutmut results
