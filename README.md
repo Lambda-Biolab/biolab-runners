@@ -227,14 +227,10 @@ pip install -e ".[all]"
 make validate
 
 # Auto-fix lint/format issues
-make lint_fix
+make lint
 
 # Run tests only
 make test
-
-# Smoke test (requires real OpenMM + GPU; runs the existing
-# smoke_test/run_smoke.py driver)
-make smoke_test
 ```
 
 ## License
