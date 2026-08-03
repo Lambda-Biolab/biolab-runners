@@ -8,8 +8,6 @@ name: pre-commit autoupdate
 # new hooks still pass before merge.
 #
 # Manual trigger: workflow_dispatch (for ad-hoc bumps).
-# Skip condition: skip if the file doesn't exist (not all repos
-# use pre-commit yet).
 
 "on":
   schedule:
@@ -23,7 +21,6 @@ jobs:
   autoupdate:
     name: Bump pre-commit revs
     runs-on: ubuntu-latest
-    if: hashFiles('.pre-commit-config.yaml') != ''
     permissions:
       contents: write
       pull-requests: write
