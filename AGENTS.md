@@ -92,10 +92,8 @@ The checkpoint invariants (atomic save, manifest binding, terminal schema, force
 ```bash
 make validate       # Full gate: ruff → pyright → complexity → pytest (read-only, CI-safe)
 make quick_validate # Fast gate: ruff + pyright
-make lint_fix       # Auto-fix formatting + linting
+make lint           # Check linting and formatting
 make test           # Run tests only
-make check_links    # Check links with lychee
-make check_docs     # Lint markdown files
 ```
 
 ## Quick Reference
