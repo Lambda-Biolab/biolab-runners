@@ -22,13 +22,6 @@
 #   hyphenated form `github-actions` does NOT exist by default and
 #   will trigger a "label not found" error)
 #
-# The `secrets:` block at the bottom grants Dependabot PRs access
-# to the GITLEAKS_LICENSE secret so the gitleaks CI scan can run on
-# dependency bumps. Without this, the gitleaks v3.0.0 action fails
-# to start on Dependabot PRs with "missing gitleaks license"
-# (GitHub's default is to NOT pass repo secrets to Dependabot for
-# security reasons).
-#
 # Save as: .github/dependabot.yml
 ---
 version: 2
