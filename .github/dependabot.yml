@@ -12,6 +12,8 @@
 # - Group patches/minors together (single PR per group)
 # - Use the org's standard commit prefixes
 # - Apply the same labels
+# - Produce signed commits (Dependabot's commits satisfy
+#   required_signatures: true on main).
 #
 # Repo rule: all `uses:` references MUST be full commit SHAs. This
 # dependabot config keeps them current with new upstream tags.
@@ -23,6 +25,13 @@
 #   will trigger a "label not found" error)
 #
 # Save as: .github/dependabot.yml
+#
+# Manual bumps (no Dependabot ecosystem available; Renovate handles
+# pre-commit-hooks instead — see renovate.json):
+# - llms.txt (auto-generated from .github/templates/llms.txt.tpl):
+#   run locally with
+#     envsubst < .github/templates/llms.txt.tpl > llms.txt
+#   commit, push. There is no automation for this.
 ---
 version: 2
 updates:
@@ -52,13 +61,6 @@ updates:
       github-actions:
         patterns: ["*"]
         update-types: ["minor", "patch"]
-
-  # Note on pre-commit-hooks and conventional-pre-commit rev pins
-  # in .pre-commit-config.yaml: Dependabot does not have a native
-  # `pre-commit` package-ecosystem. Bump them manually with
-  #   uv run pre-commit autoupdate
-  # (the org provides a `pre-commit-autoupdate.yml` workflow that
-  # does this weekly) and verify the new hooks pass before merging.
 
 # Grant GITLEAKS_LICENSE to Dependabot via the GitHub UI:
 #   Settings > Secrets and variables > Dependabot > New repository secret
