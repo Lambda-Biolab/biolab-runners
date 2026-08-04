@@ -41,9 +41,6 @@ jobs:
         uses: peter-evans/create-pull-request@4320041ed380b20e97d388d56a7fb4f9b8c20e79 # v7.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          # sign-commits: route the commit through the GitHub Data API so
-          # the branch receives a `web-flow` signature. main has
-          # required_signatures: true, so an unsigned head commit blocks the merge.
           sign-commits: true
           commit-message: "docs: update llms.txt"
           title: "docs: update llms.txt"
