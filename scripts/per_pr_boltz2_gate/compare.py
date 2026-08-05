@@ -150,15 +150,20 @@ def main() -> int:
     baseline = load_baseline(args.baseline)
     actual = load_actual(args.boltz2_smoke)
 
-    b_conf = baseline.get("confidence", {})
-    a_conf = actual.get("confidence", {})
-    print(f"baseline: iptm={b_conf.get('iptm'):.4f if b_conf.get('iptm') else 'N/A'}, "
-          f"ptm={b_conf.get('ptm'):.4f if b_conf.get('ptm') else 'N/A'}, "
-          f"plddt={b_conf.get('plddt_mean'):.2f if b_conf.get('plddt_mean') else 'N/A'}, "
+    b_conf = baseline.get("confidence") or {}
+    a_conf = actual.get("confidence") or {}
+
+    def fmt_iptm(c): v = c.get("iptm"); return f"{v:.4f}" if v is not None else "N/A"
+    def fmt_ptm(c): v = c.get("ptm"); return f"{v:.4f}" if v is not None else "N/A"
+    def fmt_plddt(c): v = c.get("plddt_mean"); return f"{v:.2f}" if v is not None else "N/A"
+
+    print(f"baseline: iptm={fmt_iptm(b_conf)}, "
+          f"ptm={fmt_ptm(b_conf)}, "
+          f"plddt={fmt_plddt(b_conf)}, "
           f"clashes={b_conf.get('clash_count', 0)}")
-    print(f"actual:   iptm={a_conf.get('iptm'):.4f if a_conf.get('iptm') else 'N/A'}, "
-          f"ptm={a_conf.get('ptm'):.4f if a_conf.get('ptm') else 'N/A'}, "
-          f"plddt={a_conf.get('plddt_mean'):.2f if a_conf.get('plddt_mean') else 'N/A'}, "
+    print(f"actual:   iptm={fmt_iptm(a_conf)}, "
+          f"ptm={fmt_ptm(a_conf)}, "
+          f"plddt={fmt_plddt(a_conf)}, "
           f"clashes={a_conf.get('clash_count', 0)}")
     print()
 
