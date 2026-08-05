@@ -1,11 +1,12 @@
-# Link Checker — uses the reusable workflow from the org's shared config.
+# Link Checker — uses the lychee-action directly.
 #
-# The reusable workflow (with `workflow_call`) is the single source of
-# truth for the link checker. Edit it once, all repos benefit.
+# This was previously a reusable workflow call to Lambda-Biolab/.github-private
+# but that path kept failing with "workflow was not found" errors despite the
+# file existing at the pinned SHA. The reusable workflow itself only contained
+# the lychee-action invocation, so it's inlined here to remove the dependency.
 #
-# Source: Lambda-Biolab/.github-private/.github/workflows/links.yml@v1
-#         (pinned to SHA because the org's policy requires SHA-pinned
-#         references for both actions and reusable workflows)
+# When the .github-private repo's reusable workflows stabilize, this can revert
+# to the reusable call.
 name: Link Checker
 
 on:
@@ -18,6 +19,19 @@ on:
     - cron: "00 00 * * 0"
   workflow_dispatch:
 
+permissions:
+  contents: read
+  issues: write
+
 jobs:
   check-links:
-    uses: Lambda-Biolab/.github-private/.github/workflows/links.yml@b063c56
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Lychee link check
+        id: lychee
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: "--config .lychee.toml ."
+          fail: true
