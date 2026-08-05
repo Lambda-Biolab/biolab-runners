@@ -84,9 +84,18 @@ jobs:
 
   codeql:
     name: CodeQL
-    # CodeQL only runs on push to main, weekly schedule, and manual
-    # dispatch — NOT on pull_request (merge-ref SHA race).
-    if: github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # CodeQL MUST run on every PR so security findings block the
+    # merge instead of showing up post-merge. The hosting workflow's
+    # `on: pull_request:` trigger (set at the top of this file)
+    # already defines the PR event — the old `if:` filter dropped it,
+    # which downgraded CodeQL to post-merge advisory.
+    #
+    # The "merge-ref SHA races merge-protection" concern that the old
+    # filter guarded against does not apply to `pull_request` triggers
+    # on the workflow's own `on:` block — only to a hypothetical
+    # `pull_request` trigger on a reusable file (which this inline
+    # codeql isn't). Mirroring the org rule documented in
+    # antomicblitz/opencode-config/templates/python-repo/.github/workflows/ci.yml.
     runs-on: ubuntu-latest
     permissions:
       actions: read
