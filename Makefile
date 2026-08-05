@@ -253,6 +253,40 @@ lint-makefile:  ## Verify this Makefile matches the opencode-config canonical
 		echo "  opencode-config/skills/lambda-biolab-makefile-conventions/references/lint-makefile.sh"; \
 		exit 1; \
 	fi
+
+
+# Run the GPU smoke test on a tiny MD simulation. Produces a
+# smoke_verify.json in SMOKE_OUT (default: smoke_test/out) that
+# can be compared to a baseline. Used by both the manual smoke-test
+# workflow and the per-PR smoke gate. Requires a CUDA-capable GPU
+# and OpenMM with CUDA support. The SMOKE_OUT variable is honored
+# by run_smoke.py.
+smoke_test:  ## Run the GPU smoke test (50ps MD on tinytest system)
+	uv run python smoke_test/run_smoke.py "$${SMOKE_OUT:-smoke_test/out}"
+
+# Generate the per-PR smoke gate baseline. Run ONCE on a known-good
+# GPU (the org's self-hosted [self-hosted, gpu] runner) to capture
+# the reference output. The per-pr-smoke-gate workflow then compares
+# every PR's smoke test output against this baseline.
+#
+# Prerequisites:
+# - Access to a self-hosted GPU runner with CUDA + OpenMM
+# - The runner must have label [self-hosted, gpu]
+#
+# This is a manual ops task. The baseline is committed to the repo
+# and used as the reference for all PR gates.
+smoke-baseline:  ## Generate the per-PR smoke gate baseline (run once on a self-hosted GPU, commit result)
+	mkdir -p smoke_test/baseline_gen
+	SMOKE_OUT=smoke_test/baseline_gen make smoke_test
+	if [ -f smoke_test/baseline_gen/smoke_verify.json ]; then \
+		cp smoke_test/baseline_gen/smoke_verify.json smoke_test/baseline.json; \
+		echo "Baseline written to smoke_test/baseline.json"; \
+		echo "Review the file, then: git add smoke_test/baseline.json && git commit"; \
+	else \
+		echo "ERROR: smoke test did not produce smoke_verify.json"; \
+		exit 1; \
+	fi
+
 # --- Propagate this Makefile to other repos (opencode-config only) ---
 # Reads ~/.config/opencode/repos.yaml and copies the canonical Makefile
 # to every repo. Idempotent. Only available when MAKEFILE_PROPAGATE=1
