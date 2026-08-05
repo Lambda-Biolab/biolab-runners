@@ -4,6 +4,8 @@
 # truth for the link checker. Edit it once, all repos benefit.
 #
 # Source: Lambda-Biolab/.github-private/.github/workflows/links.yml@v1
+#         (pinned to SHA because the org's policy requires SHA-pinned
+#         references for both actions and reusable workflows)
 name: Link Checker
 
 on:
@@ -18,4 +20,4 @@ on:
 
 jobs:
   check-links:
-    uses: Lambda-Biolab/.github-private/.github/workflows/links.yml@v1
+    uses: Lambda-Biolab/.github-private/.github/workflows/links.yml@d82b41c33d124b96cf20cf998c6c9c673e15b40e
