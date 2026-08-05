@@ -1,0 +1,21 @@
+{
+  "error": "",
+  "num_atoms": 3066,
+  "total_ns": 0.05,
+  "elapsed_seconds": 3.9,
+  "ns_per_day": 1115.7,
+  "trajectory_path": "/tmp/smoke_test_v3_out/trajectory.dcd",
+  "energy_path": "/tmp/smoke_test_v3_out/energy.csv",
+  "state_xml_path": "/tmp/smoke_test_v3_out/state.225000_667641_1785968277944655053.xml",
+  "topology_path": "/tmp/smoke_test_v3_out/topology.pdb",
+  "early_abort": false,
+  "abort_reason": "",
+  "energy_num_rows": 5,
+  "energy_last_row": [
+    "225000",
+    "450.0000000014206",
+    "-41271.4289598086",
+    "8135.452912472356"
+  ],
+  "topology_lines": 3073
+}

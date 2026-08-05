@@ -69,7 +69,7 @@ def load_actual(path: Path) -> dict:
 
 def compare(actual: dict, baseline: dict) -> tuple[bool, str]:
     """Return (passed, reason). Boltz-2 is non-deterministic, so use tolerance bands."""
-    if actual.get("error") is not None:
+    if actual.get("error"):
         return False, f"❌ boltz-2 reported error: {actual['error']!r}"
 
     structure_size = actual.get("structure_size_bytes", 0)
