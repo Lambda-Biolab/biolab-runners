@@ -27,6 +27,18 @@ name: "Per-PR boltz-2 gate"
 on:
   pull_request:
     branches: [main]
+    # Only gate PRs that touch the GPU-touching code paths. Docs,
+    # formatting, and unrelated CI changes skip the gate entirely
+    # so contributors without GPU access aren't blocked.
+    paths:
+      - "biolab_runners/openmm/**"
+      - "biolab_runners/boltz2/**"
+      - "smoke_test/**"
+      - "pyproject.toml"
+      - "scripts/per_pr_smoke_gate/**"
+      - "scripts/per_pr_boltz2_gate/**"
+      - ".github/workflows/per-pr-smoke-gate.yml"
+      - ".github/workflows/per-pr-boltz2-gate.yml"
   workflow_dispatch:  # for manual runs + baseline regeneration
 
 concurrency:
