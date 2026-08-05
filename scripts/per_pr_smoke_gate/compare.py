@@ -124,12 +124,20 @@ def main() -> int:
     baseline = load_baseline(args.baseline)
     actual = load_actual(args.smoke_verify)
 
+    def fmt_pe(d): 
+        row = d.get("energy_last_row")
+        if not row: return "N/A"
+        try: return f"{float(row[2]):.4f}"
+        except (ValueError, TypeError, IndexError): return "N/A"
+    def fmt_perf(d): 
+        v = d.get("ns_per_day")
+        return f"{v:.1f}" if v is not None else "N/A"
     print(f"baseline: num_atoms={baseline.get('num_atoms')}, "
-          f"PE={baseline.get('energy_last_row', [0,0,0,0])[2]:.4f}, "
-          f"perf={baseline.get('ns_per_day', 0):.1f} ns/day")
+          f"PE={fmt_pe(baseline)}, "
+          f"perf={fmt_perf(baseline)} ns/day")
     print(f"actual:   num_atoms={actual.get('num_atoms')}, "
-          f"PE={actual.get('energy_last_row', [0,0,0,0])[2] if actual.get('energy_last_row') else 'N/A'}, "
-          f"perf={actual.get('ns_per_day', 0):.1f} ns/day")
+          f"PE={fmt_pe(actual)}, "
+          f"perf={fmt_perf(actual)} ns/day")
     print()
 
     passed, reason = compare(actual, baseline)
