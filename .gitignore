@@ -43,3 +43,8 @@ Thumbs.db
 *.log
 smoke_test/
 # uv.lock is intentionally NOT ignored — committed for reproducible CI builds.
+
+# Baselines for the per-PR GPU gates (biolab-runners #151, #152).
+# Override the smoke_test/ ignore for these specific files:
+!smoke_test/baseline.json
+!smoke_test/boltz2_baseline.json

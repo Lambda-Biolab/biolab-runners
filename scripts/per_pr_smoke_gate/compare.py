@@ -68,7 +68,7 @@ def load_actual(path: Path) -> dict:
 
 def compare(actual: dict, baseline: dict) -> tuple[bool, str]:
     """Return (passed, reason)."""
-    if actual.get("error") is not None:
+    if actual.get("error"):
         return False, f"❌ smoke test reported error: {actual['error']!r}"
 
     if actual.get("num_atoms") != baseline.get("num_atoms"):

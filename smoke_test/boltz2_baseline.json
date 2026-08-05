@@ -1,0 +1,18 @@
+{
+  "name": "per_pr_gate_smoke",
+  "quality_gate": "FAIL",
+  "error": "",
+  "structure_path": "/tmp/boltz_test_real/per_pr_gate_smoke/boltz2/output/boltz_results_input/predictions/input/input_model_0.pdb",
+  "structure_size_bytes": 10610,
+  "confidence": {
+    "iptm": 0.23411856591701508,
+    "ptm": 0.24535822868347168,
+    "plddt_mean": 80.48015236854553,
+    "clash_count": 0,
+    "clash_severe_count": 0
+  },
+  "gate_reasons": [
+    "LOW INTERFACE CONFIDENCE: ipTM=0.234 < 0.5 threshold",
+    "MODERATE CONFIDENCE SCORE: 0.691 (PASS: >=0.7)"
+  ]
+}
