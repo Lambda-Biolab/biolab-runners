@@ -1,0 +1,125 @@
+# Per-PR smoke test gate for biolab-runners.
+#
+# The deepvariant-arm64-Linux pattern: every PR runs the actual
+# scientific code (OpenMM MD on a real GPU) and is gated on the
+# result. Catches regressions that unit tests miss — wrong CUDA
+# build, broken OpenMM platform detection, energy drift, real
+# performance regressions.
+#
+# Uses the self-hosted GPU runner (same one as the existing
+# smoke-test job in ci.yml). No cloud VMs, no secrets, no cost
+# per PR. Just runs the smoke test on hardware the org already
+# owns and compares to a committed baseline.
+#
+# Soft opt-in: the workflow skips when smoke_test/baseline.json
+# is missing (the gate has nothing to compare against). Once a
+# baseline is committed, the gate activates on every PR.
+#
+# Status: this workflow is independent of the existing smoke-test
+# job in ci.yml (which is tag/manual-only). They serve different
+# purposes: ci.yml's smoke-test is the slow release-gate; this
+# per-pr gate is the fast PR-gate.
+name: "Per-PR smoke gate"
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:  # for manual runs + baseline regeneration
+
+concurrency:
+  group: per-pr-smoke-gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true  # newer PR pushes supersede older runs
+
+permissions:
+  contents: read
+  pull-requests: write  # to comment on the PR with results
+
+jobs:
+  smoke-gate:
+    # Skip if no baseline has been committed yet (gate has nothing
+    # to compare against). Once smoke_test/baseline.json exists,
+    # this `if:` always evaluates true and the gate runs on every PR.
+    if: hashFiles('smoke_test/baseline.json') != ''
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        # Smoke test needs the boltz2 extra too (the boltz CLI is
+        # referenced indirectly through biolab_runners imports).
+        run: uv sync --frozen --all-extras --group dev
+
+      - name: Run smoke test
+        # make smoke_test is the canonical entry point — it runs
+        # smoke_test/run_smoke.py and writes smoke_verify.json.
+        # The smoke test itself takes ~5 min on a typical GPU.
+        run: |
+          mkdir -p smoke_test_out
+          make smoke_test SMOKE_OUT=smoke_test_out 2>&1 | tail -30
+          # Find the smoke_verify.json (location depends on the
+          # smoke test driver; check standard locations)
+          if [ -f smoke_test_out/smoke_verify.json ]; then
+            SMOKE_VERIFY=smoke_test_out/smoke_verify.json
+          elif [ -f smoke_test/smoke_verify.json ]; then
+            SMOKE_VERIFY=smoke_test/smoke_verify.json
+          else
+            echo "::error::smoke_verify.json not found"
+            find . -name "smoke_verify.json" 2>/dev/null
+            exit 1
+          fi
+          echo "SMOKE_VERIFY=$SMOKE_VERIFY" >> "$GITHUB_ENV"
+
+      - name: Compare to baseline
+        id: compare
+        run: |
+          uv run python scripts/per_pr_smoke_gate/compare.py "$SMOKE_VERIFY"
+          echo "GATE_PASSED=$?" >> "$GITHUB_ENV"
+
+      - name: Upload smoke test output
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: smoke-test-output
+          path: |
+            smoke_test_out/
+            smoke_test/smoke_verify.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Comment on PR with results
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          GATE_PASSED: ${{ env.GATE_PASSED }}
+        with:
+          script: |
+            const passed = process.env.GATE_PASSED === '0';
+            const emoji = passed ? '✅' : '❌';
+            const lines = [];
+            lines.push(`## ${emoji} Per-PR smoke gate (self-hosted GPU)`);
+            lines.push('');
+            if (passed) {
+              lines.push('Smoke test passed on real GPU. See [artifacts](' + context.payload.repository.html_url + '/actions/runs/' + context.runId + ') for details.');
+            } else {
+              lines.push('**Smoke test failed** — see [artifacts](' + context.payload.repository.html_url + '/actions/runs/' + context.runId + ') and the workflow log for the diff vs the baseline.');
+            }
+            lines.push('');
+            lines.push('Acceptance criteria: `num_atoms` matches, `topology_lines` matches, `energy_last_row` within 1% of baseline, `ns_per_day` ≥ 80% of baseline.');
+            // Post comment
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: lines.join('\n'),
+            });
