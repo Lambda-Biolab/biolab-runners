@@ -1,0 +1,123 @@
+# Per-PR boltz-2 gate for biolab-runners.
+#
+# The deepvariant-arm64-Linux pattern for structure prediction:
+# every PR runs Boltz-2 (the actual scientific code, not a mocked
+# unit test) and is gated on the result. Catches regressions that
+# unit tests miss — boltz-2 binary updates that silently degrade
+# quality, broken MSA fetch, code changes that introduce clashes.
+#
+# Uses the same self-hosted GPU runner as the OpenMM gate (per-pr-smoke-gate).
+# No cloud VMs, no secrets, no cost per PR. Just runs the boltz-2
+# module on a small fixed input on hardware the org already owns
+# and compares confidence scores against a committed baseline.
+#
+# Boltz-2 is non-deterministic (random sampling, GPU seeding), so
+# the comparison uses tolerance bands rather than exact match:
+#   iptm          >= baseline - 0.05  (5% relative)
+#   ptm           >= baseline - 0.05  (5% relative)
+#   plddt_mean    >= baseline - 2.0   (absolute)
+#   clash_count   <= baseline + 5     (absolute)
+#   clash_severe  == 0                (hard fail)
+#
+# Status: ready, with soft opt-in. The workflow skips when
+# smoke_test/boltz2_baseline.json is missing. Once a baseline
+# is committed, the gate runs on every PR.
+name: "Per-PR boltz-2 gate"
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:  # for manual runs + baseline regeneration
+
+concurrency:
+  group: per-pr-boltz2-gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  boltz2-gate:
+    # Skip if no baseline has been committed yet. Once a baseline
+    # exists, this `if:` always evaluates true and the gate runs.
+    if: hashFiles('smoke_test/boltz2_baseline.json') != ''
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        # Boltz-2 lives in the boltz2 extra. We pull all-extras so
+        # boltz2, openmm, and boltz's transitive deps are available.
+        run: uv sync --frozen --all-extras --group dev
+
+      - name: Run boltz-2 smoke prediction
+        # The driver runs a fixed 15-residue complex (8-residue receptor
+        # + 7-residue peptide) which Boltz-2 predicts in ~2-4 min on
+        # an RTX 4090 / 3060. The output is boltz2_smoke.json in
+        # SMOKE_OUT with confidence scores for comparison.
+        run: |
+          mkdir -p smoke_test/boltz2_out
+          uv run python scripts/per_pr_boltz2_gate/run_boltz2_smoke.py smoke_test/boltz2_out
+          echo "BOLTZ2_EXIT=$?" >> "$GITHUB_ENV"
+
+      - name: Compare to baseline
+        id: compare
+        # The compare script decides whether the run passes the gate.
+        # Exit code 0 = pass, 1 = gate failure, 2 = setup error.
+        if: env.BOLTZ2_EXIT == '0'
+        run: |
+          uv run python scripts/per_pr_boltz2_gate/compare.py smoke_test/boltz2_out/boltz2_smoke.json
+          echo "GATE_PASSED=$?" >> "$GITHUB_ENV"
+
+      - name: Upload boltz-2 output
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: boltz2-smoke-output
+          path: |
+            smoke_test/boltz2_out/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Comment on PR with results
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          BOLTZ2_EXIT: ${{ env.BOLTZ2_EXIT }}
+          GATE_PASSED: ${{ env.GATE_PASSED }}
+        with:
+          script: |
+            const boltzFailed = process.env.BOLTZ2_EXIT !== '0';
+            const gateFailed = process.env.GATE_PASSED !== '0' && process.env.GATE_PASSED !== '';
+            const passed = !boltzFailed && !gateFailed;
+            const emoji = passed ? '✅' : '❌';
+            const lines = [];
+            lines.push(`## ${emoji} Per-PR boltz-2 gate (self-hosted GPU)`);
+            lines.push('');
+            if (boltzFailed) {
+              lines.push('**Boltz-2 prediction failed** (boltz binary not installed, MSA unreachable, or out of GPU memory). See [artifacts](' + context.payload.repository.html_url + '/actions/runs/' + context.runId + ') and workflow log.');
+            } else if (gateFailed) {
+              lines.push('**Confidence score regression detected** — boltz-2 output diverged from baseline within tolerance. See [artifacts](' + context.payload.repository.html_url + '/actions/runs/' + context.runId + ') for the diff vs the baseline.');
+            } else {
+              lines.push('Boltz-2 prediction passed confidence gate on real GPU. See [artifacts](' + context.payload.repository.html_url + '/actions/runs/' + context.runId + ') for details.');
+            }
+            lines.push('');
+            lines.push('Tolerances (boltz-2 is non-deterministic): `iptm` ≥ baseline-0.05, `ptm` ≥ baseline-0.05, `plddt_mean` ≥ baseline-2.0, `clash_count` ≤ baseline+5, `clash_severe` == 0.');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: lines.join('\n'),
+            });

@@ -64,7 +64,7 @@ debug-layout:
 	@echo "TEST_DIR = $(TEST_DIR)"
 
 help:  ## Show this help
-	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z0-9_-]+:.*?## / {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 setup_dev:  ## Install uv, sync all dependency groups, install pre-commit hooks
 	@command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -284,6 +284,39 @@ smoke-baseline:  ## Generate the per-PR smoke gate baseline (run once on a self-
 		echo "Review the file, then: git add smoke_test/baseline.json && git commit"; \
 	else \
 		echo "ERROR: smoke test did not produce smoke_verify.json"; \
+		exit 1; \
+	fi
+
+
+# Run a small boltz-2 prediction (15-residue complex). Produces a
+# boltz2_smoke.json with confidence scores that can be compared to
+# a baseline. Used by both the manual boltz-2 workflow and the
+# per-PR boltz-2 gate. Requires a CUDA-capable GPU and boltz binary
+# installed (via the [boltz2] extra).
+boltz2_smoke:  ## Run the boltz-2 smoke prediction (15-residue complex on GPU)
+	uv run python scripts/per_pr_boltz2_gate/run_boltz2_smoke.py "$${SMOKE_OUT:-smoke_test/boltz2_out}"
+
+# Generate the per-PR boltz-2 gate baseline. Run ONCE on a known-good
+# GPU (the org's self-hosted [self-hosted, gpu] runner) to capture
+# the reference confidence scores. The per-pr-boltz2-gate workflow
+# then compares every PR's boltz-2 output against this baseline.
+#
+# Prerequisites:
+# - Access to a self-hosted GPU runner with CUDA + boltz
+# - The runner must have label [self-hosted, gpu]
+# - The boltz binary must be installed (run `uv sync --all-extras`)
+#
+# This is a manual ops task. The baseline is committed to the repo
+# and used as the reference for all PR gates.
+boltz2-baseline:  ## Generate the per-PR boltz-2 gate baseline (run once on a self-hosted GPU, commit result)
+	mkdir -p smoke_test/boltz2_baseline_gen
+	SMOKE_OUT=smoke_test/boltz2_baseline_gen make boltz2_smoke
+	if [ -f smoke_test/boltz2_baseline_gen/boltz2_smoke.json ]; then \
+		cp smoke_test/boltz2_baseline_gen/boltz2_smoke.json smoke_test/boltz2_baseline.json; \
+		echo "Baseline written to smoke_test/boltz2_baseline.json"; \
+		echo "Review the file, then: git add smoke_test/boltz2_baseline.json && git commit"; \
+	else \
+		echo "ERROR: boltz-2 smoke did not produce boltz2_smoke.json"; \
 		exit 1; \
 	fi
 
