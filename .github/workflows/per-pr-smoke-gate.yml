@@ -22,21 +22,14 @@
 name: "Per-PR smoke gate"
 
 on:
-  pull_request:
-    branches: [main]
-    # Only gate PRs that touch the GPU-touching code paths. Docs,
-    # formatting, and unrelated CI changes skip the gate entirely
-    # so contributors without GPU access aren't blocked.
-    paths:
-      - "biolab_runners/openmm/**"
-      - "biolab_runners/boltz2/**"
-      - "smoke_test/**"
-      - "pyproject.toml"
-      - "scripts/per_pr_smoke_gate/**"
-      - "scripts/per_pr_boltz2_gate/**"
-      - ".github/workflows/per-pr-smoke-gate.yml"
-      - ".github/workflows/per-pr-boltz2-gate.yml"
-  workflow_dispatch:  # for manual runs + baseline regeneration
+  # Disabled on PR until the [self-hosted, gpu] runner is registered.
+  # Without it, every PR queues the gate indefinitely ("Waiting for
+  # a runner to pick up this job"), cluttering the check list.
+  # Re-enable pull_request: when the runner exists.
+  #
+  # Until then, trigger the gate manually:
+  #   gh workflow run per-pr-smoke-gate.yml
+  workflow_dispatch:
 
 concurrency:
   group: per-pr-smoke-gate-${{ github.event.pull_request.number || github.ref }}
