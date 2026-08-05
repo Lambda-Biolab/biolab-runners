@@ -42,8 +42,8 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Lazy import so this script can be syntax-checked without boltz installed
-    from biolab_runners.boltz2 import Boltz2Config, Boltz2Runner, QualityGate
-    from biolab_runners.boltz2.config import ConfidenceScores
+    from biolab_runners.boltz2 import Boltz2Config, Boltz2Runner
+    from biolab_runners.boltz2.config import ConfidenceScores, QualityGate
 
     # Clean previous output for idempotency
     for child in output_dir.glob("*"):
