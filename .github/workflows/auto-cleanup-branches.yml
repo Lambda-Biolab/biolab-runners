@@ -41,7 +41,10 @@ jobs:
               exit 0
               ;;
           esac
-          # 404 (already gone) is fine; anything else is a real failure we'd want to know about.
+          # 404 (already gone) and 422 (reference does not exist) are both fine.
+          # 422 is what GitHub returns when DELETE is called on a missing ref —
+          # it happens whenever `gh pr merge --delete-branch` (or any UI delete)
+          # beat us to the deletion. Either way, the desired end state is met.
           # Use curl directly because we need the HTTP status code, and `gh api` does not expose
           # %{http_code} the way curl does.
           status=$(curl -sS -o /dev/null -w '%{http_code}' \
@@ -50,6 +53,6 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${REPO}/git/refs/heads/${BRANCH}" 2>/dev/null || echo "000")
           case "$status" in
-            204|404) echo "OK (deleted or already gone): $BRANCH" ;;
+            204|404|422) echo "OK (deleted or already gone): $BRANCH" ;;
             *) echo "Failed to delete $BRANCH: HTTP $status"; exit 1 ;;
           esac
