@@ -51,9 +51,10 @@ permissions:
 
 jobs:
   boltz2-gate:
-    # Skip if no baseline has been committed yet. Once a baseline
-    # exists, this `if:` always evaluates true and the gate runs.
-    if: hashFiles('smoke_test/boltz2_baseline.json') != ''
+    # Skip via step-level check below (hashFiles() isn't allowed
+    # at the job-level if: per the Actions expression context rules).
+    # If the baseline is missing, the compare step exits 0 with
+    # a ::notice:: annotation, treating the gate as a no-op.
     runs-on: [self-hosted, gpu]
     timeout-minutes: 15
 
@@ -88,8 +89,16 @@ jobs:
         id: compare
         # The compare script decides whether the run passes the gate.
         # Exit code 0 = pass, 1 = gate failure, 2 = setup error.
+        # If the baseline is missing, skip with a notice (don't fail
+        # the gate — it's a soft opt-in until the baseline is committed).
+        # Also skip if the boltz-2 driver itself failed.
         if: env.BOLTZ2_EXIT == '0'
         run: |
+          if [ ! -f smoke_test/boltz2_baseline.json ]; then
+            echo "::notice::No baseline committed yet. Run 'make boltz2-baseline' on the self-hosted GPU runner to enable this gate."
+            echo "GATE_PASSED=0" >> "$GITHUB_ENV"
+            exit 0
+          fi
           uv run python scripts/per_pr_boltz2_gate/compare.py smoke_test/boltz2_out/boltz2_smoke.json
           echo "GATE_PASSED=$?" >> "$GITHUB_ENV"
 

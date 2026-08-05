@@ -48,10 +48,10 @@ permissions:
 
 jobs:
   smoke-gate:
-    # Skip if no baseline has been committed yet (gate has nothing
-    # to compare against). Once smoke_test/baseline.json exists,
-    # this `if:` always evaluates true and the gate runs on every PR.
-    if: hashFiles('smoke_test/baseline.json') != ''
+    # Skip via step-level check below (hashFiles() isn't allowed
+    # at the job-level if: per the Actions expression context rules).
+    # If the baseline is missing, the compare step exits 0 with
+    # a ::notice:: annotation, treating the gate as a no-op.
     runs-on: [self-hosted, gpu]
     timeout-minutes: 15
 
