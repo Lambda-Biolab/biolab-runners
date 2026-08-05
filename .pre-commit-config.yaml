@@ -38,6 +38,18 @@ repos:
       - id: mixed-line-ending
       - id: detect-private-key
 
+  # Markdownlint — catches MD040 (missing code language), MD022/MD032 (blanks
+  # around headings/lists), MD034 (bare URLs), and similar real rendering bugs.
+  # Strict-but-permissive config in .markdownlint.jsonc. Many style rules
+  # (MD013 line-length, MD033 inline-html, etc.) are explicitly disabled.
+  # The --config argument is required to prevent the CLI from auto-discovering
+  # a parent directory's .markdownlint.json (which would pull in unrelated
+  # opencode-config skill files when this template is generated).
+  - repo: https://github.com/igorshubovych/markdownlint-cli
+    rev: v0.49.0
+    hooks:
+      - id: markdownlint
+        args: [--config, .markdownlint.jsonc]
   - repo: local
     hooks:
       - id: ruff
