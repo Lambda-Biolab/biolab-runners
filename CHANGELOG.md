@@ -188,6 +188,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   so callers and tests can reuse the same fallback semantics.
 
 ### Added
+
 - `.pre-commit-config.yaml` with `ruff-format` and `ruff-check` hooks.
 - `make smoke_test` recipe that wraps `smoke_test/run_smoke.py` with a
   guard for missing OpenMM.

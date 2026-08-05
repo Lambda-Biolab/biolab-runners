@@ -14,7 +14,7 @@ The runners are designed for researchers who want to use these tools in their ow
 
 ## Architecture
 
-```
+```text
 biolab_runners/
 ├── boltz2/
 │   ├── config.py     # Boltz2Config, ConfidenceScores, PredictionResult, QualityGate
@@ -30,7 +30,7 @@ biolab_runners/
     ├── offline_gate.py   # Offline mdtraj gate + verdict I/O
     ├── paths.py          # Centralized filenames (FileNames)
     └── utils.py          # Availability checks (openmm_available, pdbfixer_available) + diagnostic reporter (verify_production_outputs)
-```
+```text
 
 The checkpoint invariants (atomic save, manifest binding, terminal schema, force=True quarantine) all describe `biolab_runners.openmm.checkpoint` — that module is the single source of truth for the checkpoint protocol. `system_builder.py` does the system construction only; it does NOT touch the manifest. `biolab_runners.openmm.checkpoint.inspect_checkpoint(output_dir, config)` is the single canonical entry point — it reads the manifest once and returns a fully-classified `CheckpointSnapshot` carrying the absolute step, state filename, last record, structured `CompletionStatus`, completion reason, and validated terminal payload. The previous multi-call pattern (`load_checkpoint` + `is_run_complete` + `load_terminal_payload`) is now a sequence of thin wrappers that delegate to `inspect_checkpoint`.
 
@@ -94,11 +94,11 @@ make validate       # Full gate: ruff → pyright → complexity → pytest (rea
 make quick_validate # Fast gate: ruff + pyright
 make lint           # Check linting and formatting
 make test           # Run tests only
-```
+```text
 
 ## Quick Reference
 
-```
+```text
 Package:     biolab_runners (hatchling build)
 Python:      >=3.11 (3.11, 3.12 tested)
 Lint:        ruff (line-length=100, Google docstrings, C90 ≤10, RUF/ANN/PT enabled)
@@ -136,4 +136,4 @@ should be catching them — the biolab-runners audit found 20 latent
 errors that were hidden because tests/ was excluded from pyright.
 CI:          .github/workflows/ci.yml (lint → type → complexity → test, Python 3.11+3.12)
 Coverage:    70% floor (ratcheting to 80%)
-```
+```text

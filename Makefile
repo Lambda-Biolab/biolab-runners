@@ -44,11 +44,18 @@ TEST_DIR := $(if $(wildcard tests),tests,test)
 PYTHON := uv run python
 UV := uv
 
+# Pinned dev/test tools. Match pyproject.toml dev/test groups exactly
+# so `uv sync --frozen` fetches a deterministic version. Run
+# `make update` to see what's available, then `make update-bump TOOL=X.Y.Z`.
+RUFF_VERSION := 0.15.10
+PYTEST_VERSION := 8.3.4
+PYTEST_COV_VERSION := 5.0.0
+
 .PHONY: help setup_dev install_tools lint format type_check complexity test \
-        validate validate-branch quick_validate pre-push-validate \
-        secrets bandit \
-        mutate mutate-changed mutate-stats mutate-score _mutate-prepare \
-        propagate-makefile clean
+	validate validate-branch quick_validate pre-push-validate \
+	secrets bandit \
+	mutate mutate-changed mutate-stats mutate-score _mutate-prepare \
+	propagate-makefile clean
 
 # Show the detected source layout (debug aid)
 debug-layout:
@@ -88,6 +95,12 @@ COMPLEXITY_MAX ?= $(shell uv run python -c "import tomllib; print(tomllib.load(o
 
 complexity:  ## Complexipy gate (threshold from [tool.complexipy] in pyproject.toml)
 	$(UV) run complexipy $(SRC) --max-complexity-allowed $(COMPLEXITY_MAX)
+
+# Markdownlint — catches real rendering bugs (missing code language, missing
+# blank lines, bare URLs). Strict-but-permissive config in .markdownlint.jsonc.
+# Delegates to pre-commit which manages the markdownlint-cli install.
+markdownlint:  ## Markdownlint: catches MD040, MD022/MD032, MD034, etc. (config in .markdownlint.jsonc)
+	$(UV) run pre-commit run markdownlint --all-files
 
 test:  ## Run pytest with coverage
 	$(UV) run pytest $(TEST_DIR) -m "not slow" --cov=$(SRC) --cov-report=term-missing
@@ -159,7 +172,7 @@ install_tools:
 quick_validate: lint type_check complexity  ## Fast iteration: skip tests
 	@echo "quick validate passed"
 
-validate: lint type_check complexity test secrets bandit  ## Full pre-push gate: lint + types + complexity + tests + secrets + bandit (mirrors CI)
+validate: lint type_check complexity test secrets bandit  markdownlint ## Full pre-push gate: lint + types + complexity + tests + secrets + bandit (mirrors CI)
 
 # The mandatory pre-push gate. Runs validate (fast quality gates) PLUS
 # branch coverage on changed files PLUS mutation testing on changed
@@ -167,7 +180,7 @@ validate: lint type_check complexity test secrets bandit  ## Full pre-push gate:
 # tracked function changed thanks to mutmut's function_hashes cache;
 # slow (30+ min) only when tracked functions actually changed \u2014 exactly
 # when you want the gate. CI does NOT run this.
-pre-push-validate: validate validate-branch mutate-changed
+pre-push-validate: validate validate-branch mutate-changed lint-makefile
 
 # --- Mutation testing (mutmut) ---
 # Local-only at pre-push (NOT in CI). Weekly CI mutation was removed in
@@ -225,6 +238,21 @@ mutate-score:
 		else printf "Mutation score: 0%% (no mutants)\n" \
 	}'
 
+
+# --- Makefile self-lint ---
+# Verifies this Makefile still matches the canonical in
+# opencode-config/templates/python-repo/Makefile. Required at
+# pre-push-validate to catch drift between this repo and the
+# canonical. The linter script is propagated to scripts/ in each
+# Lambda-Biolab Python repo (see scripts/propagate_makefile.py).
+lint-makefile:  ## Verify this Makefile matches the opencode-config canonical
+	@if [ -f scripts/lint-makefile.sh ]; then \
+		bash scripts/lint-makefile.sh Makefile; \
+	else \
+		echo "scripts/lint-makefile.sh not found — download from"; \
+		echo "  opencode-config/skills/lambda-biolab-makefile-conventions/references/lint-makefile.sh"; \
+		exit 1; \
+	fi
 # --- Propagate this Makefile to other repos (opencode-config only) ---
 # Reads ~/.config/opencode/repos.yaml and copies the canonical Makefile
 # to every repo. Idempotent. Only available when MAKEFILE_PROPAGATE=1
