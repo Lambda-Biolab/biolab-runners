@@ -253,6 +253,30 @@ lint-makefile:  ## Verify this Makefile matches the opencode-config canonical
 		echo "  opencode-config/skills/lambda-biolab-makefile-conventions/references/lint-makefile.sh"; \
 		exit 1; \
 	fi
+
+# Generate the per-PR GPU gate baseline. Run once on a known-good
+# RTX 3060 to capture the reference output. The gate then compares
+# every PR's smoke test output against this baseline.
+#
+# Prerequisites:
+# - VASTAI_API_KEY set in your shell
+# - $0.05 credit in your Vast.ai account
+#
+# Cost: ~$0.0033 (single 5 min run on RTX 3060)
+smoke-baseline:  ## Generate the per-PR GPU gate baseline (run once, commit result)
+	@if [ -z "$$VASTAI_API_KEY" ]; then \
+		echo "Set VASTAI_API_KEY first. The baseline MUST be generated on a real GPU."; \
+		exit 1; \
+	fi
+	rm -rf /tmp/smoke_baseline_$$
+	uv run python scripts/per_pr_gpu_gate/gate.py \
+		--ref "$$(git rev-parse HEAD)" \
+		--repo "$$(git remote get-url origin)" \
+		--baseline /tmp/smoke_baseline_$$/baseline.json \
+		2>&1 | tee /tmp/smoke_baseline_$$.log
+	echo "If the run succeeded, baseline.json was created at the path above."
+	echo "Move it to smoke_test/baseline.json and commit."
+
 # --- Propagate this Makefile to other repos (opencode-config only) ---
 # Reads ~/.config/opencode/repos.yaml and copies the canonical Makefile
 # to every repo. Idempotent. Only available when MAKEFILE_PROPAGATE=1

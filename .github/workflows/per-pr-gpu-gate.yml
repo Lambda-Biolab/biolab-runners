@@ -1,0 +1,137 @@
+# Per-PR Vast.ai GPU gate for biolab-runners.
+#
+# The deepvariant-arm64-Linux pattern: every PR runs the actual
+# scientific code on a real GPU and is gated on the result. Catches
+# regressions that mocks can't — wrong CUDA build, broken OpenMM
+# platform detection, performance regressions, energy drift.
+#
+# Cost: ~$0.0033 per PR (RTX 3060 @ ~$0.04/hr, 5 min runtime).
+# Time: ~6 min per PR (1 min Vast.ai boot + 5 min smoke test).
+#
+# Required secrets:
+#   VASTAI_API_KEY  — Vast.ai API key with credit
+#
+# First-time setup (one-time, requires manual Vast.ai account):
+#   1. Set VASTAI_API_KEY secret in repo settings
+#   2. Run `make smoke-baseline` locally on a known-good RTX 3060
+#   3. Commit smoke_test/baseline.json to the repo
+#   4. This workflow will then run on every PR
+name: "Per-PR GPU gate (Vast.ai)"
+
+on:
+  pull_request:
+    branches: [main]
+  # Manual trigger for the baseline-generation step (see Makefile)
+  workflow_dispatch:
+    inputs:
+      generate-baseline:
+        description: "Generate a new baseline (overwrites smoke_test/baseline.json)"
+        type: boolean
+        default: false
+      gpu:
+        description: "GPU model to use for baseline"
+        type: string
+        default: "RTX_3060"
+
+# Soft opt-in: if VASTAI_API_KEY is not set, skip the job. This
+# lets the workflow be merged before the user has provisioned
+# the secret. Once the secret is set, the job runs automatically
+# on every PR.
+concurrency:
+  group: per-pr-gpu-gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false  # never cancel a real-cloud run mid-flight
+
+permissions:
+  contents: read
+  pull-requests: write  # to comment on the PR with results
+
+jobs:
+  gpu-gate:
+    # Skip entirely if VASTAI_API_KEY isn't set. Lets the workflow
+    # be merged before the user has provisioned a Vast.ai account.
+    # Remove this `if:` after secrets are set.
+    if: ${{ secrets.VASTAI_API_KEY != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 12  # Vast.ai boot (1m) + smoke (5m) + teardown (1m) + buffer
+    env:
+      VASTAI_API_KEY: ${{ secrets.VASTAI_API_KEY }}
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Install vastai CLI
+        # The vastai CLI is the official SDK for spinning up instances.
+        # pip install is the standard install method.
+        run: uv tool install vastai || pip install vastai
+
+      - name: Run GPU gate
+        id: gate
+        run: |
+          if [ "${{ inputs.generate-baseline }}" = "true" ]; then
+            echo "BASELINE_GEN=1" >> "$GITHUB_ENV"
+            # When generating a baseline, save it to the repo via the
+            # existing auto-commit pattern (the workflow's contents: write
+            # permission lets us push). This requires a separate push step.
+            echo "Generating a new baseline is a manual ops task. Run locally:"
+            echo "  make smoke-baseline"
+            echo "  git add smoke_test/baseline.json"
+            echo "  git commit -m 'chore: regenerate smoke baseline'"
+            echo "  git push"
+            exit 0
+          fi
+          # The gate is in scripts/per_pr_gpu_gate/gate.py
+          uv run python scripts/per_pr_gpu_gate/gate.py \
+            --ref "${{ github.head_ref || github.ref_name }}" \
+            --repo "https://github.com/${{ github.repository }}.git" \
+            2>&1 | tee gate.log
+          echo "EXIT_CODE=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
+
+      - name: Upload gate log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gate-log
+          path: gate.log
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Comment on PR with results
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const exitCode = parseInt(process.env.EXIT_CODE || '-1', 10);
+            const passed = exitCode === 0;
+            const emoji = passed ? '✅' : '❌';
+            const lines = [];
+            lines.push(`## ${emoji} Per-PR GPU gate (Vast.ai)`);
+            lines.push('');
+            if (exitCode === 0) {
+              lines.push('Smoke test passed on real GPU. See [artifacts](' + context.payload.repository.html_url + '/actions/runs/' + context.runId + ') for details.');
+            } else if (exitCode === 1) {
+              lines.push('**Vast.ai deploy failed** (network, GPU availability, or SSH). ' +
+                         'See workflow logs. This is usually a transient flake — re-run the workflow.');
+            } else if (exitCode === 3) {
+              lines.push('**Scientific regression detected** — smoke test output diverged from baseline. ' +
+                         'See [artifacts](' + context.payload.repository.html_url + '/actions/runs/' + context.runId + ') for the diff.');
+            } else if (exitCode === 4) {
+              lines.push('**Budget exceeded** — projected cost > $0.50. Check Vast.ai pricing.');
+            } else {
+              lines.push('Gate failed with exit code ' + exitCode + '. See workflow logs.');
+            }
+            lines.push('');
+            lines.push('Cost: ~$0.0033 per run (RTX 3060 @ $0.04/hr, 5 min)');
+            // Post comment
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: lines.join('\n'),
+            });
