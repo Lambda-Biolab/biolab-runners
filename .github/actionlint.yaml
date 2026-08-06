@@ -1,10 +1,11 @@
-# Configuration for actionlint (https://github.com/rhysd/actionlint)
-# 
-# This file configures actionlint to know about custom self-hosted
-# runner labels used by biolab-runners. Without this, actionlint
-# warns that 'gpu' is unknown. The label is accepted at runtime by
-# GitHub Actions but isn't in the standard runner label list.
-
+# actionlint config — see https://github.com/rhysd/actionlint/blob/main/docs/config.md
+#
+# Add this file to .github/actionlint.yaml of any repo that uses a custom
+# self-hosted runner label. Without this, actionlint reports the label as
+# unknown and fails every workflow that references it.
+#
+# Lambda-Biolab runner labels (add whichever your repo uses):
 self-hosted-runner:
   labels:
-    - gpu
+    - gpu        # biolab-runners, vastai-gpu-runner
+    - arm64      # deepvariant-linux-arm64
