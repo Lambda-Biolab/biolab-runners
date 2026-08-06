@@ -157,7 +157,10 @@ def _find_structure_file(output_dir: Path) -> str:
     return ""
 
 
-def _populate_confidence_from_data(confidence: ConfidenceScores, data: dict) -> None:
+def _populate_confidence_from_data(
+    confidence: ConfidenceScores,
+    data: dict[str, typing.Any],
+) -> None:
     """Populate a ConfidenceScores from a parsed confidence JSON dict."""
     confidence.ptm = float(data.get("ptm", 0))
     confidence.iptm = float(data.get("iptm", data.get("protein_iptm", 0)))

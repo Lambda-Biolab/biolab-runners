@@ -10,7 +10,7 @@ from __future__ import annotations
 import sys
 import types
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
 from biolab_runners.openmm.config import OpenMMConfig, SimulationResult
@@ -223,11 +223,11 @@ class _FakeOpenMMForAssemble:
         self.barostat = MagicMock()
         self.integrator = MagicMock()
 
-    def MonteCarloBarostat(self, pressure, temperature, interval) -> MagicMock:
+    def MonteCarloBarostat(self, pressure: Any, temperature: Any, interval: Any) -> MagicMock:
         self._barostat_args = (pressure, temperature, interval)
         return self.barostat
 
-    def LangevinMiddleIntegrator(self, temperature, friction, timestep) -> MagicMock:
+    def LangevinMiddleIntegrator(self, temperature: Any, friction: Any, timestep: Any) -> MagicMock:
         self._integrator_args = (temperature, friction, timestep)
         return self.integrator
 
@@ -239,7 +239,7 @@ class _FakeForceField:
         self.system = MagicMock()
         self.system.addForce = MagicMock()
 
-    def createSystem(self, topology, **kwargs) -> MagicMock:
+    def createSystem(self, topology: Any, **kwargs: Any) -> MagicMock:
         self._topology = topology
         self._kwargs = kwargs
         return self.system
@@ -510,7 +510,6 @@ class TestPrepareSimulationMissingOpenMM:
         """
         import importlib
         import importlib.abc
-        import importlib.machinery
 
         from biolab_runners.openmm import system_builder as sb
         from biolab_runners.openmm.config import SimulationResult
