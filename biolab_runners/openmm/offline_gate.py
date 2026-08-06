@@ -61,7 +61,6 @@ from typing import TYPE_CHECKING
 import numpy as np
 import numpy.typing as npt
 
-# Shorthand for the common float64 array type used by Kabsch / unwrap / sample.
 from biolab_runners.openmm.paths import FileNames
 
 if TYPE_CHECKING:
