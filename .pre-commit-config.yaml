@@ -91,6 +91,18 @@ repos:
         pass_filenames: false
         types: [python]
 
+  # actionlint — lints .github/workflows/*.yml for syntax errors, context
+  # availability (e.g. hashFiles() at job-level if:), and unknown runner
+  # labels. The `actionlint-system` hook uses the locally-installed binary
+  # (installed via `make install_tools` or scripts/install-actionlint.sh)
+  # rather than downloading via Go toolchain — keeps CI fast and matches
+  # the org's single-version policy (ACTIONLINT_VERSION pin in Makefile).
+  # Found biolab-runners' links.yml reusable-workflow-not-found bug.
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.12
+    hooks:
+      - id: actionlint-system
+
   - repo: https://github.com/compilerla/conventional-pre-commit
     rev: v3.6.0
     hooks:
