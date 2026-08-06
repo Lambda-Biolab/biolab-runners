@@ -10,8 +10,17 @@
 name: Link Checker
 
 on:
-  push:
-    branches-ignore: [main]
+  # Dropped the `push: branches-ignore: [main]` trigger that was here
+  # before. Each push was firing a full lychee run on every commit,
+  # which competed for the limited GitHub-hosted ubuntu-latest runner
+  # pool and queued other workflows (CI, secrets) for 30-60 minutes.
+  #
+  # The remaining triggers are sufficient:
+  # - pull_request: types: [closed] — fires when a PR is closed/merged,
+  #   catching any link breakage that landed before the merge
+  # - schedule: weekly Sunday 00:00 UTC — catches external link rot
+  #   (URLs that 404 weeks/months after they're added)
+  # - workflow_dispatch — manual trigger for ad-hoc checks
   pull_request:
     types: [closed]
     branches: [main]
