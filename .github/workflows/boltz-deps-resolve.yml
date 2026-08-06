@@ -1,0 +1,57 @@
+name: biolab-runners[all] deps resolve
+
+# Opt-in check that biolab-runners[all] (boltz + torch + rdkit + openmm
+# + mdtraj) can be resolved and imported. Runs separately from default
+# CI because:
+# 1. --all-extras installs ~5 GB of ML deps (~5 min cold cache, ~30s warm)
+# 2. It's not needed for the unit-test gate (which only needs [openmm])
+# 3. The org ran into boltz/mdtraj numpy conflicts in Aug 2026 that
+#    silently broke Dependabot — this catches that class of issue.
+#
+# Triggers:
+# - workflow_dispatch: manual trigger
+# - schedule: nightly so dep conflicts surface within 24h
+# - pull_request: ONLY when biolab-runners' dep files change
+#   (pyproject.toml or uv.lock), to keep the queue pressure low.
+
+"on":
+  workflow_dispatch:
+  schedule:
+    - cron: "27 9 * * *"   # daily 09:27 UTC
+  pull_request:
+    paths:
+      - pyproject.toml
+      - uv.lock
+
+permissions:
+  contents: read
+
+jobs:
+  resolve-all-extras:
+    name: resolve [all] + smoke import
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Resolve biolab-runners[all]
+        # Catches dep-resolution breakages (e.g. boltz pinning numpy<2.0
+        # conflicting with mdtraj requiring numpy>=2.0). No install —
+        # just resolve. If resolution fails, uv exits non-zero.
+        run: uv lock --upgrade --all-extras
+      - name: Verify import of every boltz-touching module
+        # Smoke-imports biolab_runners.boltz2.* to catch missing
+        # imports / type stub breakages that resolution alone misses.
+        run: |
+          uv sync --frozen --all-extras --group dev
+          uv run python -c "
+          import biolab_runners.boltz2.config
+          import biolab_runners.boltz2.runner
+          import biolab_runners.boltz2.utils
+          print('All boltz-touching modules importable')
+          "
