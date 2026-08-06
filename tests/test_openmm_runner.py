@@ -17,7 +17,7 @@ from biolab_runners.openmm.config import (
     SimulationResult,
 )
 from biolab_runners.openmm.runner import OpenMMRunner
-from biolab_runners.openmm.system_builder import build_forcefield
+from biolab_runners.openmm.system_builder import SimulationContext, build_forcefield
 from biolab_runners.openmm.utils import verify_production_outputs
 
 from tests._helpers import FakeApp
@@ -455,7 +455,12 @@ class TestOpenMMRunner:
         """
         from biolab_runners.openmm import runner as runner_mod
 
-        def fake_prepare_simulation(config, output_dir, resume_xml, result):
+        def fake_prepare_simulation(
+            config: OpenMMConfig,
+            output_dir: Path,
+            resume_xml: str,
+            result: SimulationResult,
+        ) -> SimulationContext | None:
             result.error = "OpenMM not installed: No module named 'openmm'"
             return None
 

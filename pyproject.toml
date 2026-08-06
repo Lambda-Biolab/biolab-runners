@@ -116,6 +116,7 @@ convention = "google"
     "D",     # docstring rules (tests are self-documenting via test names)
     "S",     # security (asserts, subprocess mocks are safe in tests)
     "ARG",   # unused arguments (fixtures may pass extras)
+    "TC002", # type-checking block (tests import FloatArray from offline_gate for annotations)
     "TC003", # type-checking block (tests import broadly)
     "SIM117", # combine multiple with statements (test readability)
     "ANN",   # annotations (tests use pytest fixtures; full annotations noisy)
@@ -136,13 +137,42 @@ convention = "google"
 include = ["biolab_runners", "tests"]
 exclude = ["**/__pycache__", "**/.venv"]
 pythonVersion = "3.11"
-typeCheckingMode = "standard"
+typeCheckingMode = "strict"
 # `mdtraj` is an optional dep under the `openmm` extra; imported lazily
 # inside `biolab_runners/openmm/offline_gate.py`. Pyright can't see the
 # dep unless the extra is installed, so silence the missing-import
 # diagnostic specifically.
 reportMissingImports = "warning"
-reportAttributeAccessIssue = "warning"
+# Third-party stub-gap suppressions — biolab-runners depends on packages
+# with partial/incomplete type stubs (openmm, pdbfixer, mdtraj, boltz).
+# Strict mode promotes several "Unknown" diagnostics to errors; these
+# are pyright not knowing what `openmm.System.addParticle(int)` returns,
+# not real bugs in our code. Same rationale as the bioml-tools config.
+# Disabled rules (real errors fixed in source; these are pure noise):
+#   reportMissingTypeStubs — openmm, pdbfixer, mdtraj, openmm.unit
+#   reportUnknownMemberType, reportUnknownVariableType,
+#     reportUnknownArgumentType, reportUnknownParameterType —
+#     cascading Unknown from the stub gaps above
+#   reportAttributeAccessIssue — openmm/boltz internal attribute access
+reportMissingTypeStubs = false
+reportUnknownMemberType = false
+reportUnknownVariableType = false
+reportUnknownArgumentType = false
+reportUnknownParameterType = false
+reportAttributeAccessIssue = false
+# Test-mock-infrastructure suppressions — strict mode flags patterns that
+# are inherent to MagicMock-heavy unit tests, not real type issues:
+#   reportPrivateUsage — tests intentionally exercise _protected methods
+#     to verify internal contracts (e.g. `_build_command`, `_kabsch_rotation`).
+#     Renaming every internal method to be public would leak implementation
+#     details into the public API. Production code does NOT use the
+#     underscored names from other modules.
+#   reportUnknownLambdaType — lambdas used as `side_effect` callbacks on
+#     MagicMock have no inferred type for their parameter (it comes from
+#     the mock's __call__ signature, which is `Any`). Production code uses
+#     def functions, not lambdas, for typed callbacks.
+reportPrivateUsage = false
+reportUnknownLambdaType = false
 # Hypothesis decorators (@given, @settings) are untyped by design; they
 # obscure the inner function's signature in pyright's strict mode. This
 # is a known third-party-stub gap, not a real type bug. Same rationale

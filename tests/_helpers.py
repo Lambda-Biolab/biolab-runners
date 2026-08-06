@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 
 import numpy as np
+from biolab_runners.openmm.offline_gate import FloatArray
 
 # ---------------------------------------------------------------------------
 # Topology stand-ins (for tests that walk chain.atoms() / atom.name / atom.index)
@@ -117,7 +118,7 @@ class FakeApp:
 # ---------------------------------------------------------------------------
 
 
-def dodecahedron_box(d: float = 60.0) -> np.ndarray:
+def dodecahedron_box(d: float = 60.0) -> FloatArray:
     """GROMACS rhombic dodecahedron (xy-square) with edge length ``d``.
 
     Returns a 3x3 box matrix as a numpy array.

@@ -24,6 +24,7 @@ import pytest
 pytest.importorskip("mdtraj", reason="offline_gate requires mdtraj")
 
 from biolab_runners.openmm.offline_gate import (
+    FloatArray,
     GateVerdict,
     _decide,
     _frame_interval_ns,
@@ -70,7 +71,7 @@ def _build_topology() -> object:
     return top
 
 
-def _receptor_frame() -> np.ndarray:
+def _receptor_frame() -> FloatArray:
     """10-Cα α-helix-ish receptor layout (nm)."""
     return np.array(
         [[np.cos(i * 1.0), np.sin(i * 1.0), i * 0.15] for i in range(10)],
@@ -78,20 +79,20 @@ def _receptor_frame() -> np.ndarray:
     )
 
 
-def _peptide_frame() -> np.ndarray:
+def _peptide_frame() -> FloatArray:
     """3-Cα peptide in the receptor's "pocket" (nm)."""
     return np.array([[0.30, 0.0, 0.20], [0.35, 0.05, 0.35], [0.30, 0.10, 0.50]], dtype=float)
 
 
-def _orthorhombic_box(size_nm: float = 5.78) -> np.ndarray:
+def _orthorhombic_box(size_nm: float = 5.78) -> FloatArray:
     """5.78 nm = typical production water-box size."""
     return np.eye(3) * size_nm
 
 
 def _write_trajectory(
     tmp_path: Path,
-    frames: np.ndarray,
-    box_vectors: np.ndarray,
+    frames: FloatArray,
+    box_vectors: FloatArray,
     save_interval_ps: float = SAVE_INTERVAL_PS,
 ) -> Path:
     """Save frames + topology + system_config.json to ``tmp_path``.
@@ -129,7 +130,7 @@ def _make_trajectory(
     rotation_angle_per_frame: float = 0.0,
     global_translation_per_frame: float = 0.0,
     box_size_nm: float = 5.78,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[FloatArray, FloatArray]:
     """Construct ``n_frames`` of receptor + peptide with optional perturbations.
 
     All perturbations accumulate linearly across frames, so the final frame

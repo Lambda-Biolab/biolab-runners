@@ -59,11 +59,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
+import numpy.typing as npt
 
+# Shorthand for the common float64 array type used by Kabsch / unwrap / sample.
 from biolab_runners.openmm.paths import FileNames
 
 if TYPE_CHECKING:
     import mdtraj as md
+
+# Shorthand for the common float64 array type used by Kabsch / unwrap / sample.
+FloatArray = npt.NDArray[np.float64]
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +123,7 @@ class GateVerdict:
     threshold_a: float
 
 
-def _kabsch_rotation(cur_centered: np.ndarray, ref_centered: np.ndarray) -> np.ndarray:
+def _kabsch_rotation(cur_centered: FloatArray, ref_centered: FloatArray) -> FloatArray:
     """Return the 3×3 proper-rotation matrix that best aligns cur → ref.
 
     Both inputs must already be centroid-subtracted (N, 3) arrays. Uses the
@@ -128,15 +133,15 @@ def _kabsch_rotation(cur_centered: np.ndarray, ref_centered: np.ndarray) -> np.n
     h = cur_centered.T @ ref_centered
     u, _, vt = np.linalg.svd(h)
     d = np.sign(np.linalg.det(vt.T @ u.T))
-    reflect = np.diag([1.0, 1.0, d])
+    reflect = np.diag(np.array([1.0, 1.0, float(d)], dtype=np.float64))
     return vt.T @ reflect @ u.T
 
 
 def _unwrap_to_receptor_image(
-    mobile_xyz: np.ndarray,
-    anchor_xyz: np.ndarray,
-    box_vectors: np.ndarray,
-) -> np.ndarray:
+    mobile_xyz: FloatArray,
+    anchor_xyz: FloatArray,
+    box_vectors: FloatArray,
+) -> FloatArray:
     """Shift ``mobile_xyz`` as a rigid body to the image closest to ``anchor_xyz``.
 
     Triclinic-aware: expresses the centroid delta in fractional lattice
@@ -166,9 +171,9 @@ def _unwrap_to_receptor_image(
 
 def _compute_per_frame_rmsd(
     traj: md.Trajectory,
-    rec_ca_idx: np.ndarray,
-    pep_ca_idx: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
+    rec_ca_idx: npt.NDArray[np.int64],
+    pep_ca_idx: npt.NDArray[np.int64],
+) -> tuple[FloatArray, FloatArray]:
     """Receptor-aligned peptide-Cα RMSD + receptor self-fit residual per frame.
 
     Reference is frame 0 with the peptide unwrapped to the receptor's image.
@@ -368,7 +373,7 @@ def evaluate_trajectory(
     )
 
 
-def _sample_at(rmsd_ang: np.ndarray, time_ns: np.ndarray, t_target_ns: float) -> float | None:
+def _sample_at(rmsd_ang: FloatArray, time_ns: FloatArray, t_target_ns: float) -> float | None:
     """Nearest-frame sample of ``rmsd_ang`` at ``t_target_ns``.
 
     Returns ``None`` if the trajectory has not reached ``t_target_ns`` yet.
@@ -380,8 +385,8 @@ def _sample_at(rmsd_ang: np.ndarray, time_ns: np.ndarray, t_target_ns: float) ->
 
 
 def _slope_5ns_to_10ns(
-    rmsd_ang: np.ndarray,
-    time_ns: np.ndarray,
+    rmsd_ang: FloatArray,
+    time_ns: FloatArray,
     t_lo_ns: float,
     t_hi_ns: float,
     min_window_ns: float,

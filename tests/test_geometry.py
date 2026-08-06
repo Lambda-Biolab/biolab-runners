@@ -15,6 +15,7 @@ from biolab_runners.openmm.geometry import (
     min_pbc_distance,
     pbc_correct,
 )
+from biolab_runners.openmm.offline_gate import FloatArray
 
 from tests._helpers import FakeAtom, FakeChain, dodecahedron_box
 
@@ -180,10 +181,10 @@ class TestPbcCorrectProperties:
     """Invariants that must hold for any lattice / displacement."""
 
     @pytest.fixture
-    def small_box(self) -> np.ndarray:
+    def small_box(self) -> FloatArray:
         return np.diag([7.0, 8.0, 9.0])
 
-    def test_lattice_vector_always_zero(self, small_box: np.ndarray) -> None:
+    def test_lattice_vector_always_zero(self, small_box: FloatArray) -> None:
         """Any integer combination of lattice vectors wraps to 0."""
         from hypothesis import given
         from hypothesis import strategies as st
@@ -196,7 +197,7 @@ class TestPbcCorrectProperties:
 
         inner()  # type: ignore[reportCallIssue]
 
-    def test_idempotent(self, small_box: np.ndarray) -> None:
+    def test_idempotent(self, small_box: FloatArray) -> None:
         """pbc_correct(pbc_correct(x)) == pbc_correct(x) for any x in the box."""
         from hypothesis import given
         from hypothesis import strategies as st
@@ -216,7 +217,7 @@ class TestPbcCorrectProperties:
 
         inner()  # type: ignore[reportCallIssue]
 
-    def test_output_within_half_box(self, small_box: np.ndarray) -> None:
+    def test_output_within_half_box(self, small_box: FloatArray) -> None:
         """For orthorhombic cells, output components lie in [-L/2, L/2)."""
         from hypothesis import given
         from hypothesis import strategies as st
