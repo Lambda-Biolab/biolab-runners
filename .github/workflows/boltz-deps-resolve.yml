@@ -43,7 +43,12 @@ jobs:
         # Catches dep-resolution breakages (e.g. boltz pinning numpy<2.0
         # conflicting with mdtraj requiring numpy>=2.0). No install —
         # just resolve. If resolution fails, uv exits non-zero.
-        run: uv lock --upgrade --all-extras
+        #
+        # Note: `uv lock` does NOT accept `--all-extras` (that's a
+        # `uv sync` flag). `--upgrade` alone is sufficient — extras are
+        # part of the project's own dep tree, so the upgrade considers
+        # them without explicit specification.
+        run: uv lock --upgrade
       - name: Verify import of every boltz-touching module
         # Smoke-imports biolab_runners.boltz2.* to catch missing
         # imports / type stub breakages that resolution alone misses.
