@@ -113,8 +113,46 @@ def test_config_to_cli_default_includes_four_sequences(pdb_input: Path) -> None:
     assert cli["num_seq_per_target"] == "4"
     assert cli["sampling_temp"] == "0.2"
     assert cli["seed"] == "42"
-    assert cli["model_name"] == "vanilla_model_weights"
+    # Upstream ProteinMPNN expects `model_name` to be a *checkpoint
+    # prefix* (joined with ".pt" to form the file name), not the
+    # weight-folder name. The historical default of "vanilla_model_weights"
+    # was a folder name and silently broke checkpoint loading. See
+    # protein_mpnn_run.py:57 (`checkpoint_path = model_folder_path +
+    # f'{args.model_name}.pt'`) and protein_mpnn_run.py:426 (the
+    # --model_name help text lists the valid prefixes).
+    assert cli["model_name"] == "v_48_020"
     assert cli["pdb_path"] == pdb_input.name
+
+
+@pytest.mark.parametrize("checkpoint", ["v_48_002", "v_48_010", "v_48_020", "v_48_030"])
+def test_config_to_cli_supports_all_upstream_checkpoints(pdb_input: Path, checkpoint: str) -> None:
+    """Lock the runner-side model_name contract to upstream's choices.
+
+    If a future PR widens or narrows this contract, this test forces the
+    author to update both the config default and this parametrize list
+    in lockstep.
+    """
+    cli = _config_to_cli(ProteinMPNNConfig(model_name=checkpoint), pdb_input)
+    assert cli["model_name"] == checkpoint
+
+
+def test_proteinmpnn_config_default_is_an_upstream_checkpoint_prefix() -> None:
+    """Guard against re-introducing a folder-name default by mistake.
+
+    Pre-existing bug: the dataclass default was the *folder* name
+    (``vanilla_model_weights``) instead of the *checkpoint* prefix
+    (e.g. ``v_48_020``). Upstream ``--model_name`` expects the latter
+    (see protein_mpnn_run.py:57; the script concatenates
+    ``<weights_dir>/<model_name>.pt`` to find the checkpoint file).
+    """
+    default = ProteinMPNNConfig().model_name
+    upstream_checkpoints = {"v_48_002", "v_48_010", "v_48_020", "v_48_030"}
+    assert default in upstream_checkpoints, (
+        f"ProteinMPNNConfig().model_name defaults to {default!r}; "
+        f"must be one of upstream's checkpoint prefixes "
+        f"({sorted(upstream_checkpoints)}). A folder name silently "
+        f"breaks checkpoint loading upstream."
+    )
 
 
 def test_config_to_cli_handles_fixed_positions(pdb_input: Path) -> None:

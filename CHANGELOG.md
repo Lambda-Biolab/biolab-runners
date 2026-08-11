@@ -6,6 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- **Bug fix (runner ProteinMPNN model_name default)**:
+  `ProteinMPNNConfig.model_name` defaulted to `"vanilla_model_weights"`
+  — a *folder* name. Upstream `protein_mpnn_run.py:57` joins
+  `<model_folder_path>/<model_name>.pt`, so passing a folder name
+  silently broke checkpoint loading on every default invocation.
+  Switch the default to `"v_48_020"` (one of the four upstream
+  `--model_name` choices: `v_48_002`, `v_48_010`, `v_48_020`,
+  `v_48_030` — each is a checkpoint *prefix*, joined with `.pt`
+  upstream). The runner's contract is unchanged: callers may pass any
+  of the four prefixes via `ProteinMPNNConfig(model_name=...)`. The
+  companion
+  `test_config_to_cli_default_includes_four_sequences` is updated to
+  assert the new default; a parametrised
+  `test_config_to_cli_supports_all_upstream_checkpoints` and a guard
+  `test_proteinmpnn_config_default_is_an_upstream_checkpoint_prefix`
+  lock the contract against re-introducing a folder name.
+  See [protein_mpnn_run.py:57](https://github.com/dauparas/ProteinMPNN/blob/main/protein_mpnn_run.py#L57)
+  and the upstream `--model_name` argparse help text.
+
 - **Bug fix (runner total_ns precision, v15 follow-up)**: `total_ns` in
   `SimulationResult` was rounded to 2 decimal places, which silently
   collapsed sub-100 ps simulations (``round(0.001, 2) == 0.0``). The

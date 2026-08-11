@@ -20,7 +20,16 @@ class ProteinMPNNConfig:
     """Per-invocation configuration for the ProteinMPNN runner.
 
     Defaults produce four canonical L-amino-acid sequences per PDB
-    input via the upstream ``vanilla_model_weights`` checkpoint.
+    input via the upstream ``v_48_020`` checkpoint (one of
+    ``v_48_002``, ``v_48_010``, ``v_48_020``, ``v_48_030`` — these are
+    the upstream ``--model_name`` values; they are *checkpoint
+    prefixes*, not folder names). The upstream script joins
+    ``model_folder_path + model_name + ".pt"`` to resolve the
+    checkpoint file, so passing the folder name (e.g.
+    ``"vanilla_model_weights"``) instead of the checkpoint prefix
+    silently breaks loading — the historical default was a folder
+    name, not a checkpoint prefix.
+
     Cyclic and D-residue behaviour is not part of ProteinMPNN's
     vocabulary — the runner exposes positions the consumer can pin
     to Cys / D-residues, but the actual conversion happens in the
@@ -31,7 +40,7 @@ class ProteinMPNNConfig:
     task_count: int = 4
     temperature: float = 0.1
     seed: int = 0
-    model_name: str = "vanilla_model_weights"
+    model_name: str = "v_48_020"
     ca_only: bool = False
     fixed_positions: tuple[int, ...] = field(default_factory=_empty_int_tuple)
     omit_aa: str = ""  # e.g. "CDF" to omit these amino acids
