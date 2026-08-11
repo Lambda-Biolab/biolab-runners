@@ -96,6 +96,7 @@ def _resolved_binary() -> list[str]:
         ]
     return [binary]
 
+
 def parse_fasta_sequences(path: Path) -> list[tuple[str, str]]:
     """Parse a FASTA file into a list of ``(name, sequence)`` tuples.
 
@@ -123,9 +124,7 @@ def _parse_fasta_lines(lines: list[str]) -> list[tuple[str, str]]:
     return records
 
 
-def _flush_record(
-    records: list[tuple[str, str]], name: str | None, seq: list[str]
-) -> None:
+def _flush_record(records: list[tuple[str, str]], name: str | None, seq: list[str]) -> None:
     """Append a (name, sequence) pair to ``records`` if a name is pending."""
     if name is not None:
         records.append((name, "".join(seq)))

@@ -52,7 +52,6 @@ from __future__ import annotations
 import json
 import sys
 import time
-from io import StringIO
 from pathlib import Path
 
 import pytest
@@ -103,9 +102,7 @@ def test_proteinmpnn_parse_fasta_returns_both_records_with_protein_alpha() -> No
     assert len(seq1) == 43, f"TQ2 length {len(seq1)} != 43"
     canonical_aa = set("ACDEFGHIKLMNPQRSTVWY")
     for seq in (seq0, seq1):
-        assert all(aa in canonical_aa for aa in seq), (
-            f"non-canonical AA in sequence: {seq[:30]!r}"
-        )
+        assert all(aa in canonical_aa for aa in seq), f"non-canonical AA in sequence: {seq[:30]!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -129,9 +126,7 @@ def test_gromacs_parse_nthcol_returns_first_data_row() -> None:
 
     assert SAMPLE_XVG.exists(), f"missing fixture {SAMPLE_XVG}"
     value = parse_nthcol_energy(SAMPLE_XVG, column=1)
-    assert 100.0 < value < 500.0, (
-        f"GROMACS parse_nthcol_energy column 1 -> {value}, expected ~425"
-    )
+    assert 100.0 < value < 500.0, f"GROMACS parse_nthcol_energy column 1 -> {value}, expected ~425"
 
 
 def test_gromacs_parse_nthcol_handles_comment_lines() -> None:
@@ -144,12 +139,9 @@ def test_gromacs_parse_nthcol_handles_comment_lines() -> None:
 
     value = parse_nthcol_energy(SAMPLE_XVG, column=2)
     assert value < 0.0, (
-        f"expected negative potential energy, got {value} — "
-        f"parser may not be reading data rows"
+        f"expected negative potential energy, got {value} — parser may not be reading data rows"
     )
-    assert value > -500.0, (
-        f"value {value} outside physical window — parser mis-parsed"
-    )
+    assert value > -500.0, f"value {value} outside physical window — parser mis-parsed"
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +149,7 @@ def test_gromacs_parse_nthcol_handles_comment_lines() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _pick_openmm_platform() -> tuple[str, "openmm.Platform"]:
+def _pick_openmm_platform() -> tuple[str, object]:
     """Return ('CUDA', platform), ('OpenCL', platform), or ('CPU', platform).
 
     Priority is CUDA > OpenCL > CPU. Returns (name, instance); the
@@ -226,33 +218,24 @@ def test_openmm_minimization_produces_physically_plausible_energy() -> None:
     * TIP3P: Jorgensen et al. 1983, J. Chem. Phys. 79(2): 926-935.
     """
     pytest.importorskip("openmm", reason="OpenMM Python module not installed")
-    from openmm import unit  # type: ignore[import-untyped]
-    from openmm.app import ForceField, PDBFile, Simulation, Modeller  # type: ignore[import-untyped]
-    from openmm import LangevinIntegrator  # type: ignore[import-untyped]
-    from openmm import Platform  # type: ignore[import-untyped]
+    from openmm.app import ForceField, Modeller, PDBFile, Simulation  # type: ignore[import-untyped]
+
+    from openmm import (
+        LangevinIntegrator,  # type: ignore[import-untyped]
+        Platform,  # type: ignore[import-untyped]
+        unit,  # type: ignore[import-untyped]
+    )
 
     assert SAMPLE_1BRS_A.exists(), f"missing fixture {SAMPLE_1BRS_A}"
 
     # Strip the chain to a small slice for speed (the first 5 residues).
     # This still exercises every code path that matters: PDB parse,
     # amber14 ff loading, hydrogen addition, system construction,
-    # integrators, minimise.
-    pdb_full = PDBFile(str(SAMPLE_1BRS_A))
-    keep_atoms = []
-    keep_positions = []
-    for atom, pos in zip(pdb_full.topology.atoms(), pdb_full.positions):
-        # Take residues 3-7 of chain A only (5 residues = ~40 heavy atoms).
-        if atom.residue.index < 5:
-            keep_atoms.append(atom)
-            keep_positions.append(pos)
-    modeller_full = Modeller(pdb_full.topology, pdb_full.positions)
-    # Modeller.deleteAtoms is the canonical way to drop atoms; we
-    # build a new Modeller keeping only the first 5 residues' atoms.
-    new_topology = modeller_full.topology
-    new_positions = list(modeller_full.positions)
-    # Simpler approach: just load the full chain and rely on the
-    # test being fast on CUDA. 1700-atom minimisation takes 0.3s on
-    # this machine.
+    # integrators, minimise. Loading the full chain (108 residues,
+    # 1700 atoms after H addition) takes 0.3 s on CUDA — short
+    # enough to use the full structure rather than building a
+    # sliced subset, which keeps the test focused on the wrapper
+    # contract.
     pdb = PDBFile(str(SAMPLE_1BRS_A))
     modeller = Modeller(pdb.topology, pdb.positions)
     ff = ForceField("amber14/protein.ff14SB.xml", "amber14/tip3p.xml")
@@ -265,16 +248,16 @@ def test_openmm_minimization_produces_physically_plausible_energy() -> None:
 
     system = ff.createSystem(modeller.topology)
     integrator = LangevinIntegrator(
-        300 * unit.kelvin,
-        1 / unit.picosecond,
-        1 * unit.femtosecond,
+        300 * unit.kelvin,  # type: ignore[reportOperatorIssue]
+        1 / unit.picosecond,  # type: ignore[reportOperatorIssue]
+        1 * unit.femtosecond,  # type: ignore[reportOperatorIssue]
     )
 
     chosen_name, chosen_platform = _pick_openmm_platform()
     t0 = time.perf_counter()
     try:
         sim = Simulation(modeller.topology, system, integrator, chosen_platform)
-    except Exception as exc:
+    except Exception:
         # CUDA/OpenCL platforms can be registered but unusable if /dev
         # is wrong. Fall back to CPU to keep the test runnable.
         if chosen_name == "CUDA":
@@ -427,8 +410,8 @@ def test_openmm_runner_completes_short_vacuum_simulation(tmp_path: Path) -> None
     summary = output_dir / "md_summary.json"
     state_files = list(output_dir.glob("state.*.xml"))
     topology = output_dir / "topology.pdb"
-    assert topology.exists(), f"topology.pdb not written — system build failed"
-    assert summary.exists(), f"md_summary.json not written — runner didn't finish"
+    assert topology.exists(), "topology.pdb not written — system build failed"
+    assert summary.exists(), "md_summary.json not written — runner didn't finish"
     assert len(state_files) >= 1, (
         f"no checkpoint state files in {output_dir} — production loop didn't step"
     )
