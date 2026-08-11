@@ -1,10 +1,10 @@
 # biolab-runners
 
-[![Version](https://img.shields.io/badge/version-0.1.0-8A2BE2)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-0.4.0-8A2BE2)](pyproject.toml)
 [![License](https://img.shields.io/badge/license-Apache_2.0-blue)](LICENSE)
 [![Tests](https://github.com/Lambda-Biolab/biolab-runners/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Lambda-Biolab/biolab-runners/actions/workflows/ci.yml)
 [![Dependabot Updates](https://github.com/Lambda-Biolab/biolab-runners/actions/workflows/dependabot/dependabot-updates/badge.svg?branch=main)](https://github.com/Lambda-Biolab/biolab-runners/actions/workflows/dependabot/dependabot-updates)
-Standalone, modular Python runners for **Boltz-2 structure prediction** and **OpenMM molecular dynamics simulations**.
+Standalone, modular Python runners for **Boltz-2** structure prediction, **OpenMM** molecular dynamics, **RFdiffusion** backbone generation, **ProteinMPNN** sequence design, **Rosetta** InterfaceAnalyzer, and **GROMACS** integration.
 
 Extracted from the [OralBiome-AMP](https://github.com/Lambda-Biolab/OralBiome-AMP) pipeline for use in other research projects.
 
@@ -12,12 +12,44 @@ Extracted from the [OralBiome-AMP](https://github.com/Lambda-Biolab/OralBiome-AM
 
 - **Boltz2Runner** — Local GPU structure prediction with quality gating, MSA caching, pocket constraints, and dry-run mode
 - **OpenMMRunner** — Full MD pipeline: system building, 3-stage equilibration, production NPT, checkpointing, early abort, SIGTERM handling
+- **RFdiffusionRunner** — Subprocess wrapper for unconditional / motif-scaffolding backbone generation (Hydra CLI translation)
+- **ProteinMPNNRunner** — Subprocess wrapper for fixed-backbone sequence design (CLI translation from biolab-runners contract to upstream `protein_mpnn_run.py`)
+- **RosettaRunner** — Subprocess wrapper for Rosetta InterfaceAnalyzer (license-gated; skips when the license is absent)
+- **GROMACSRunner** — Subprocess wrapper for `.xvg` parsing integration
 - Config-driven with dataclasses (no magic strings)
 - Structured result objects (not raw dicts)
 - Full type annotations (pyright-clean)
 - Python logging (no print statements)
-- Dry-run mode for both runners
+- Dry-run mode for all runners
 - **Scientific-validation integration suite** — 8 tests gated by `@pytest.mark.integration` driving parsers and the OpenMM runner on real reference inputs (barnase chain A, ProteinMPNN FASTA, GROMACS energy.xvg). End-to-end CUDA smoke is opt-in via `BIOLAB_RUN_HEAVY_CUDA_TESTS=1`.
+
+### Runner CLI contracts
+
+The `Boltz2Runner`, `OpenMMRunner`, `RFdiffusionRunner`, and
+`ProteinMPNNRunner` are pure-Python wrappers around their upstream
+binaries. The runner-level CLI contract is what the biolab-runners
+binary expects:
+
+| Runner | Required upstream binary | CLI contract |
+|---|---|---|
+| `Boltz2Runner` | `boltz` (Conda) | upstream CLI passes through directly |
+| `OpenMMRunner` | `python -m openmm` (Python lib) | n/a — no subprocess |
+| `RFdiffusionRunner` | `rfdiffusion` (or `${RFDIFFUSION_BIN}`) | `--input_path DIR`, `--output_path DIR`, `--num_designs N`, `--length MINMAX`, `--contig_map SPEC` |
+| `ProteinMPNNRunner` | `proteinmpnn` (or `${PROTEINMPNN_BIN}`) | `--input_path DIR`, `--output_path DIR`, `--batch_size N`, `--seed N`, `--sampling_temp F`, `--num_seq_per_target N`, `--model_name CHECKPOINT` (one of `v_48_002`, `v_48_010`, `v_48_020`, `v_48_030`), `--ca_only`, `--omit_AA`, `--fixed_positions` |
+| `RosettaRunner` | Rosetta InterfaceAnalyzer | license-gated; skipped when absent |
+| `GROMACSRunner` | n/a (parser-only) | fixture `.xvg` files |
+
+The host-level bootstrap script
+`~/.local/bin/install-proteinmpnn-rfdiffusion.sh` clones the upstream
+`dauparas/ProteinMPNN` and `RosettaCommons/RFdiffusion` repos shallowly
+into `~/tools/`, then writes thin Python wrappers at
+`~/.local/bin/proteinmpnn` and `~/.local/bin/rfdiffusion` that adapt
+the biolab-runners CLI to upstream's expected one
+(`--pdb_path` / `--out_folder` for ProteinMPNN; Hydra
+`contigmap.contigs=...` for RFdiffusion). After running the script,
+`biolab_runners.proteinmpnn.utils.proteinmpnn_available()` and
+`biolab_runners.rfdiffusion.utils.rfdiffusion_available()` both return
+True.
 
 ## Installation
 

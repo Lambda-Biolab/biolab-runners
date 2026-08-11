@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- **CI workflow fix (`boltz-deps-resolve.yml`)**: `uv lock --upgrade --all-extras`
+  was the nightly dep-resolution job failing every run. The `--all-extras`
+  flag is invalid for `uv lock` (it is only valid for `uv sync`). Fix:
+  drop the flag — `uv lock --upgrade` is sufficient. Also added
+  `.opencode/` and `mutants/` to `.gitignore`.
+
+- **Heavy CUDA smoke env-gate restored**: `BIOLAB_RUN_HEAVY_CUDA_TESTS=1`
+  opt-in on `test_openmm_runner_completes_short_vacuum_simulation`
+  was accidentally dropped by the squash-merge of PR #181. The
+  1-ps vacuum simulation (~90 s on RTX 4090, >10 min on CPU) now
+  skips by default for both the pre-push gate and CI; only operators
+  who set `BIOLAB_RUN_HEAVY_CUDA_TESTS=1` pay the GPU cost. Reset
+  the default `--skipif` condition that was lost in the squash.
+
 - **Bug fix (runner ProteinMPNN model_name default)**:
   `ProteinMPNNConfig.model_name` defaulted to `"vanilla_model_weights"`
   — a *folder* name. Upstream `protein_mpnn_run.py:57` joins
@@ -288,5 +302,63 @@ Initial release. Two runners extracted from the OralBiome-AMP pipeline:
   via offline mdtraj gate, SIGTERM-safe checkpointing, and PBC-aware
   RMSD checks.
 
-[Unreleased]: https://github.com/Lambda-Biolab/biolab-runners/compare/v0.1.0...HEAD
+## [0.2.0] — 2026-08
+
+Adds the RFdiffusion runner (Slice 5).
+
+- **`RFdiffusionRunner`** — `biolab_runners.rfdiffusion.runner.RFdiffusionRunner`
+  drives the upstream RFdiffusion Hydra CLI for unconditional / motif-
+  scaffolding backbone generation. Subprocess wrapper with Hydra
+  `contigmap.contigs=...` translation, JSON config passthrough, and
+  hook-based result collection. Companion availability probe
+  `rfdiffusion_available()` returns `True` iff the wrapper is on
+  `$PATH` and exits 0 on `--help`.
+- `biolab_runners/rfdiffusion/config.py` — `RFdiffusionConfig` dataclass
+  with `length`, `contig_map`, `num_designs`, and JSON config passthrough.
+- `tests/integration/test_scientific_validation.py` — early stub for
+  `test_rfdiffusion_runner_availablity_check_works` (later re-named
+  by the v0.4.0 doc-sweep PR).
+- Cleanup: removed dead `.markdownlint.json` and empty `MEMORY.md`;
+  declared the documentation hierarchy and refreshed `llms.txt`.
+
+## [0.3.0] — 2026-08
+
+Adds the ProteinMPNN runner (Slice 6).
+
+- **`ProteinMPNNRunner`** — `biolab_runners.proteinmpnn.runner.ProteinMPNNRunner`
+  drives the upstream ProteinMPNN `protein_mpnn_run.py` for fixed-backbone
+  sequence design. CLI translation: biolab-runners contract
+  (`--input_path` / `--output_path` / `--batch_size` / `--seed` /
+  `--sampling_temp` / `--num_seq_per_target` /
+  `--model_name` / `--ca_only` / `--omit_AA` / `--fixed_positions`)
+  to upstream's expected `--pdb_path` / `--out_folder` / `--model_name`
+  / `--sampling_temp` etc. Idempotent skip on existing FASTA output.
+  Companion `proteinmpnn_available()`.
+- `biolab_runners/proteinmpnn/config.py` — `ProteinMPNNConfig` dataclass
+  with `task_count`, `temperature`, `seed`, `model_name`, `ca_only`,
+  `fixed_positions`, `omit_aa`, `extra` passthrough.
+- `tests/integration/test_scientific_validation.py` —
+  `test_proteinmpnn_parse_fasta_returns_both_records_with_protein_alpha`.
+
+## [0.4.0] — 2026-08
+
+Adds the Rosetta runner (license-gated).
+
+- **`RosettaRunner`** — `biolab_runners.rosetta.runner.RosettaRunner` is
+  the fourth runner. Subprocess wrapper for the Rosetta InterfaceAnalyzer
+  binary. Skips at the availability probe when the Rosetta license is
+  absent (Rosetta is closed-source / commercial). Companion
+  `rosetta_available()`.
+- `biolab_runners/rosetta/config.py` — `RosettaConfig` dataclass.
+
+The release commit also touched the Pre-PR gate machinery (the
+`hashFiles()` job-level `if:` fix in PR #157) and rolled GitHub Actions
+versions forward (PRs #115, #117, #121, #122, #127, #137 — all
+through `b34f41a`).
+
+
+[Unreleased]: https://github.com/Lambda-Biolab/biolab-runners/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/Lambda-Biolab/biolab-runners/releases/tag/v0.4.0
+[0.3.0]: https://github.com/Lambda-Biolab/biolab-runners/releases/tag/v0.3.0
+[0.2.0]: https://github.com/Lambda-Biolab/biolab-runners/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Lambda-Biolab/biolab-runners/releases/tag/v0.1.0

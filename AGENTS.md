@@ -5,10 +5,14 @@ Read this file first. It supersedes any default behavior.
 
 ## Project Purpose
 
-Standalone, modular Python library containing two computational biology runners extracted from the [OralBiome-AMP](https://github.com/Lambda-Biolab/OralBiome-AMP) pipeline:
+Standalone, modular Python library containing the computational biology runners extracted from the [OralBiome-AMP](https://github.com/Lambda-Biolab/OralBiome-AMP) pipeline:
 
 1. **Boltz2Runner** — Runs Boltz-2 structure predictions for peptide-protein complexes
 2. **OpenMMRunner** — Runs OpenMM molecular dynamics simulations with multi-stage equilibration
+3. **RFdiffusionRunner** — Runs RFdiffusion for unconditional / motif-scaffolding backbone generation
+4. **ProteinMPNNRunner** — Runs ProteinMPNN for fixed-backbone sequence design
+5. **RosettaRunner** — Runs Rosetta InterfaceAnalyzer (license-gated)
+6. **GROMACSRunner** — GROMACS integration via subprocess for production-scale MD
 
 The runners are designed for researchers who want to use these tools in their own pipelines without importing the full OralBiome-AMP codebase.
 
@@ -39,16 +43,32 @@ biolab_runners/
 │   ├── config.py     # Boltz2Config, ConfidenceScores, PredictionResult, QualityGate
 │   ├── runner.py     # Boltz2Runner class + apply_quality_gate()
 │   └── utils.py      # YAML writer, output parser, availability check
-└── openmm/
-    ├── config.py         # OpenMMConfig, SimulationResult
-    ├── runner.py         # OpenMMRunner class (thin dispatcher — MD mechanics only)
-    ├── run_state.py      # Decide fresh/resume/skip/fail_fast; tagged-union RunPlan (deep module — owns the run-state decision)
-    ├── system_builder.py # ForceField, Modeller, System, Integrator, Cα restraint, prepare_simulation
-    ├── checkpoint.py     # Manifest I/O, atomic save, orphan GC, quarantine, inspect_checkpoint (single coherent read), CompletionStatus enum (deep module — owns the entire checkpoint lifecycle)
-    ├── geometry.py       # Pure-numpy PBC math (pbc_correct, min_pbc_distance)
-    ├── offline_gate.py   # Offline mdtraj gate + verdict I/O
-    ├── paths.py          # Centralized filenames (FileNames)
-    └── utils.py          # Availability checks (openmm_available, pdbfixer_available) + diagnostic reporter (verify_production_outputs)
+├── openmm/
+│   ├── config.py         # OpenMMConfig, SimulationResult
+│   ├── runner.py         # OpenMMRunner class (thin dispatcher — MD mechanics only)
+│   ├── run_state.py      # Decide fresh/resume/skip/fail_fast; tagged-union RunPlan (deep module — owns the run-state decision)
+│   ├── system_builder.py # ForceField, Modeller, System, Integrator, Cα restraint, prepare_simulation
+│   ├── checkpoint.py     # Manifest I/O, atomic save, orphan GC, quarantine, inspect_checkpoint (single coherent read), CompletionStatus enum (deep module — owns the entire checkpoint lifecycle)
+│   ├── geometry.py       # Pure-numpy PBC math (pbc_correct, min_pbc_distance)
+│   ├── offline_gate.py   # Offline mdtraj gate + verdict I/O
+│   ├── paths.py          # Centralized filenames (FileNames)
+│   └── utils.py          # Availability checks (openmm_available, pdbfixer_available) + diagnostic reporter (verify_production_outputs)
+├── rfdiffusion/
+│   ├── config.py     # RFdiffusionConfig
+│   ├── runner.py     # RFdiffusionRunner class + Hydra CLI translation
+│   └── utils.py      # rfdiffusion_available() probe
+├── proteinmpnn/
+│   ├── config.py     # ProteinMPNNConfig (model_name is a checkpoint prefix)
+│   ├── runner.py     # ProteinMPNNRunner + _config_to_cli()
+│   └── utils.py      # proteinmpnn_available(), parse_fasta_sequences(), invoke()
+├── rosetta/
+│   ├── config.py     # RosettaConfig
+│   ├── runner.py     # RosettaRunner (license-gated)
+│   └── utils.py      # rosetta_available() probe
+└── gromacs/
+    ├── config.py     # GROMACSConfig
+    ├── runner.py     # GROMACSRunner
+    └── utils.py      # parse_nthcol() for `.xvg` files
 ```text
 
 The checkpoint invariants (atomic save, manifest binding, terminal schema, force=True quarantine) all describe `biolab_runners.openmm.checkpoint` — that module is the single source of truth for the checkpoint protocol. `system_builder.py` does the system construction only; it does NOT touch the manifest. `biolab_runners.openmm.checkpoint.inspect_checkpoint(output_dir, config)` is the single canonical entry point — it reads the manifest once and returns a fully-classified `CheckpointSnapshot` carrying the absolute step, state filename, last record, structured `CompletionStatus`, completion reason, and validated terminal payload. The previous multi-call pattern (`load_checkpoint` + `is_run_complete` + `load_terminal_payload`) is now a sequence of thin wrappers that delegate to `inspect_checkpoint`.
@@ -96,6 +116,22 @@ The checkpoint invariants (atomic save, manifest binding, terminal schema, force
 
 - **Boltz-2:** `boltz` CLI on PATH, GPU with 24 GB VRAM (RTX 4090)
 - **OpenMM:** Best via conda (`conda install -c conda-forge openmm pdbfixer`); pip only provides OpenCL
+- **RFdiffusion:** upstream clone at `~/tools/RFdiffusion` + wrapper at `~/.local/bin/rfdiffusion` (installed via `~/.local/bin/install-proteinmpnn-rfdiffusion.sh`); GPU with ~10 GB VRAM for design
+- **ProteinMPNN:** upstream clone at `~/tools/ProteinMPNN` + wrapper at `~/.local/bin/proteinmpnn` (same bootstrap script)
+- **Rosetta:** license-gated; the runner skips when the license is absent
+- **GROMACS:** heavy install; parse_nthcol tested via fixture `.xvg` files
+
+### Integration / Scientific-Validation Tests
+
+The `tests/integration/test_scientific_validation.py` suite is the floor
+under which the runner plumbing cannot claim scientific correctness. The
+suite is marked `@pytest.mark.integration` and runs as part of the
+default `make validate` (the `not slow` filter does not deselect the
+integration marker). One heavy test,
+`test_openmm_runner_completes_short_vacuum_simulation`, is gated
+behind `BIOLAB_RUN_HEAVY_CUDA_TESTS=1` *and* `/dev/nvidia0` reachability
+— both must be true for the 1-ps vacuum simulation (~90 s on RTX 4090)
+to run. The validation plan is `docs/testing/scientific-validation.md`.
 
 ## How to Add a New Runner
 
@@ -103,8 +139,11 @@ The checkpoint invariants (atomic save, manifest binding, terminal schema, force
 2. Define config + result dataclasses
 3. Implement runner class with `run()`, `dry_run`, idempotency, logging
 4. Add tests in `tests/` using mocks (no real GPU/CLI deps)
-5. Add optional extras in `pyproject.toml`
-6. Export from `__init__.py`
+5. Add an integration test in `tests/integration/test_scientific_validation.py`
+   that asserts the runner produces a plausible result on a real
+   reference input (cite the literature source in the docstring)
+6. Add optional extras in `pyproject.toml`
+7. Export from `__init__.py`
 
 ## Quality Assurance
 
@@ -113,6 +152,8 @@ make validate       # Full gate: ruff → pyright → complexity → pytest (rea
 make quick_validate # Fast gate: ruff + pyright
 make lint           # Check linting and formatting
 make test           # Run tests only
+# Heavy OpenMM CUDA smoke (opt-in; ~90 s on RTX 4090):
+BIOLAB_RUN_HEAVY_CUDA_TESTS=1 uv run pytest -m integration -v
 ```text
 
 ## Quick Reference
