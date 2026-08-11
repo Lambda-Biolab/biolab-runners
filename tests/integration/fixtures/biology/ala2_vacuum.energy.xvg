@@ -1,0 +1,19 @@
+# GROMACS-style energy.xvg output - synthetic, matches the upstream
+# plain-text whitespace-separated format. The wrapper parses the
+# requested column (default column 1 = potential energy) and skips
+# lines starting with '#' or '@'.
+#
+# Reference values: PE drifting between -345.7 and -340.1 across
+# a 5-step sample. This is in the physically reasonable window for
+# a small solvated peptide (Amber or CHARMM force field at 300 K).
+# A wrapper that picks up column 2 instead of column 1 would read
+# 425.0 - a value that fails our parse-window assertion.
+@   title "GROMACS energy file"
+@   xaxis  label "Time (ps)"
+@   yaxis  label "Energy (kJ/mol)"
+#
+   0.000   425.0   -340.1
+   0.002   425.5   -341.9
+   0.004   426.0   -343.4
+   0.006   425.7   -344.2
+   0.008   425.3   -345.7
