@@ -203,11 +203,7 @@ addopts = [
     "--cov-report=term-missing",
 ]
 markers = [
-    # The current pytest suite runs entirely with mocks + numpy + the
-    # optional `mdtraj` extra. No tests require real GPU hardware,
-    # the live boltz CLI, or network access — so no markers are
-    # defined. Add markers here when such tests are introduced and
-    # gate them via `--strict-markers` + `pytest -m <marker>` in CI.
+    "integration: real scientific tools (OpenMM/RFdiffusion/ProteinMPNN/GROMACS/Rosetta) — each test skips if binary or model is missing. Excluded from default pytest run; activate with pytest -m integration.",
 ]
 
 # --- Coverage ---
