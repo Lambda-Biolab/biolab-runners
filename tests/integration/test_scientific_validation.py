@@ -50,6 +50,7 @@ References:
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -333,11 +334,13 @@ def test_openmm_runner_constructs_and_validates(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(
-    not Path("/dev/nvidia0").exists(),
+    not Path("/dev/nvidia0").exists() or os.environ.get("BIOLAB_RUN_HEAVY_CUDA_TESTS") != "1",
     reason=(
-        "Heavy runner smoke: requires /dev/nvidia0 to be reachable from this "
-        "process (the runner does 400 ps of equilibration; CPU-only takes >10 min). "
-        "Run the opencode-gpu systemd drop-in if this skips unexpectedly."
+        "Heavy runner smoke (~90 s on CUDA, >10 min on CPU): requires "
+        "/dev/nvidia0 to be reachable AND BIOLAB_RUN_HEAVY_CUDA_TESTS=1 to opt in. "
+        "Excluded from the default integration suite and the pre-push gate so "
+        "regular commits don't pay the GPU cost. Run manually after CUDA-affecting "
+        "changes with `BIOLAB_RUN_HEAVY_CUDA_TESTS=1 uv run pytest -m integration`."
     ),
 )
 def test_openmm_runner_completes_short_vacuum_simulation(tmp_path: Path) -> None:
