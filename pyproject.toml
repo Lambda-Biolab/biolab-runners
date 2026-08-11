@@ -246,5 +246,15 @@ exclude_lines = [
 # only required setup; the Makefile target auto-detects changed files.
 [tool.mutmut]
 source_path = ["biolab_runners"]
-pytest_add_cli_args = ["--no-cov", "--tb=short", "-q"]
+# The integration suite (`tests/integration/`) runs real OpenMM MD
+# against the barnase chain A fixture. It depends on GPU/CUDA
+# availability and takes ~90 s per run on RTX 4090. Mutmut's
+# pytest.main() exec is broken in this repo's mutants/ cwd (the
+# mutants/ tree is missing pyproject.toml and a README, so pytest
+# collection reports ImportError for openmm even though openmm
+# imports fine via os.chdir). Exclude integration tests from
+# mutation: their correctness is covered by `make validate`'s
+# normal pytest run; mutmut's job is to catch regressions in the
+# source modules the integration suite calls into.
+pytest_add_cli_args = ["--no-cov", "--tb=short", "-q", "--ignore=tests/integration"]
 pytest_add_cli_args_test_selection = ["tests"]
