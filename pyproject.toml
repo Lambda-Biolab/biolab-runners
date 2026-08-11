@@ -1,6 +1,6 @@
 [project]
 name = "biolab-runners"
-version = "0.3.0"
+version = "0.4.0"
 description = "Standalone modular runners for Boltz-2 structure prediction and OpenMM MD simulations"
 requires-python = ">=3.11"
 authors = [{ name = "Lambda-Biolab" }]
