@@ -1,6 +1,6 @@
 [project]
 name = "biolab-runners"
-version = "0.1.0"
+version = "0.4.0"
 description = "Standalone modular runners for Boltz-2 structure prediction and OpenMM MD simulations"
 requires-python = ">=3.11"
 authors = [{ name = "Lambda-Biolab" }]
@@ -44,6 +44,16 @@ openmm = [
     # conflicts with boltz's numpy<2.0 constraint. 1.11.0 is the last
     # release compatible with the numpy 1.x line.
     "mdtraj>=1.10,<1.11.1",
+    # CUDA platform plugin for OpenMM 8.5+. The [cuda12] extra installs
+    # the prebuilt C++ plugin against CUDA 12.x; openmm ships matching
+    # extras for CUDA 12 and CUDA 13 — pin whichever matches the host's
+    # installed CUDA toolkit (this machine has CUDA 12.9 at
+    # /usr/local/cuda-12.9/, so [cuda12] is the right selector). On a
+    # workstation where nvidia-smi works but /dev/nvidia* is missing
+    # from the agent's mount namespace, see the opencode systemd drop-in
+    # fix described in ../docs/testing/scientific-validation.md and
+    # /home/antonio/.local/bin/enable-opencode-gpu-systemd.sh.
+    "openmm[cuda12]",
 ]
 all = [
     "biolab-runners[boltz2,openmm]",
@@ -203,11 +213,7 @@ addopts = [
     "--cov-report=term-missing",
 ]
 markers = [
-    # The current pytest suite runs entirely with mocks + numpy + the
-    # optional `mdtraj` extra. No tests require real GPU hardware,
-    # the live boltz CLI, or network access — so no markers are
-    # defined. Add markers here when such tests are introduced and
-    # gate them via `--strict-markers` + `pytest -m <marker>` in CI.
+    "integration: real scientific tools (OpenMM/RFdiffusion/ProteinMPNN/GROMACS/Rosetta) — each test skips if binary or model is missing. Excluded from default pytest run; activate with pytest -m integration.",
 ]
 
 # --- Coverage ---
@@ -240,5 +246,15 @@ exclude_lines = [
 # only required setup; the Makefile target auto-detects changed files.
 [tool.mutmut]
 source_path = ["biolab_runners"]
-pytest_add_cli_args = ["--no-cov", "--tb=short", "-q"]
+# The integration suite (`tests/integration/`) runs real OpenMM MD
+# against the barnase chain A fixture. It depends on GPU/CUDA
+# availability and takes ~90 s per run on RTX 4090. Mutmut's
+# pytest.main() exec is broken in this repo's mutants/ cwd (the
+# mutants/ tree is missing pyproject.toml and a README, so pytest
+# collection reports ImportError for openmm even though openmm
+# imports fine via os.chdir). Exclude integration tests from
+# mutation: their correctness is covered by `make validate`'s
+# normal pytest run; mutmut's job is to catch regressions in the
+# source modules the integration suite calls into.
+pytest_add_cli_args = ["--no-cov", "--tb=short", "-q", "--ignore=tests/integration"]
 pytest_add_cli_args_test_selection = ["tests"]

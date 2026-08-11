@@ -404,8 +404,11 @@ class TestDecideSkip:
         assert plan.state_xml_path == str(tmp_path / f"state.{target}_1_1.xml")
         # Exact rounded value, not just > 0. The reviewer flagged
         # that the previous implementation did ``round(..., 2)`` and
-        # the test should verify the rounding contract.
-        assert plan.total_ns == round(config.total_steps * config.timestep_fs / 1e6, 2)
+        # the test should verify the rounding contract. We now round
+        # to 6 dp (sub-femtosecond precision in ns) so the integration
+        # 1-ps smoke test in tests/integration/ doesn't collapse 0.001
+        # ns to 0.0.
+        assert plan.total_ns == round(config.total_steps * config.timestep_fs / 1e6, 6)
         assert plan.early_abort is False
         # ``abort_reason`` is typed ``str`` (not ``Optional[str]``)
         # so the runner can copy it into ``SimulationResult.abort_reason``
@@ -415,15 +418,20 @@ class TestDecideSkip:
         assert plan.abort_reason == ""
 
     def test_normal_completion_total_ns_rounded_for_float_timestep(self, tmp_path: Path) -> None:
-        """Float timestep: total_ns is rounded to 2 dp.
+        """Float timestep: total_ns is rounded to 6 dp.
 
         ``production_ns=1.5678`` with ``timestep_fs=1.0`` yields
         ``total_steps = 1_567_800`` and
         ``total_ns = 1_567_800 * 1.0 / 1e6 = 1.5678`` (unrounded).
-        After ``round(_, 2)`` the value is exactly ``1.57`` — this
-        is a test the unrounded implementation would FAIL on
-        (asserting equality to 1.57 against the raw 1.5678), so it
-        genuinely guards the rounding contract.
+        After ``round(_, 6)`` the value is exactly ``1.5678`` — this
+        guards the rounding contract.
+
+        Why 6 dp and not 2: the integration test in
+        ``tests/integration/test_scientific_validation.py`` exercises
+        a 1-ps simulation (0.001 ns) and round-to-2 dropped it to 0.0.
+        6 dp gives sub-femtosecond precision in ns, which is exact
+        enough for any plausible MD run while still hiding floating-
+        point artifacts from non-integer timesteps.
         """
         config = OpenMMConfig(production_ns=1.5678, timestep_fs=1.0)
         target = config.total_equil_steps + config.total_steps
@@ -438,7 +446,7 @@ class TestDecideSkip:
 
         assert isinstance(plan, SkipPlan)
         assert plan.completion == CompletionStatus.NORMAL_COMPLETE
-        assert plan.total_ns == 1.57
+        assert plan.total_ns == 1.5678
 
     def test_valid_terminal_payload(self, tmp_path: Path) -> None:
         config = _config(production_ns=10.0, timestep_fs=2.0)
