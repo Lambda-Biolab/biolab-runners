@@ -6,6 +6,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- **Bug fix (runner total_ns precision, v15 follow-up)**: `total_ns` in
+  `SimulationResult` was rounded to 2 decimal places, which silently
+  collapsed sub-100 ps simulations (``round(0.001, 2) == 0.0``). The
+  1-ps smoke test in ``tests/integration/test_scientific_validation.py``
+  used to see ``total_ns == 0.0`` even though the production loop ran
+  1,000 steps. Three call sites changed from ``round(_, 2)`` to
+  ``round(_, 6)``, giving sub-femtosecond precision in ns while still
+  hiding floating-point artefacts from non-integer timesteps:
+
+    * ``biolab_runners.openmm.runner._finalize_result`` — the post-run
+      assignment to ``result.total_ns``.
+    * ``biolab_runners.openmm.config.SimulationResult.to_dict`` — the
+      JSON serialisation.
+    * ``biolab_runners.openmm.run_state._normal_completion_total_ns``
+      — the skip-population reconstruction path.
+
+  Updated ``tests/test_run_state.py::test_normal_completion_total_ns_rounded_for_float_timestep``
+  to assert ``plan.total_ns == 1.5678`` (the 6-dp-rounded value) and
+  updated ``tests/test_run_state.py::test_skip_path_populates_full_skip_plan``
+  to round against the new contract. Added a new regression assertion
+  in the integration suite that ``md_summary["total_ns"]`` is in
+  ``[0.0001, 0.01]`` for a 1-ps production, so the round-to-2
+  regression is now caught by CI.
+
 - **Architecture (run-state machine extraction, v15, revised twice)**: Extracted the
   pre-run decision tree and skip-population logic from `OpenMMRunner`
   into a new `biolab_runners.openmm.run_state` deep module. The nine
