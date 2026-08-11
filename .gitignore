@@ -34,6 +34,13 @@ htmlcov/
 .ruff_cache/
 .complexipy_cache/
 
+# Session-local artifacts (handoffs, scratch). Tracked elsewhere via
+# .opencode/handoffs/ but never committed to the repo root.
+.opencode/
+
+# mutmut output directory (mutation testing).
+mutants/
+
 # OS
 .DS_Store
 Thumbs.db
