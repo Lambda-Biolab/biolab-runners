@@ -103,14 +103,12 @@ def parse_fasta_sequences(path: Path) -> list[tuple[str, str]]:
     The runner only needs the sequence strings; the parsed names
     are preserved for downstream tooling.
     """
-
     lines = path.read_text().splitlines()
     return _parse_fasta_lines(lines)
 
 
 def _parse_fasta_lines(lines: list[str]) -> list[tuple[str, str]]:
     """Inner helper that splits a FASTA into ``(name, sequence)`` pairs."""
-
     records: list[tuple[str, str]] = []
     current_name: str | None = None
     current_seq: list[str] = []
@@ -129,14 +127,12 @@ def _flush_record(
     records: list[tuple[str, str]], name: str | None, seq: list[str]
 ) -> None:
     """Append a (name, sequence) pair to ``records`` if a name is pending."""
-
     if name is not None:
         records.append((name, "".join(seq)))
 
 
 def _parse_header(line: str) -> str:
     """Return the FASTA header name (everything after ``>`` until whitespace)."""
-
     match = _FASTA_HEADER_RE.match(line)
     return match.group(1) if match else ""
 
