@@ -94,11 +94,46 @@ this doc, so it shows up in test failure output.)
 ```bash
 make test_integration    # runs pytest -m integration
 pytest -m integration tests/integration/ -v
+
+# End-to-end OpenMM CUDA smoke (opt-in; ~90 s on RTX 4090).
+# By default this test is skipped so `make validate` stays < 30 s.
+BIOLAB_RUN_HEAVY_CUDA_TESTS=1 uv run pytest -m integration -v
 ```
 
 These tests are excluded from `make validate` via the `integration`
 marker. CI does not run them; humans run them on a workstation that
 has the scientific tools installed.
+
+### Tool wrappers
+
+The ProteinMPNN and RFdiffusion runners expect a `proteinmpnn` /
+`rfdiffusion` binary on `$PATH` (or `${PROTEINMPNN_BIN}` /
+`${RFDIFFUSION_BIN}`) that accepts the biolab-runners CLI:
+
+| Flag | Meaning |
+|---|---|
+| `--input_path DIR` | Directory containing a `.pdb` file |
+| `--output_path DIR` | Where to write results |
+| `--batch_size N`, `--seed N`, `--sampling_temp F` | Pass-through |
+| `--num_seq_per_target N`, `--model_name CHECKPOINT` | ProteinMPNN |
+| `--num_designs N`, `--length MINMAX`, `--contig_map SPEC` | RFdiffusion |
+
+A host-level bootstrap script (`~/.local/bin/install-proteinmpnn-rfdiffusion.sh`)
+clones the upstream repos shallowly into `~/tools/ProteinMPNN` and
+`~/tools/RFdiffusion`, then writes thin Python wrappers that adapt
+the biolab-runners CLI to upstream's expected one
+(`--pdb_path` / `--out_folder` for ProteinMPNN; Hydra
+`contigmap.contigs=...` for RFdiffusion). After running
+the script, `biolab_runners.proteinmpnn.utils.proteinmpnn_available()`
+and `biolab_runners.rfdiffusion.utils.rfdiffusion_available()` both
+return True, and `pytest -m integration` exercises the real wrappers
+instead of skipping.
+
+Real backbone design with RFdiffusion still requires a GPU and
+~10 GB of model weights (downloaded on first run from the upstream
+RFdiffusion repo); the OpenMM heavy runner test requires
+`/dev/nvidia0` *and* `BIOLAB_RUN_HEAVY_CUDA_TESTS=1` (see the
+`@pytest.mark.skipif` on `test_openmm_runner_completes_short_vacuum_simulation`).
 
 ## When a test fails
 

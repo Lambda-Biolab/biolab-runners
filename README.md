@@ -17,6 +17,7 @@ Extracted from the [OralBiome-AMP](https://github.com/Lambda-Biolab/OralBiome-AM
 - Full type annotations (pyright-clean)
 - Python logging (no print statements)
 - Dry-run mode for both runners
+- **Scientific-validation integration suite** — 8 tests gated by `@pytest.mark.integration` driving parsers and the OpenMM runner on real reference inputs (barnase chain A, ProteinMPNN FASTA, GROMACS energy.xvg). End-to-end CUDA smoke is opt-in via `BIOLAB_RUN_HEAVY_CUDA_TESTS=1`.
 
 ## Installation
 
@@ -228,7 +229,20 @@ make lint
 
 # Run tests only
 make test
+
+# Integration suite (gated by GPU + binary availability)
+# Verifies scientific contracts on real reference inputs:
+#   - ProteinMPNN FASTA parser
+#   - GROMACS energy.xvg parser
+#   - OpenMM minimization physics on barnase chain A
+#   - OpenMM CUDA Plugin registration
+#   - OpenMMRunner construction smoke
+#   - Heavy runner pipeline (set BIOLAB_RUN_HEAVY_CUDA_TESTS=1 for 90-s CUDA end-to-end)
+pytest -m integration
 ```
+
+See `docs/testing/scientific-validation.md` for the validation plan,
+threshold sources, and the failure-classification rule.
 
 ## License
 
