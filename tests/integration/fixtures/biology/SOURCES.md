@@ -8,7 +8,8 @@ any developer with the test suite gets the same reference inputs.
 |---|---|---|---|---|
 | `barnase_barstar_proteinmpnn.fa` | ProteinMPNN | Synthetic (matches ProteinMPNN's expected output format) | <1 KB | Project (CC0) |
 | `ala2_vacuum.energy.xvg` | GROMACS | Synthetic (matches GROMACS energy.xvg format with a 5-row drift sanity-check sample) | <1 KB | Project (CC0) |
-| `barnase_chainA.pdb` | OpenMM | RCSB 1BRS, chain A (barnase) only, heavy atoms | ~140 KB | Public domain |
+| `barnase_chainA.pdb` | OpenMM | RCSB 1BRS, chain A (barnase) only, heavy atoms | 70 KB | Public domain |
+| `ala5_peptide.pdb` | OpenMM | Synthetic: ACE-ALA×5-NME pentapeptide | 1.7 KB | Project (CC0) |
 
 ## How to add a fixture
 

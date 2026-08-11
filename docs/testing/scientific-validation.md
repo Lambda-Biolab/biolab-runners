@@ -1,13 +1,13 @@
 # Scientific Validation Plan — biolab-runners
 
 This document defines the **tool-level smoke validation** that proves
-each scientific runner (OpenMM, RFdiffusion, ProteinMPNN, GROMACS,
-Rosetta) produces biologically plausible outputs on known reference
-problems. Pure plumbing tests are not enough.
+each scientific runner (OpenMM, RFdiffusion, ProteinMPNN, GROMACS)
+produces biologically plausible outputs on known reference inputs.
+Pure plumbing tests are not enough.
 
 ## Why this exists
 
-The biolab-runners test suite proves that each runner:
+The biolab-runners unit test suite proves that each runner:
 
 - Wires config to subprocess args correctly.
 - Idempotently skips already-completed work.
@@ -21,28 +21,32 @@ that layer.
 ## What "tool-level smoke" means here
 
 For each runner, pick a reference problem small enough to run in
-minutes, with a published answer, and assert the runner's output lies
-in a tight bound around the known reference. We do **not** assert
-exact reproducibility (seeded or not) because the upstream tools do
-not guarantee bit-exact reproduction across versions; we assert
+seconds-to-minutes, with a published answer, and assert the runner's
+output lies in a tight bound around the known reference. We do **not**
+assert exact reproducibility (seeded or not) because the upstream tools
+do not guarantee bit-exact reproduction across versions; we assert
 **biochemical plausibility windows**.
 
 ## What this plan covers
 
-| Runner | Reference input | Settings | What we assert |
-|---|---|---|---|
-| OpenMM MD | Aladdin (alanine dipeptide in vacuum) — 2 residues | Amber99SB-ILDN, 1 fs, 1000 steps, 300 K | Total energy stays bounded, trajectory RMSD < 2 Å, no atom clashes |
-| OpenMM MD (TIP3P solvated) | ALA5 pentapeptide in TIP3P | Amber99SB-ILDN + TIP3P, 1 fs, 1000 steps | Energy bounded, RMSD < 4 Å (solvent allows more drift), non-zero water count |
-| RFdiffusion | Empty pdb (no hotspot, just unconditional) | length 10, 1 design | Output has 10 residues, all Cα distances 3.7–3.9 Å (1.4×protein rise), no atom clashes |
-| ProteinMPNN | ALA5 fixed backbone | T = 0.1, 1 design, deterministic seed | Returns 5-residue sequence, AA distribution roughly matches background frequencies (proportion of any one AA ≤ 0.4, not all-proline), sequence is valid 20-AA alphabet |
-| Rosetta (interface) | 1BRS (barnase–barstar interface) | InterfaceAnalyzer, 1 repack | dG_separation in [-15, -5] REU range (typical protein-protein binding), I_sc > 0.5 |
-| GROMACS | ALA5 in TIP3P | 1000 steps, dt = 1 fs | Energy.xvg parses, total energy row count matches step count, potential energy stays bounded |
+The integration suite (`tests/integration/test_scientific_validation.py`)
+exercises 8 tests across 4 runners:
 
-Tools that **fail** validation tests on missing binaries (Rosetta
-requires commercial license; GROMACS is heavy install; RFdiffusion /
-ProteinMPNN need GPU) **skip gracefully** with a pytest skip message.
-Tools that **fail** validation tests *because the wrapper produces
-wrong numbers* get fixed.
+| Test | Runner | Reference input | What we assert |
+|---|---|---|---|
+| `test_openmm_install_has_cuda_plugin_when_cuda_wheel_present` | OpenMM | environment probe | `pip install "openmm[cuda12]"` lands `openmm-cuda-12` (or `openmm-cuda-11`) with the `CUDA` platform available |
+| `test_openmm_runner_constructs_and_validates` | OpenMM | in-memory `ala5_peptide.pdb` | Constructor accepts a 5-residue test PDB; rejects malformed PDBs |
+| `test_openmm_minimization_produces_physically_plausible_energy` | OpenMM | `ala5_peptide.pdb` (CPU) | Minimization converges; total energy bounded (no NaN, no explosion) |
+| `test_openmm_runner_completes_short_vacuum_simulation` (heavy) | OpenMM MD | `barnase_chainA.pdb` (chain A only) | 1 ps vacuum simulation completes; `total_ns` in `[0.0001, 0.01]` ns; `potential_energy` finite |
+| `test_gromacs_parse_nthcol_returns_first_data_row` | GROMACS | fixture `.xvg` | `parse_nthcol` correctly extracts the first non-comment data row |
+| `test_gromacs_parse_nthcol_handles_comment_lines` | GROMACS | fixture `.xvg` | Parser correctly skips `@` / `#` comment lines |
+| `test_proteinmpnn_parse_fasta_returns_both_records_with_protein_alpha` | ProteinMPNN | fixture `.fa` | `parse_fasta_sequences` returns both design records when the input has 2 |
+| `test_rfdiffusion_runner_availablity_check_works` | RFdiffusion | environment probe | `rfdiffusion_available()` returns True iff the wrapper is on `$PATH` and exits 0 on `--help` |
+
+Tools that **fail** binary-availability checks (Rosetta requires
+commercial license; GPU-dependent weights missing) **skip gracefully**
+with a pytest skip message. Tools that **fail** validation tests
+*because the wrapper produces wrong numbers* get fixed.
 
 ## What this plan does NOT cover
 
@@ -55,36 +59,28 @@ wrong numbers* get fixed.
 
 ## Reference inputs
 
-Stored under `tests/integration/fixtures/biology/` in this repo.
-Sources documented in `SOURCES.md`. Files ≤10 KB each. PDBs obtained
-from RCSB (public domain). Synthetic peptides (ALA5, ALA2) built from
-canonical amino acid geometries using a one-off script
-(`scripts/build_test_inputs.py`), then committed.
+Stored under `tests/integration/fixtures/biology/`. Provenance and
+licence documented in `SOURCES.md`. Files are checked into the repo
+so the integration suite has no external dependencies at runtime.
 
-| File | Tool | Source |
-|---|---|---|
-| `ala2_vacuum.pdb` | OpenMM | Built: ACE-ALA-ALA-NME |
-| `ala5_water.pdb` | OpenMM, GROMACS | Built: ACE-ALA×5-NME |
-| `rfdiffusion_length10/empty_target.pdb` | RFdiffusion | Built: empty PDB (no atoms) |
-| `proteinmpnn_input/ala5_fixed.pdb` | ProteinMPNN | Same as `ala5_water.pdb` (no waters in input) |
-| `1brs_chain_AB.pdb` | Rosetta (InterfaceAnalyzer) | RCSB 1BRS |
-| `expected/ala2_vacuum/trajectory.pdb` | OpenMM | Reference output from prior run with pinned versions (regenerated by `scripts/regenerate_openmm_reference.sh`) |
+| File | Size | Used by | Source |
+|---|---|---|---|
+| `ala5_peptide.pdb` | 1.7 KB | OpenMM constructor + minimization | Hand-built: ACE-ALA×5-NME (canonical amino acid geometries) |
+| `barnase_chainA.pdb` | 70 KB | OpenMM heavy CUDA smoke | RCSB PDB 1BRS, chain A (barnase copy 1) only |
 
-(Reference outputs are committed **only** when the scientific
-primitive is deterministic and small. Most are NOT committed because
-they're 10s of MB.)
+The `OpenMM` heavy smoke test (`test_openmm_runner_completes_short_vacuum_simulation`)
+runs on `barnase_chainA.pdb` (70 KB). It is **not** run by default;
+see the "How to run" section below.
 
 ## Threshold sources
 
 | Assertion | Threshold | Source |
 |---|---|---|
-| ALA2 vacuum energy drift | < 5 kJ/mol | Standard energy-conservation check for 1 fs vacuum sim |
-| ALA2 RMSD from initial | < 1.5 Å | Ala2 in vacuum barely moves in 1 ps |
-| ALA5 solvated RMSD | < 4 Å | Solvent allows backbone flexibility |
-| RFdiffusion Cα-Cα distance | 3.7–3.9 Å | Pauling–Corey α-helix rise / canonical peptide bond geometry |
-| ProteinMPNN sequence length | matches input | Wrapper contract |
-| Rosetta 1BRS ΔG separation | -15 to -5 REU | Published values for barnase-barstar (Schreiber & Fersht 1996) |
-| GROMACS energy.xvg row count | matches step count + 1 | Wrapper contract |
+| OpenMM minimization | `potential_energy` finite, no NaN | Standard vacuum-sim sanity check |
+| OpenMM vacuum 1 ps | `total_ns ∈ [0.0001, 0.01]` ns | `round(_, 6)` precision contract (CHANGELOG: 1-ps sim = 1.0e-3 ns; ±10× absorbs integrator tuning across OpenMM versions) |
+| GROMACS xvg parse | first non-comment row extracted | Wrapper contract |
+| ProteinMPNN FASTA parse | both records returned | Wrapper contract |
+| RFdiffusion availability | `--help` exits 0 | Wrapper contract |
 
 (Each threshold cites the source in the test docstring, not just in
 this doc, so it shows up in test failure output.)
@@ -92,17 +88,23 @@ this doc, so it shows up in test failure output.)
 ## How to run
 
 ```bash
-make test_integration    # runs pytest -m integration
-pytest -m integration tests/integration/ -v
+# Default — runs as part of `make validate` and CI.
+uv run pytest -m "not slow" -v
+
+# Standalone — only the integration tier.
+uv run pytest -m integration tests/integration/ -v
 
 # End-to-end OpenMM CUDA smoke (opt-in; ~90 s on RTX 4090).
-# By default this test is skipped so `make validate` stays < 30 s.
+# By default this test is skipped so regular `make validate` runs
+# stay under 30 s. Requires both /dev/nvidia0 and the env var.
 BIOLAB_RUN_HEAVY_CUDA_TESTS=1 uv run pytest -m integration -v
 ```
 
-These tests are excluded from `make validate` via the `integration`
-marker. CI does not run them; humans run them on a workstation that
-has the scientific tools installed.
+The integration suite is part of the default `make validate` invocation
+(`pytest -m "not slow"` does not deselect the `integration` marker).
+The heavy OpenMM CUDA test is the only test gated by `BIOLAB_RUN_HEAVY_CUDA_TESTS=1`;
+it remains in the integration suite but is skipped at runtime unless
+both `/dev/nvidia0` is reachable AND the env var is set.
 
 ### Tool wrappers
 
@@ -118,16 +120,16 @@ The ProteinMPNN and RFdiffusion runners expect a `proteinmpnn` /
 | `--num_seq_per_target N`, `--model_name CHECKPOINT` | ProteinMPNN |
 | `--num_designs N`, `--length MINMAX`, `--contig_map SPEC` | RFdiffusion |
 
-A host-level bootstrap script (`~/.local/bin/install-proteinmpnn-rfdiffusion.sh`)
-clones the upstream repos shallowly into `~/tools/ProteinMPNN` and
-`~/tools/RFdiffusion`, then writes thin Python wrappers that adapt
-the biolab-runners CLI to upstream's expected one
-(`--pdb_path` / `--out_folder` for ProteinMPNN; Hydra
-`contigmap.contigs=...` for RFdiffusion). After running
-the script, `biolab_runners.proteinmpnn.utils.proteinmpnn_available()`
-and `biolab_runners.rfdiffusion.utils.rfdiffusion_available()` both
-return True, and `pytest -m integration` exercises the real wrappers
-instead of skipping.
+A host-level bootstrap script
+(`~/.local/bin/install-proteinmpnn-rfdiffusion.sh`) clones the upstream
+repos shallowly into `~/tools/ProteinMPNN` and `~/tools/RFdiffusion`,
+then writes thin Python wrappers that adapt the biolab-runners CLI to
+upstream's expected one (`--pdb_path` / `--out_folder` for ProteinMPNN;
+Hydra `contigmap.contigs=...` for RFdiffusion). After running the
+script, `biolab_runners.proteinmpnn.utils.proteinmpnn_available()` and
+`biolab_runners.rfdiffusion.utils.rfdiffusion_available()` both return
+True, and `pytest -m integration` exercises the real wrappers instead
+of skipping.
 
 Real backbone design with RFdiffusion still requires a GPU and
 ~10 GB of model weights (downloaded on first run from the upstream
@@ -137,16 +139,14 @@ RFdiffusion repo); the OpenMM heavy runner test requires
 
 ## When a test fails
 
-Failures point to one of four things:
+Failures point to one of three things:
 
 1. **Wrapper bug**: runner passes wrong arg, parses file wrong, etc.
    → Fix the runner.
 2. **Tool bug**: the upstream tool itself gives wrong numbers. → Fix
-   the version pin in pyproject.toml and re-run.
-3. **Fixture drift**: someone changed the hand-built PDB. → Re-build
-   from `scripts/build_test_inputs.py` and re-run.
-4. **Threshold drift**: e.g. OpenMM 8.6 has slightly different
-   default integrator tuning. → Re-derive from literature.
+   the version pin in `pyproject.toml` and re-run.
+3. **Threshold drift**: e.g. OpenMM 8.6 has slightly different default
+   integrator tuning. → Re-derive from literature.
 
 Failures MUST NOT be fixed by widening the threshold. A failing test
 is a signal.

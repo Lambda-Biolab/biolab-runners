@@ -213,7 +213,7 @@ addopts = [
     "--cov-report=term-missing",
 ]
 markers = [
-    "integration: real scientific tools (OpenMM/RFdiffusion/ProteinMPNN/GROMACS/Rosetta) — each test skips if binary or model is missing. Excluded from default pytest run; activate with pytest -m integration.",
+    "integration: scientific-validation tier (tests/integration/test_scientific_validation.py) — runs under default -m 'not slow' because the suite depends on committed fixtures (no external binaries required except the heavy OpenMM CUDA smoke gated by BIOLAB_RUN_HEAVY_CUDA_TESTS=1). Reserved for future opt-in tiers that need real external binaries.",
 ]
 
 # --- Coverage ---

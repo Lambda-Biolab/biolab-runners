@@ -366,9 +366,11 @@ def test_openmm_runner_completes_short_vacuum_simulation(tmp_path: Path) -> None
     * ``state.NNN_*.xml`` exists — proves production actually stepped.
 
     Note: the runner's ``result.total_ns`` is computed from
-    ``(final_step - total_equil_steps) * timestep`` and is currently
-    reported as 0.0 even when production ran (separate runner-side
-    bug, not a CUDA-validation issue). We don't assert on it.
+    ``(final_step - total_equil_steps) * timestep`` and is asserted
+    below to be in ``[0.0001, 0.01] ns`` (i.e. precision ≥ 0.1 ps).
+    The round-to-2 precision bug (where 1 ps → 0.001 ns → 0.0 ns when
+    rounded to 2 dp) was fixed to round-to-6 dp; this assertion
+    catches any regression of that fix.
 
     Skips when /dev/nvidia0 is missing — the opencode systemd drop-in
     at /etc/systemd/system/opencode.service.d/10-gpu-bind.conf is
