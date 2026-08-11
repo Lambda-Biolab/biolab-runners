@@ -12,6 +12,25 @@ Standalone, modular Python library containing two computational biology runners 
 
 The runners are designed for researchers who want to use these tools in their own pipelines without importing the full OralBiome-AMP codebase.
 
+## Documentation Hierarchy
+
+This file is the primary instruction document for AI coding agents. For
+content outside its scope, follow the chain below — do not duplicate
+content from an authority doc into a dependent one.
+
+| Topic | Authority doc | Audience |
+|---|---|---|
+| Project overview, features, install, quick start | [`README.md`](README.md) | Humans |
+| Project purpose, architecture, domain rules, QA | [`AGENTS.md`](AGENTS.md) | AI agents (this file) |
+| Contributor workflow, PR guidelines, code style | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contributors |
+| Version history | [`CHANGELOG.md`](CHANGELOG.md) | All |
+| Security policy, vulnerability reporting | [`SECURITY.md`](SECURITY.md) | Researchers |
+| Community standards | [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) | Contributors |
+| Agent patterns, incident writeups | [`AGENT_LEARNINGS.md`](AGENT_LEARNINGS.md) | AI agents |
+| Escalation to humans | [`AGENT_REQUESTS.md`](AGENT_REQUESTS.md) | AI agents |
+| Always-loaded domain constraints | [`.claude/rules/`](.claude/rules/) | Claude Code |
+| Claude Code entry point (redirects here) | [`CLAUDE.md`](CLAUDE.md) | Claude Code |
+
 ## Architecture
 
 ```text

@@ -1,26 +1,42 @@
 # biolab-runners
 
-> Standalone, modular Python runners for Boltz-2 structure prediction and OpenMM molecular dynamics simulations.
+> Standalone, modular Python runners for Boltz-2 structure prediction
+> and OpenMM molecular dynamics simulations.
 
 ## Documentation
 
-- [README](https://github.com/Lambda-Biolab/biolab-runners/blob/aecaecde639742367f6e574fd3db0f879b02288c/README.md): Project overview, architecture, usage, and dependency notes
-- [CLAUDE.md](https://github.com/Lambda-Biolab/biolab-runners/blob/aecaecde639742367f6e574fd3db0f879b02288c/CLAUDE.md): Agent instructions, architecture details, and common gotchas
+- [README](https://github.com/Lambda-Biolab/biolab-runners/blob/main/README.md): Project overview, features, install, quick start
+- [AGENTS.md](https://github.com/Lambda-Biolab/biolab-runners/blob/main/AGENTS.md): Project purpose, architecture, domain rules, QA
+- [CONTRIBUTING.md](https://github.com/Lambda-Biolab/biolab-runners/blob/main/CONTRIBUTING.md): Contributor workflow, PR guidelines, code style
+- [CHANGELOG.md](https://github.com/Lambda-Biolab/biolab-runners/blob/main/CHANGELOG.md): Version history
 
 ## Source — biolab_runners
 
 ### Core
 
-- [biolab_runners/__init__.py](https://github.com/Lambda-Biolab/biolab-runners/blob/aecaecde639742367f6e574fd3db0f879b02288c/biolab_runners/__init__.py): Package root and version
+- [biolab_runners/__init__.py](https://github.com/Lambda-Biolab/biolab-runners/blob/main/biolab_runners/__init__.py): Package root and version (`0.1.0`)
 
 ### Boltz-2 structure prediction (boltz2/)
 
-- [boltz2/runner.py](https://github.com/Lambda-Biolab/biolab-runners/blob/aecaecde639742367f6e574fd3db0f879b02288c/biolab_runners/boltz2/runner.py): Boltz2Runner class — invokes boltz predict CLI, parses confidence scores, applies quality gate
-- [boltz2/config.py](https://github.com/Lambda-Biolab/biolab-runners/blob/aecaecde639742367f6e574fd3db0f879b02288c/biolab_runners/boltz2/config.py): Boltz2Config, ConfidenceScores, PredictionResult, QualityGate dataclasses
-- [boltz2/utils.py](https://github.com/Lambda-Biolab/biolab-runners/blob/aecaecde639742367f6e574fd3db0f879b02288c/biolab_runners/boltz2/utils.py): YAML input writer, output parser, boltz CLI availability check
+Public API: `Boltz2Config`, `PocketConstraint`, `Boltz2Runner`.
+
+- [boltz2/__init__.py](https://github.com/Lambda-Biolab/biolab-runners/blob/main/biolab_runners/boltz2/__init__.py): Re-exports `Boltz2Config`, `PocketConstraint`, `Boltz2Runner`
+- [boltz2/runner.py](https://github.com/Lambda-Biolab/biolab-runners/blob/main/biolab_runners/boltz2/runner.py): `Boltz2Runner` — invokes `boltz predict` CLI, parses confidence scores, applies quality gate
+- [boltz2/config.py](https://github.com/Lambda-Biolab/biolab-runners/blob/main/biolab_runners/boltz2/config.py): `Boltz2Config`, `PocketConstraint` dataclasses; quality gate thresholds
+- [boltz2/utils.py](https://github.com/Lambda-Biolab/biolab-runners/blob/main/biolab_runners/boltz2/utils.py): YAML input writer, output parser, `boltz` CLI availability check
 
 ### OpenMM molecular dynamics (openmm/)
 
-- [openmm/runner.py](https://github.com/Lambda-Biolab/biolab-runners/blob/aecaecde639742367f6e574fd3db0f879b02288c/biolab_runners/openmm/runner.py): OpenMMRunner class — system building, multi-stage equilibration, production NPT with checkpointing
-- [openmm/config.py](https://github.com/Lambda-Biolab/biolab-runners/blob/aecaecde639742367f6e574fd3db0f879b02288c/biolab_runners/openmm/config.py): OpenMMConfig, SimulationResult, EquilibrationStage dataclasses
-- [openmm/utils.py](https://github.com/Lambda-Biolab/biolab-runners/blob/aecaecde639742367f6e574fd3db0f879b02288c/biolab_runners/openmm/utils.py): Output verification, checkpoint loading, OpenMM availability check
+Public API: `OpenMMConfig`, `OpenMMRunner`, `GateVerdict`, `evaluate_trajectory`,
+`latest_verdict_file`, `load_verdict`, `write_verdict_file`.
+
+- [openmm/__init__.py](https://github.com/Lambda-Biolab/biolab-runners/blob/main/biolab_runners/openmm/__init__.py): Re-exports the public API
+- [openmm/runner.py](https://github.com/Lambda-Biolab/biolab-runners/blob/main/biolab_runners/openmm/runner.py): `OpenMMRunner` — thin dispatcher; calls `run_state.decide()` then acts on the returned `RunPlan`
+- [openmm/config.py](https://github.com/Lambda-Biolab/biolab-runners/blob/main/biolab_runners/openmm/config.py): `OpenMMConfig` (incl. `physiological`/`saliva`/`gastric`/`intestinal` preset classmethods), `SimulationResult`
+- [openmm/run_state.py](https://github.com/Lambda-Biolab/biolab-runners/blob/main/biolab_runners/openmm/run_state.py): Pre-run decision tree — `decide()` returns a tagged-union `RunPlan` (`FreshPlan`/`ResumePlan`/`SkipPlan`/`FailurePlan`)
+- [openmm/checkpoint.py](https://github.com/Lambda-Biolab/biolab-runners/blob/main/biolab_runners/openmm/checkpoint.py): Checkpoint lifecycle — `atomic_save_checkpoint`, `quarantine_stale_checkpoint`, `load_checkpoint`, `inspect_checkpoint`, `CompletionStatus` enum
+- [openmm/system_builder.py](https://github.com/Lambda-Biolab/biolab-runners/blob/main/biolab_runners/openmm/system_builder.py): ForceField + Modeller + System + Integrator assembly; Cα restraint; `Simulation` construction
+- [openmm/offline_gate.py](https://github.com/Lambda-Biolab/biolab-runners/blob/main/biolab_runners/openmm/offline_gate.py): Offline mdtraj gate — `evaluate_trajectory`, verdict I/O, `GateVerdict`
+- [openmm/geometry.py](https://github.com/Lambda-Biolab/biolab-runners/blob/main/biolab_runners/openmm/geometry.py): Pure-numpy PBC helpers — `pbc_correct`, `min_pbc_distance`, `collect_chain_ca_positions`
+- [openmm/paths.py](https://github.com/Lambda-Biolab/biolab-runners/blob/main/biolab_runners/openmm/paths.py): `FileNames` — centralized production filenames
+- [openmm/utils.py](https://github.com/Lambda-Biolab/biolab-runners/blob/main/biolab_runners/openmm/utils.py): Availability checks (`openmm_available`, `pdbfixer_available`) + diagnostic reporter (`verify_production_outputs`)
