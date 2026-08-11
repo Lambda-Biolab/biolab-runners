@@ -426,7 +426,12 @@ class OpenMMRunner:
         result.energy_path = energy_path
         result.state_xml_path = str(output_dir / state_basename)
         # v10 BLOCKER #3: total_ns is production ns, not absolute ns.
-        result.total_ns = round(total_ns_value, 2)
+        # 6 decimals gives ns-precision down to femtoseconds, which
+        # is exact enough for any plausible MD run. The previous
+        # round-to-2 silently dropped sub-100ps simulations (1 ps =
+        # 0.001 ns rounds to 0.0) and broke the 1-ps smoke test in
+        # tests/integration/test_scientific_validation.py.
+        result.total_ns = round(total_ns_value, 6)
         result.elapsed_seconds = round(elapsed, 1)
         result.ns_per_day = round(ns_per_day, 1)
 
