@@ -525,16 +525,17 @@ def _normal_completion_total_ns(absolute_step: int, config: OpenMMConfig) -> flo
     PRODUCTION ns: ``max(0, absolute_step - total_equil_steps) *
     timestep_fs / 1e6``.
 
-    Rounded to 2 decimal places to match the historical behavior
-    of the original skip-population path. ``config.timestep_fs``
+    Rounded to 6 decimal places (sub-fs precision in ns) for the
+    same reason as ``runner.py``: the historical 2-decimal round
+    silently dropped sub-100ps simulations. ``config.timestep_fs``
     accepts float values, so the unrounded result can carry
-    floating-point artifacts invisible at the typical 2 fs
-    integer timestep. Keeping the round() preserves the
-    behavior-preservation contract of this refactor.
+    floating-point artifacts invisible at the typical 2 fs integer
+    timestep — 6 decimals is enough to capture one extra digit
+    beyond those artifacts without affecting production reporting.
     """
     return round(
         max(0, absolute_step - config.total_equil_steps) * config.timestep_fs / 1e6,
-        2,
+        6,
     )
 
 

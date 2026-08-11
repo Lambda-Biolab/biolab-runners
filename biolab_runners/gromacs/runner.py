@@ -189,6 +189,7 @@ def _config_to_cli(config: GromacsConfig) -> dict[str, str]:
         payload[str(key)] = str(value)
     return payload
 
+
 def invoke(  # noqa: F811 - re-export for the test monkeypatch seam
     *,
     config_dict: dict[str, str],

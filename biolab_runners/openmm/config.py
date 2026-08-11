@@ -365,7 +365,10 @@ class SimulationResult:
             "energy_path": self.energy_path,
             "state_xml_path": self.state_xml_path,
             "topology_path": self.topology_path,
-            "total_ns": round(self.total_ns, 2),
+            # 6 decimals = sub-fs precision in ns, needed for the
+            # 1-ps smoke test in tests/integration/. round-to-2
+            # silently dropped 0.001 ns (1 ps) to 0.0.
+            "total_ns": round(self.total_ns, 6),
             "elapsed_seconds": round(self.elapsed_seconds, 1),
             "ns_per_day": round(self.ns_per_day, 1),
             "num_atoms": self.num_atoms,
