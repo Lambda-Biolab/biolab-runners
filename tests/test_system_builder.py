@@ -10,9 +10,10 @@ from __future__ import annotations
 import sys
 import types
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
 from biolab_runners.openmm.config import OpenMMConfig, SimulationResult
 from biolab_runners.openmm.system_builder import (
     SimulationContext,
@@ -21,9 +22,6 @@ from biolab_runners.openmm.system_builder import (
     resolve_pdb,
     write_topology,
 )
-
-if TYPE_CHECKING:
-    import pytest
 
 from tests._helpers import (
     FakeApp,
@@ -348,6 +346,96 @@ class TestAssembleSystem:
         )
 
         ff.system.addForce.assert_called_once_with(openmm.barostat)
+
+    def test_pme_false_selects_cutoff_periodic(self) -> None:
+        """``config.pme=False`` selects ``app.CutoffPeriodic`` (not
+        ``app.Cutoff``, which doesn't exist in OpenMM).
+
+        Regression guard for biolab-runners#189 — the wire-up must
+        not produce an ``AttributeError`` against the actual OpenMM
+        API.
+        """
+        ff = _FakeForceField()
+        config = OpenMMConfig(protein_ff="amber14/protein.ff14SB", pme=False)
+        openmm = _FakeOpenMMForAssemble()
+        app = FakeApp()
+        unit = FakeUnit()
+
+        _system, _integrator = assemble_system(
+            ff,
+            MagicMock(),
+            config,
+            openmm,
+            app,
+            unit,  # type: ignore[arg-type]
+        )
+
+        assert ff._kwargs["nonbondedMethod"] == "CutoffPeriodic"
+
+    def test_constraints_none_passes_python_none(self) -> None:
+        """``config.constraints="None"`` must pass Python ``None`` to
+        ``createSystem`` (OpenMM's "no constraints" sentinel) — not
+        raise on a missing ``app.None`` attribute.
+
+        Regression guard for biolab-runners#189 — ``getattr(app, "None")``
+        returns ``None`` (the Python sentinel) which used to be
+        conflated with the "unknown attribute" fallback.
+        """
+        ff = _FakeForceField()
+        config = OpenMMConfig(protein_ff="amber14/protein.ff14SB", constraints="None")
+        openmm = _FakeOpenMMForAssemble()
+        app = FakeApp()
+        unit = FakeUnit()
+
+        _system, _integrator = assemble_system(
+            ff,
+            MagicMock(),
+            config,
+            openmm,
+            app,
+            unit,  # type: ignore[arg-type]
+        )
+
+        assert ff._kwargs["constraints"] is None
+
+    def test_constraints_allbonds_selects_app_allbonds(self) -> None:
+        """``config.constraints="AllBonds"`` selects ``app.AllBonds``."""
+        ff = _FakeForceField()
+        config = OpenMMConfig(protein_ff="amber14/protein.ff14SB", constraints="AllBonds")
+        openmm = _FakeOpenMMForAssemble()
+        app = FakeApp()
+        unit = FakeUnit()
+
+        _system, _integrator = assemble_system(
+            ff,
+            MagicMock(),
+            config,
+            openmm,
+            app,
+            unit,  # type: ignore[arg-type]
+        )
+
+        assert ff._kwargs["constraints"] == "AllBonds"
+
+    def test_unknown_constraints_string_raises(self) -> None:
+        """An unknown constraints string raises ``ValueError`` with a
+        helpful message listing the valid options.
+        """
+        ff = _FakeForceField()
+        config = OpenMMConfig(protein_ff="amber14/protein.ff14SB", constraints="bogus")
+        openmm = _FakeOpenMMForAssemble()
+        app = FakeApp()
+        unit = FakeUnit()
+
+        with pytest.raises(ValueError, match="unknown OpenMM constraints"):
+            assemble_system(
+                ff,
+                MagicMock(),
+                config,
+                openmm,
+                app,
+                unit,  # type: ignore[arg-type]
+            )
 
 
 # ---------------------------------------------------------------------------

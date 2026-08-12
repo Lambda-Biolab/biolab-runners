@@ -108,7 +108,10 @@ class FakeApp:
 
     def __init__(self) -> None:
         self.PME = "PME"
+        self.CutoffPeriodic = "CutoffPeriodic"
         self.HBonds = "HBonds"
+        self.AllBonds = "AllBonds"
+        self.HAngles = "HAngles"
         self.ForceField = RecordingForceField
         self.PDBFile = FakePDBFile
 

@@ -16,15 +16,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   engine-specific keys raise `TypeError` at the construction boundary
   (catches the "production_NS vs production_ns" typo class).
 
-  Deferred fields (carried on the spec, not yet honored by the
-  runner — the runner's hardcoded 100/100/200 ps equilibration,
-  PME=True, 50k-iter minimization cap currently match
-  `ACTIVIN_E_PRODUCTION_PROFILE`, so dropping them is silent for
-  the only registered profile today): `equilibration_ps`,
-  `pme`, `minimization_max_iterations`, `constraints`. The
-  `MDSpec` carries them so a reviewer-signed-off profile change
-  round-trips through the JSON wire format; the runner-side
-  wiring is tracked as a follow-up.
+  **Slice 16 wire-up (biolab-runners#189)** — `from_md_spec` now
+  projects the four fields that were previously deferred:
+  `equilibration_ps` (reduced from `spec.equilibration`, a tuple
+  of stage dicts, via `_extract_equilibration_ps`), `pme`,
+  `minimization_max_iterations`, `constraints`. The runner now
+  honors them:
+  - `_run_equilibration` reads `config.equilibration_ps` for stage
+    durations and `config.minimization_max_iterations` for the
+    steepest-descent cap; stage 3 uses a fixed 100 ps ramp +
+    `npt_free − 100` ps unrestrained remainder (with a warning
+    when the configured `npt_free` is shorter than the ramp).
+  - `system_builder._create_system` reads `config.pme`
+    (`app.PME` ↔ `app.CutoffPeriodic`) and `config.constraints`
+    (string mapped to `app.<NAME>`, with `"None"` → Python `None`
+    for OpenMM's "no constraints" sentinel).
+
+  **Behavior change** (spec-driven paths only): the runner's legacy
+  hardcoded minimization cap was 1,000 iterations. The
+  `ACTIVIN_E_PRODUCTION_PROFILE` carries `minimization_max_iterations=50_000`,
+  which now reaches the runner — spec-driven runs minimize up to 50×
+  longer than before. Steepest descent usually converges early, but
+  systems that previously hit the 1,000-iteration cap will reach a
+  genuinely different minimized structure. `OpenMMConfig()` direct
+  callers are unaffected (the dataclass default is 1,000, matching
+  legacy).
+
+  `to_dict` includes the 4 fields under `simulation`; `from_json`
+  parses them back. Legacy `system_config.json` files (without the
+  new keys) default to the legacy values so in-flight simulations
+  continue unchanged. Closes biolab-runners#189.
 
 - **Slice 14 (BMT-MD-001) — `biolab_runners.mmpbsa` package**:
   optional gmx_MMPBSA integration. The runner gracefully degrades

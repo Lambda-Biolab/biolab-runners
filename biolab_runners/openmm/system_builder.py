@@ -272,12 +272,60 @@ def assemble_system(
     app: object,
     unit: object,
 ) -> tuple[object, object]:
-    """Create the OpenMM System (with barostat) and integrator."""
+    """Create the OpenMM System (with barostat) and integrator.
+
+    ``config.pme`` selects the nonbonded method (``app.PME`` when
+    ``True``, ``app.CutoffPeriodic`` when ``False``); ``config.constraints``
+    selects the bond constraint algorithm — a string from
+    ``{"None", "HBonds", "AllBonds", "HAngles"}`` mapped to the
+    matching ``app.<NAME>`` symbol (with ``"None"`` → Python
+    ``None``, the literal OpenMM "no constraints" sentinel). Both
+    fields come from ``MDSpec.pme`` / ``MDSpec.constraints`` via
+    ``OpenMMConfig.from_md_spec`` (slice 16 / biolab-runners#189).
+
+    Note on ``pme=False``: ``CutoffPeriodic`` (not ``Cutoff``,
+    which is not an OpenMM symbol) is used because the runner
+    always attaches a ``MonteCarloBarostat`` and the system is in a
+    periodic box. ``CutoffNonPeriodic`` would conflict with the
+    barostat — a vacuum system requires omitting the barostat
+    entirely, which is out of scope for the canonical peptide-protein
+    MD pipeline.
+    """
+    # Map the spec's pme flag onto OpenMM's nonbonded method symbols.
+    # ``CutoffPeriodic`` is the periodic-box counterpart to ``PME``;
+    # both work with a MonteCarloBarostat (the runner's setup).
+    pme_methods = {
+        True: app.PME,
+        False: app.CutoffPeriodic,
+    }
+    try:
+        nonbonded_method = pme_methods[config.pme]
+    except KeyError as exc:
+        raise ValueError(f"config.pme must be True or False; got {config.pme!r}") from exc
+
+    # Map the constraints string to the matching ``app`` symbol.
+    # ``"None"`` is special-cased to Python ``None`` — OpenMM uses
+    # Python ``None`` as the "no constraints" sentinel (not an
+    # ``app.None`` symbol), so a bare ``getattr(app, "None")`` would
+    # accidentally land on the unknown-attribute fallback path.
+    constraints_map: dict[str, object] = {
+        "None": None,
+        "HBonds": app.HBonds,
+        "AllBonds": app.AllBonds,
+        "HAngles": app.HAngles,
+    }
+    if config.constraints not in constraints_map:
+        raise ValueError(
+            f"unknown OpenMM constraints algorithm: {config.constraints!r}. "
+            f"Expected one of: None, HBonds, AllBonds, HAngles."
+        )
+    constraints_attr = constraints_map[config.constraints]
+
     system = forcefield.createSystem(  # type: ignore[union-attr]
         modeller.topology,  # type: ignore[union-attr]
-        nonbondedMethod=app.PME,  # type: ignore[union-attr]
+        nonbondedMethod=nonbonded_method,
         nonbondedCutoff=1.0 * unit.nanometers,  # type: ignore[union-attr]
-        constraints=app.HBonds,  # type: ignore[union-attr]
+        constraints=constraints_attr,
     )
     system.addForce(
         openmm.MonteCarloBarostat(  # type: ignore[union-attr]
