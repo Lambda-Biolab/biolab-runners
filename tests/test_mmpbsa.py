@@ -163,3 +163,19 @@ class TestRunnerStatusConstants:
         assert GmxMMPBSAStatus.SUCCEEDED == "succeeded"
         assert GmxMMPBSAStatus.FAILED == "failed"
         assert GmxMMPBSAStatus.UNSUPPORTED == "unsupported"
+
+    def test_status_class_is_single_source_of_truth(self) -> None:
+        """Regression: ``GmxMMPBSAStatus`` must be a single class object
+        whether imported from the package root or the runner submodule.
+
+        Two parallel definitions (one in ``__init__`` + one in ``runner``)
+        would silently pass the string-equality tests above but let
+        the runner's emitter diverge from the package's public class.
+        The fix: ``__init__`` re-exports the runner's class, so
+        ``biolab_runners.mmpbsa.GmxMMPBSAStatus is
+        biolab_runners.mmpbsa.runner.GmxMMPBSAStatus``.
+        """
+        import biolab_runners.mmpbsa
+        import biolab_runners.mmpbsa.runner
+
+        assert biolab_runners.mmpbsa.GmxMMPBSAStatus is biolab_runners.mmpbsa.runner.GmxMMPBSAStatus

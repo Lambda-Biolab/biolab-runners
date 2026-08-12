@@ -27,7 +27,17 @@ __all__ = [
 
 
 class GmxMMPBSAStatus:
-    """Normalized outcome values for the gmx_MMPBSA runner."""
+    """Normalized outcome values for the gmx_MMPBSA runner.
+
+    The class lives in :mod:`biolab_runners.mmpbsa.runner` because
+    :meth:`GmxMMPBSARunner.run` is what emits these status values
+    — keeping the constants adjacent to the only emitter makes
+    future divergence (one side changing a string, the other
+    forgetting to mirror it) impossible. The package
+    :mod:`biolab_runners.mmpbsa.__init__` re-exports this class so
+    consumers always import a single class object regardless of
+    which submodule they came in through.
+    """
 
     SUCCEEDED = "succeeded"
     FAILED = "failed"
