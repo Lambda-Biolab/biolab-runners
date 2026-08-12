@@ -61,13 +61,10 @@ openmm = [
     # runtime overlay (platform, extra force-field XMLs, water XML
     # override, early-abort threshold).
     #
-    # Pinned to the ``feat/slice-12-md-spec`` branch while the
-    # canonical slice-12 producer PR is open (so other consumers
-    # in this org can pull it before merge). Once the slice-12
-    # feature merges to ``main`` and a versioned release ships
-    # (``bioml-tools>=1.9.0``), flip this constraint to a version
-    # range and drop the git URL.
-    "bioml-tools @ git+https://github.com/Lambda-Biolab/bioml-tools.git@feat/slice-12-md-spec",
+    # Pinned to the ``v1.9.0`` tag (the slice-12 feature has merged
+    # to ``main`` and the versioned release ships today). Bump the
+    # pin on each slice-12 minor release.
+    "bioml-tools @ git+https://github.com/Lambda-Biolab/bioml-tools.git@v1.9.0",
 ]
 all = [
     "biolab-runners[boltz2,openmm]",

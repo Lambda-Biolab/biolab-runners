@@ -220,7 +220,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "biolab-runners", extras = ["boltz2", "openmm"], marker = "extra == 'all'" },
-    { name = "bioml-tools", marker = "extra == 'openmm'", git = "https://github.com/Lambda-Biolab/bioml-tools.git?rev=feat%2Fslice-12-md-spec" },
+    { name = "bioml-tools", marker = "extra == 'openmm'", git = "https://github.com/Lambda-Biolab/bioml-tools.git?rev=v1.9.0" },
     { name = "boltz", marker = "extra == 'boltz2'", specifier = ">=2.2" },
     { name = "mdtraj", marker = "extra == 'openmm'", specifier = ">=1.10,<1.11.1" },
     { name = "numpy", marker = "extra == 'openmm'", specifier = ">=1.26,<2.0" },
@@ -246,7 +246,7 @@ dev = [
 [[package]]
 name = "bioml-tools"
 version = "1.9.0"
-source = { git = "https://github.com/Lambda-Biolab/bioml-tools.git?rev=feat%2Fslice-12-md-spec#1d28b79d11c17bf5581ffb82a9a2933e5d42fb68" }
+source = { git = "https://github.com/Lambda-Biolab/bioml-tools.git?rev=v1.9.0#b0a52659bd67bdd9b3a51fce83c63fd97216d063" }
 
 [[package]]
 name = "biopython"
