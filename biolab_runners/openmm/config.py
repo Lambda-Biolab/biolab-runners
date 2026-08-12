@@ -1,4 +1,24 @@
-"""Configuration models for OpenMM MD simulations."""
+"""Configuration models for OpenMM MD simulations.
+
+This module owns the engine-specific dataclass that the OpenMM
+runner consumes. The canonical, engine-neutral producer is
+:mod:`bioml_tools.md.system_spec` (``MDSpec``, slice 12). The
+:class:`OpenMMConfig` here is the **engine-specific runtime**
+view: every field in :class:`OpenMMConfig` is either (a) a
+projection of an :class:`MDSpec` field onto the dataclass or
+(b) an OpenMM-only overlay (``platform``, ``extra_forcefields``,
+``water_ff_xml``, ``target_irmsd_threshold_a``).
+
+The :meth:`OpenMMConfig.from_md_spec` classmethod is the canonical
+construction path going forward; the legacy ``__init__`` and the
+physiological / saliva / gastric / intestinal preset classmethods
+remain in place for backward compatibility with serialised
+``system_config.json`` files written before slice 12.
+
+The :meth:`OpenMMConfig.from_json` loader still parses the legacy
+flat wire format so existing in-flight simulations and golden
+fixtures keep working.
+"""
 
 from __future__ import annotations
 
@@ -6,9 +26,12 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from biolab_runners.openmm.paths import FileNames
+
+if TYPE_CHECKING:
+    from bioml_tools.md.system_spec import MDSpec
 
 logger = logging.getLogger(__name__)
 
@@ -304,6 +327,92 @@ class OpenMMConfig:
                 protonation_ph=6.8,
                 overrides=overrides,
             )
+        )
+
+    @classmethod
+    def from_md_spec(
+        cls,
+        spec: MDSpec,
+        **engine_overrides: Any,  # noqa: ANN401
+    ) -> OpenMMConfig:
+        """Build an :class:`OpenMMConfig` from a canonical :class:`MDSpec`.
+
+        Slice 12 (MD-OPENMM-001) makes :class:`MDSpec` (from
+        :mod:`bioml_tools.md.system_spec`) the canonical producer of
+        MD configuration. This classmethod is the canonical
+        ``OpenMMConfig`` construction path going forward — it projects
+        every engine-neutral :class:`MDSpec` field onto the matching
+        :class:`OpenMMConfig` field and adds the OpenMM-specific
+        runtime overlay fields with their defaults.
+
+        Engine-specific overlays (``openmm_platform``,
+        ``extra_forcefields``, ``water_ff_xml``,
+        ``target_irmsd_threshold_a``) take their default values; pass
+        any subset via ``engine_overrides`` to override.
+
+        Args:
+            spec: Canonical engine-neutral MD spec from bioml-tools.
+            **engine_overrides: OpenMM-only fields (see OpenMMConfig
+                docs). Caller overrides win; everything else comes
+                from the :class:`MDSpec`.
+
+        Returns:
+            An :class:`OpenMMConfig` ready for ``prepare_simulation``.
+
+        Raises:
+            TypeError: if an unknown engine-specific field is in
+                ``engine_overrides``. Catching this at the construction
+                boundary keeps a typo (``production_NS`` vs
+                ``production_ns``) from silently falling through.
+
+        Notes:
+            ``nacl_mol`` on the dataclass corresponds to
+            ``spec.ionic_strength_m`` on the spec. ``box_shape``
+            comes through as the enum value (string); the rest are
+            identical-name projections.
+        """
+        allowed_overrides = frozenset(
+            {
+                "openmm_platform",
+                "water_ff_xml",
+                "extra_forcefields",
+                "target_irmsd_threshold_a",
+            }
+        )
+        unknown = set(engine_overrides) - allowed_overrides
+        if unknown:
+            raise TypeError(
+                f"unknown engine-specific override(s): {sorted(unknown)}. "
+                f"Allowed: {sorted(allowed_overrides)}. Engine-neutral "
+                "fields live on MDSpec — change them via spec, not via "
+                "from_md_spec."
+            )
+
+        return cls(
+            # Per-instance paths / identifiers
+            receptor_pdb=spec.receptor_pdb,
+            peptide_pdb=spec.peptide_pdb,
+            output_dir=spec.output_dir,
+            target=spec.target,
+            peptide_id=spec.peptide_id,
+            # Ionic
+            nacl_mol=spec.ionic_strength_m,
+            # Simulation
+            temperature_k=spec.temperature_k,
+            pressure_atm=spec.pressure_atm,
+            timestep_fs=spec.timestep_fs,
+            box_padding_nm=spec.box_padding_nm,
+            box_shape=spec.box_shape.value,
+            # Force fields
+            protein_ff=spec.protein_ff,
+            water_model=spec.water_model,
+            # Production cadence (defaults preserved; caller overrides via engine_overrides)
+            production_ns=spec.production_ns,
+            save_interval_ps=spec.save_interval_ps,
+            checkpoint_interval_hours=spec.checkpoint_interval_hours,
+            # Protonation
+            protonation_ph=spec.protonation_ph,
+            **engine_overrides,
         )
 
 

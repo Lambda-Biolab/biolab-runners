@@ -186,6 +186,7 @@ source = { editable = "." }
 
 [package.optional-dependencies]
 all = [
+    { name = "bioml-tools" },
     { name = "boltz" },
     { name = "mdtraj" },
     { name = "numpy" },
@@ -196,6 +197,7 @@ boltz2 = [
     { name = "boltz" },
 ]
 openmm = [
+    { name = "bioml-tools" },
     { name = "mdtraj" },
     { name = "numpy" },
     { name = "openmm", extra = ["cuda12"] },
@@ -218,6 +220,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "biolab-runners", extras = ["boltz2", "openmm"], marker = "extra == 'all'" },
+    { name = "bioml-tools", marker = "extra == 'openmm'", git = "https://github.com/Lambda-Biolab/bioml-tools.git?rev=v1.9.0" },
     { name = "boltz", marker = "extra == 'boltz2'", specifier = ">=2.2" },
     { name = "mdtraj", marker = "extra == 'openmm'", specifier = ">=1.10,<1.11.1" },
     { name = "numpy", marker = "extra == 'openmm'", specifier = ">=1.26,<2.0" },
@@ -239,6 +242,11 @@ dev = [
     { name = "pytest-cov" },
     { name = "ruff", specifier = ">=0.16.1" },
 ]
+
+[[package]]
+name = "bioml-tools"
+version = "1.9.0"
+source = { git = "https://github.com/Lambda-Biolab/bioml-tools.git?rev=v1.9.0#b0a52659bd67bdd9b3a51fce83c63fd97216d063" }
 
 [[package]]
 name = "biopython"
