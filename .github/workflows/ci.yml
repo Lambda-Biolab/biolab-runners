@@ -111,6 +111,19 @@ jobs:
         python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Register PAT for private bioml-tools fetch
+        # The [openmm] extra pins ``bioml-tools @ git+...v1.9.0`` to
+        # the private Lambda-Biolab/bioml-tools repo. Default
+        # GITHUB_TOKEN can't reach cross-org private deps. We use
+        # gh auth setup-git to register a credential helper for
+        # ``git fetch`` of private repos, then uv (which shells
+        # out to git) inherits the helper. Follow-up: publish
+        # bioml-tools to PyPI and remove this step.
+        env:
+          GH_TOKEN: ${{ secrets.GH_BIOML_TOOLS_TOKEN }}
+        run: |
+          echo "$GH_TOKEN" | gh auth login --with-token
+          gh auth setup-git
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
@@ -125,18 +138,6 @@ jobs:
         # ML dep set and is OPT-IN: only the smoke-test job below
         # installs it, and only on the self-hosted GPU runner.
         # Saves ~30s of cold-cache install time per CI invocation.
-        #
-        # GH_BIOML_TOOLS_TOKEN is a PAT scoped to the private
-        # Lambda-Biolab/bioml-tools repo, injected so ``uv sync``
-        # can resolve the ``bioml-tools @ git+...v1.9.0`` pin in
-        # the [openmm] extra. The default GITHUB_TOKEN cannot
-        # reach cross-repo private deps. Tracked as
-        # follow-up: "publish bioml-tools to PyPI" + remove this
-        # env-var pass-through.
-        env:
-          GH_BIOML_TOOLS_TOKEN: ${{ secrets.GH_BIOML_TOOLS_TOKEN }}
-          UV_GIT_USERNAME: oauth2
-          UV_GIT_PASSWORD: ${{ secrets.GH_BIOML_TOOLS_TOKEN }}
         run: uv sync --frozen --extra openmm --group dev
       - name: Type check
         run: uv run pyright biolab_runners/ tests/
