@@ -75,7 +75,7 @@ def _split_chain_residue(first_token: str) -> tuple[str, str]:
     return "", first_token
 
 
-def _parse_energy_tokens(energy_tokens: tuple[str, ...]) -> tuple[float, ...] | None:
+def _parse_energy_tokens(energy_tokens: list[str]) -> tuple[float, ...] | None:
     """Parse the first five energy tokens; return None on malformed input.
 
     Tokens with parse failures, or fewer than 5 tokens, yield ``None``
