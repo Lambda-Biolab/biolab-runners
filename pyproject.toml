@@ -54,6 +54,20 @@ openmm = [
     # fix described in ../docs/testing/scientific-validation.md and
     # /home/antonio/.local/bin/enable-opencode-gpu-systemd.sh.
     "openmm[cuda12]",
+    # Slice 12 (MD-OPENMM-001) step 1: bioml-tools is the canonical
+    # producer of engine-neutral MD configuration. biolab-runners
+    # consumes ``MDSpec`` (added in bioml-tools 1.9.0) via
+    # ``OpenMMConfig.from_md_spec`` and adds the OpenMM-specific
+    # runtime overlay (platform, extra force-field XMLs, water XML
+    # override, early-abort threshold).
+    #
+    # Pinned to the ``feat/slice-12-md-spec`` branch while the
+    # canonical slice-12 producer PR is open (so other consumers
+    # in this org can pull it before merge). Once the slice-12
+    # feature merges to ``main`` and a versioned release ships
+    # (``bioml-tools>=1.9.0``), flip this constraint to a version
+    # range and drop the git URL.
+    "bioml-tools @ git+https://github.com/Lambda-Biolab/bioml-tools.git@feat/slice-12-md-spec",
 ]
 all = [
     "biolab-runners[boltz2,openmm]",
@@ -78,6 +92,12 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["biolab_runners"]
+
+[tool.hatch.metadata]
+# The `[openmm]` extra pins bioml-tools to a git ref (slice 12
+# feature branch); PEP 621 forbids direct references in
+# ``optional-dependencies`` unless this opt-in is set.
+allow-direct-references = true
 
 # --- Ruff ---
 [tool.ruff]
