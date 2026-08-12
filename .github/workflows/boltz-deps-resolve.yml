@@ -46,9 +46,9 @@ jobs:
         # registers a credential helper so uv's underlying git
         # fetch can authenticate.
         env:
-          GH_TOKEN: ${{ secrets.GH_BIOML_TOOLS_TOKEN }}
+          BIOML_PAT: ${{ secrets.GH_BIOML_TOOLS_TOKEN }}
         run: |
-          echo "$GH_TOKEN" | gh auth login --with-token
+          echo "$BIOML_PAT" | gh auth login --with-token
           gh auth setup-git
       - name: Resolve biolab-runners[all]
         # Catches dep-resolution breakages (e.g. boltz pinning numpy<2.0
