@@ -64,6 +64,71 @@ def _parse_float(token: str) -> float | None:
         return None
 
 
+def _split_chain_residue(first_token: str) -> tuple[str, str]:
+    """Split the leading ``chain:resname<resid>`` token.
+
+    Returns ``("", token)`` when no chain prefix is present.
+    """
+    if ":" in first_token:
+        chain_token, residue_token = first_token.split(":", 1)
+        return chain_token, residue_token
+    return "", first_token
+
+
+def _parse_energy_tokens(energy_tokens: tuple[str, ...]) -> tuple[float, ...] | None:
+    """Parse the first five energy tokens; return None on malformed input.
+
+    Tokens with parse failures, or fewer than 5 tokens, yield ``None``
+    so the caller can drop the record (mirroring the malformed-line
+    behavior of the upstream gmx_MMPBSA output consumer).
+    """
+    if len(energy_tokens) < 5:
+        return None
+    values = tuple(_parse_float(t) for t in energy_tokens[:5])
+    if any(v is None for v in values):
+        return None
+    return tuple(v or 0.0 for v in values)
+
+
+def _is_skippable_line(line: str) -> bool:
+    """Return True for blank or comment-prefixed lines."""
+    stripped = line.strip()
+    return not stripped or stripped.startswith("#")
+
+
+def _build_record(
+    chain_token: str,
+    residue_token: str,
+    values: tuple[float, ...],
+) -> GmxMMPBSARecord:
+    """Build a :class:`GmxMMPBSARecord` from chain + residue + energy values.
+
+    The five values are interpreted in order as van-der-Waals,
+    electrostatic, polar solvation, non-polar solvation, and total
+    (kcal/mol each).
+    """
+    return GmxMMPBSARecord(
+        residue_label=residue_token,
+        chain=chain_token,
+        vdw_A=values[0],
+        electrostatic_A=values[1],
+        polar_solvation_A=values[2],
+        non_polar_solvation_A=values[3],
+        total_A=values[4],
+    )
+
+
+def _read_lines(path: Path) -> list[str] | None:
+    """Read the file's lines; return ``None`` on read failure or absent file."""
+    if not path.exists():
+        return None
+    try:
+        return path.read_text().splitlines()
+    except OSError as exc:
+        logger.debug("could not read %s: %s", path, exc)
+        return None
+
+
 def parse_residue_decomposition(path: Path) -> tuple[GmxMMPBSARecord, ...]:
     r"""Parse a gmx_MMPBSA per-residue decomposition file.
 
@@ -76,47 +141,19 @@ def parse_residue_decomposition(path: Path) -> tuple[GmxMMPBSARecord, ...]:
     Records with malformed numbers are dropped (the consumer
     treats empty results the same as ``unsupported``).
     """
-    if not path.exists():
-        return ()
-    try:
-        lines = path.read_text().splitlines()
-    except OSError as exc:
-        logger.debug("could not read %s: %s", path, exc)
+    lines = _read_lines(path)
+    if lines is None:
         return ()
     records: list[GmxMMPBSARecord] = []
     for line in lines:
-        if not line.strip() or line.lstrip().startswith("#"):
+        if _is_skippable_line(line):
             continue
         tokens = line.split()
         if len(tokens) < 6:
             continue
-        first = tokens[0]
-        if ":" in first:
-            chain_token, residue_token = first.split(":", 1)
-            energy_tokens = tokens[1:]
-        else:
-            chain_token = ""
-            residue_token = first
-            energy_tokens = tokens[1:]
-        if len(energy_tokens) < 5:
+        chain_token, residue_token = _split_chain_residue(tokens[0])
+        values = _parse_energy_tokens(tokens[1:])
+        if values is None:
             continue
-        values = tuple(_parse_float(t) for t in energy_tokens[:5])
-        if any(v is None for v in values):
-            continue
-        vdw = values[0] or 0.0
-        ele = values[1] or 0.0
-        pol = values[2] or 0.0
-        npl = values[3] or 0.0
-        tot = values[4] or 0.0
-        records.append(
-            GmxMMPBSARecord(
-                residue_label=residue_token,
-                chain=chain_token,
-                vdw_A=vdw,
-                electrostatic_A=ele,
-                polar_solvation_A=pol,
-                non_polar_solvation_A=npl,
-                total_A=tot,
-            )
-        )
+        records.append(_build_record(chain_token, residue_token, values))
     return tuple(records)
