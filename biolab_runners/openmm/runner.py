@@ -520,22 +520,23 @@ class OpenMMRunner:
         Stage 3: NPT with gradual restraint ramp (100->0) + unrestrained
 
         Stage durations come from ``config.equilibration_ps`` — a
-        ``(nvt, npt_restrained, npt_free)`` tuple projected from
-        ``MDSpec.equilibration_ps`` by ``OpenMMConfig.from_md_spec``
+        ``(nvt, npt_restrained, npt_free)`` tuple reduced from
+        ``MDSpec.equilibration`` (a tuple of stage dicts) by
+        ``OpenMMConfig.from_md_spec`` via ``_extract_equilibration_ps``
         (slice 16 / biolab-runners#189). The runner no longer
         hardcodes 100/100/200 ps; a reviewer-signed-off profile change
         round-trips.
 
-        Stage 3 splits the configured ``npt_free`` duration into two
-        halves: a ramp (5 k-values × 20 ps each = 100 ps by default)
-        followed by an unrestrained run of equal length. If the
-        configured ``npt_free`` duration is not even, the unrestrained
-        half absorbs the odd ps (no data is dropped). If the ramp
-        length alone exceeds the configured ``npt_free``, the
-        unrestrained half is dropped entirely and the runner logs a
-        warning — every profile registered today has ``npt_free``
-        ≥ the ramp length, but this guards against a future profile
-        misconfiguration.
+        Stage 3 uses a **fixed** ramp protocol (5 k-values × 20 ps each
+        = 100 ps by default) followed by an unrestrained run of
+        ``npt_free - ramp_total_ps``. The two halves are not equal —
+        at the canonical 100/100/200 profile, the split is 100 + 100,
+        but a profile with ``npt_free=150`` produces 100 + 50. If the
+        configured ``npt_free`` is shorter than the ramp (which would
+        cause the ramp to overrun the configured duration), the
+        unrestrained half is dropped and the runner logs a warning —
+        ``total_equil_steps`` (computed from ``sum(equilibration_ps)``)
+        no longer matches the steps actually executed in that case.
         """
         simulation = ctx.simulation
         restraint_force = ctx.restraint_force
@@ -595,11 +596,16 @@ class OpenMMRunner:
         ramp_steps = int(_EQUIL_RAMP_STAGE_PS * 1000.0 / timestep_fs)
         if npt_free_ps < ramp_total_ps:
             unrestrained_ps = 0.0
+            overrun_ps = ramp_total_ps - npt_free_ps
             logger.warning(
                 "npt_free=%.1f ps is shorter than the equilibration ramp "
-                "(%.1f ps); skipping the unrestrained half.",
+                "(%.1f ps); the ramp will overrun the configured duration "
+                "by %.1f ps and the unrestrained half is skipped. "
+                "total_equil_steps no longer matches the steps actually "
+                "executed.",
                 npt_free_ps,
                 ramp_total_ps,
+                overrun_ps,
             )
         else:
             unrestrained_ps = npt_free_ps - ramp_total_ps

@@ -59,11 +59,12 @@ WATER_MODEL = "tip3p"
 OPENMM_PLATFORM = "OpenCL"
 
 # Equilibration protocol — 3 stages (NVT + NPT-restrained + NPT-free).
-# These are the *defaults*; the canonical source is ``MDSpec.equilibration_ps``
-# (slice 12), which ``OpenMMConfig.from_md_spec`` projects onto
-# ``self.equilibration_ps``. ``OpenMMConfig()`` users get these defaults
-# so legacy call sites still produce a reasonable simulation. The
-# runner reads ``self.equilibration_ps`` directly when planning steps.
+# These are the *defaults*; the canonical source is ``MDSpec.equilibration``
+# (a tuple of stage dicts, slice 12), which ``OpenMMConfig.from_md_spec``
+# reduces to a 3-tuple via ``_extract_equilibration_ps`` and assigns
+# to ``self.equilibration_ps``. ``OpenMMConfig()`` users get these
+# defaults so legacy call sites still produce a reasonable simulation.
+# The runner reads ``self.equilibration_ps`` directly when planning steps.
 DEFAULT_EQUIL_NVT_PS = 100.0
 DEFAULT_EQUIL_NPT_RESTRAINED_PS = 100.0
 DEFAULT_EQUIL_NPT_FREE_PS = 200.0
@@ -179,9 +180,10 @@ class OpenMMConfig:
     target_irmsd_threshold_a: float = DEFAULT_IRMSD_THRESHOLD_A
 
     # Equilibration protocol (3 stages, NVT + NPT-restrained + NPT-free).
-    # Engine-neutral — projected from ``MDSpec.equilibration_ps`` by
-    # ``from_md_spec`` (slice 12). Defaults match the canonical
-    # ``ACTIVIN_E_PRODUCTION_PROFILE`` (100/100/200 ps).
+    # Engine-neutral — projected from ``MDSpec.equilibration`` (a
+    # tuple of stage dicts, the canonical wire format) by
+    # ``from_md_spec`` via ``_extract_equilibration_ps``. Defaults
+    # match the canonical ``ACTIVIN_E_PRODUCTION_PROFILE`` (100/100/200 ps).
     equilibration_ps: tuple[float, float, float] = field(
         default=(
             DEFAULT_EQUIL_NVT_PS,

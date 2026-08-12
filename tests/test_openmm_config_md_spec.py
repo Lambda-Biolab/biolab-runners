@@ -20,6 +20,7 @@ Covers:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -609,3 +610,66 @@ def _extract_equilibration_ps_from_spec_for_test(spec: MDSpec) -> tuple[float, f
         float(spec.equilibration[1]["duration_ps"]),
         float(spec.equilibration[2]["duration_ps"]),
     )
+
+
+# ---------------------------------------------------------------------------
+# 7. Wire-format round-trip + backwards compatibility (biolab-runners#189)
+# ---------------------------------------------------------------------------
+
+
+class TestJsonWireRoundTrip:
+    """``OpenMMConfig.save`` → ``from_json`` round-trip for the 4
+    deferred fields, plus legacy-file backwards compatibility.
+
+    The 4 fields are added under the ``simulation`` block of
+    ``to_dict``; ``from_json`` parses them back. Legacy
+    ``system_config.json`` files (written before slice 16) omit
+    the new keys and must default to the legacy hardcoded values
+    so in-flight simulations don't break.
+    """
+
+    def test_save_then_load_round_trips_deferred_fields(self, tmp_path: Path) -> None:
+        spec = _spec_with_custom_equilibration(50.0, 75.0, 150.0)
+        cfg = OpenMMConfig.from_md_spec(spec)
+        cfg.pme = False
+        cfg.minimization_max_iterations = 20_000
+        cfg.constraints = "AllBonds"
+        path = cfg.save(tmp_path / "system_config.json")
+        loaded = OpenMMConfig.from_json(path)
+
+        assert loaded.equilibration_ps == (50.0, 75.0, 150.0)
+        assert loaded.pme is False
+        assert loaded.minimization_max_iterations == 20_000
+        assert loaded.constraints == "AllBonds"
+
+    def test_legacy_json_file_defaults_deferred_fields(self, tmp_path: Path) -> None:
+        """A ``system_config.json`` written before slice 16 has no
+        ``simulation.equilibration_ps`` / ``pme`` /
+        ``minimization_max_iterations`` / ``constraints`` keys.
+        ``from_json`` must default to the legacy hardcoded values
+        so the simulation continues exactly as it would have
+        before the slice.
+        """
+        legacy = {
+            "receptor_pdb": "r.pdb",
+            "peptide_pdb": "p.pdb",
+            "output_dir": str(tmp_path),
+            "target": "t",
+            "peptide_id": "p",
+            "ionic_conditions": {"NaCl_M": 0.150},
+            "simulation": {
+                "temperature_K": 310.0,
+                "production_ns": 100.0,
+            },
+            "force_fields": {"protein": "charmm36m", "water": "tip3p"},
+        }
+        path = tmp_path / "legacy_system_config.json"
+        path.write_text(json.dumps(legacy))
+
+        cfg = OpenMMConfig.from_json(path)
+
+        # Legacy defaults — match the runner's hardcoded values.
+        assert cfg.equilibration_ps == (100.0, 100.0, 200.0)
+        assert cfg.pme is True
+        assert cfg.minimization_max_iterations == 1_000
+        assert cfg.constraints == "HBonds"
