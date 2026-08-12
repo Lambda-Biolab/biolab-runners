@@ -125,6 +125,18 @@ jobs:
         # ML dep set and is OPT-IN: only the smoke-test job below
         # installs it, and only on the self-hosted GPU runner.
         # Saves ~30s of cold-cache install time per CI invocation.
+        #
+        # GH_BIOML_TOOLS_TOKEN is a PAT scoped to the private
+        # Lambda-Biolab/bioml-tools repo, injected so ``uv sync``
+        # can resolve the ``bioml-tools @ git+...v1.9.0`` pin in
+        # the [openmm] extra. The default GITHUB_TOKEN cannot
+        # reach cross-repo private deps. Tracked as
+        # follow-up: "publish bioml-tools to PyPI" + remove this
+        # env-var pass-through.
+        env:
+          GH_BIOML_TOOLS_TOKEN: ${{ secrets.GH_BIOML_TOOLS_TOKEN }}
+          UV_GIT_USERNAME: oauth2
+          UV_GIT_PASSWORD: ${{ secrets.GH_BIOML_TOOLS_TOKEN }}
         run: uv sync --frozen --extra openmm --group dev
       - name: Type check
         run: uv run pyright biolab_runners/ tests/
