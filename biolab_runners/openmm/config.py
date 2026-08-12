@@ -341,8 +341,8 @@ class OpenMMConfig:
         :mod:`bioml_tools.md.system_spec`) the canonical producer of
         MD configuration. This classmethod is the canonical
         ``OpenMMConfig`` construction path going forward — it projects
-        every engine-neutral :class:`MDSpec` field onto the matching
-        :class:`OpenMMConfig` field and adds the OpenMM-specific
+        every engine-neutral :class:`MDSpec` field that has a matching
+        :class:`OpenMMConfig` slot, and adds the OpenMM-specific
         runtime overlay fields with their defaults.
 
         Engine-specific overlays (``openmm_platform``,
@@ -370,6 +370,20 @@ class OpenMMConfig:
             ``spec.ionic_strength_m`` on the spec. ``box_shape``
             comes through as the enum value (string); the rest are
             identical-name projections.
+
+            Deferred fields (carried on the spec, not yet honored by
+            the runner — the runner's hardcoded 100/100/200 ps
+            equilibration, PME=True, and 50k-iter minimization cap
+            currently match :data:`bioml_tools.md.system_spec.ACTIVIN_E_PRODUCTION_PROFILE`,
+            so dropping them is silent for the only registered
+            profile today): ``equilibration_ps`` (3-stage tuple),
+            ``pme``, ``minimization_max_iterations``, ``constraints``.
+            Adding them requires runner-side wiring; tracked as a
+            follow-up. The :class:`MDSpec` carries them so a
+            reviewer-signed-off profile change to any of them will
+            round-trip through the JSON wire format correctly
+            (see ``MDSpec.to_dict``); only the engine execution
+            side is deferred.
         """
         allowed_overrides = frozenset(
             {
@@ -412,6 +426,13 @@ class OpenMMConfig:
             checkpoint_interval_hours=spec.checkpoint_interval_hours,
             # Protonation
             protonation_ph=spec.protonation_ph,
+            # NOTE: spec.equilibration_ps / spec.pme /
+            # spec.minimization_max_iterations / spec.constraints are
+            # deferred — see Notes section above. They're carried on
+            # the spec for round-tripping through the JSON wire
+            # format; the runner has not been taught to honor them
+            # yet. Hardcoded values in the runner match the canonical
+            # Activin-E profile today.
             **engine_overrides,
         )
 
