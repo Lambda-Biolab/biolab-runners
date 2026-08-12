@@ -58,14 +58,27 @@ WATER_MODEL = "tip3p"
 # GPU platform — pip OpenMM has OpenCL (not CUDA); conda OpenMM has both
 OPENMM_PLATFORM = "OpenCL"
 
-# Equilibration protocol (3 stages, 100 + 100 + 200 = 400 ps total).
-# The runner hardcodes the k-values for each stage; only the durations
-# (in ps) are exposed as constants so the total-equil-steps calculation
-# in __post_init__ stays in sync with the runner's behavior.
-EQUIL_NVT_PS = 100.0
-EQUIL_NPT_RESTRAINED_PS = 100.0
-EQUIL_NPT_FREE_PS = 200.0
-EQUIL_TOTAL_PS = EQUIL_NVT_PS + EQUIL_NPT_RESTRAINED_PS + EQUIL_NPT_FREE_PS
+# Equilibration protocol — 3 stages (NVT + NPT-restrained + NPT-free).
+# These are the *defaults*; the canonical source is ``MDSpec.equilibration_ps``
+# (slice 12), which ``OpenMMConfig.from_md_spec`` projects onto
+# ``self.equilibration_ps``. ``OpenMMConfig()`` users get these defaults
+# so legacy call sites still produce a reasonable simulation. The
+# runner reads ``self.equilibration_ps`` directly when planning steps.
+DEFAULT_EQUIL_NVT_PS = 100.0
+DEFAULT_EQUIL_NPT_RESTRAINED_PS = 100.0
+DEFAULT_EQUIL_NPT_FREE_PS = 200.0
+DEFAULT_EQUIL_TOTAL_PS = (
+    DEFAULT_EQUIL_NVT_PS + DEFAULT_EQUIL_NPT_RESTRAINED_PS + DEFAULT_EQUIL_NPT_FREE_PS
+)
+
+# Engine-neutral defaults for the runner's hardcoded knobs — these
+# are the values the runner uses when the caller doesn't supply a
+# custom value. ``OpenMMConfig.from_md_spec`` overrides them with the
+# canonical ``MDSpec`` values (which match these defaults for the only
+# registered profile today).
+DEFAULT_PME = True
+DEFAULT_MINIMIZATION_MAX_ITERATIONS = 1_000
+DEFAULT_CONSTRAINTS = "HBonds"  # mapped to ``app.HBonds`` in system_builder.py
 
 
 @dataclass
@@ -165,6 +178,33 @@ class OpenMMConfig:
     # Early-abort reference threshold (Å). See DEFAULT_IRMSD_THRESHOLD_A docstring.
     target_irmsd_threshold_a: float = DEFAULT_IRMSD_THRESHOLD_A
 
+    # Equilibration protocol (3 stages, NVT + NPT-restrained + NPT-free).
+    # Engine-neutral — projected from ``MDSpec.equilibration_ps`` by
+    # ``from_md_spec`` (slice 12). Defaults match the canonical
+    # ``ACTIVIN_E_PRODUCTION_PROFILE`` (100/100/200 ps).
+    equilibration_ps: tuple[float, float, float] = field(
+        default=(
+            DEFAULT_EQUIL_NVT_PS,
+            DEFAULT_EQUIL_NPT_RESTRAINED_PS,
+            DEFAULT_EQUIL_NPT_FREE_PS,
+        )
+    )
+
+    # PME on/off. Engine-neutral — projected from ``MDSpec.pme``.
+    pme: bool = DEFAULT_PME
+
+    # Steepest-descent minimization cap. Engine-neutral — projected
+    # from ``MDSpec.minimization_max_iterations``. Default 1,000
+    # iterations is the runner's legacy cap; the spec's default is
+    # 50,000 (more thorough but rarely reached in practice).
+    minimization_max_iterations: int = DEFAULT_MINIMIZATION_MAX_ITERATIONS
+
+    # Constraints algorithm name. Engine-neutral — projected from
+    # ``MDSpec.constraints``. Must be one of ``"None"`` / ``"HBonds"``
+    # / ``"AllBonds"`` / ``"HAngles"`` (mapped to ``app.<NAME>`` in
+    # ``system_builder.py``).
+    constraints: str = DEFAULT_CONSTRAINTS
+
     # Computed fields
     total_steps: int = 0
     total_equil_steps: int = 0
@@ -175,7 +215,7 @@ class OpenMMConfig:
         """Compute derived step counts."""
         steps_per_ps = 1000.0 / self.timestep_fs
         self.total_steps = int(self.production_ns * 1000.0 * steps_per_ps)
-        self.total_equil_steps = int(EQUIL_TOTAL_PS * steps_per_ps)
+        self.total_equil_steps = int(sum(self.equilibration_ps) * steps_per_ps)
         self.save_every_steps = int(self.save_interval_ps * steps_per_ps)
         self.checkpoint_every_steps = int(
             self.checkpoint_interval_hours * 3600.0 * 1000.0 / self.timestep_fs
@@ -199,6 +239,10 @@ class OpenMMConfig:
                 "box_padding_nm": self.box_padding_nm,
                 "box_shape": self.box_shape,
                 "production_ns": self.production_ns,
+                "equilibration_ps": list(self.equilibration_ps),
+                "pme": self.pme,
+                "minimization_max_iterations": self.minimization_max_iterations,
+                "constraints": self.constraints,
                 "total_steps": self.total_steps,
                 "save_interval_ps": self.save_interval_ps,
                 "save_every_steps": self.save_every_steps,
@@ -266,6 +310,24 @@ class OpenMMConfig:
             target_irmsd_threshold_a=float(
                 data.get("target_irmsd_threshold_a", DEFAULT_IRMSD_THRESHOLD_A)
             ),
+            # Engine-neutral fields projected from MDSpec; defaults
+            # match the legacy ``runner`` hardcodes for ``system_config.json``
+            # files written before the slice 16 wire-up.
+            equilibration_ps=tuple(
+                sim.get(
+                    "equilibration_ps",
+                    [
+                        DEFAULT_EQUIL_NVT_PS,
+                        DEFAULT_EQUIL_NPT_RESTRAINED_PS,
+                        DEFAULT_EQUIL_NPT_FREE_PS,
+                    ],
+                )
+            ),
+            pme=bool(sim.get("pme", DEFAULT_PME)),
+            minimization_max_iterations=int(
+                sim.get("minimization_max_iterations", DEFAULT_MINIMIZATION_MAX_ITERATIONS)
+            ),
+            constraints=sim.get("constraints", DEFAULT_CONSTRAINTS),
         )
 
     @classmethod
@@ -341,7 +403,7 @@ class OpenMMConfig:
         :mod:`bioml_tools.md.system_spec`) the canonical producer of
         MD configuration. This classmethod is the canonical
         ``OpenMMConfig`` construction path going forward — it projects
-        every engine-neutral :class:`MDSpec` field that has a matching
+        every engine-neutral :class:`MDSpec` field onto the matching
         :class:`OpenMMConfig` slot, and adds the OpenMM-specific
         runtime overlay fields with their defaults.
 
@@ -369,21 +431,12 @@ class OpenMMConfig:
             ``nacl_mol`` on the dataclass corresponds to
             ``spec.ionic_strength_m`` on the spec. ``box_shape``
             comes through as the enum value (string); the rest are
-            identical-name projections.
-
-            Deferred fields (carried on the spec, not yet honored by
-            the runner — the runner's hardcoded 100/100/200 ps
-            equilibration, PME=True, and 50k-iter minimization cap
-            currently match :data:`bioml_tools.md.system_spec.ACTIVIN_E_PRODUCTION_PROFILE`,
-            so dropping them is silent for the only registered
-            profile today): ``equilibration_ps`` (3-stage tuple),
-            ``pme``, ``minimization_max_iterations``, ``constraints``.
-            Adding them requires runner-side wiring; tracked as a
-            follow-up. The :class:`MDSpec` carries them so a
-            reviewer-signed-off profile change to any of them will
-            round-trip through the JSON wire format correctly
-            (see ``MDSpec.to_dict``); only the engine execution
-            side is deferred.
+            identical-name projections. ``equilibration_ps``,
+            ``pme``, ``minimization_max_iterations``, and
+            ``constraints`` are projected from the spec and honored
+            by the runner (``_run_equilibration``,
+            ``system_builder._create_system``,
+            ``runner._run_minimization``).
         """
         allowed_overrides = frozenset(
             {
@@ -426,13 +479,19 @@ class OpenMMConfig:
             checkpoint_interval_hours=spec.checkpoint_interval_hours,
             # Protonation
             protonation_ph=spec.protonation_ph,
-            # NOTE: spec.equilibration_ps / spec.pme /
-            # spec.minimization_max_iterations / spec.constraints are
-            # deferred — see Notes section above. They're carried on
-            # the spec for round-tripping through the JSON wire
-            # format; the runner has not been taught to honor them
-            # yet. Hardcoded values in the runner match the canonical
-            # Activin-E profile today.
+            # Engine-neutral overrides formerly deferred — now projected
+            # from the spec and honored by the runner (slice 16 /
+            # biolab-runners#189). ``spec.equilibration`` is a tuple
+            # of stage dicts (NVT / NPT-restrained / NPT-free); we
+            # extract the 3 ``duration_ps`` values to populate the
+            # 3-tuple ``equilibration_ps`` the runner plans steps
+            # against. The runner is hardcoded to 3-stage
+            # equilibration, so a profile with a different stage
+            # count raises at this boundary.
+            equilibration_ps=_extract_equilibration_ps(spec),
+            pme=spec.pme,
+            minimization_max_iterations=spec.minimization_max_iterations,
+            constraints=spec.constraints,
             **engine_overrides,
         )
 
@@ -452,6 +511,31 @@ def _preset(
     }
     values.update(overrides)
     return values
+
+
+def _extract_equilibration_ps(spec: MDSpec) -> tuple[float, float, float]:
+    """Pull the 3 ``duration_ps`` values from ``spec.equilibration``.
+
+    ``MDSpec.equilibration`` is a tuple of stage dicts (NVT /
+    NPT-restrained / NPT-free) — the canonical, JSON-stable
+    representation. ``OpenMMConfig.equilibration_ps`` is the 3-tuple
+    of ps durations the runner plans steps against.
+
+    The runner is hardcoded to 3-stage equilibration; a profile with
+    a different stage count raises at this boundary rather than
+    silently truncating or padding.
+    """
+    if len(spec.equilibration) != 3:
+        raise ValueError(
+            f"OpenMM runner requires exactly 3 equilibration stages "
+            f"(NVT / NPT-restrained / NPT-free); got {len(spec.equilibration)} "
+            f"from spec.equilibration. Update the runner to handle the "
+            f"new stage count or pass a 3-stage spec."
+        )
+    nvt_ps = float(spec.equilibration[0]["duration_ps"])
+    npt_r_ps = float(spec.equilibration[1]["duration_ps"])
+    npt_free_ps = float(spec.equilibration[2]["duration_ps"])
+    return (nvt_ps, npt_r_ps, npt_free_ps)
 
 
 @dataclass

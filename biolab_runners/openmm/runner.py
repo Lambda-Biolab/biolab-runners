@@ -78,12 +78,24 @@ _ABORT_MULTIPLIER = 2.0
 # Post-equilibration displacement
 _DISPLACEMENT_THRESHOLD_A = 8.0  # peptide-receptor Ca min distance (A)
 
-# Energy minimization
-_MAX_MINIMIZATION_ITERS = 1000
+# Energy minimization — legacy default when ``OpenMMConfig`` is
+# constructed without going through ``MDSpec`` / ``from_md_spec``.
+# ``_run_equilibration`` reads ``config.minimization_max_iterations``
+# directly so a reviewer-signed-off profile change round-trips.
+_LEGACY_MAX_MINIMIZATION_ITERS = 1000
 
 # Equilibration restraint strengths (kJ/mol/nm^2)
 _RESTRAINT_K_STRONG = 1000.0
 _RESTRAINT_K_MEDIUM = 100.0
+
+# Equilibration stage 3 protocol — the restraint ramp + the final
+# unrestrained run are split into two fixed steps (ramp + free). The
+# profile-driven ``equilibration_ps[2]`` (the NPT-free duration) is
+# the **total** of the two (ramp + unrestrained) — not the
+# unrestrained portion alone. This mirrors the canonical 100/100/200
+# default where 100 + 100 = 200.
+_EQUIL_RAMP_K_VALUES = (80.0, 50.0, 25.0, 10.0, 0.0)
+_EQUIL_RAMP_STAGE_PS = 20  # each ramp step is 20 ps; 5 steps = 100 ps
 
 
 class OpenMMRunner:
@@ -503,9 +515,27 @@ class OpenMMRunner:
     def _run_equilibration(ctx: SimulationContext, config: OpenMMConfig, output_dir: Path) -> None:
         """Run 3-stage equilibration protocol.
 
-        Stage 1: NVT 100ps with strong restraints (k=1000 kJ/mol/nm^2)
-        Stage 2: NPT 100ps with reduced restraints (k=100)
-        Stage 3: NPT 200ps with gradual restraint ramp (100->0) + unrestrained
+        Stage 1: NVT with strong restraints (k=1000 kJ/mol/nm^2)
+        Stage 2: NPT with reduced restraints (k=100)
+        Stage 3: NPT with gradual restraint ramp (100->0) + unrestrained
+
+        Stage durations come from ``config.equilibration_ps`` — a
+        ``(nvt, npt_restrained, npt_free)`` tuple projected from
+        ``MDSpec.equilibration_ps`` by ``OpenMMConfig.from_md_spec``
+        (slice 16 / biolab-runners#189). The runner no longer
+        hardcodes 100/100/200 ps; a reviewer-signed-off profile change
+        round-trips.
+
+        Stage 3 splits the configured ``npt_free`` duration into two
+        halves: a ramp (5 k-values × 20 ps each = 100 ps by default)
+        followed by an unrestrained run of equal length. If the
+        configured ``npt_free`` duration is not even, the unrestrained
+        half absorbs the odd ps (no data is dropped). If the ramp
+        length alone exceeds the configured ``npt_free``, the
+        unrestrained half is dropped entirely and the runner logs a
+        warning — every profile registered today has ``npt_free``
+        ≥ the ramp length, but this guards against a future profile
+        misconfiguration.
         """
         simulation = ctx.simulation
         restraint_force = ctx.restraint_force
@@ -514,8 +544,15 @@ class OpenMMRunner:
         chains = ctx.chains
         np = ctx.np_mod
 
-        logger.info("Minimizing energy...")
-        simulation.minimizeEnergy(maxIterations=_MAX_MINIMIZATION_ITERS)  # type: ignore[union-attr]
+        nvt_ps, npt_restrained_ps, npt_free_ps = config.equilibration_ps
+        max_min_iters = (
+            config.minimization_max_iterations
+            if config.minimization_max_iterations > 0
+            else _LEGACY_MAX_MINIMIZATION_ITERS
+        )
+
+        logger.info("Minimizing energy (maxIterations=%d)...", max_min_iters)
+        simulation.minimizeEnergy(maxIterations=max_min_iters)  # type: ignore[union-attr]
 
         # Update restraint reference positions to post-minimization coords
         init_positions = (
@@ -532,26 +569,53 @@ class OpenMMRunner:
 
         # Stage 1: NVT with strong restraints
         simulation.context.setParameter("k", _RESTRAINT_K_STRONG)  # type: ignore[union-attr]
-        logger.info("Equilibrating (NVT 100ps, k=%.0f kJ/mol/nm^2)...", _RESTRAINT_K_STRONG)
-        simulation.step(int(100_000 / timestep_fs))  # type: ignore[union-attr]
+        nvt_steps = int(nvt_ps * 1000.0 / timestep_fs)
+        logger.info(
+            "Equilibrating (NVT %.0fps, k=%.0f kJ/mol/nm^2)...",
+            nvt_ps,
+            _RESTRAINT_K_STRONG,
+        )
+        simulation.step(nvt_steps)  # type: ignore[union-attr]
 
         # Stage 2: NPT with reduced restraints
         simulation.context.setParameter("k", _RESTRAINT_K_MEDIUM)  # type: ignore[union-attr]
-        logger.info("Equilibrating (NPT 100ps, k=%.0f kJ/mol/nm^2)...", _RESTRAINT_K_MEDIUM)
-        simulation.step(int(100_000 / timestep_fs))  # type: ignore[union-attr]
+        npt_restrained_steps = int(npt_restrained_ps * 1000.0 / timestep_fs)
+        logger.info(
+            "Equilibrating (NPT %.0fps, k=%.0f kJ/mol/nm^2)...",
+            npt_restrained_ps,
+            _RESTRAINT_K_MEDIUM,
+        )
+        simulation.step(npt_restrained_steps)  # type: ignore[union-attr]
 
-        # Stage 3: Gradual restraint ramp + unrestrained
-        ramp_k = [80.0, 50.0, 25.0, 10.0, 0.0]
-        ramp_ps = 20
-        ramp_steps = int(ramp_ps * 1000 / timestep_fs)
-        for k in ramp_k:
+        # Stage 3: ramp + unrestrained. The ramp is a fixed protocol
+        # (5 k-values × 20 ps each = 100 ps by default). If the
+        # configured ``npt_free`` duration is less than the ramp, the
+        # unrestrained half is dropped and the runner logs a warning.
+        ramp_total_ps = len(_EQUIL_RAMP_K_VALUES) * _EQUIL_RAMP_STAGE_PS
+        ramp_steps = int(_EQUIL_RAMP_STAGE_PS * 1000.0 / timestep_fs)
+        if npt_free_ps < ramp_total_ps:
+            unrestrained_ps = 0.0
+            logger.warning(
+                "npt_free=%.1f ps is shorter than the equilibration ramp "
+                "(%.1f ps); skipping the unrestrained half.",
+                npt_free_ps,
+                ramp_total_ps,
+            )
+        else:
+            unrestrained_ps = npt_free_ps - ramp_total_ps
+        for k in _EQUIL_RAMP_K_VALUES:
             simulation.context.setParameter("k", k)  # type: ignore[union-attr]
             simulation.step(ramp_steps)  # type: ignore[union-attr]
-        logger.info("Equilibrating (NPT restraint ramp 100->0 over %dps)...", len(ramp_k) * ramp_ps)
-
-        # Final 100ps unrestrained
-        simulation.step(int(100_000 / timestep_fs))  # type: ignore[union-attr]
-        logger.info("Equilibrating (NPT 100ps unrestrained)...")
+        logger.info(
+            "Equilibrating (NPT restraint ramp %.0f->%.0f over %.0fps)...",
+            _EQUIL_RAMP_K_VALUES[0],
+            _EQUIL_RAMP_K_VALUES[-1],
+            ramp_total_ps,
+        )
+        if unrestrained_ps > 0:
+            unrestrained_steps = int(unrestrained_ps * 1000.0 / timestep_fs)
+            logger.info("Equilibrating (NPT %.0fps unrestrained)...", unrestrained_ps)
+            simulation.step(unrestrained_steps)  # type: ignore[union-attr]
 
         OpenMMRunner._check_post_equilibration_displacement(
             simulation, chains, output_dir, unit, np

@@ -272,12 +272,28 @@ def assemble_system(
     app: object,
     unit: object,
 ) -> tuple[object, object]:
-    """Create the OpenMM System (with barostat) and integrator."""
+    """Create the OpenMM System (with barostat) and integrator.
+
+    ``config.pme`` selects the nonbonded method (``app.PME`` when
+    ``True``, ``app.Cutoff`` when ``False``); ``config.constraints``
+    selects the bond constraint algorithm — a string from
+    ``{"None", "HBonds", "AllBonds", "HAngles"}`` mapped to the
+    matching ``app.<NAME>`` symbol. Both fields come from
+    ``MDSpec.pme`` / ``MDSpec.constraints`` via
+    ``OpenMMConfig.from_md_spec`` (slice 16 / biolab-runners#189).
+    """
+    nonbonded_method = app.PME if config.pme else app.Cutoff  # type: ignore[union-attr]
+    constraints_attr = getattr(app, config.constraints, None)
+    if constraints_attr is None:
+        raise ValueError(
+            f"unknown OpenMM constraints algorithm: {config.constraints!r}. "
+            f"Expected one of: None, HBonds, AllBonds, HAngles."
+        )
     system = forcefield.createSystem(  # type: ignore[union-attr]
         modeller.topology,  # type: ignore[union-attr]
-        nonbondedMethod=app.PME,  # type: ignore[union-attr]
+        nonbondedMethod=nonbonded_method,
         nonbondedCutoff=1.0 * unit.nanometers,  # type: ignore[union-attr]
-        constraints=app.HBonds,  # type: ignore[union-attr]
+        constraints=constraints_attr,
     )
     system.addForce(
         openmm.MonteCarloBarostat(  # type: ignore[union-attr]

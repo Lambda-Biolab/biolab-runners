@@ -302,6 +302,10 @@ class TestEquivalenceWithLegacyPath:
             save_interval_ps=spec.save_interval_ps,
             checkpoint_interval_hours=spec.checkpoint_interval_hours,
             protonation_ph=spec.protonation_ph,
+            equilibration_ps=_extract_equilibration_ps_from_spec_for_test(spec),
+            pme=spec.pme,
+            minimization_max_iterations=spec.minimization_max_iterations,
+            constraints=spec.constraints,
         )
         # Same dataclass field → same value.
         for field_name in (
@@ -325,6 +329,10 @@ class TestEquivalenceWithLegacyPath:
             "total_steps",
             "save_every_steps",
             "checkpoint_every_steps",
+            "equilibration_ps",
+            "pme",
+            "minimization_max_iterations",
+            "constraints",
         ):
             assert getattr(cfg_from_spec, field_name) == getattr(cfg_manual, field_name), (
                 f"field {field_name!r} diverges between from_md_spec and manual"
@@ -409,3 +417,195 @@ class TestWireFormatRoundTrip:
             assert getattr(cfg_a, field_name) == getattr(cfg_b, field_name), (
                 f"field {field_name!r} diverges after round-trip"
             )
+
+
+# ---------------------------------------------------------------------------
+# 6. Deferred fields now projected (biolab-runners#189 / slice 16)
+# ---------------------------------------------------------------------------
+
+
+def _spec_with_custom_equilibration(
+    nvt_ps: float,
+    npt_restrained_ps: float,
+    npt_free_ps: float,
+) -> MDSpec:
+    """Build an MDSpec with a custom 3-stage equilibration protocol.
+
+    Bypasses ``MDSpec.from_profile`` (which only accepts the
+    profile's hardcoded ``equilibration_ps``) by constructing
+    ``MDSpec`` directly with a custom ``equilibration`` stage list.
+    """
+    return MDSpec(
+        receptor_pdb="receptor.pdb",
+        peptide_pdb="peptide.pdb",
+        output_dir="results/md",
+        target="t",
+        peptide_id="p",
+        equilibration=(
+            {"name": "NVT", "ensemble": "NVT", "duration_ps": nvt_ps, "restraint_k": 1000.0},
+            {
+                "name": "NPT-restrained",
+                "ensemble": "NPT",
+                "duration_ps": npt_restrained_ps,
+                "restraint_k": 100.0,
+            },
+            {
+                "name": "NPT-free",
+                "ensemble": "NPT",
+                "duration_ps": npt_free_ps,
+                "restraint_k": 0.0,
+            },
+        ),
+        production_ns=10.0,  # short production; the equilibration is what we're testing
+    )
+
+
+class TestDeferredFieldsProjected:
+    """biolab-runners#189 — slice 16 wire-up.
+
+    ``equilibration_ps``, ``pme``, ``minimization_max_iterations``,
+    and ``constraints`` were carried on the spec for round-tripping
+    but the runner silently dropped them. This class pins the
+    ``from_md_spec`` projection so a reviewer-signed-off profile
+    change reaches the runner.
+    """
+
+    def test_equilibration_ps_extracted_from_spec(self) -> None:
+        """``spec.equilibration`` (list of stage dicts) projects onto
+        ``OpenMMConfig.equilibration_ps`` (3-tuple of ps durations).
+
+        The runner is hardcoded to 3-stage equilibration, so the
+        projection raises if the spec carries a different stage count.
+        """
+        spec = _spec_with_custom_equilibration(50.0, 75.0, 150.0)
+        cfg = OpenMMConfig.from_md_spec(spec)
+        assert cfg.equilibration_ps == (50.0, 75.0, 150.0)
+
+    def test_equilibration_ps_default_matches_canonical_profile(self) -> None:
+        """The canonical ``ACTIVIN_E_PRODUCTION_PROFILE`` carries
+        100/100/200 ps; ``from_md_spec`` reproduces that.
+        """
+        spec = MDSpec.from_profile(
+            ACTIVIN_E_PRODUCTION_PROFILE,
+            receptor_pdb="r",
+            peptide_pdb="p",
+            output_dir="o",
+        )
+        cfg = OpenMMConfig.from_md_spec(spec)
+        assert cfg.equilibration_ps == (100.0, 100.0, 200.0)
+
+    def test_equilibration_ps_with_wrong_stage_count_raises(self) -> None:
+        """4-stage or 2-stage specs must raise at the projection boundary,
+        not silently truncate. The runner is hardcoded for 3 stages.
+        """
+        spec = MDSpec(
+            receptor_pdb="r",
+            peptide_pdb="p",
+            output_dir="o",
+            equilibration=(
+                {"name": "NVT", "ensemble": "NVT", "duration_ps": 50.0, "restraint_k": 1000.0},
+                {"name": "NPT-r", "ensemble": "NPT", "duration_ps": 100.0, "restraint_k": 100.0},
+                {"name": "NPT-f", "ensemble": "NPT", "duration_ps": 150.0, "restraint_k": 0.0},
+                {"name": "extra", "ensemble": "NPT", "duration_ps": 50.0, "restraint_k": 0.0},
+            ),
+        )
+        with pytest.raises(ValueError, match="3 equilibration stages"):
+            OpenMMConfig.from_md_spec(spec)
+
+    def test_total_equil_steps_uses_spec_durations(self) -> None:
+        """``total_equil_steps`` is derived from the sum of
+        ``equilibration_ps`` (post-projection). A custom spec with
+        non-default durations produces a different step count.
+        """
+        spec = _spec_with_custom_equilibration(50.0, 75.0, 150.0)
+        cfg = OpenMMConfig.from_md_spec(spec)
+        # 50 + 75 + 150 = 275 ps total equilibration; timestep 2 fs →
+        # 137_500 steps.
+        assert cfg.total_equil_steps == 137_500
+
+    def test_pme_propagates(self) -> None:
+        """``spec.pme`` projects onto ``OpenMMConfig.pme``. The runner
+        uses this to select ``app.PME`` vs ``app.Cutoff``.
+        """
+        spec = MDSpec(
+            receptor_pdb="r",
+            peptide_pdb="p",
+            output_dir="o",
+            equilibration=_ACTIVIN_E_3_STAGES,
+            pme=False,  # coarse-grained system; PME off
+            production_ns=10.0,
+        )
+        cfg = OpenMMConfig.from_md_spec(spec)
+        assert cfg.pme is False
+
+    def test_minimization_max_iterations_propagates(self) -> None:
+        """``spec.minimization_max_iterations`` projects onto
+        ``OpenMMConfig.minimization_max_iterations``. The runner's
+        ``simulation.minimizeEnergy(maxIterations=...)`` reads this.
+        """
+        spec = MDSpec(
+            receptor_pdb="r",
+            peptide_pdb="p",
+            output_dir="o",
+            equilibration=_ACTIVIN_E_3_STAGES,
+            minimization_max_iterations=20_000,
+            production_ns=10.0,
+        )
+        cfg = OpenMMConfig.from_md_spec(spec)
+        assert cfg.minimization_max_iterations == 20_000
+
+    def test_constraints_propagates(self) -> None:
+        """``spec.constraints`` projects onto ``OpenMMConfig.constraints``.
+        ``system_builder._create_system`` maps the string to
+        ``app.<NAME>``.
+        """
+        spec = MDSpec(
+            receptor_pdb="r",
+            peptide_pdb="p",
+            output_dir="o",
+            equilibration=_ACTIVIN_E_3_STAGES,
+            constraints="AllBonds",
+            production_ns=10.0,
+        )
+        cfg = OpenMMConfig.from_md_spec(spec)
+        assert cfg.constraints == "AllBonds"
+
+    def test_to_dict_includes_deferred_fields(self) -> None:
+        """``OpenMMConfig.to_dict`` must carry the 4 deferred fields so
+        ``system_config.json`` round-trips through disk without loss.
+        """
+        spec = _spec_with_custom_equilibration(50.0, 75.0, 150.0)
+        cfg = OpenMMConfig.from_md_spec(spec)
+        # Override one more field to test pme round-trip too.
+        cfg.pme = False
+        cfg.minimization_max_iterations = 20_000
+        cfg.constraints = "AllBonds"
+        sim: dict[str, object] = cfg.to_dict()["simulation"]  # type: ignore[assignment]
+        assert sim["equilibration_ps"] == [50.0, 75.0, 150.0]
+        assert sim["pme"] is False
+        assert sim["minimization_max_iterations"] == 20_000
+        assert sim["constraints"] == "AllBonds"
+
+
+# Helper: the canonical Activin-E 3-stage equilibration block, used
+# across multiple test methods above.
+_ACTIVIN_E_3_STAGES = (
+    {"name": "NVT", "ensemble": "NVT", "duration_ps": 100.0, "restraint_k": 1000.0},
+    {"name": "NPT-restrained", "ensemble": "NPT", "duration_ps": 100.0, "restraint_k": 100.0},
+    {"name": "NPT-free", "ensemble": "NPT", "duration_ps": 200.0, "restraint_k": 0.0},
+)
+
+
+def _extract_equilibration_ps_from_spec_for_test(spec: MDSpec) -> tuple[float, float, float]:
+    """Test-side mirror of ``_extract_equilibration_ps`` in config.py.
+
+    Required because pyright treats ``tuple[float, ...]`` as
+    indeterminate-length; we need an explicit 3-tuple annotation
+    to match the dataclass field type. Kept private to this test
+    module — the canonical extraction lives in ``from_md_spec``.
+    """
+    return (
+        float(spec.equilibration[0]["duration_ps"]),
+        float(spec.equilibration[1]["duration_ps"]),
+        float(spec.equilibration[2]["duration_ps"]),
+    )
