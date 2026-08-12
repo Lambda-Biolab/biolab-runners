@@ -4,14 +4,15 @@
 [![License](https://img.shields.io/badge/license-Apache_2.0-blue)](LICENSE)
 [![Tests](https://github.com/Lambda-Biolab/biolab-runners/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Lambda-Biolab/biolab-runners/actions/workflows/ci.yml)
 [![Dependabot Updates](https://github.com/Lambda-Biolab/biolab-runners/actions/workflows/dependabot/dependabot-updates/badge.svg?branch=main)](https://github.com/Lambda-Biolab/biolab-runners/actions/workflows/dependabot/dependabot-updates)
-Standalone, modular Python runners for **Boltz-2** structure prediction, **OpenMM** molecular dynamics, **RFdiffusion** backbone generation, **ProteinMPNN** sequence design, **Rosetta** InterfaceAnalyzer, and **GROMACS** integration.
+Standalone, modular Python runners for **Boltz-2** structure prediction, **OpenMM** molecular dynamics, **RFdiffusion** backbone generation, **ProteinMPNN** sequence design, **Rosetta** InterfaceAnalyzer, **GROMACS** integration, and **gmx_MMPBSA** per-residue decomposition.
 
 Extracted from the [OralBiome-AMP](https://github.com/Lambda-Biolab/OralBiome-AMP) pipeline for use in other research projects.
 
 ## Features
 
 - **Boltz2Runner** — Local GPU structure prediction with quality gating, MSA caching, pocket constraints, and dry-run mode
-- **OpenMMRunner** — Full MD pipeline: system building, 3-stage equilibration, production NPT, checkpointing, early abort, SIGTERM handling
+- **OpenMMRunner** — Full MD pipeline: system building, 3-stage equilibration, production NPT, checkpointing, early abort, SIGTERM handling. `OpenMMConfig.from_md_spec()` is the canonical construction path going forward (slice 12 — projects `bioml_tools.md.system_spec.MDSpec` onto the matching `OpenMMConfig` slot, with fail-closed allowlist for engine-specific overlays)
+- **GmxMMPBSARunner** (slice 14) — Optional gmx_MMPBSA integration for per-residue MM/PBSA decomposition. Gracefully degrades to `status="unsupported"` when the binary is missing
 - **RFdiffusionRunner** — Subprocess wrapper for unconditional / motif-scaffolding backbone generation (Hydra CLI translation)
 - **ProteinMPNNRunner** — Subprocess wrapper for fixed-backbone sequence design (CLI translation from biolab-runners contract to upstream `protein_mpnn_run.py`)
 - **RosettaRunner** — Subprocess wrapper for Rosetta InterfaceAnalyzer (license-gated; skips when the license is absent)
@@ -213,6 +214,94 @@ Note: very low pH (e.g. gastric) affects protonation of His/Asp/Glu/N-termini. V
 ```python
 result = runner.run(dry_run=True)  # Validates config, no GPU needed
 ```
+
+### OpenMM: canonical `MDSpec` → `OpenMMConfig` (slice 12)
+
+For new code, prefer the canonical construction path over the direct
+`OpenMMConfig(...)` keyword form. The `MDSpec` from
+[`bioml_tools.md.system_spec`](https://github.com/Lambda-Biolab/bioml-tools)
+is the engine-neutral source of truth for the MD protocol; pass it to
+`OpenMMConfig.from_md_spec()` and add OpenMM-only overlays as needed.
+
+```python
+from biolab_runners.openmm import OpenMMRunner
+from biolab_tools.md.system_spec import ACTIVIN_E_PRODUCTION_PROFILE, MDSpec
+
+# Canonical production profile (Amber99SB-ILDN / TIP3P / cubic / 1.0 nm padding /
+# 0.150 M NaCl / 310 K / PME / 50k-iter minimization cap / 100+100+200 ps
+# equilibration / 200 ns production). Defined in bioml-tools 1.9.0.
+spec = MDSpec.from_profile(
+    ACTIVIN_E_PRODUCTION_PROFILE,
+    receptor_pdb="receptor.pdb",
+    peptide_pdb="peptide.pdb",
+    output_dir="results/md/demo",
+    target="demo",
+    peptide_id="PEP001",
+)
+
+# Engine-specific overlays are passed via **engine_overrides; unknown
+# keys raise TypeError at the construction boundary.
+config = OpenMMConfig.from_md_spec(
+    spec,
+    openmm_platform="OpenCL",
+    target_irmsd_threshold_a=3.5,
+)
+
+runner = OpenMMRunner(config)
+result = runner.run()
+```
+
+The allowlist on `**engine_overrides` is fail-closed: only
+`openmm_platform`, `water_ff_xml`, `extra_forcefields`, and
+`target_irmsd_threshold_a` are accepted. Engine-neutral fields
+(force field, water model, box geometry, ionic strength, temperature,
+production ns) live on the `MDSpec` and must be changed there, not
+via `from_md_spec`.
+
+### gmx_MMPBSA per-residue decomposition (slice 14)
+
+`GmxMMPBSARunner` (in `biolab_runners.mmpbsa`) drives the
+[gmx_MMPBSA](https://github.com/Valdes-Tresanco-MS/gmx_MMPBSA) CLI
+for per-residue MM/PBSA decomposition of a finished MD trajectory.
+The runner is **opt-in** — when the binary is missing (no AmberTools
+install, no container), `run()` returns `status="unsupported"` and
+an empty `per_residue_records` list, not a fabricated value. This
+matches the slice-14 acceptance contract: missing optional tooling
+must not break the calling pipeline.
+
+```python
+from biolab_runners.mmpbsa import GmxMMPBSARunner, GmxMMPBSAStatus
+from biolab_runners.openmm import OpenMMConfig
+
+config = OpenMMConfig(
+    receptor_pdb="receptor.pdb",
+    peptide_pdb="peptide.pdb",
+    output_dir="results/md/demo",
+    target="demo",
+    peptide_id="PEP001",
+)
+
+runner = GmxMMPBSARunner(
+    config=config,
+    prefix="demo_residue_decomposition",
+    mmpbsa_binary="gmx_MMPBSA",  # or "container://docker://valdes-tre/msdocker:latest"
+)
+result = runner.run()
+
+if result["status"] == GmxMMPBSAStatus.SUCCEEDED:
+    for record in result["per_residue_records"]:
+        print(f"{record.residue} ({record.chain}): "
+              f"ΔG = {record.total_A:.2f} kcal/mol")
+elif result["status"] == GmxMMPBSAStatus.UNSUPPORTED:
+    # gmx_MMPBSA not on PATH; slice 14 graceful-degradation path.
+    logger.info("Per-residue decomposition skipped: gmx_MMPBSA not installed")
+```
+
+The `mmpbsa_binary` accepts either a bare command name (PATH lookup)
+or a `container://<engine>://<image>` URL (delegated to whichever
+container runtime you've configured). `parse_residue_decomposition`
+exposes the per-residue `.dat` parser for direct use without
+re-running gmx_MMPBSA.
 
 ## Quality Gates (Boltz-2)
 

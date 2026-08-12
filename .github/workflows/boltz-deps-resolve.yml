@@ -39,6 +39,17 @@ jobs:
           python-version: "3.12"
           enable-cache: true
           cache-dependency-glob: "uv.lock"
+      - name: Register PAT for private bioml-tools fetch
+        # Same as ci.yml typecheck-test step. The [openmm] extra
+        # pins ``bioml-tools @ git+...v1.9.0`` to the private
+        # Lambda-Biolab/bioml-tools repo. gh auth setup-git
+        # registers a credential helper so uv's underlying git
+        # fetch can authenticate.
+        env:
+          BIOML_PAT: ${{ secrets.GH_BIOML_TOOLS_TOKEN }}
+        run: |
+          echo "$BIOML_PAT" | gh auth login --with-token
+          gh auth setup-git
       - name: Resolve biolab-runners[all]
         # Catches dep-resolution breakages (e.g. boltz pinning numpy<2.0
         # conflicting with mdtraj requiring numpy>=2.0). No install —

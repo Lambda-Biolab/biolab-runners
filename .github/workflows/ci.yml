@@ -111,6 +111,25 @@ jobs:
         python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Register PAT for private bioml-tools fetch
+        # The [openmm] extra pins ``bioml-tools @ git+...v1.9.0`` to
+        # the private Lambda-Biolab/bioml-tools repo. Default
+        # GITHUB_TOKEN can't reach cross-org private deps. We use
+        # gh auth setup-git to register a credential helper for
+        # ``git fetch`` of private repos, then uv (which shells
+        # out to git) inherits the helper. Follow-up: publish
+        # bioml-tools to PyPI and remove this step.
+        #
+        # Note: the env var must NOT be named GH_TOKEN — gh
+        # refuses to authenticate when GH_TOKEN is set in the
+        # environment, since it interprets the variable as a
+        # pre-existing session and skips the login flow. Pass it
+        # through a different name and pipe it via stdin.
+        env:
+          BIOML_PAT: ${{ secrets.GH_BIOML_TOOLS_TOKEN }}
+        run: |
+          echo "$BIOML_PAT" | gh auth login --with-token
+          gh auth setup-git
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:

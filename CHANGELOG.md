@@ -6,6 +6,57 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- **Slice 12 (MD-OPENMM-001) — `OpenMMConfig.from_md_spec` classmethod**:
+  the canonical construction path going forward. Projects every
+  engine-neutral field on `bioml_tools.md.system_spec.MDSpec` (added
+  in bioml-tools 1.9.0) onto the matching `OpenMMConfig` slot, and
+  accepts OpenMM-only overlays (`openmm_platform`, `water_ff_xml`,
+  `extra_forcefields`, `target_irmsd_threshold_a`) via
+  `**engine_overrides`. The allowlist is fail-closed — unknown
+  engine-specific keys raise `TypeError` at the construction boundary
+  (catches the "production_NS vs production_ns" typo class).
+
+  Deferred fields (carried on the spec, not yet honored by the
+  runner — the runner's hardcoded 100/100/200 ps equilibration,
+  PME=True, 50k-iter minimization cap currently match
+  `ACTIVIN_E_PRODUCTION_PROFILE`, so dropping them is silent for
+  the only registered profile today): `equilibration_ps`,
+  `pme`, `minimization_max_iterations`, `constraints`. The
+  `MDSpec` carries them so a reviewer-signed-off profile change
+  round-trips through the JSON wire format; the runner-side
+  wiring is tracked as a follow-up.
+
+- **Slice 14 (BMT-MD-001) — `biolab_runners.mmpbsa` package**:
+  optional gmx_MMPBSA integration. The runner gracefully degrades
+  to `status="unsupported"` when the binary is missing — slice 14
+  acceptance: missing optional tooling yields `unsupported`, not a
+  fabricated value. Public surface:
+  `GmxMMPBSARunner` (subprocess wrapper around gmx_MMPBSA's
+  per-residue decomposition), `GmxMMPBSAStatus` (single class
+  object, defined in `runner.py` next to the only emitter, and
+  re-exported from the package root), `GmxMMPBSARecord`
+  (per-energy-component breakdown), `gmx_mmpbsa_available`
+  (PATH probe), `parse_residue_decomposition` (file parser for
+  the `<prefix>_residue_decomposition_*.dat` output). The
+  `parse_residue_decomposition` function was refactored from
+  cognitive complexity 24 to 8 via five single-purpose helpers
+  (`_read_lines`, `_is_skippable_line`, `_split_chain_residue`,
+  `_parse_energy_tokens`, `_build_record`) to satisfy the
+  biolab-runners complexity gate (15).
+
+- **CI: private-repo dep resolution**: the `[openmm]` extra pins
+  `bioml-tools @ git+https://github.com/Lambda-Biolab/bioml-tools.git@v1.9.0`
+  (a private repo on the same GitHub org). The default `GITHUB_TOKEN`
+  on a public repo's CI runner can't read cross-org private deps, so
+  `uv sync` failed with "could not read Username for 'github.com'".
+  Add a `GH_BIOML_TOOLS_TOKEN` PAT as a repo secret and pipe it
+  through `gh auth login --with-token` + `gh auth setup-git` in
+  `ci.yml` and `boltz-deps-resolve.yml` so the credential helper
+  is registered before `uv sync` runs.
+
+  Follow-up: publish bioml-tools to PyPI (Lambda-Biolab/bioml-tools#43)
+  and drop the git URL + the `GH_BIOML_TOOLS_TOKEN` secret.
+
 - **CI workflow fix (`boltz-deps-resolve.yml`)**: `uv lock --upgrade --all-extras`
   was the nightly dep-resolution job failing every run. The `--all-extras`
   flag is invalid for `uv lock` (it is only valid for `uv sync`). Fix:
