@@ -39,6 +39,17 @@ jobs:
           python-version: "3.12"
           enable-cache: true
           cache-dependency-glob: "uv.lock"
+      - name: Register PAT for private bioml-tools fetch
+        # Same as ci.yml typecheck-test step. The [openmm] extra
+        # pins ``bioml-tools @ git+...v1.9.0`` to the private
+        # Lambda-Biolab/bioml-tools repo. gh auth setup-git
+        # registers a credential helper so uv's underlying git
+        # fetch can authenticate.
+        env:
+          GH_TOKEN: ${{ secrets.GH_BIOML_TOOLS_TOKEN }}
+        run: |
+          echo "$GH_TOKEN" | gh auth login --with-token
+          gh auth setup-git
       - name: Resolve biolab-runners[all]
         # Catches dep-resolution breakages (e.g. boltz pinning numpy<2.0
         # conflicting with mdtraj requiring numpy>=2.0). No install —
@@ -48,23 +59,10 @@ jobs:
         # `uv sync` flag). `--upgrade` alone is sufficient — extras are
         # part of the project's own dep tree, so the upgrade considers
         # them without explicit specification.
-        #
-        # GH_BIOML_TOOLS_TOKEN: same as ci.yml — the [openmm] extra
-        # pins ``bioml-tools @ git+...v1.9.0`` which is a private
-        # repo. Without auth, ``uv sync --all-extras`` can't resolve
-        # the [openmm] pin. Follow-up: publish bioml-tools to PyPI.
-        env:
-          GH_BIOML_TOOLS_TOKEN: ${{ secrets.GH_BIOML_TOOLS_TOKEN }}
-          UV_GIT_USERNAME: oauth2
-          UV_GIT_PASSWORD: ${{ secrets.GH_BIOML_TOOLS_TOKEN }}
         run: uv lock --upgrade
       - name: Verify import of every boltz-touching module
         # Smoke-imports biolab_runners.boltz2.* to catch missing
         # imports / type stub breakages that resolution alone misses.
-        env:
-          GH_BIOML_TOOLS_TOKEN: ${{ secrets.GH_BIOML_TOOLS_TOKEN }}
-          UV_GIT_USERNAME: oauth2
-          UV_GIT_PASSWORD: ${{ secrets.GH_BIOML_TOOLS_TOKEN }}
         run: |
           uv sync --frozen --all-extras --group dev
           uv run python -c "
