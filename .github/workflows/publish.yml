@@ -1,0 +1,61 @@
+name: Publish to PyPI
+
+# Builds an sdist + wheel for biolab-runners and publishes to
+# PyPI when a ``v*.*.*`` tag is pushed to main.
+#
+# Uses PyPI's trusted publishing (OIDC) — no long-lived API
+# token stored in the repo's secrets. The operator must register
+# this workflow as a "trusted publisher" on the PyPI project
+# page (https://pypi.org/manage/project/biolab-runners/settings/publishing/).
+#
+# Operator checkpoint:
+#   1. Create the PyPI project (https://pypi.org/manage/project/biolab-runners/).
+#   2. Register this workflow as a trusted publisher:
+#      - Owner: Lambda-Biolab
+#      - Repository: Lambda-Biolab/biolab-runners
+#      - Workflow file: publish.yml
+#      - Environment: (leave blank)
+#   3. Push a ``v*.*.*`` tag — this workflow builds + publishes.
+
+"on":
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write  # Required for PyPI trusted publishing (OIDC).
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Build sdist + wheel
+        run: uv build --out-dir dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@67339c736fd9354cd4f8cb0a744c4c9f1c6333eb # v1.10.3
+        with:
+          packages-dir: dist/
+
+  verify-tag-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Verify tag matches pyproject version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PYPROJECT_VERSION="$(uv run --no-sync python -c 'import tomllib; print(tomllib.loads(open("pyproject.toml").read())["project"]["version"])')"
+          if [ "$TAG_VERSION" != "$PYPROJECT_VERSION" ]; then
+            echo "::error::Tag version $TAG_VERSION does not match pyproject.toml version $PYPROJECT_VERSION"
+            exit 1
+          fi
