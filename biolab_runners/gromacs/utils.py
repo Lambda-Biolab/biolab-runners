@@ -1,14 +1,42 @@
-"""CLI + availability helpers for the GROMACS runner."""
+"""CLI + availability helpers for the GROMACS runner, plus the protocol manifest.
+
+This module owns:
+
+- :func:`gromacs_available` — PATH probe (preserved from S3).
+- :class:`GromacsRecord` and :class:`GromacsRecordStatus` — the
+  per-run record (preserved from S3).
+- :func:`parse_nthcol_energy` — ``.xvg`` parser (preserved from S3).
+- :func:`invoke` — the thin ``gmx mdrun`` subprocess wrapper
+  (preserved from S3; the S4 protocol runner calls ``subprocess.run``
+  directly so it can install a SIGTERM handler before invoking the
+  child).
+
+The S4 additions are at the bottom of the file:
+
+- :func:`load_stage_manifest` / :func:`save_stage_manifest` /
+  :func:`record_stage_status` — the structured stage manifest I/O.
+  The manifest is a JSON file at ``work_dir /
+  GromacsFiles.STAGE_MANIFEST``; the runner reads it to decide
+  skip-vs-resume-vs-fresh on every invocation and writes it
+  progressively after each stage completes.
+
+The manifest schema is versioned (``schema_version = 1``); a future
+version that breaks the schema MUST bump the version and gate
+the loader on it.
+"""
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
 import shutil
 import subprocess
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -18,8 +46,13 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "GromacsRecord",
     "GromacsRecordStatus",
+    "StageStatus",
     "gromacs_available",
+    "invoke",
+    "load_stage_manifest",
     "parse_nthcol_energy",
+    "record_stage_status",
+    "save_stage_manifest",
 ]
 
 
@@ -56,8 +89,6 @@ _FLOAT_RE = re.compile(r"^[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$")
 
 def gromacs_available(timeout_seconds: int = 30) -> bool:
     """Return True when the GROMACS CLI is callable."""
-    import os
-
     binary = os.environ.get("GROMACS_BIN", "gmx")
     if binary.startswith("container://"):
         return True
@@ -78,8 +109,6 @@ def gromacs_available(timeout_seconds: int = 30) -> bool:
 
 def _resolved_binary() -> list[str]:
     """Return the command prefix used to invoke ``gmx``."""
-    import os
-
     binary = os.environ.get("GROMACS_BIN", "gmx")
     if binary.startswith("container://"):
         spec = binary[len("container://") :]
@@ -119,7 +148,13 @@ def invoke(
     binary_prefix: list[str] | None = None,
     timeout_seconds: int = 86400,
 ) -> int:
-    """Run ``gmx mdrun`` once; returns the process exit code."""
+    """Run ``gmx mdrun`` once; returns the process exit code.
+
+    Used by the legacy one-shot runner; the S4 protocol runner calls
+    ``subprocess.run`` / ``subprocess.Popen`` directly so it can
+    install a SIGTERM handler before invoking the child (Spot /
+    preemption semantics).
+    """
     prefix = binary_prefix if binary_prefix is not None else _resolved_binary()
     output_dir.mkdir(parents=True, exist_ok=True)
     args = [
@@ -160,3 +195,140 @@ def invoke(
         time.monotonic() - started,
     )
     return completed.returncode
+
+
+# ---------------------------------------------------------------------------
+# S4 stage manifest
+# ---------------------------------------------------------------------------
+
+
+class StageStatus:
+    """Outcome states recorded in the structured stage manifest.
+
+    The runner writes one of these strings into
+    ``stage_record["status"]`` after each stage completes. A
+    ``PENDING`` stage is one the runner has not yet attempted;
+    ``RUNNING`` is set when the subprocess is launched and cleared
+    when the subprocess returns (Spot interruption leaves
+    ``RUNNING`` for the next invocation to detect and recover from).
+    """
+
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+_STAGE_MANIFEST_SCHEMA_VERSION = 1
+_STAGE_MANIFEST_STATUSES = frozenset(
+    {
+        StageStatus.PENDING,
+        StageStatus.RUNNING,
+        StageStatus.COMPLETED,
+        StageStatus.FAILED,
+    }
+)
+
+
+def load_stage_manifest(work_dir: Path) -> dict[str, Any]:
+    """Load the structured stage manifest from ``work_dir``.
+
+    Returns a fresh empty manifest when the file does not exist
+    (the runner treats the absent-manifest case as "no stages have
+    ever completed" and starts at the topology stage). Returns
+    the on-disk manifest when present, regardless of schema
+    version (the runner is forward-compatible by ignoring extra
+    keys).
+
+    Returns:
+        The manifest as a ``dict``; ``{"stages": {<kind>: {...}}}``
+        keyed by :class:`biolab_runners.gromacs.protocol.StageKind`
+        values. A fresh manifest is
+        ``{"schema_version": 1, "stages": {}}``.
+    """
+    # Local import to avoid a circular dependency
+    # (utils ↔ protocol ↔ paths are import-clean today; this comment
+    # documents the seam).
+    from biolab_runners.gromacs.paths import GromacsFiles
+
+    manifest_path = work_dir / GromacsFiles.STAGE_MANIFEST
+    if not manifest_path.exists():
+        return {"schema_version": _STAGE_MANIFEST_SCHEMA_VERSION, "stages": {}}
+    try:
+        data = json.loads(manifest_path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Manifest at %s is unreadable (%s); starting fresh", manifest_path, exc)
+        return {"schema_version": _STAGE_MANIFEST_SCHEMA_VERSION, "stages": {}}
+    if not isinstance(data, dict) or "stages" not in data:
+        return {"schema_version": _STAGE_MANIFEST_SCHEMA_VERSION, "stages": {}}
+    if not isinstance(data["stages"], dict):
+        return {"schema_version": _STAGE_MANIFEST_SCHEMA_VERSION, "stages": {}}
+    return data
+
+
+def save_stage_manifest(work_dir: Path, manifest: dict[str, Any]) -> None:
+    """Atomically write the stage manifest to ``work_dir``.
+
+    Atomicity is via ``os.replace`` on a temp file in the same
+    directory — a crash mid-write leaves the previous manifest
+    intact (the runner's skip-vs-resume decision is conservative
+    under that condition: a missing stage record forces a re-run).
+    """
+    from biolab_runners.gromacs.paths import GromacsFiles
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = work_dir / GromacsFiles.STAGE_MANIFEST
+    tmp_path = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    os.replace(str(tmp_path), str(manifest_path))
+
+
+def record_stage_status(
+    work_dir: Path,
+    stage_kind: str,
+    status: str,
+    *,
+    outputs: tuple[str, ...] = (),
+    command: str = "",
+    started_at: str | None = None,
+    completed_at: str | None = None,
+    error: str = "",
+) -> None:
+    """Record a stage's outcome into the manifest.
+
+    Loads the current manifest, updates the ``stage_kind`` record,
+    and saves atomically. The status MUST be one of the
+    :class:`StageStatus` values; an invalid status raises
+    ``ValueError`` (the caller is responsible for translating
+    subprocess exit codes into one of the four canonical states).
+    """
+    if status not in _STAGE_MANIFEST_STATUSES:
+        raise ValueError(
+            f"invalid status {status!r}; must be one of {sorted(_STAGE_MANIFEST_STATUSES)}"
+        )
+    manifest = load_stage_manifest(work_dir)
+    record: dict[str, Any] = manifest["stages"].get(stage_kind, {})
+    record["status"] = status
+    if outputs:
+        record["outputs"] = list(outputs)
+    if command:
+        record["command"] = command
+    if started_at is not None:
+        record["started_at"] = started_at
+    if completed_at is not None:
+        record["completed_at"] = completed_at
+    if error:
+        record["error"] = error
+    manifest["stages"][stage_kind] = record
+    save_stage_manifest(work_dir, manifest)
+
+
+def now_utc_iso() -> str:
+    """Return the current UTC time as an ISO-8601 string.
+
+    The runner stamps ``started_at`` and ``completed_at`` on each
+    stage record. The format is ``YYYY-MM-DDTHH:MM:SS.ffffff+00:00``
+    (microsecond precision; matches the OpenMM checkpoint module's
+    convention).
+    """
+    return datetime.now(tz=UTC).isoformat()
