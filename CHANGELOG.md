@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- **CI / release**: `.github/workflows/publish.yml` publishes
+  biolab-runners to PyPI on `v*.*.*` tag push using PyPI's
+  trusted publishing (OIDC, no long-lived API token). Operator
+  checkpoint: register this workflow as a "trusted publisher" on
+  https://pypi.org/manage/project/biolab-runners/settings/publishing/
+  (Owner: Lambda-Biolab, Repository: Lambda-Biolab/biolab-runners,
+  Workflow file: publish.yml). Closes #190.
+
 - **Slice 12 (MD-OPENMM-001) — `OpenMMConfig.from_md_spec` classmethod**:
   the canonical construction path going forward. Projects every
   engine-neutral field on `bioml_tools.md.system_spec.MDSpec` (added
