@@ -19,6 +19,8 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from biolab_runners.provenance import InvokeResult, stderr_tail
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -27,6 +29,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "RecordData",
     "RecordDataStatus",
+    "invoke",
     "parse_backbone_pdb",
     "rfdiffusion_available",
 ]
@@ -162,18 +165,20 @@ _THREE_TO_ONE: dict[str, str] = {
 }
 
 
-def invoke(
+def _invoke_with_metadata(
     *,
     config_dict: dict[str, str],
     output_dir: Path,
     binary_prefix: list[str] | None = None,
     timeout_seconds: int = 3600,
-) -> int:
-    """Run RFdiffusion once; returns the process exit code.
+) -> InvokeResult:
+    """Internal helper: run RFdiffusion once and capture rich metadata.
 
-    Callers should use :class:`RFdiffusionRunner` instead of invoking
-    this directly; it is exposed for tests that want to stub the
-    process execution.
+    Returns an :class:`InvokeResult` carrying the exit code, a
+    512-char stderr tail, the timeout flag, and a short failure
+    reason. Public callers use the legacy :func:`invoke` wrapper
+    (which discards everything except the exit code); the S2
+    provenance wiring uses this helper directly.
     """
     prefix = binary_prefix if binary_prefix is not None else _resolved_binary()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -196,12 +201,38 @@ def invoke(
             timeout=timeout_seconds,
             check=False,
         )
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
         logger.error("RFdiffusion timed out after %ds", timeout_seconds)
-        return 124
-    logger.info(
-        "RFdiffusion run finished rc=%d in %.1fs",
-        completed.returncode,
-        time.monotonic() - started,
-    )
-    return completed.returncode
+        return InvokeResult(
+            exit_code=124,
+            stderr_tail=stderr_tail(exc.stderr),
+            timed_out=True,
+            failure_reason=f"timeout after {timeout_seconds}s",
+        )
+    elapsed = time.monotonic() - started
+    logger.info("RFdiffusion run finished rc=%d in %.1fs", completed.returncode, elapsed)
+    return InvokeResult.from_stderr(exit_code=completed.returncode, stderr=completed.stderr)
+
+
+def invoke(
+    *,
+    config_dict: dict[str, str],
+    output_dir: Path,
+    binary_prefix: list[str] | None = None,
+    timeout_seconds: int = 3600,
+) -> int:
+    """Run RFdiffusion once; returns the process exit code.
+
+    Callers should use :class:`RFdiffusionRunner` instead of invoking
+    this directly; it is exposed for tests that want to stub the
+    process execution. The legacy ``int`` return type is preserved
+    for backward compatibility — new code that needs stderr /
+    timeout metadata should call :func:`_invoke_with_metadata`
+    instead (it is the implementation that backs this function).
+    """
+    return _invoke_with_metadata(
+        config_dict=config_dict,
+        output_dir=output_dir,
+        binary_prefix=binary_prefix,
+        timeout_seconds=timeout_seconds,
+    ).exit_code

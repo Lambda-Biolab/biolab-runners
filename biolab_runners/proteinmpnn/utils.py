@@ -10,6 +10,8 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from biolab_runners.provenance import InvokeResult, stderr_tail
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -18,6 +20,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "DesignRecord",
     "DesignRecordStatus",
+    "invoke",
     "parse_fasta_sequences",
     "proteinmpnn_available",
 ]
@@ -136,15 +139,22 @@ def _parse_header(line: str) -> str:
     return match.group(1) if match else ""
 
 
-def invoke(
+def _invoke_with_metadata(
     *,
     config_dict: dict[str, str],
     input_pdb: Path,
     output_dir: Path,
     binary_prefix: list[str] | None = None,
     timeout_seconds: int = 3600,
-) -> int:
-    """Run ProteinMPNN once; returns the process exit code."""
+) -> InvokeResult:
+    """Internal helper: run ProteinMPNN once and capture rich metadata.
+
+    Returns an :class:`InvokeResult` carrying the exit code, a
+    512-char stderr tail, the timeout flag, and a short failure
+    reason. Public callers use the legacy :func:`invoke` wrapper
+    (which discards everything except the exit code); the S2
+    provenance wiring uses this helper directly.
+    """
     prefix = binary_prefix if binary_prefix is not None else _resolved_binary()
     output_dir.mkdir(parents=True, exist_ok=True)
     extra_args: list[str] = []
@@ -170,12 +180,37 @@ def invoke(
             timeout=timeout_seconds,
             check=False,
         )
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
         logger.error("ProteinMPNN timed out after %ds", timeout_seconds)
-        return 124
-    logger.info(
-        "ProteinMPNN run finished rc=%d in %.1fs",
-        completed.returncode,
-        time.monotonic() - started,
-    )
-    return completed.returncode
+        return InvokeResult(
+            exit_code=124,
+            stderr_tail=stderr_tail(exc.stderr),
+            timed_out=True,
+            failure_reason=f"timeout after {timeout_seconds}s",
+        )
+    elapsed = time.monotonic() - started
+    logger.info("ProteinMPNN run finished rc=%d in %.1fs", completed.returncode, elapsed)
+    return InvokeResult.from_stderr(exit_code=completed.returncode, stderr=completed.stderr)
+
+
+def invoke(
+    *,
+    config_dict: dict[str, str],
+    input_pdb: Path,
+    output_dir: Path,
+    binary_prefix: list[str] | None = None,
+    timeout_seconds: int = 3600,
+) -> int:
+    """Run ProteinMPNN once; returns the process exit code.
+
+    Legacy ``int`` return type — preserved for backward compatibility.
+    New code that needs stderr / timeout metadata should call
+    :func:`_invoke_with_metadata` directly.
+    """
+    return _invoke_with_metadata(
+        config_dict=config_dict,
+        input_pdb=input_pdb,
+        output_dir=output_dir,
+        binary_prefix=binary_prefix,
+        timeout_seconds=timeout_seconds,
+    ).exit_code
