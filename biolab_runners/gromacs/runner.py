@@ -288,9 +288,9 @@ def _stage_already_complete(work_dir: Path, stage: ProtocolStage) -> bool:
 def _outputs_complete_on_disk(work_dir: Path, stage: ProtocolStage) -> bool:
     """True iff every MINIMUM output for the stage is on disk and non-empty.
 
-    Used as a fallback when the manifest is silent (e.g. a Spot
-    reclaim that lost the manifest write — the outputs may have
-    survived).
+    Used only by the legacy manifest-silent recovery fallback in
+    :meth:`GromacsProtocolRunner._run_single_stage`; the runner's
+    guard requires a silent manifest and no on-disk ``.cpt``.
 
     **Uses ``stage_minimum_outputs``, NOT ``stage_outputs_for``.**
     The minimum set is the strict subset of files that ``gmx``
@@ -491,10 +491,11 @@ class GromacsProtocolRunner:
     - **Manifest authority**: the manifest is the source of truth.
       A stage whose manifest record is ``completed`` is **skipped**
       (no subprocess launched) — this is the skip counter.
-    - **Output fallback**: when the manifest is silent (Spot
-      reclaim that lost the manifest write) but every canonical
-      output is on disk and non-empty, the runner treats the
-      stage as complete and records it as such.
+    - **Output fallback**: when the manifest is silent, no
+      ``.cpt`` is on disk, and every canonical output is
+      non-empty, the runner treats the stage as complete
+      (legacy recovery). An on-disk ``.cpt`` always routes
+      to the execution path so ``-cpi`` resume is preserved.
     - **MD stage resume**: an MD stage with a ``.cpt`` on disk
       resumes via ``gmx grompp -t <cpt>`` + ``gmx mdrun -cpi
       <cpt> -append``. Without ``.cpt``, the stage starts fresh
@@ -505,8 +506,9 @@ class GromacsProtocolRunner:
       given up to 30 s to write its periodic ``.cpt`` and exit.
       The stage is recorded as ``running`` (not ``failed``) so
       the next invocation sees the on-disk ``.cpt`` and resumes.
-      The runner returns ``interrupted`` (not ``failed``) in the
-      per-stage accounting.
+      The runner returns ``interrupted`` (not ``failed``) and
+      halts at the interrupted stage, so a missing-input FAILED
+      cannot overwrite the truthful interruption result.
     - **``nt_threads=0``**: the runner OMITS ``-nt`` so GROMACS
       auto-detects the host thread count (the recommended default
       on cloud VMs where you don't know the vCPU count a priori).
@@ -579,14 +581,14 @@ class GromacsProtocolRunner:
                 # a dry-run validation.
                 validated += 1
             elif status == "interrupted":
+                # Halt: a missing-input FAILED on the next stage
+                # would overwrite the truthful interruption result.
+                # The next invocation re-enters the RUNNING stage
+                # via the on-disk ``.cpt`` (or restarts fresh).
                 interrupted += 1
-                # Don't halt: a Spot reclaim that interrupted an
-                # earlier stage should NOT prevent later stages from
-                # being attempted (they'll find their inputs missing
-                # and fail fast, which is the right signal). However,
-                # for clarity we record the first interruption's rc.
                 exit_code = rc
-                continue
+                error = f"stage {stage.kind.value} interrupted by SIGTERM (rc={rc})"
+                break
             elif status == StageStatus.FAILED:
                 failed += 1
                 exit_code = rc
@@ -624,14 +626,21 @@ class GromacsProtocolRunner:
           scratch.
         - Manifest says COMPLETED → record COMPLETED, return
           (``was_skipped=True``).
-        - Manifest silent + outputs on disk → mark COMPLETED in
-          the manifest, return (``was_skipped=True``; this is the
-          Spot-reclaim recovery path).
+        - Manifest silent AND no ``.cpt`` AND minimum outputs on
+          disk → mark COMPLETED, return ``was_skipped=True``
+          (LEGACY recovery path; see the guard below).
         - Otherwise: emit ``.mdp``, build commands, execute.
 
         MD-stage resume:
         - ``.cpt`` exists → resume via ``-cpi`` + ``-append``.
         - No ``.cpt`` → start fresh.
+
+        INTERRUPTED-STAGE RECOVERY: a RUNNING manifest or an
+        on-disk ``.cpt`` is always re-entered via the execution
+        path. The legacy disk-output fallback fires only when the
+        manifest is silent AND no ``.cpt`` exists, so a
+        post-SIGTERM state is never silently promoted to
+        ``COMPLETED``.
         """
         # --- Manifest authority check ---
         if not config.force and _stage_already_complete(work_dir, stage):
@@ -644,18 +653,26 @@ class GromacsProtocolRunner:
             )
             return StageStatus.COMPLETED, 0, True
 
-        # --- Output fallback (manifest silent but outputs present) ---
-        if not config.force and _outputs_complete_on_disk(work_dir, stage):
-            # Spot-reclaim recovery: manifest was lost but outputs
-            # survived. Mark COMPLETED so subsequent invocations
-            # honour manifest authority.
-            record_stage_status(
-                work_dir,
-                stage.kind.value,
-                StageStatus.COMPLETED,
-                outputs=stage_minimum_outputs(stage.kind, stage.prefix),
-            )
-            return StageStatus.COMPLETED, 0, True
+        # --- Legacy disk-output fallback (manifest silent + no .cpt) ---
+        # Without this guard, a Spot-reclaim RUNNING manifest with
+        # on-disk outputs would be promoted to COMPLETED here,
+        # silently dropping the -cpi resume. A non-silent manifest
+        # status or an available .cpt routes to the execution path.
+        if not config.force:
+            manifest_record = load_stage_manifest(work_dir).get("stages", {}).get(stage.kind.value)
+            manifest_status = manifest_record.get("status") if manifest_record else None
+            if (
+                manifest_status is None
+                and _checkpoint_for(work_dir, stage) is None
+                and _outputs_complete_on_disk(work_dir, stage)
+            ):
+                record_stage_status(
+                    work_dir,
+                    stage.kind.value,
+                    StageStatus.COMPLETED,
+                    outputs=stage_minimum_outputs(stage.kind, stage.prefix),
+                )
+                return StageStatus.COMPLETED, 0, True
 
         # --- Emit .mdp and build commands ---
         _emit_mdp(work_dir, stage, config)
