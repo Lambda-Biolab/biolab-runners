@@ -450,3 +450,19 @@ def test_rfdiffusion_runner_availablity_check_works() -> None:
     assert isinstance(result, bool), (
         f"rfdiffusion_available returned non-bool: {type(result).__name__}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Rosetta (real-binary smoke is an external gate — see rosetta/__init__.py)
+# ---------------------------------------------------------------------------
+#
+# The Rosetta runner is license-gated and cannot be exercised on a
+# vanilla dev workstation. Pure-Python parser/translation coverage
+# lives in ``tests/test_rosetta_runner.py`` (synthetic fixtures modeling
+# known upstream scorefile headers). A real-binary roundtrip is left
+# as an external gate for operators with a licensed install: see the
+# module docstring on :mod:`biolab_runners.rosetta` for the entry
+# points (``parse_relax_score``, ``parse_score_files``, ``RosettaRunner``)
+# to assert against a verified scorefile. A pure-Python test here would
+# duplicate the unit suite without adding coverage, so it is
+# intentionally absent.
