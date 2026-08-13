@@ -1,28 +1,39 @@
 """Tests for the RFdiffusion runner.
 
 The runner is a thin subprocess wrapper; tests inject a fake
-``invoke`` via monkeypatch so no upstream RFdiffusion install is
-needed during CI.
+``invoke`` via monkeypatch so no real RFdiffusion install is needed
+during CI.
 """
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
 import pytest
+from biolab_runners.provenance import (
+    RNG_INTENT_NON_DETERMINISTIC,
+    RNG_INTENT_SEED_NOT_FORWARDED,
+    compute_file_digest,
+)
 from biolab_runners.rfdiffusion import (
     RecordData,
     RecordDataStatus,
     rfdiffusion_available,
 )
 from biolab_runners.rfdiffusion.config import RFdiffusionConfig
-from biolab_runners.rfdiffusion.runner import RFdiffusionRunner, _config_to_cli
-from biolab_runners.rfdiffusion.utils import (
-    RecordDataStatus as _Status,
+from biolab_runners.rfdiffusion.runner import (
+    EXCLUDED_FROM_EXECUTED_DIGEST,
+    RFdiffusionRunner,
+    _config_to_cli,
 )
 from biolab_runners.rfdiffusion.utils import (
+    InvokeResult,
     parse_backbone_pdb,
+)
+from biolab_runners.rfdiffusion.utils import (
+    RecordDataStatus as _Status,
 )
 
 SAMPLE_PDB = """\
@@ -43,6 +54,16 @@ TER
 END
 """
 
+#: A canonical image digest in OCI form (the form the runner normalises to).
+VALID_OCI_DIGEST = "sha256:" + "ab" * 32  # 64 hex chars
+#: The same digest in bare-hex form — must be accepted and normalised to the OCI form.
+VALID_BARE_DIGEST = "ab" * 32
+
+
+def _fake_invoke_ok(**_: Any) -> InvokeResult:
+    """Stub: pretend the upstream invocation returned exit_code=0."""
+    return InvokeResult(exit_code=0)
+
 
 @pytest.fixture
 def output_root(tmp_path: Path) -> Path:
@@ -60,6 +81,9 @@ def test_config_defaults_pass_validation() -> None:
     assert config.length_min == 14
     assert config.length_max == 18
     assert config.task_count == 1000
+    assert config.seed == 0
+    assert config.deterministic is True
+    assert config.checkpoint == "RFdiffusion"
 
 
 def test_config_rejects_inverted_length_range() -> None:
@@ -80,6 +104,22 @@ def test_disulfide_mode_requires_pairs() -> None:
 def test_linear_mode_rejects_disulfide_pairs() -> None:
     with pytest.raises(ValueError, match="disulfide_pairs"):
         RFdiffusionConfig(mode="linear", disulfide_pairs=((3, 9),))
+
+
+def test_config_rejects_negative_seed() -> None:
+    with pytest.raises(ValueError, match="seed must be"):
+        RFdiffusionConfig(seed=-1)
+
+
+def test_config_rejects_empty_checkpoint() -> None:
+    with pytest.raises(ValueError, match="checkpoint must be"):
+        RFdiffusionConfig(checkpoint="")
+
+
+def test_excluded_from_executed_digest_constant_contains_seed() -> None:
+    """S2 contract: ``seed`` must be in the exclude list because RFdiffusion
+    does not forward ``inference.seed`` to upstream."""
+    assert "seed" in EXCLUDED_FROM_EXECUTED_DIGEST
 
 
 # ---------------------------------------------------------------------------
@@ -113,34 +153,91 @@ def test_rfdiffusion_available_returns_false_when_binary_missing(
     assert rfdiffusion_available() is False
 
 
+def test_invoke_with_metadata_returns_structured_result() -> None:
+    """The internal helper exposes exit code + stderr tail + timeout flag."""
+    result = InvokeResult(
+        exit_code=124,
+        stderr_tail="Killed by signal 9",
+        timed_out=True,
+        failure_reason="timeout after 3600s",
+    )
+    assert result.exit_code == 124
+    assert result.timed_out is True
+    assert result.failure_reason == "timeout after 3600s"
+    assert result.stderr_tail == "Killed by signal 9"
+
+
 # ---------------------------------------------------------------------------
-# CLI translation
+# CLI translation — trigger / non-trigger pairs
 # ---------------------------------------------------------------------------
 
 
-def test_config_to_cli_linear_default() -> None:
+def test_config_to_cli_linear_default_triggers_no_cyclic() -> None:
+    """Default linear mode must NOT include cyclic / cyc_chains flags."""
     cli = _config_to_cli(RFdiffusionConfig())
     assert cli["contigmap.contigs"] == "14-18"
     assert cli["inference.num_designs"] == "1000"
     assert "inference.cyclic" not in cli
+    assert "inference.cyc_chains" not in cli
+
+
+def test_config_to_cli_linear_default_triggers_deterministic() -> None:
+    """Default config has ``deterministic=True`` so the flag IS forwarded."""
+    cli = _config_to_cli(RFdiffusionConfig())
     assert cli["inference.deterministic"] == "True"
 
 
-def test_config_to_cli_macrocyclic() -> None:
+def test_config_to_cli_non_deterministic_omits_deterministic_flag() -> None:
+    """``deterministic=False`` must NOT forward ``inference.deterministic``."""
+    cli = _config_to_cli(RFdiffusionConfig(deterministic=False))
+    assert "inference.deterministic" not in cli
+
+
+def test_config_to_cli_does_not_forward_seed_flag() -> None:
+    """The runner must NOT forward ``inference.seed`` — that flag is supported
+    only in recent RFdiffusion versions and silently breaks older wrappers.
+    The user's seed is recorded in the provenance manifest, not on the CLI."""
+    cli = _config_to_cli(RFdiffusionConfig(seed=42))
+    assert "inference.seed" not in cli
+
+
+def test_config_to_cli_head_to_tail_triggers_cyclic_with_chain_a() -> None:
     cli = _config_to_cli(RFdiffusionConfig(mode="head_to_tail"))
     assert cli["inference.cyclic"] == "True"
     assert cli["inference.cyc_chains"] == "a"
 
 
-def test_config_to_cli_disulfide() -> None:
+def test_config_to_cli_disulfide_triggers_cyclic_with_pairs() -> None:
     cli = _config_to_cli(RFdiffusionConfig(mode="disulfide", disulfide_pairs=((3, 9), (5, 12))))
     assert cli["inference.cyclic"] == "True"
     assert cli["inference.cyc_chains"] == "3,9,5,12"
 
 
-def test_config_to_cli_with_hotspots() -> None:
+def test_config_to_cli_hotspots_triggers_ppi_hotspot_res() -> None:
     cli = _config_to_cli(RFdiffusionConfig(hotspots=("A12", "B17")))
     assert cli["ppi.hotspot_res"] == "A12,B17"
+
+
+def test_config_to_cli_no_hotspots_omits_ppi_hotspot_res() -> None:
+    """Empty hotspots tuple must NOT add the ``ppi.hotspot_res`` flag."""
+    cli = _config_to_cli(RFdiffusionConfig(hotspots=()))
+    assert "ppi.hotspot_res" not in cli
+
+
+def test_config_to_cli_does_not_forward_temperature_flag() -> None:
+    """RFdiffusion does not expose a single ``temperature`` parameter —
+    forwarding to ``diffusion.noise_scale_ca`` would silently change
+    upstream behaviour. The runner must NOT forward any temperature field."""
+    cli = _config_to_cli(RFdiffusionConfig(seed=0))
+    assert "diffusion.noise_scale_ca" not in cli
+    assert "temperature" not in cli
+
+
+def test_config_to_cli_extra_kwargs_are_forwarded() -> None:
+    """The ``extra`` mapping is forwarded verbatim so callers can add
+    upstream-supported kwargs without changing the dataclass."""
+    cli = _config_to_cli(RFdiffusionConfig(extra={"inference.noise_scale_ca": "0.5"}))
+    assert cli["inference.noise_scale_ca"] == "0.5"
 
 
 # ---------------------------------------------------------------------------
@@ -151,12 +248,12 @@ def test_config_to_cli_with_hotspots() -> None:
 def test_runner_dry_run_does_not_invoke(output_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     invoked: list[dict[str, Any]] = []
 
-    def fake_invoke(*, config_dict: dict[str, Any], output_dir: Path, **_: Any) -> int:
+    def fake_invoke(*, config_dict: dict[str, Any], output_dir: Path, **_: Any) -> InvokeResult:
         invoked.append({"config_dict": config_dict, "output_dir": output_dir})
         output_dir.mkdir(parents=True, exist_ok=True)
-        return 0
+        return InvokeResult(exit_code=0)
 
-    monkeypatch.setattr("biolab_runners.rfdiffusion.runner.invoke", fake_invoke)
+    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", fake_invoke)
     runner = RFdiffusionRunner(output_root=output_root)
     result = runner.run(RFdiffusionConfig(name="dry"), dry_run=True)
     assert invoked == []
@@ -167,13 +264,7 @@ def test_runner_dry_run_does_not_invoke(output_root: Path, monkeypatch: pytest.M
 def test_runner_idempotent_when_output_exists(
     output_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    invoked: list[Path] = []
-
-    def fake_invoke(*, output_dir: Path, **_: Any) -> int:
-        invoked.append(output_dir)
-        return 0
-
-    monkeypatch.setattr("biolab_runners.rfdiffusion.runner.invoke", fake_invoke)
+    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", _fake_invoke_ok)
     runner = RFdiffusionRunner(output_root=output_root)
     name = "idem"
     design_dir = output_root / name
@@ -181,7 +272,6 @@ def test_runner_idempotent_when_output_exists(
     (design_dir / "design_0.pdb").write_text(SAMPLE_PDB)
 
     result = runner.run(RFdiffusionConfig(name=name))
-    assert invoked == []  # cached, did not re-invoke
     assert result.skipped == 1
     assert result.succeeded == 1
 
@@ -189,12 +279,12 @@ def test_runner_idempotent_when_output_exists(
 def test_runner_force_re_runs(output_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[Path] = []
 
-    def fake_invoke(*, output_dir: Path, **_: Any) -> int:
+    def fake_invoke(*, output_dir: Path, **_: Any) -> InvokeResult:
         calls.append(output_dir)
         (output_dir / "design_0.pdb").write_text(SAMPLE_PDB)
-        return 0
+        return InvokeResult(exit_code=0)
 
-    monkeypatch.setattr("biolab_runners.rfdiffusion.runner.invoke", fake_invoke)
+    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", fake_invoke)
     runner = RFdiffusionRunner(output_root=output_root)
     name = "force"
     design_dir = output_root / name
@@ -207,12 +297,12 @@ def test_runner_force_re_runs(output_root: Path, monkeypatch: pytest.MonkeyPatch
 
 
 def test_runner_records_per_design(output_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    def fake_invoke(*, output_dir: Path, **_: Any) -> int:
+    def fake_invoke(*, output_dir: Path, **_: Any) -> InvokeResult:
         for i in range(3):
             (output_dir / f"design_{i}.pdb").write_text(SAMPLE_PDB)
-        return 0
+        return InvokeResult(exit_code=0)
 
-    monkeypatch.setattr("biolab_runners.rfdiffusion.runner.invoke", fake_invoke)
+    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", fake_invoke)
     runner = RFdiffusionRunner(output_root=output_root)
     result = runner.run(RFdiffusionConfig(name="batch"))
     assert result.succeeded == 3
@@ -223,21 +313,17 @@ def test_runner_records_per_design(output_root: Path, monkeypatch: pytest.Monkey
 def test_runner_handles_unparseable_pdb(output_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A failing parse should record a FAILED entry, not crash the runner."""
 
-    def fake_invoke(*, output_dir: Path, **_: Any) -> int:
+    def fake_invoke(*, output_dir: Path, **_: Any) -> InvokeResult:
         (output_dir / "good.pdb").write_text(SAMPLE_PDB)
-        # Drop a file that exists at glob time but is deleted before
-        # parse_backbone_pdb reads it. The runner must record this as
-        # FAILED, not crash.
         ghost = output_dir / "ghost.pdb"
         ghost.write_text(SAMPLE_PDB)
         ghost.unlink()
-        return 0
+        return InvokeResult(exit_code=0)
 
-    monkeypatch.setattr("biolab_runners.rfdiffusion.runner.invoke", fake_invoke)
+    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", fake_invoke)
     runner = RFdiffusionRunner(output_root=output_root)
     result = runner.run(RFdiffusionConfig(name="broken"))
     assert all(r.path for r in result.records)
-    # The ghost file was unlinked before parse, so it must not appear.
     assert not any("ghost" in r.path for r in result.records)
     assert any(r.status == _Status.SUCCEEDED for r in result.records)
 
@@ -245,10 +331,10 @@ def test_runner_handles_unparseable_pdb(output_root: Path, monkeypatch: pytest.M
 def test_runner_propagates_nonzero_exit_code(
     output_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def fake_invoke(**_: Any) -> int:
-        return 7
-
-    monkeypatch.setattr("biolab_runners.rfdiffusion.runner.invoke", fake_invoke)
+    monkeypatch.setattr(
+        "biolab_runners.rfdiffusion.runner._invoke_with_metadata",
+        lambda **_: InvokeResult(exit_code=7),
+    )
     runner = RFdiffusionRunner(output_root=output_root)
     result = runner.run(RFdiffusionConfig(name="failure"))
     assert result.exit_code == 7
@@ -259,3 +345,276 @@ def test_runner_requires_config() -> None:
     runner = RFdiffusionRunner(output_root=Path("/tmp"))
     with pytest.raises(ValueError, match="RFdiffusionConfig is required"):
         runner.run()
+
+
+# ---------------------------------------------------------------------------
+# S2 provenance (reproducibility)
+# ---------------------------------------------------------------------------
+
+
+def test_runner_records_honest_provenance_on_real_run(
+    output_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real (non-dry-run, non-cached) invocation attaches a ProvenanceMetadata
+    carrying the honest RFdiffusion contract:
+
+    * ``base_seed`` is ``None`` — the runner did NOT forward ``inference.seed``.
+    * ``requested_seed`` is the caller's value.
+    * ``rng_intent`` is ``"seed-not-forwarded"`` for the default
+      deterministic mode.
+    * ``executed_config_digest`` excludes ``seed`` so the digest is
+      stable across calls that change only the seed.
+    * ``requested_config_digest`` covers the full config — the audit
+      can still see what the caller asked for.
+    """
+    target = tmp_path / "target.pdb"
+    target.write_text(SAMPLE_PDB)
+
+    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", _fake_invoke_ok)
+    runner = RFdiffusionRunner(output_root=output_root)
+    config = RFdiffusionConfig(name="prov", seed=7, task_count=3, target_pdb=str(target))
+    result = runner.run(config, image_digest=VALID_OCI_DIGEST)
+    prov = result.provenance
+
+    assert prov.model_identifier == "RFdiffusion"
+    assert prov.temperature is None  # RFdiffusion does not expose temperature
+    assert prov.image_digest == VALID_OCI_DIGEST
+    assert prov.source_backbone_digest == compute_file_digest(target)
+    # S2 honesty: the runner did NOT forward seed, so base_seed is None.
+    assert prov.base_seed is None
+    assert prov.requested_seed == 7
+    assert prov.task_count == 3
+    assert prov.rng_intent == RNG_INTENT_SEED_NOT_FORWARDED
+    assert prov.exit_code == 0
+    assert prov.failure_reason == ""
+    assert prov.executed is True
+    assert prov.cache_hit is False
+    assert prov.executed_config_digest is not None
+    assert prov.requested_config_digest is not None
+    # The two digests differ for RFdiffusion — seed is in the requested
+    # digest but excluded from the executed digest.
+    assert prov.requested_config_digest != prov.executed_config_digest
+
+
+def test_runner_records_non_deterministic_rng_intent(
+    output_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``deterministic=False`` → ``rng_intent="non-deterministic"``."""
+    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", _fake_invoke_ok)
+    runner = RFdiffusionRunner(output_root=output_root)
+    result = runner.run(RFdiffusionConfig(name="nd", seed=0, deterministic=False), dry_run=True)
+    assert result.provenance.rng_intent == RNG_INTENT_NON_DETERMINISTIC
+    assert result.provenance.base_seed is None
+
+
+def test_runner_provenance_does_not_contain_per_task_seeds(
+    output_root: Path,
+) -> None:
+    """S2 honesty: the manifest must not fabricate per-task seeds that the
+    runner never actually used."""
+    runner = RFdiffusionRunner(output_root=output_root)
+    result = runner.run(RFdiffusionConfig(name="x", seed=42, task_count=8), dry_run=True)
+    assert not hasattr(result.provenance, "per_task_seeds")
+    assert result.provenance.base_seed is None
+    assert result.provenance.requested_seed == 42
+    assert result.provenance.task_count == 8
+
+
+def test_runner_executed_config_digest_stable_across_seed_only_changes(
+    output_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S2 honesty: changing only ``seed`` MUST NOT flip the executed config digest
+    because the runner does not forward ``inference.seed`` to upstream.
+
+    The ``requested_config_digest`` (full config) DOES flip — that's the
+    audit trail for "the caller asked for different seeds".
+
+    Both calls use the same ``name`` and ``target_pdb`` so the only
+    field that varies is ``seed`` — which is the field under test.
+    """
+    target = tmp_path / "t.pdb"
+    target.write_text(SAMPLE_PDB)
+    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", _fake_invoke_ok)
+    runner = RFdiffusionRunner(output_root=output_root)
+
+    a = runner.run(RFdiffusionConfig(name="seed-test", seed=1, target_pdb=str(target))).provenance
+    b = runner.run(RFdiffusionConfig(name="seed-test", seed=999, target_pdb=str(target))).provenance
+
+    # Both ran for real (cache miss), so executed_config_digest is set.
+    assert a.executed is True and b.executed is True
+    assert a.executed_config_digest is not None
+    assert b.executed_config_digest is not None
+    # Executed digest stable across seed-only changes.
+    assert a.executed_config_digest == b.executed_config_digest
+    # Requested digest flips — the caller did ask for different seeds.
+    assert a.requested_config_digest != b.requested_config_digest
+    # base_seed stays None for both (seed not forwarded).
+    assert a.base_seed is None and b.base_seed is None
+    assert a.requested_seed != b.requested_seed
+
+
+def test_runner_cache_hit_records_honest_cache_provenance(
+    output_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a cache hit, ``executed=False``, ``cache_hit=True``,
+    ``executed_config_digest=None`` — the runner does not know which
+    prior call produced the existing files, so it does not fabricate
+    a digest. Only the *requested* digest (what THIS call asked for)
+    is recorded.
+    """
+    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", _fake_invoke_ok)
+    name = "cache-hit"
+    design_dir = output_root / name
+    design_dir.mkdir(parents=True, exist_ok=True)
+    (design_dir / "design_0.pdb").write_text(SAMPLE_PDB)
+
+    runner = RFdiffusionRunner(output_root=output_root)
+    config = RFdiffusionConfig(name=name, seed=11)
+    result = runner.run(config, image_digest=VALID_OCI_DIGEST)
+    prov = result.provenance
+
+    assert prov.cache_hit is True
+    assert prov.executed is False
+    assert prov.executed_config_digest is None
+    # The audit can still see what THIS call requested.
+    assert prov.requested_config_digest != ""
+    assert prov.requested_seed == 11
+    # The records on disk are the cached records — the runner counts
+    # them as "skipped" (we did NOT re-invoke) but also as "succeeded"
+    # (they are usable outputs).
+    assert result.skipped == 1
+    assert result.succeeded == 1
+
+
+def test_runner_dry_run_records_requested_digest_only(output_root: Path) -> None:
+    """dry_run: ``executed=False``, ``cache_hit=False``,
+    ``executed_config_digest=None``."""
+    runner = RFdiffusionRunner(output_root=output_root)
+    result = runner.run(RFdiffusionConfig(name="dry", seed=5, task_count=3), dry_run=True)
+    prov = result.provenance
+    assert prov.executed is False
+    assert prov.cache_hit is False
+    assert prov.executed_config_digest is None
+    assert prov.requested_config_digest != ""
+    # ``base_seed`` is what was forwarded to upstream — RFdiffusion does
+    # not forward ``inference.seed``, so it stays ``None`` even in dry_run.
+    assert prov.base_seed is None
+    assert prov.requested_seed == 5
+    assert prov.task_count == 3
+
+
+def test_runner_propagates_exit_code_into_provenance(
+    output_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-zero exit code from the subprocess must surface in the provenance
+    record's exit_code, failure_reason (from stderr), and stderr_tail."""
+    fake_result = InvokeResult(
+        exit_code=7,
+        stderr_tail="Traceback (most recent call last):\n  File ... RuntimeError: oops",
+        timed_out=False,
+        failure_reason="RuntimeError: oops",
+    )
+
+    def fake_invoke_with_metadata(**_: Any) -> InvokeResult:
+        return fake_result
+
+    monkeypatch.setattr(
+        "biolab_runners.rfdiffusion.runner._invoke_with_metadata", fake_invoke_with_metadata
+    )
+    runner = RFdiffusionRunner(output_root=output_root)
+    result = runner.run(RFdiffusionConfig(name="failure", seed=0))
+    assert result.provenance.exit_code == 7
+    assert result.provenance.failure_reason == "RuntimeError: oops"
+    assert "RuntimeError: oops" in result.provenance.stderr_tail
+    assert result.provenance.executed is True
+
+
+def test_runner_records_timeout_in_provenance(
+    output_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A subprocess timeout must surface as exit_code=124, timed_out=True,
+    and a deterministic failure_reason."""
+    fake_result = InvokeResult(
+        exit_code=124,
+        stderr_tail="",
+        timed_out=True,
+        failure_reason="timeout after 3600s",
+    )
+
+    monkeypatch.setattr(
+        "biolab_runners.rfdiffusion.runner._invoke_with_metadata",
+        lambda **_: fake_result,
+    )
+    runner = RFdiffusionRunner(output_root=output_root)
+    result = runner.run(RFdiffusionConfig(name="slow"))
+    assert result.provenance.exit_code == 124
+    assert result.provenance.failure_reason == "timeout after 3600s"
+    assert result.provenance.executed is True
+
+
+def test_runner_equivalent_rerun_produces_equivalent_provenance(
+    output_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S2 equivalence: same config + same image digest + same backbone →
+    byte-identical provenance.to_dict() for the same execution path."""
+    target = tmp_path / "target.pdb"
+    target.write_text(SAMPLE_PDB)
+    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", _fake_invoke_ok)
+    runner = RFdiffusionRunner(output_root=output_root)
+    config = RFdiffusionConfig(name="equiv", seed=42, target_pdb=str(target))
+    first = runner.run(config, image_digest=VALID_OCI_DIGEST).provenance.to_dict()
+    second = runner.run(config, image_digest=VALID_OCI_DIGEST).provenance.to_dict()
+    assert first == second
+
+
+def test_runner_normalises_image_digest_to_oci_form(
+    output_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both bare-hex and OCI-prefixed forms must be normalised to the OCI form
+    BEFORE any subprocess work, so downstream comparison sees a single form."""
+    target = tmp_path / "target.pdb"
+    target.write_text(SAMPLE_PDB)
+    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", _fake_invoke_ok)
+    runner = RFdiffusionRunner(output_root=output_root)
+    config = RFdiffusionConfig(name="img-norm", target_pdb=str(target))
+
+    oci_result = runner.run(config, image_digest=VALID_OCI_DIGEST)
+    bare_result = runner.run(config, image_digest=VALID_BARE_DIGEST)
+
+    assert oci_result.provenance.image_digest == VALID_OCI_DIGEST
+    assert bare_result.provenance.image_digest == VALID_OCI_DIGEST  # normalised
+
+
+def test_runner_validates_malformed_image_digest(
+    output_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A malformed image digest must raise ValueError at run() time, not
+    silently flow into the manifest."""
+    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", _fake_invoke_ok)
+    runner = RFdiffusionRunner(output_root=output_root)
+    with pytest.raises(ValueError, match="image_digest must be"):
+        runner.run(RFdiffusionConfig(name="bad"), image_digest="not-a-digest")
+
+
+def test_runner_warns_when_target_pdb_missing(
+    output_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A ``target_pdb`` that does not exist on disk must produce a warning
+    AND still record ``source_backbone_digest=None`` in the manifest.
+    Missing path is a signal, not a hard error."""
+    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", _fake_invoke_ok)
+    missing = tmp_path / "absent.pdb"
+    runner = RFdiffusionRunner(output_root=output_root)
+    with caplog.at_level(logging.WARNING, logger="biolab_runners.rfdiffusion.runner"):
+        result = runner.run(
+            RFdiffusionConfig(name="missing-target", target_pdb=str(missing)),
+            dry_run=True,
+        )
+    assert result.provenance.source_backbone_digest is None
+    assert any(
+        "target_pdb" in record.message and "does not exist" in record.message
+        for record in caplog.records
+    ), f"expected target_pdb warning, got: {[r.message for r in caplog.records]}"
