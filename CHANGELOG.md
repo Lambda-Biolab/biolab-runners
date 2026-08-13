@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- **GROMACS interrupted-stage handling (slice S4, post-merge
+  hotfix)**: a stage with a RUNNING manifest or an on-disk
+  `.cpt` is never silently promoted to `COMPLETED` from disk
+  output — it is re-entered via the execution path so the
+  `-cpi`/`-append` resume is preserved. An interrupted run now
+  halts at the first interrupted stage and reports
+  `interrupted=1`, `exit_code=-SIGTERM`, and an error naming
+  the stage; the next invocation resumes from that stage.
+
 - **Rosetta `parser:script_vars` argv-flattening regression fix
   (slice S3, review-fix pass)**:
 

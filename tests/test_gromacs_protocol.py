@@ -1124,16 +1124,23 @@ class TestRunnerAccounting:
         assert result.succeeded == 8
 
     def test_interruption_increments_interrupted_not_failed(self, tmp_path: Path) -> None:
-        """SIGTERM must increment ``interrupted``, NOT ``failed``."""
+        """SIGTERM halts at the first interrupted stage; only that stage counts.
+
+        The runner MUST NOT continue past an interrupted stage —
+        a missing-input FAILED on the next stage would overwrite
+        the truthful interruption result. ``interrupted=1``,
+        ``failed=0``, ``exit_code=-SIGTERM``.
+        """
         cfg = _valid_protocol_config(output_root=str(tmp_path))
         runner = GromacsProtocolRunner()
         with patch.object(GromacsProtocolRunner, "_run_subprocess", return_value=-15):
             result = runner.run_protocol(cfg)
-        # All 8 stages are "interrupted" (not failed); the runner
-        # does NOT halt on interruption (continues past it).
-        assert result.interrupted == 8
+        # Only the first stage (topology) is recorded as interrupted;
+        # the loop halted there so the truthful exit_code is preserved.
+        assert result.interrupted == 1
         assert result.failed == 0
         assert result.exit_code == -15
+        assert StageKind.TOPOLOGY.value in result.stage_statuses
 
     def test_per_replica_subdirectory_under_replicas_total(self, tmp_path: Path) -> None:
         cfg = _valid_protocol_config(
