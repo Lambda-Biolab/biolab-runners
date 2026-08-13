@@ -6,6 +6,150 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- **Rosetta `parser:script_vars` argv-flattening regression fix
+  (slice S3, review-fix pass)**:
+
+  - The internal CLI representation of ``parser:script_vars`` is
+    now a ``list[str]`` (one element per ``%%variable%%`` token),
+    not a single space-joined string. ``invoke`` repeats the flag
+    once per element so each token lands as its own argv value:
+    ``-parser:script_vars k1=v1 -parser:script_vars k2=v2``.
+    Pre-joining them as a single argument would have silently
+    fed Rosetta the wrong shape (its parser would treat the
+    trailing ``"k1=v1 k2=v2"`` blob as one variable name). The
+    argv behavior is locked by
+    ``tests/test_rosetta_runner.py::test_invoke_repeats_parser_script_vars_per_token``,
+    which captures ``subprocess.run``'s actual argv list.
+  - ``_config_to_cli`` accepts the dict-channel ``parser:script_vars``
+    value as either ``str`` (whitespace-split into tokens — the
+    user-friendly form) or ``Sequence[str]`` (each element
+    preserved verbatim — the explicit form). The
+    ``extra_flags`` channel accepts the canonical
+    ``"parser:script_vars k=v ..."`` trailing-tokens form and
+    splits on whitespace so each ``k=v`` becomes a separate
+    token. Net effect: callers can pass script-var tokens via
+    any of three channels and the runner formats them
+    identically for the upstream binary.
+  - **Additive field split**: ``RelaxScore`` exposes
+    ``packstat`` (Lawrence & Coleman packing statistic) and
+    ``hbond_energy_fraction`` (fractional H-bond contribution) as
+    DISTINCT optional fields, no longer collapsed into
+    ``shape_complementarity`` / ``hbond_energy``. The bare
+    aliases ``dG`` and ``sc`` are intentionally NOT registered —
+    both are too ambiguous (could be interface or whole-complex
+    energy, shape complementarity or supercharge). Callers should
+    pass the scoped alias (``dG_separated``, ``interface_sc``,
+    etc.) for explicit, unambiguous metric assignment. See the
+    docstring above :data:`biolab_runners.rosetta.utils.METRIC_ALIASES`
+    for the full list of accepted aliases.
+  - **Positional ``RelaxRecord`` compat**: the additive ``score``
+    field is appended AFTER the legacy field set
+    (``index, path, total_score, status, error``), so the
+    v0.5 positional-args form ``RelaxRecord(0, "x.sc", -99.5,
+    "succeeded", "")`` continues to bind to those fields
+    verbatim. The new ``score`` field defaults to an empty
+    :class:`RelaxScore` when not supplied (positional or
+    keyword). Locked by
+    ``tests/test_rosetta_runner.py::test_relax_record_legacy_positional_constructor_preserved``.
+  - **JSON serialization**: the legacy ``payload["total_score"]``
+    keeps its v0.5 float-as-string repr for source compat, but
+    the new ``payload["metrics"]`` dict emits native Python
+    ``float`` / ``None`` so downstream JSON consumers don't need
+    a float-parsing detour for the structured form. See
+    ``RelaxScore.to_dict`` and
+    ``tests/test_rosetta_runner.py::test_relax_score_to_dict_emits_native_numbers``.
+  - **Accept / reject edge cases** in ``RosettaConfig.__post_init__``:
+    rejects empty-string ``preparation_mode`` (``""`` is not
+    ``None`` but is not a recognized Literal value); an empty
+    ``ConstrainedRelaxOptions()`` contributes no script-var
+    tokens at all. Locked by
+    ``tests/test_rosetta_runner.py::test_config_rejects_empty_preparation_mode``
+    and
+    ``tests/test_rosetta_runner.py::test_config_to_cli_empty_constrained_relax_emits_no_script_vars``.
+
+  **Backward-compat summary (unchanged from v0.6)**: every public
+  symbol a v0.5 consumer could have touched continues to work
+  byte-for-byte. New symbols are strictly additive.
+
+- **RosettaRunner scorefile parser + structured CLI translation
+  (slice S3, hardening pass)**:
+
+  - `biolab_runners.rosetta.utils.parse_score_file` remains the
+    legacy entry point: it returns the first-row `total_score` as
+    a `float`, with `0.0` for empty / garbage / unparseable files.
+    **No consumer change required** to keep working.
+  - New `biolab_runners.rosetta.utils.parse_relax_score` returns
+    the structured `RelaxScore` form (every named metric, with
+    `None` for absent columns). New code should prefer this.
+  - New `biolab_runners.rosetta.utils.RelaxScore` dataclass
+    exposes every InterfaceAnalyzer-style metric by name:
+    `total_score`, `total_sasa`, `delta_sasa`, `hydrophobic_sasa`,
+    `polar_sasa`, **`interface_polar_sasa`** (new), **`interface_hydrophobic_sasa`** (new),
+    `interface_dG`, `interface_dSASA`,
+    `buried_unsatisfied_hbonds`, `cross_interface_hbonds`,
+    `hbond_energy`, `shape_complementarity`. Each field is
+    `float | None` — never defaulted to `0.0` for absent columns;
+    upstream `inf` / `-inf` / `nan` sentinel tokens are also
+    surfaced as `None` to preserve the missing-vs-present contract.
+  - New canonical InterfaceAnalyzer column-name aliases added to
+    `METRIC_ALIASES`: **`dSASA_int`** (interface dSASA),
+    **`dSASA_polar`** / `polar_int_sasa` (buried polar SASA at the
+    interface — distinct from total `polar_sasa`),
+    **`dSASA_hphobic`** / `hphobic_int_sasa` (buried hydrophobic
+    SASA at the interface — distinct from total `hydrophobic_sasa`),
+    **`delta_unsatHbonds`** (delta unsatisfied H-bonds),
+    **`hbond_E_fraction`** (fractional hbond energy — collapses
+    into `hbond_energy` for historical compatibility; the
+    fraction-vs-absolute distinction is the consumer's
+    responsibility), and **`packstat`** (Lawrence & Coleman
+    packing statistic — collapses into `shape_complementarity`).
+  - `RelaxRecord` keeps its legacy `total_score: float` field
+    *and* gains a structured `score: RelaxScore` field; the two are
+    populated independently. `RelaxRecord.to_dict()` retains the
+    legacy v0.5 keys (`index` / `path` / `total_score` / `status` /
+    `error`) byte-for-byte and adds a new `metrics` key carrying
+    the structured form. Consumers that only read the legacy keys
+    see no behavior change.
+  - `parse_score_files` now marks all-None / garbage rows as
+    `FAILED` (with a synthetic `error` string) so the runner's
+    `RosettaResult.succeeded` / `failed` counters reflect "this row
+    meant something", not "this row was syntactically readable".
+    Counts are taken by per-record `status`, so OSError-on-read and
+    unrecognized-header rows both decrement `succeeded`.
+  - `RosettaConfig` gains structured options for the upstream
+    `%%prep_mode%%` and constrained-relax protocol variables:
+    `preparation_mode: Literal["linear", "cyclic"]` and
+    `constrained_relax: ConstrainedRelaxOptions | None`. Both are
+    optional and translate into `-parser:script_vars key=value`
+    pairs.
+  - `_config_to_cli` now applies a documented **precedence order**
+    for `parser:script_vars` tokens:
+
+    1. Structured `preparation_mode` / `constrained_relax` tokens.
+    2. `config.extra["parser:script_vars"]` (the dict-channel
+       escape hatch).
+    3. `config.extra_flags` entries of the form
+       `"parser:script_vars k=v ..."`.
+
+    Each step appends to the same accumulated list; no step
+    silently clobbers tokens from earlier steps (the v0.5
+    `--no-clobber` regression this fixed is exercised in
+    `tests/test_rosetta_runner.py::test_config_to_cli_extra_flags_with_script_vars_does_not_clobber`).
+
+  **Backward-compatibility summary**: every public symbol a v0.5
+  consumer could have touched (`parse_score_file` returning
+  `float`, `RelaxRecord.total_score`, `RelaxRecord.to_dict`'s
+  legacy keys) is preserved. New symbols (`parse_relax_score`,
+  `RelaxScore`, `RelaxRecord.score`, `to_dict()["metrics"]`,
+  `preparation_mode`, `constrained_relax`) are strictly additive.
+
+  **Real-binary smoke gate**: there is no pytest that invokes
+  `rosetta_scripts` — the binary is licensed and not installed in
+  CI. Operators with a licensed install should write a regression
+  test against a captured scorefile using `parse_relax_score` /
+  `parse_score_files`; the entry points are documented in the
+  module docstring on `biolab_runners.rosetta`.
+
 - **Slice 12 (MD-OPENMM-001) — `OpenMMConfig.from_md_spec` classmethod**:
   the canonical construction path going forward. Projects every
   engine-neutral field on `bioml_tools.md.system_spec.MDSpec` (added

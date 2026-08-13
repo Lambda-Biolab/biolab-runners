@@ -15,7 +15,9 @@ from biolab_runners.rosetta.utils import (
 )
 
 if TYPE_CHECKING:
-    from biolab_runners.rosetta.config import RosettaConfig
+    from collections.abc import Mapping
+
+    from biolab_runners.rosetta.config import ConstrainedRelaxOptions, RosettaConfig
 
 logger = logging.getLogger(__name__)
 
@@ -94,12 +96,20 @@ class RosettaRunner:
 
         if not force and self.is_complete(cfg):
             records = parse_score_files(sorted(output_dir.glob("score.sc")))
+            # Count by per-record status so all-None / garbage
+            # scorefiles (which `parse_score_files` now flags as
+            # FAILED with a synthetic error) decrement ``succeeded``
+            # and increment ``failed``. The runner's reported counts
+            # reflect "this row meant something", not "this row was
+            # syntactically readable".
+            succeeded = sum(1 for r in records if r.status == RelaxRecordStatus.SUCCEEDED)
+            failed = len(records) - succeeded
             return RosettaResult(
                 name=cfg.name,
                 output_dir=str(output_dir),
                 records=tuple(records),
-                succeeded=len(records),
-                failed=0,
+                succeeded=succeeded,
+                failed=failed,
                 skipped=len(records),
                 exit_code=0,
                 duration_seconds=0.0,
@@ -145,20 +155,152 @@ class RosettaRunner:
         return self._output_root / config.name
 
 
-def _config_to_cli(config: RosettaConfig) -> dict[str, str]:
-    """Translate :class:`RosettaConfig` into a flat CLI kwargs dict."""
-    payload: dict[str, str] = {
+def _config_to_cli(config: RosettaConfig) -> dict[str, Any]:
+    """Translate :class:`RosettaConfig` into a CLI kwargs dict.
+
+    Most entries become single ``-key value`` argv tokens at invoke
+    time. The structured ``preparation_mode`` and
+    ``constrained_relax`` options are translated into
+    ``-parser:script_vars key=value`` pairs and stored as a
+    ``list[str]`` value under that dict key — :func:`invoke` repeats
+    the flag once per element so each ``%%variable%%`` lands as its
+    own argv token. Pre-joining them into one space-separated
+    string would silently feed Rosetta the wrong shape (its parser
+    would treat the entire ``"k1=v1 k2=v2"`` blob as one variable).
+
+    Precedence (later sources appended after earlier ones, in order;
+    no source is allowed to *delete* a token already accumulated):
+
+    1. :func:`_structured_script_vars` — the typed options.
+    2. ``config.extra["parser:script_vars"]`` — the dict-channel
+       escape hatch. May be ``str`` (whitespace-split into tokens)
+       or ``Sequence[str]`` (each element preserved as a token).
+    3. ``config.extra_flags`` entries of the form
+       ``"parser:script_vars k=v ..."`` — trailing tokens after
+       the literal key prefix become one script-var per token.
+
+    All other ``config.extra`` and ``config.extra_flags`` entries
+    use last-write-wins on the dict (the v0.5 contract).
+    """
+    payload: dict[str, Any] = {
         "s": config.script_file,
         "in:file:s": config.input_pdb,
         "out:path:all": config.output_dir,
         "nstruct": str(config.nstruct),
     }
-    for key, value in config.extra.items():
+
+    script_vars: list[str] = list(_structured_script_vars(config))
+
+    _apply_extra_mapping(payload, script_vars, config.extra)
+    _apply_extra_flags(payload, script_vars, config.extra_flags)
+
+    if script_vars:
+        # Sequence value so ``invoke`` repeats the flag per element.
+        # See ``_config_value_to_argv``.
+        payload["parser:script_vars"] = script_vars
+
+    return payload
+
+
+def _apply_extra_mapping(
+    payload: dict[str, Any],
+    script_vars: list[str],
+    extra: Mapping[str, Any],
+) -> None:
+    """Apply ``config.extra`` entries to ``payload`` / ``script_vars``.
+
+    The ``"parser:script_vars"`` key is special-cased. A ``str``
+    value is whitespace-split into separate tokens (so callers can
+    pass either ``"k1=v1 k2=v2"`` or ``["k1=v1", "k2=v2"]``); a
+    list / tuple value is used as-is. The accumulator stays
+    ordered, so invoke emits ``-parser:script_vars k1=v1
+    -parser:script_vars k2=v2`` rather than the wrong
+    space-joined shape.
+    """
+    for key, value in extra.items():
+        if key == "parser:script_vars":
+            if isinstance(value, (list, tuple)):
+                script_vars.extend(str(v) for v in value if str(v))
+                continue
+            user_value = str(value).strip()
+            if user_value:
+                # Whitespace-split so the dict-channel accepts the
+                # user-friendly ``"k1=v1 k2=v2"`` form AND the
+                # explicit ``["k1=v1", "k2=v2"]`` form interchangeably.
+                script_vars.extend(user_value.split())
+            continue
         payload[str(key)] = str(value)
-    for flag in config.extra_flags:
+
+
+def _apply_extra_flags(
+    payload: dict[str, Any],
+    script_vars: list[str],
+    extra_flags: tuple[str, ...],
+) -> None:
+    """Apply ``config.extra_flags`` entries.
+
+    ``parser:script_vars`` variants accumulate, everything else
+    uses last-write-wins on the dict.
+
+    Each flag entry is one of:
+
+    - A bare flag (``"no_output"``) — sets
+      ``payload[flag] = ""`` on the dict.
+    - A ``key=value`` flag (``"beta=1.0"``) — sets
+      ``payload[key] = value`` (the v0.5 last-write-wins contract).
+    - A ``parser:script_vars`` flag — bare (no value) is ignored;
+      ``parser:script_vars k1=v1 k2=v2 ...`` (one or more trailing
+      tokens after the literal ``parser:script_vars`` prefix) is
+      whitespace-split so each ``k=v`` becomes a separate
+      script-var token.
+    """
+    for flag in extra_flags:
+        if flag.startswith("parser:script_vars"):
+            rest = flag[len("parser:script_vars") :].lstrip(" =").strip()
+            if rest:
+                # Split on whitespace so each ``k=v`` becomes one
+                # script-var token in the accumulated list.
+                script_vars.extend(rest.split())
+            continue
         if "=" in flag:
             key, _, value = flag.partition("=")
             payload[key] = value
         else:
             payload[flag] = ""
-    return payload
+
+
+def _structured_script_vars(config: RosettaConfig) -> tuple[str, ...]:
+    """Translate structured options into ``key=value`` script-var tokens.
+
+    The returned tuple is empty when neither ``preparation_mode`` nor
+    ``constrained_relax`` is set; callers then skip emitting the
+    ``parser:script_vars`` flag entirely so the consumer protocol XML
+    inherits the upstream default.
+    """
+    tokens: list[str] = []
+    if config.preparation_mode is not None:
+        tokens.append(f"prep_mode={config.preparation_mode}")
+    if config.constrained_relax is not None:
+        tokens.extend(_constrained_relax_vars(config.constrained_relax))
+    return tuple(tokens)
+
+
+def _constrained_relax_vars(opts: ConstrainedRelaxOptions) -> tuple[str, ...]:
+    """Translate :class:`ConstrainedRelaxOptions` into ``key=value`` pairs.
+
+    Each field is emitted only when explicitly set (non-``None``) so
+    the protocol XML receives the union of what the caller requested
+    rather than a fully populated bag of N/A fields.
+    """
+    tokens: list[str] = []
+    if opts.constrain_to_start_coords is not None:
+        tokens.append(f"constrain_to_start_coords={1 if opts.constrain_to_start_coords else 0}")
+    if opts.ramp_constraints is not None:
+        tokens.append(f"ramp_constraints={1 if opts.ramp_constraints else 0}")
+    if opts.coord_constrain_sidechains is not None:
+        tokens.append(f"coord_constrain_sidechains={1 if opts.coord_constrain_sidechains else 0}")
+    if opts.relax_cycles is not None:
+        tokens.append(f"relax_cycles={opts.relax_cycles}")
+    if opts.bb_min_only is not None:
+        tokens.append(f"bb_min_only={1 if opts.bb_min_only else 0}")
+    return tuple(tokens)
