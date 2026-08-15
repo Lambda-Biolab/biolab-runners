@@ -27,11 +27,13 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import signal
 import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -47,6 +49,7 @@ from biolab_runners.gromacs.protocol import (
     generate_production_mdp,
     ions_mdp_content,
     stage_minimum_outputs,
+    stage_prebuilt_topology,
 )
 from biolab_runners.gromacs.utils import (
     GromacsRecord,
@@ -57,6 +60,7 @@ from biolab_runners.gromacs.utils import (
     now_utc_iso,
     parse_nthcol_energy,
     record_stage_status,
+    save_stage_manifest,
 )
 
 if TYPE_CHECKING:
@@ -279,10 +283,47 @@ def _stage_already_complete(work_dir: Path, stage: ProtocolStage) -> bool:
 
     The disk-output check is a separate fallback (used when the
     manifest is silent) — see ``_outputs_complete_on_disk``.
+
+    Prebuilt-source binding: the TOPOLOGY stage also stores a
+    ``prebuilt_source`` block with the source digests. A
+    different prebuilt source (different ``.top`` /
+    ``.gro`` pair supplied by the caller) MUST invalidate the
+    cached stage even when the manifest status is COMPLETED.
+    This helper currently only consults the status field; the
+    caller (``_run_single_stage``) does the prebuilt-source
+    diff check separately — see the comment block in
+    :meth:`GromacsProtocolRunner.run_protocol`.
     """
     manifest = load_stage_manifest(work_dir)
     record = manifest.get("stages", {}).get(stage.kind.value)
     return record is not None and record.get("status") == StageStatus.COMPLETED
+
+
+def _prebuilt_source_changed(work_dir: Path, config: GromacsProtocolConfig) -> bool:
+    """Return True iff the supplied prebuilt source differs from the cached one.
+
+    A cached TOPOLOGY stage is invalidated when EITHER of the
+    prebuilt source paths OR their digests has changed. This
+    prevents a stale topology from being silently reused when
+    the caller supplied a new ``.top`` / ``.gro`` pair.
+
+    Returns ``False`` when the manifest is silent (the
+    no-cache case) or when the prebuilt pair is empty (legacy
+    ``input_pdb`` path) — only the prebuilt path ever has a
+    "previous" identity to compare against.
+    """
+    if not (config.prebuilt_topology and config.prebuilt_coordinates):
+        return False
+    manifest = load_stage_manifest(work_dir)
+    record = manifest.get("stages", {}).get(StageKind.TOPOLOGY.value)
+    if not record:
+        return False
+    cached = record.get("prebuilt_source") or {}
+    new = _prebuilt_meta(config)
+    return (
+        cached.get("sha256_topology") != new["sha256_topology"]
+        or cached.get("sha256_coordinates") != new["sha256_coordinates"]
+    )
 
 
 def _outputs_complete_on_disk(work_dir: Path, stage: ProtocolStage) -> bool:
@@ -553,6 +594,20 @@ class GromacsProtocolRunner:
         See the class docstring for the skip-vs-resume-vs-fresh
         decision tree. The method is the only public entry point
         — everything else is an internal helper.
+
+        Prebuilt mode: when ``config.prebuilt_topology`` and
+        ``config.prebuilt_coordinates`` are both set, the
+        runner stages the caller-supplied ``.top`` / ``.gro``
+        into canonical filenames at the START of the protocol
+        (BEFORE the stage loop). The TOPOLOGY stage's command
+        list is empty (returned by ``build_commands``), so the
+        per-stage logic skips ``pdb2gmx``. The prebuilt source
+        digests are recorded into the stage manifest under
+        ``stages[TOPOLOGY].prebuilt_source`` so a future
+        invocation that supplies a different
+        ``prebuilt_topology`` / ``prebuilt_coordinates`` pair
+        correctly invalidates the cached stage (see the
+        ``_stage_already_complete`` short-circuit).
         """
         work_dir = _work_dir(config)
         work_dir.mkdir(parents=True, exist_ok=True)
@@ -565,6 +620,11 @@ class GromacsProtocolRunner:
         validated = 0
         exit_code = 0
         error = ""
+
+        # Prebuilt stage (no subprocess — file copy only).
+        prebuilt_failure = self._stage_prebuilt(work_dir, config, started)
+        if prebuilt_failure is not None:
+            return prebuilt_failure
 
         for stage in build_stage_plan():
             status, rc, was_skipped = self._run_single_stage(work_dir, stage, config)
@@ -642,37 +702,12 @@ class GromacsProtocolRunner:
         post-SIGTERM state is never silently promoted to
         ``COMPLETED``.
         """
-        # --- Manifest authority check ---
-        if not config.force and _stage_already_complete(work_dir, stage):
-            # Stage was COMPLETED in a prior invocation — skip.
-            record_stage_status(
-                work_dir,
-                stage.kind.value,
-                StageStatus.COMPLETED,
-                outputs=stage_minimum_outputs(stage.kind, stage.prefix),
-            )
+        # --- Skip accounting (manifest authority) ---
+        # The skip accounting is delegated to a single helper so
+        # this orchestrator stays at one branch level. The helper
+        # returns ``True`` when the stage should be skipped.
+        if _stage_should_skip(work_dir, stage, config):
             return StageStatus.COMPLETED, 0, True
-
-        # --- Legacy disk-output fallback (manifest silent + no .cpt) ---
-        # Without this guard, a Spot-reclaim RUNNING manifest with
-        # on-disk outputs would be promoted to COMPLETED here,
-        # silently dropping the -cpi resume. A non-silent manifest
-        # status or an available .cpt routes to the execution path.
-        if not config.force:
-            manifest_record = load_stage_manifest(work_dir).get("stages", {}).get(stage.kind.value)
-            manifest_status = manifest_record.get("status") if manifest_record else None
-            if (
-                manifest_status is None
-                and _checkpoint_for(work_dir, stage) is None
-                and _outputs_complete_on_disk(work_dir, stage)
-            ):
-                record_stage_status(
-                    work_dir,
-                    stage.kind.value,
-                    StageStatus.COMPLETED,
-                    outputs=stage_minimum_outputs(stage.kind, stage.prefix),
-                )
-                return StageStatus.COMPLETED, 0, True
 
         # --- Emit .mdp and build commands ---
         _emit_mdp(work_dir, stage, config)
@@ -685,19 +720,6 @@ class GromacsProtocolRunner:
         )
 
         if self._dry_run:
-            # Dry-run path: emit the .mdp file (so the operator can
-            # inspect it via `cat work_dir/min.mdp` etc.) and emit the
-            # grompp / mdrun command list (so the operator can verify
-            # what would be run), but **DO NOT** write a terminal
-            # manifest record. The previous implementation wrote
-            # COMPLETED to the manifest here, which had a subtle
-            # foot-gun: a subsequent real run on the same work_dir
-            # would honour manifest authority and SKIP every stage,
-            # even though no actual simulation had run. The fix is
-            # to leave the manifest empty so the next invocation
-            # exercises every stage from scratch (the .mdp files
-            # are useful as a preview, but they don't constitute
-            # completion).
             return _DRY_RUN_STATUS, 0, False
 
         record_stage_status(
@@ -745,6 +767,67 @@ class GromacsProtocolRunner:
             error="" if rc == 0 else f"rc={rc}",
         )
         return status, rc, False
+
+    def _stage_prebuilt(
+        self,
+        work_dir: Path,
+        config: GromacsProtocolConfig,
+        started: float,
+    ) -> GromacsProtocolResult | None:
+        """Stage the caller-supplied prebuilt .top/.gro (B4 + cascade invalidation).
+
+        Compares the supplied prebuilt source digests to the
+        cached ones BEFORE staging the new files. If the source
+        has changed, every downstream stage that depends on
+        ``topol.top`` / ``processed.gro`` is invalidated —
+        their on-disk outputs are quarantined to
+        ``.stale/<UTC>/`` and their manifest entries are reset
+        to PENDING so the per-stage loop re-runs them from
+        scratch. Without this guard the staging block would
+        re-record the manifest BEFORE the loop, making the
+        invalidation check unreachable (probe 5 surfaced this).
+
+        Returns ``None`` on success, or a failure
+        :class:`GromacsProtocolResult` on staging error.
+        """
+        if not (config.prebuilt_topology and config.prebuilt_coordinates):
+            return None
+
+        if _prebuilt_source_changed(work_dir, config):
+            logger.info(
+                "prebuilt source digests differ from cached values; "
+                "invalidating downstream dependent stages"
+            )
+            _invalidate_downstream_for_prebuilt_change(work_dir)
+
+        try:
+            stage_prebuilt_topology(config, work_dir)
+            prebuilt_meta = _prebuilt_meta(config)
+            record_stage_status(
+                work_dir,
+                StageKind.TOPOLOGY.value,
+                StageStatus.COMPLETED,
+                outputs=stage_minimum_outputs(StageKind.TOPOLOGY, "topol"),
+                prebuilt_source=prebuilt_meta,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            return GromacsProtocolResult(
+                name=config.name,
+                output_dir=str(work_dir),
+                replica_index=config.replica_index,
+                replicas_total=config.replicas_total,
+                stage_statuses={},
+                succeeded=0,
+                failed=1,
+                skipped=0,
+                interrupted=0,
+                validated=0,
+                dry_run=self._dry_run,
+                exit_code=2,
+                duration_seconds=time.monotonic() - started,
+                error=f"prebuilt topology staging failed: {exc}",
+            )
+        return None
 
     def _run_subprocess(
         self,
@@ -877,3 +960,202 @@ class GromacsProtocolRunner:
                 (stderr or "")[-500:],
             )
         return rc
+
+
+def _cached_stage_invalidated_for_topology(work_dir: Path, config: GromacsProtocolConfig) -> bool:
+    """Return True iff the cached TOPOLOGY stage is invalidated by a prebuilt-source mismatch.
+
+    Helper extracted from :meth:`GromacsProtocolRunner._run_single_stage`
+    so the stage's branch structure stays under the complexity
+    gate. A different prebuilt source (different ``.top`` /
+    ``.gro`` pair supplied by the caller) MUST invalidate the
+    cached stage even when the manifest status is COMPLETED.
+    """
+    return _prebuilt_source_changed(work_dir, config)
+
+
+def _invalidate_downstream_for_prebuilt_change(work_dir: Path) -> None:
+    """Invalidate every dependent stage when the prebuilt source has changed.
+
+    B4 — when the supplied prebuilt ``.top`` / ``.gro`` differs from
+    the cached digests, every stage that depends on those files
+    must be invalidated. The TOPOLOGY stage itself is RE-staged
+    below by the caller; the downstream stages (BOX, SOLVATE,
+    IONS, MINIMIZE, EQUIL_NVT, EQUIL_NPT, PRODUCTION) need their
+    cached outputs quarantined to ``.stale/<UTC>/`` and their
+    manifest entries reset to PENDING so the per-stage loop
+    re-runs them from scratch.
+
+    Implementation:
+
+    1. Read the current manifest.
+    2. For every dependent stage kind, if its manifest entry is
+       ``completed`` (or ``running`` — a partial run that was
+       interrupted) or ``failed`` (a downstream failure that
+       can't possibly be the prebuilt-source's fault), reset the
+       entry to PENDING.
+    3. Quarantine every on-disk output file that corresponds to
+       those stages to ``.stale/<UTC>/`` for forensic review.
+    4. Save the manifest.
+    """
+    manifest = load_stage_manifest(work_dir)
+    stages_section = manifest.setdefault("stages", {})
+    dependent_kinds = (
+        StageKind.BOX,
+        StageKind.SOLVATE,
+        StageKind.IONS,
+        StageKind.MINIMIZE,
+        StageKind.EQUIL_NVT,
+        StageKind.EQUIL_NPT,
+        StageKind.PRODUCTION,
+    )
+    stale_dir = _prebuilt_stale_dir(work_dir)
+
+    for kind in dependent_kinds:
+        record = stages_section.get(kind.value)
+        if record is None:
+            continue
+        existing_outputs = record.get("outputs")
+        outputs: list[str] = (
+            list(existing_outputs)
+            if isinstance(existing_outputs, list)
+            else list(stage_minimum_outputs(kind, _prefix_for(kind)))
+        )
+        _move_outputs_to_stale(work_dir, outputs, stale_dir)
+        # Reset to PENDING; the per-stage loop will re-run it.
+        stages_section[kind.value] = {
+            "status": StageStatus.PENDING,
+            "invalidated_by_prebuilt_source_change": True,
+        }
+
+    save_stage_manifest(work_dir, manifest)
+    logger.info(
+        "invalidated downstream stages for prebuilt source change; stale dir=%s",
+        stale_dir,
+    )
+
+
+def _prefix_for(kind: StageKind) -> str:
+    """Return the canonical ``-deffnm`` prefix for a stage kind."""
+    from biolab_runners.gromacs.paths import GromacsFiles
+
+    prefixes = {
+        StageKind.BOX: "box",
+        StageKind.SOLVATE: "solvate",
+        StageKind.IONS: "ions",
+        StageKind.MINIMIZE: GromacsFiles.MIN_PREFIX,
+        StageKind.EQUIL_NVT: GromacsFiles.NVT_PREFIX,
+        StageKind.EQUIL_NPT: GromacsFiles.NPT_PREFIX,
+        StageKind.PRODUCTION: GromacsFiles.PROD_PREFIX,
+    }
+    return prefixes[kind]
+
+
+def _prebuilt_stale_dir(work_dir: Path) -> Path:
+    """Return the per-invocation ``.stale/<UTC>/`` directory."""
+    ts = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%S_%f") + f"_{os.getpid()}"
+    stale_dir = work_dir / ".stale" / ts
+    stale_dir.mkdir(parents=True, exist_ok=True)
+    return stale_dir
+
+
+def _move_outputs_to_stale(work_dir: Path, outputs: list[str], stale_dir: Path) -> None:
+    """Best-effort move every named output to ``stale_dir`` (errors logged)."""
+    import shutil
+
+    for name in outputs:
+        src = work_dir / name
+        if not src.exists():
+            continue
+        try:
+            shutil.move(str(src), str(stale_dir / name))
+            logger.info("quarantined stale %s -> %s", src, stale_dir / name)
+        except OSError as exc:
+            logger.warning("quarantine failed for %s: %s", src, exc)
+
+
+def _stage_should_skip(
+    work_dir: Path,
+    stage: ProtocolStage,
+    config: GromacsProtocolConfig,
+) -> bool:
+    """Return True iff the stage is already complete and should be skipped.
+
+    Encapsulates the manifest-authority decision (canonical
+    path) plus the prebuilt-source invalidation (prebuilt path)
+    plus the legacy disk-output fallback (recovery path). When
+    the helper returns ``True``, the stage is recorded as
+    COMPLETED and the runner returns ``was_skipped=True``. When
+    it returns ``False``, the runner falls through to the
+    execution path.
+
+    The helper is module-level (not a method) so the helper
+    itself doesn't add complexity to ``_run_single_stage``.
+    """
+    if config.force:
+        return False
+
+    # Manifest authority — cache hit.
+    if _stage_already_complete(work_dir, stage):
+        # Prebuilt mode invalidates a cached TOPOLOGY stage
+        # when the supplied source digests differ from the
+        # recorded ones.
+        if stage.kind == StageKind.TOPOLOGY and _cached_stage_invalidated_for_topology(
+            work_dir, config
+        ):
+            logger.info(
+                "TOPOLOGY stage cached as COMPLETED but prebuilt source "
+                "digests differ; invalidating cached stage"
+            )
+            return False
+        record_stage_status(
+            work_dir,
+            stage.kind.value,
+            StageStatus.COMPLETED,
+            outputs=stage_minimum_outputs(stage.kind, stage.prefix),
+        )
+        return True
+
+    # Legacy disk-output fallback — manifest silent AND no
+    # on-disk .cpt AND minimum outputs on disk. Without this
+    # guard, a Spot-reclaim RUNNING manifest with on-disk
+    # outputs would be promoted to COMPLETED here, silently
+    # dropping the -cpi resume.
+    manifest_record = load_stage_manifest(work_dir).get("stages", {}).get(stage.kind.value)
+    manifest_status = manifest_record.get("status") if manifest_record else None
+    if (
+        manifest_status is None
+        and _checkpoint_for(work_dir, stage) is None
+        and _outputs_complete_on_disk(work_dir, stage)
+    ):
+        record_stage_status(
+            work_dir,
+            stage.kind.value,
+            StageStatus.COMPLETED,
+            outputs=stage_minimum_outputs(stage.kind, stage.prefix),
+        )
+        return True
+
+    return False
+
+
+def _prebuilt_meta(config: GromacsProtocolConfig) -> dict[str, str]:
+    """Compute the prebuilt-source digest metadata for the manifest binding.
+
+    Used by :class:`GromacsProtocolRunner.run_protocol` to record the
+    prebuilt source paths + digests in the TOPOLOGY stage's
+    manifest record. A future invocation with a different
+    prebuilt source sees a different digest and the cached stage
+    is invalidated (see :func:`_prebuilt_source_changed`).
+
+    Lives at module level rather than inside the class so it
+    can be unit-tested without instantiating a runner.
+    """
+    from biolab_runners.provenance import compute_file_digest
+
+    return {
+        "prebuilt_topology": config.prebuilt_topology,
+        "prebuilt_coordinates": config.prebuilt_coordinates,
+        "sha256_topology": compute_file_digest(Path(config.prebuilt_topology)) or "",
+        "sha256_coordinates": compute_file_digest(Path(config.prebuilt_coordinates)) or "",
+    }

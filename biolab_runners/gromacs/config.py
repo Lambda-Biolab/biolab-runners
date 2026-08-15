@@ -81,8 +81,9 @@ class GromacsProtocolConfig:
     Attributes:
         name: Logical run name. Used as the subdirectory under
             ``output_root`` (so multiple named runs can coexist).
-        input_pdb: Path to the input PDB file. Must be readable
-            by ``gmx pdb2gmx``.
+        input_pdb: Legacy ``gmx pdb2gmx`` source PDB. Required when
+            ``prebuilt_topology`` and ``prebuilt_coordinates`` are
+            not both set; ignored in prebuilt mode.
         output_root: Root directory for run outputs. Each run
             writes to ``output_root / name / f"rep{replica_index}"``
             when ``replicas_total > 1``, otherwise
@@ -182,6 +183,24 @@ class GromacsProtocolConfig:
     extra_mdrun_flags: tuple[str, ...] = field(default_factory=_empty_str_tuple)
     timeout_seconds: int = 86_400
     force: bool = False
+    # Slice 14 (E3 prerequisite, CHEM-001 / peptide-prep). When
+    # the peptide was prepared upstream (biolab_runners.peptide_prep)
+    # and a GROMACS ``.top`` / ``.gro`` were produced from the
+    # SAME OpenMM system, the GROMACS protocol can consume the
+    # prebuilt topology + coordinates and skip the
+    # ``pdb2gmx`` / force-field-assignment step. The
+    # ``box_buffer_nm`` / solvation / ions / equilibration /
+    # production stages are unchanged; only the topology stage
+    # is bypassed (the prebuilt topology carries the bonded +
+    # non-bonded parameters + atom charges from the upstream
+    # OpenMM ForceField).
+    #
+    # Both ``prebuilt_topology`` and ``prebuilt_coordinates``
+    # must be supplied, OR neither (the legacy ``input_pdb``
+    # path is unchanged). The runner validates this constraint
+    # and fails fast at construction.
+    prebuilt_topology: str = ""
+    prebuilt_coordinates: str = ""
 
     def __post_init__(self) -> None:
         """Validate required paths and parameter ranges."""
@@ -198,15 +217,54 @@ class GromacsProtocolConfig:
         self._validate_protocol_durations()
         self._validate_thermodynamics()
         self._validate_replicas()
+        self._validate_prebuilt()
 
     def _validate_paths(self) -> None:
-        """Validate the path-bearing required fields."""
+        """Validate the path-bearing required fields.
+
+        ``input_pdb`` is required only in legacy mode, when both
+        prebuilt paths are empty. In prebuilt mode it is ignored:
+        the runner skips ``pdb2gmx`` and stages
+        ``prebuilt_coordinates`` as ``processed.gro``. ``BOX`` uses
+        that file, and the resulting ``boxed.gro`` feeds ``SOLVATE``.
+        The prebuilt ``.top`` remains the topology source for
+        downstream GROMACS stages.
+        """
         if not self.name:
             raise ValueError("GromacsProtocolConfig.name is required")
-        if not self.input_pdb:
-            raise ValueError("GromacsProtocolConfig.input_pdb is required")
         if not self.output_root:
             raise ValueError("GromacsProtocolConfig.output_root is required")
+        if not self.input_pdb and not self.prebuilt_topology:
+            raise ValueError(
+                "GromacsProtocolConfig.input_pdb is required "
+                "(or supply prebuilt_topology + prebuilt_coordinates)"
+            )
+
+    def _validate_prebuilt(self) -> None:
+        """Validate the prebuilt-topology path pair (``both or neither``).
+
+        The prebuilt path is additive / backward-compat: when
+        BOTH ``prebuilt_topology`` and ``prebuilt_coordinates``
+        are empty, the legacy ``input_pdb`` path is used
+        unchanged (legacy tests / fixtures still pass). When
+        both are non-empty, the runner skips the
+        ``pdb2gmx`` topology stage and stages the prebuilt
+        files into the canonical ``topol.top`` /
+        ``processed.gro`` filenames at the start of the
+        protocol. ``input_pdb`` is ignored in prebuilt mode;
+        ``processed.gro`` feeds the BOX stage, and its
+        ``boxed.gro`` output feeds SOLVATE, while ``topol.top``
+        supplies the topology.
+        """
+        has_top = bool(self.prebuilt_topology)
+        has_xyz = bool(self.prebuilt_coordinates)
+        if has_top != has_xyz:
+            raise ValueError(
+                "prebuilt_topology and prebuilt_coordinates must both be set "
+                "or both be empty; got "
+                f"prebuilt_topology={self.prebuilt_topology!r}, "
+                f"prebuilt_coordinates={self.prebuilt_coordinates!r}"
+            )
 
     def _validate_geometry(self) -> None:
         """Validate the solvation-box geometry (buffer distance)."""

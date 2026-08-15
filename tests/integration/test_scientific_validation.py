@@ -291,20 +291,70 @@ def test_gromacs_protocol_runner_real_minimization_when_gmx_present(
 
 
 def _pick_openmm_platform() -> tuple[str, object]:
-    """Return ('CUDA', platform), ('OpenCL', platform), or ('CPU', platform).
+    """Return ('CUDA', platform), ('OpenCL', platform), 'CPU', or 'Reference'.
 
-    Priority is CUDA > OpenCL > CPU. Returns (name, instance); the
-    caller wraps this with a Simulation to verify the platform actually
-    works (some sandboxed /dev mounts cause the registry check to
-    succeed but the platform raise later during context init).
+    Priority is CUDA > OpenCL > CPU > Reference. Each candidate is
+    tested by actually creating a ``Context`` (some sandboxed
+    /dev mounts cause the registry check to succeed but the
+    platform raise later during context init). The function
+    returns the FIRST platform that initialises successfully
+    (NOT merely the first one whose name resolves). The CPU
+    and Reference fallbacks exist because the bare
+    ``Platform.getPlatformByName`` returns a stub on hosts
+    where the plugin is registered but unusable (the default
+    gate flake).
+
+    Args:
+        None
+
+    Returns:
+        ``(name, platform_instance)`` for the first platform that
+        successfully initialises a context with a 1-particle dummy
+        system. The caller wraps the returned platform with the
+        real ``Simulation``.
+
+    Raises:
+        pytest.fail: when NO platform initialises. This means the
+        ``openmm`` Python module is installed but no GPU / CPU
+        backend is usable — install ``openmm[cuda12]`` /
+        ``openmm-opencl`` or fix the agent's namespace.
     """
     openmm = pytest.importorskip("openmm")
-    for name in ("CUDA", "OpenCL", "CPU"):
+    import openmm.unit as _unit  # type: ignore[import-untyped]
+
+    # A 1-atom dummy system that every platform can handle. We
+    # only need to confirm the platform can create a Context;
+    # the test will replace this with the real System.
+    for name in ("CUDA", "OpenCL", "CPU", "Reference"):
         try:
-            return name, openmm.Platform.getPlatformByName(name)
+            platform = openmm.Platform.getPlatformByName(name)
         except Exception:
             continue
-    pytest.fail("OpenMM has no usable platform — install openmm-cuda/openmm-opencl")
+        # Verify the platform can ACTUALLY create a Context
+        # (not just register a stub). Some sandboxed /dev
+        # mounts cause the registry check to succeed but the
+        # context init to fail; this probe catches that. The
+        # integrator MUST be created per-probe (it binds to
+        # exactly one context).
+        try:
+            system = openmm.System()
+            system.addParticle(1.0)
+            integrator = openmm.LangevinIntegrator(
+                300.0 * _unit.kelvin,  # type: ignore[arg-type]
+                1.0 / _unit.picosecond,  # type: ignore[arg-type]
+                0.002 * _unit.picosecond,  # type: ignore[arg-type]
+            )
+            ctx = openmm.Context(system, integrator, platform)
+            del ctx, integrator  # free the binding before the next probe
+        except Exception:
+            # Platform registered but unusable — try the next one.
+            continue
+        return name, platform
+    pytest.fail(
+        "OpenMM has no usable platform — registered platforms failed "
+        "Context initialisation. Install openmm[cuda12] / "
+        "openmm-opencl or fix the agent's /dev namespace."
+    )
 
 
 def test_openmm_install_has_cuda_plugin_when_cuda_wheel_present() -> None:
@@ -396,14 +446,36 @@ def test_openmm_minimization_produces_physically_plausible_energy() -> None:
 
     chosen_name, chosen_platform = _pick_openmm_platform()
     t0 = time.perf_counter()
+    # If no platform could initialise, the probe in
+    # ``_pick_openmm_platform`` already pytest.fail()'d. If we
+    # are here, we have at least CPU / Reference working.
+    # The fallback chain in the try/except below re-runs
+    # the probe at higher fidelity (the real System + a
+    # 1700-atom topology), which can still fail if a GPU
+    # platform was selected but is broken.
     try:
         sim = Simulation(modeller.topology, system, integrator, chosen_platform)
     except Exception:
-        # CUDA/OpenCL platforms can be registered but unusable if /dev
-        # is wrong. Fall back to CPU to keep the test runnable.
-        if chosen_name == "CUDA":
-            chosen_name, chosen_platform = "OpenCL", Platform.getPlatformByName("OpenCL")
-            sim = Simulation(modeller.topology, system, integrator, chosen_platform)
+        # Block-gate flake hardening: even after the platform
+        # probe in ``_pick_openmm_platform`` passed, the
+        # real System construction can still fail if a
+        # CUDA/OpenCL platform is registered but its
+        # /dev/nvidia* mount is missing. Fall back to the
+        # next platform in priority order and retry; only
+        # re-raise when no candidate succeeds.
+        candidates = ("OpenCL", "CPU", "Reference")
+        for fallback in candidates:
+            if fallback == chosen_name:
+                continue
+            try:
+                chosen_name, chosen_platform = (
+                    fallback,
+                    Platform.getPlatformByName(fallback),
+                )
+                sim = Simulation(modeller.topology, system, integrator, chosen_platform)
+                break
+            except Exception:
+                continue
         else:
             raise
     sim.context.setPositions(modeller.positions)

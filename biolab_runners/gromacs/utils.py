@@ -293,6 +293,7 @@ def record_stage_status(
     started_at: str | None = None,
     completed_at: str | None = None,
     error: str = "",
+    prebuilt_source: dict[str, Any] | None = None,
 ) -> None:
     """Record a stage's outcome into the manifest.
 
@@ -301,6 +302,13 @@ def record_stage_status(
     :class:`StageStatus` values; an invalid status raises
     ``ValueError`` (the caller is responsible for translating
     subprocess exit codes into one of the four canonical states).
+
+    The optional ``prebuilt_source`` kwarg is consumed by the
+    GROMACS TOPOLOGY stage in prebuilt mode — it carries the
+    caller-supplied ``.top`` / ``.gro`` paths + their digests so
+    that a future invocation with a different prebuilt source
+    correctly invalidates the cached stage (see
+    ``_prebuilt_source_changed`` in the runner).
     """
     if status not in _STAGE_MANIFEST_STATUSES:
         raise ValueError(
@@ -319,6 +327,8 @@ def record_stage_status(
         record["completed_at"] = completed_at
     if error:
         record["error"] = error
+    if prebuilt_source is not None:
+        record["prebuilt_source"] = prebuilt_source
     manifest["stages"][stage_kind] = record
     save_stage_manifest(work_dir, manifest)
 
