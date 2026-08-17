@@ -13,7 +13,7 @@ Extracted from the [OralBiome-AMP](https://github.com/Lambda-Biolab/OralBiome-AM
 - **Boltz2Runner** — Local GPU structure prediction with quality gating, MSA caching, pocket constraints, and dry-run mode
 - **OpenMMRunner** — Full MD pipeline: system building, 3-stage equilibration, production NPT, checkpointing, early abort, SIGTERM handling. `OpenMMConfig.from_md_spec()` is the canonical construction path going forward (slice 12 — projects `bioml_tools.md.system_spec.MDSpec` onto the matching `OpenMMConfig` slot, with fail-closed allowlist for engine-specific overlays)
 - **GmxMMPBSARunner** (slice 14) — Optional gmx_MMPBSA integration for per-residue MM/PBSA decomposition. Gracefully degrades to `status="unsupported"` when the binary is missing
-- **RFdiffusionRunner** — Subprocess wrapper for unconditional / motif-scaffolding backbone generation (Hydra CLI translation)
+- **RFdiffusionRunner** — Subprocess wrapper for RFdiffusion backbone generation (in-package `rfdiffusion` console script; `RFDIFFUSION_HOME` → upstream clone): target-conditioned peptide binder design (`target_pdb` → stock `inference.input_pdb` + chain-referencing `contigs`, byte-for-byte) or generic unconditional generation. Truthful topology modes — `inference.cyclic`/`cyc_chains` are emitted only for the head-to-tail variants; disulfide pairs are recorded as downstream closure intent (RFdiffusion cannot encode them)
 - **ProteinMPNNRunner** — Subprocess wrapper for fixed-backbone sequence design (CLI translation from biolab-runners contract to upstream `protein_mpnn_run.py`)
 - **RosettaRunner** — Subprocess wrapper for Rosetta InterfaceAnalyzer (license-gated; skips when the license is absent)
 - **GROMACSRunner** — Subprocess wrapper for `.xvg` parsing integration
@@ -58,22 +58,31 @@ binary expects:
 |---|---|---|
 | `Boltz2Runner` | `boltz` (Conda) | upstream CLI passes through directly |
 | `OpenMMRunner` | `python -m openmm` (Python lib) | n/a — no subprocess |
-| `RFdiffusionRunner` | `rfdiffusion` (or `${RFDIFFUSION_BIN}`) | `--input_path DIR`, `--output_path DIR`, `--num_designs N`, `--length MINMAX`, `--contig_map SPEC` |
+| `RFdiffusionRunner` | in-package `rfdiffusion` console script (or `${RFDIFFUSION_BIN}`); requires `RFDIFFUSION_HOME` → upstream clone with weights | `--output_dir DIR`, `--<dotted.hydra.key> <value>` pairs (underscores hyphenated), e.g. `--inference.num-designs N`, `--contigmap.contigs SPEC`, `--inference.input-pdb PDB`, `--inference.design-startnum N`, `--inference.cyclic True`, `--ppi.hotspot-res A51,A52` |
 | `ProteinMPNNRunner` | `proteinmpnn` (or `${PROTEINMPNN_BIN}`) | `--input_path DIR`, `--output_path DIR`, `--batch_size N`, `--seed N`, `--sampling_temp F`, `--num_seq_per_target N`, `--model_name CHECKPOINT` (one of `v_48_002`, `v_48_010`, `v_48_020`, `v_48_030`), `--ca_only`, `--omit_AA`, `--fixed_positions` |
 | `RosettaRunner` | Rosetta InterfaceAnalyzer | license-gated; skipped when absent |
 | `GROMACSRunner` | n/a (parser-only) | fixture `.xvg` files |
 
+The RFdiffusion adapter ships **in the package**: the installed wheel
+provides the `rfdiffusion` console script
+(`biolab_runners.rfdiffusion.cli`), which validates the flag pairs,
+translates list-typed keys to Hydra list syntax
+(`contigmap.contigs=[...]`, `ppi.hotspot_res=['A51','A52']`), quotes
+string scalars only when needed (types preserved), and executes stock
+`scripts/run_inference.py` with positional `key=value` overrides (no
+shell). Runtime requirements: `RFDIFFUSION_HOME` pointing at the
+upstream `RosettaCommons/RFdiffusion` clone root (default
+`~/tools/RFdiffusion`), model weights downloaded, and a **Python with
+PyTorch + CUDA** in the interpreter running the console script (the
+clone is auto-prepended to `PYTHONPATH`; Hydra's own metadata is
+confined under the output directory). `--help` needs none of these.
 The host-level bootstrap script
 `~/.local/bin/install-proteinmpnn-rfdiffusion.sh` clones the upstream
 `dauparas/ProteinMPNN` and `RosettaCommons/RFdiffusion` repos shallowly
-into `~/tools/`, then writes thin Python wrappers at
-`~/.local/bin/proteinmpnn` and `~/.local/bin/rfdiffusion` that adapt
-the biolab-runners CLI to upstream's expected one
-(`--pdb_path` / `--out_folder` for ProteinMPNN; Hydra
-`contigmap.contigs=...` for RFdiffusion). After running the script,
-`biolab_runners.proteinmpnn.utils.proteinmpnn_available()` and
-`biolab_runners.rfdiffusion.utils.rfdiffusion_available()` both return
-True.
+into `~/tools/` (satisfying the default `RFDIFFUSION_HOME`). After the
+clone + weights are present, `biolab_runners.proteinmpnn.utils.proteinmpnn_available()`
+and `biolab_runners.rfdiffusion.utils.rfdiffusion_available()` both
+return True.
 
 ## Installation
 
@@ -161,6 +170,52 @@ result = runner.predict_complex(
     dry_run=True,  # Validates inputs, logs command, no GPU needed
 )
 ```
+
+### RFdiffusion Target-Conditioned Binder Design
+
+```python
+from pathlib import Path
+
+from biolab_runners.rfdiffusion import RFdiffusionConfig, RFdiffusionRunner
+
+# Target-conditioned peptide binder: two fixed target chains (A, B)
+# followed by a generated 14-18-residue binder segment. ``contigs``
+# is canonical stock syntax, forwarded byte-for-byte as
+# ``contigmap.contigs``; ``target_pdb`` becomes ``inference.input_pdb``.
+# ``target_pdb`` must point at a REAL structure on disk — a missing
+# file fails closed, and binder contigs/hotspots without a target are
+# rejected (stock upstream would silently fall back to its bundled
+# example PDB).
+config = RFdiffusionConfig(
+    name="binder-campaign",
+    target_pdb="path/to/real/target_complex.pdb",
+    contigs="A1-110/0 B1-110/0 14-18",
+    seed=7,
+    task_count=10,
+    mode="head_to_tail",          # cyclic binder (cyc_chains="a": first generated chain)
+    hotspots=("A51", "A52"),      # optional binding-site residues
+)
+
+runner = RFdiffusionRunner(output_root=Path("results/backbones"))
+result = runner.run(config, dry_run=True)  # validate inputs without a GPU
+```
+
+- `mode="linear"` — acyclic binder. `mode="disulfide"` — acyclic, with
+  `disulfide_pairs` recorded as **downstream closure intent**:
+  stock RFdiffusion cannot encode residue-pair disulfides, so no
+  cyclic flags are emitted (`inference.cyclic`/`cyc_chains` express
+  head-to-tail cyclization only). `mode="head_to_tail_and_disulfide"`
+  — head-to-tail cyclic binder whose pairs are applied downstream
+  (e.g. `biolab_runners.peptide_prep`).
+- Binder contigs (chain references) and hotspots both require
+  `target_pdb`, and a set-but-missing `target_pdb` is a hard error —
+  all fail closed so a run can never silently design against the
+  wrong structure. With an empty `target_pdb`, `contigs="14-18"` is
+  generic **unconditional** generation — not a binder.
+- Runtime requirement: `RFDIFFUSION_HOME` must point at the upstream
+  clone root (`~/tools/RFdiffusion` by default) with the model
+  weights downloaded — the wheel's `rfdiffusion` console script
+  resolves `scripts/run_inference.py` there.
 
 ### OpenMM MD Simulation
 

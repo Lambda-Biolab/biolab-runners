@@ -1,6 +1,8 @@
 """RFdiffusion runner.
 
-A subprocess wrapper around the upstream ``RFdiffusion/run_inference.py``
+A subprocess wrapper around the in-package ``rfdiffusion`` console
+script (``biolab_runners.rfdiffusion.cli``), which adapts the runner's
+flag contract to the upstream ``RFdiffusion/run_inference.py`` Hydra
 CLI. The runner owns:
 
 * ``submit()`` / ``dry_run`` semantics matching the boltz2 runner;
@@ -15,10 +17,10 @@ CLI. The runner owns:
   :class:`biolab_runners.provenance.ProvenanceMetadata` record so
   downstream consumers can audit the inputs.
 
-RFdiffusion itself is not pip-installable. The runner expects the
-caller to either (a) install the upstream conda env (rare), or (b)
-point ``RFDIFFUSION_BIN`` at a Docker-wrapped command (the GCP Batch
-path).
+RFdiffusion itself is not pip-installable. The runner invokes the
+installed ``rfdiffusion`` console script (or ``RFDIFFUSION_BIN``), which
+requires ``RFDIFFUSION_HOME`` to point at the upstream clone root with
+the model weights downloaded (see ``biolab_runners.rfdiffusion.cli``).
 
 Output layout and cache key:
 
@@ -31,26 +33,39 @@ Output layout and cache key:
   1. the full canonical requested-config digest
      (:func:`biolab_runners.provenance.compute_config_digest` —
      every field, including ``seed``, ``task_count``, ``contigs``,
-     ``mode``, ``disulfide_pairs``, ``hotspots``, ``deterministic``,
-     ``checkpoint``, and ``extra``),
-  2. the **normalized image digest** when the caller supplied one,
-  3. the **content digest of ``target_pdb``** when the file exists.
+     ``mode``, ``disulfide_pairs``, ``cyc_chains``, ``hotspots``,
+     ``deterministic``, ``checkpoint``, and ``extra``),
+  2. the **derived execution payload** — the runner-execution
+     contract version (:data:`EXECUTION_CONTRACT_VERSION`) plus the
+     exact CLI mapping (:func:`_config_to_cli`) — so a mapping-only
+     change (same requested config, different forwarded flags)
+     invalidates the cache,
+  3. the **normalized image digest** when the caller supplied one,
+  4. the **content digest of ``target_pdb``** when set.
 
-  A config variant, a different image, or changed bytes at the same
-  target path each get their own directory; the cache can never
-  return another identity's outputs. ``result.name`` still reports
-  ``config.name``.
+  A config variant, a different image, changed bytes at the same
+  target path, or a mapping change each get their own directory; the
+  cache can never return another identity's outputs. ``result.name``
+  still reports ``config.name``.
 * **Cache identity binding is what it covers.** When ``image_digest``
   is absent the identity has no image binding — two local runs with
   the same config and source but different container images could
   cross-hit. This is a documented local-compat limitation; Activin
   production supplies ``image_digest``, which makes the binding
-  complete. When ``target_pdb`` is set but the file is missing, the
-  identity has no source-content binding either (the config digest
-  still binds the path string) and the run proceeds with the
-  existing warning + ``source_backbone_digest=None``; a later run
-  with the file present computes a different identity and
-  re-executes, so a missing-then-present source can never cross-hit.
+  complete. A set-but-missing ``target_pdb`` is a hard error at
+  run time (fail closed): the file is forwarded as
+  ``inference.input_pdb``, so a dangling path would crash upstream,
+  and the identity would lose its source-content binding. An
+  **empty** ``target_pdb`` is unconditional generation — the
+  identity then has no source binding by design (absence is intent),
+  and the provenance manifest records ``source_backbone_digest=None``.
+* **Identity mechanism preserved; tokens change once.** Binding the
+  execution payload (item 2) means cache tokens computed by earlier
+  runner versions are no longer reproduced — a deliberate, one-time
+  invalidation. The identity *mechanism* (config + image + source
+  content isolation, normalized forms) is unchanged; the token for a
+  given (config, image, source, execution payload) tuple is stable
+  from here on.
 * **Migration / legacy behavior.** Runner versions before the
   digest-keyed layout wrote directly into
   ``<output_root>/<name>/*.pdb``. Those name-only outputs carry no
@@ -84,21 +99,44 @@ Notes on seed / temperature forwarding (S2 honesty):
   ``base_seed == requested_seed == config.seed`` and ``rng_intent
   == "per-design-index"``; the per-design seed range is encoded by
   ``base_seed`` + ``task_count`` (no per-seed list is fabricated).
-  ``executed_config_digest`` includes ``seed``, so a seed-only
-  change flips the executed digest (the digest describes what was
-  actually forwarded).
+  ``executed_config_digest`` covers the derived execution payload
+  (contract version + exact CLI mapping), which includes
+  ``design_startnum`` in deterministic mode — so a seed-only change
+  flips the executed digest (the digest describes what was actually
+  forwarded).
 * When ``config.deterministic`` is false the runner forwards
   neither ``inference.design_startnum`` nor
   ``inference.deterministic`` — upstream uses system entropy, so a
   forwarded base seed would be inert. The manifest records
   ``base_seed=None`` and ``rng_intent == "non-deterministic"``, and
-  the executed config digest excludes ``seed`` (it was not
-  forwarded; a seed-only change must not flip the executed digest).
+  the executed mapping omits the seed entirely (no
+  ``inference.design_startnum``) — a seed-only change must not flip
+  the executed digest.
 * RFdiffusion does not expose a single ``temperature`` parameter
   (the diffusion process uses ``noise_scale_ca`` /
   ``noise_scale_frame``, which are tuned per-application and
   upstream-internal). The provenance manifest therefore records
   ``temperature=None`` for RFdiffusion runs.
+* Target-conditioned binder design: ``config.target_pdb`` is
+  forwarded as the canonical stock Hydra key ``inference.input_pdb``
+  and bound in the cache identity + provenance by its content digest.
+  Stock upstream substitutes a bundled example PDB when
+  ``input_pdb`` is unset, so binder contigs (chain references in
+  ``contigs``) and hotspots without ``target_pdb`` are rejected at
+  config construction, and a set-but-missing ``target_pdb`` file
+  raises at ``run()`` / ``is_complete()`` time (fail closed).
+* Topology honesty: ``inference.cyclic`` / ``inference.cyc_chains``
+  express **only** head-to-tail cyclization of named chains. The
+  runner emits them for ``mode="head_to_tail"`` and
+  ``mode="head_to_tail_and_disulfide"`` (``cyc_chains`` names the
+  generated binder chain — default ``"a"``, the first generated
+  chain per stock contig output semantics; generated chains are
+  emitted as ``A``, ``B``, ... ahead of receptor fragments).
+  ``mode="disulfide"`` forwards **no** cyclic flags: stock
+  RFdiffusion cannot encode residue-pair disulfides, and
+  ``disulfide_pairs`` remains in config/provenance as downstream
+  topology intent, applied and validated by
+  ``biolab_runners.peptide_prep`` — not by RFdiffusion.
 
 Notes on cache hits (S2 honesty):
 
@@ -110,11 +148,12 @@ Notes on cache hits (S2 honesty):
   ``requested_config_digest`` describes what *this* call asked for;
   ``requested_seed`` and ``base_seed`` (and ``rng_intent``) are
   reported because the cache is **identity-bound**: the cache key IS
-  the canonical identity over the full requested config, the
+  the canonical identity over the full requested config, the derived
+  execution payload (contract version + exact CLI mapping), the
   normalized image digest, and the source-backbone content digest,
   so the cached outputs provably correspond to this exact
-  config+image+source and the per-design seed range ``base_seed ..
-  base_seed + task_count - 1`` describes them.
+  config+execution+image+source and the per-design seed range
+  ``base_seed .. base_seed + task_count - 1`` describes them.
 """
 
 from __future__ import annotations
@@ -132,10 +171,10 @@ from biolab_runners.provenance import (
     RNG_INTENT_PER_DESIGN_INDEX,
     ProvenanceMetadata,
     compute_config_digest,
-    compute_executed_config_digest,
     compute_file_digest,
     validate_image_digest,
 )
+from biolab_runners.rfdiffusion.cli import EXECUTION_CONTRACT_VERSION
 from biolab_runners.rfdiffusion.utils import (
     RecordData,
     RecordDataStatus,
@@ -156,30 +195,51 @@ __all__ = ["RFdiffusionResult", "RFdiffusionRunner"]
 # ---------------------------------------------------------------------------
 
 
+def _validate_target_file(cfg: RFdiffusionConfig) -> None:
+    """Fail closed when ``target_pdb`` is set but the file is missing.
+
+    ``target_pdb`` is forwarded as ``inference.input_pdb``: a
+    dangling path would crash upstream at best, and with the file
+    absent the cache identity would lose its source-content binding
+    (an unusable identity). Raised by ``run()`` and ``is_complete()``
+    before any directory or subprocess work. An **empty**
+    ``target_pdb`` is unconditional generation and is not an error.
+    """
+    if cfg.target_pdb and not Path(cfg.target_pdb).is_file():
+        raise ValueError(
+            f"RFdiffusionConfig.target_pdb={cfg.target_pdb!r} does not exist; "
+            "target-conditioned design requires a readable target structure"
+        )
+
+
 def _cache_identity_token(config: RFdiffusionConfig, *, image_digest: str | None) -> str:
     """Canonical cache identity for ``config``.
 
-    Binds the three things that determine upstream's output:
+    Binds the four things that determine upstream's output:
 
     1. the full canonical requested-config digest (every config field
        — ``seed``, ``task_count``, ``contigs``, ``mode``,
-       ``disulfide_pairs``, ``hotspots``, ``deterministic``,
-       ``checkpoint``, ``extra``);
-    2. the **normalized** image digest, when the caller supplied one
+       ``disulfide_pairs``, ``cyc_chains``, ``hotspots``,
+       ``deterministic``, ``checkpoint``, ``extra``);
+    2. the **derived execution payload** — the runner-execution
+       contract version plus the exact CLI mapping
+       (:func:`_execution_payload`), so a mapping-only change
+       invalidates the cache;
+    3. the **normalized** image digest, when the caller supplied one
        (``None``/absent → the identity has no image binding — local
        compatibility; Activin production supplies it);
-    3. the content digest of ``target_pdb`` **when the file exists**
-       (missing → no source-content binding; the config digest still
-       binds the path string, and a later present file yields a
-       different identity, so missing-then-present can never
-       cross-hit).
+    4. the content digest of ``target_pdb`` **when set** (the file
+       must exist — ``run()``/``is_complete()`` fail closed
+       otherwise; an empty ``target_pdb`` is unconditional
+       generation with no source binding by design).
 
     ``run()``, ``is_complete``, and ``_design_dir`` all compute the
     directory from this single function, so the cache lookup and the
     write target are always the same identity.
     """
-    payload: dict[str, str | None] = {
+    payload: dict[str, object] = {
         "config": compute_config_digest(config),
+        "execution": _execution_payload(config),
         "image_digest": validate_image_digest(image_digest),
         "source_backbone_digest": compute_file_digest(Path(config.target_pdb))
         if config.target_pdb
@@ -189,24 +249,46 @@ def _cache_identity_token(config: RFdiffusionConfig, *, image_digest: str | None
 
 
 # ---------------------------------------------------------------------------
-# Executed-digest exclusion policy
+# Derived execution payload (contract version + exact CLI mapping)
 # ---------------------------------------------------------------------------
 
+#: Version of the runner→CLI execution contract. The constant is
+#: defined in the translation-owning console-script module
+#: (``biolab_runners.rfdiffusion.cli``) and imported here so there is
+#: one authoritative bump location: bump it whenever the config→flag
+#: mapping (:func:`_config_to_cli`) OR the flag→Hydra translation /
+#: owned overrides in the CLI module change. The mapping is part of
+#: the cache identity and the executed-config digest, so a mapping-only
+#: change (identical requested config) invalidates cached outputs and
+#: re-provenances the run.
 
-def _executed_digest_excluded_fields(cfg: RFdiffusionConfig) -> tuple[str, ...]:
-    """Fields excluded from the *executed* config digest for ``cfg``.
 
-    ``seed`` maps to ``inference.design_startnum``, which the runner
-    forwards **only** when ``deterministic=True``. So:
+def _execution_payload(config: RFdiffusionConfig) -> dict[str, object]:
+    """The derived execution payload for ``config``.
 
-    * deterministic — nothing is excluded: the seed changes what
-      upstream ran (per-design seeds start at it), so a seed-only
-      change flips the executed digest.
-    * non-deterministic — ``seed`` is excluded: the base seed is not
-      forwarded (upstream uses system entropy), so a seed-only change
-      must NOT flip the executed digest.
+    The exact CLI mapping the runner forwards (contract version +
+    :func:`_config_to_cli` output). Bound into the cache identity and
+    the executed-config digest; the *requested* digest stays
+    config-based. Non-deterministic runs omit ``seed`` from the
+    mapping (no ``inference.design_startnum`` is forwarded), so the
+    payload naturally reflects that.
     """
-    return () if cfg.deterministic else ("seed",)
+    return {
+        "contract_version": EXECUTION_CONTRACT_VERSION,
+        "cli": _config_to_cli(config),
+    }
+
+
+def _executed_digest(config: RFdiffusionConfig) -> str:
+    """Digest of the DERIVED execution payload for ``config``.
+
+    Describes what upstream actually received: the runner-execution
+    contract version plus the exact CLI mapping. A mapping-only change
+    (e.g. a new forwarded flag, a renamed key) flips the executed
+    digest; a non-deterministic seed-only change does NOT — the
+    mapping omits the seed when ``deterministic=False``.
+    """
+    return compute_config_digest(_execution_payload(config))
 
 
 @dataclass(frozen=True)
@@ -273,8 +355,11 @@ class RFdiffusionRunner:
         name-only outputs (see the module docstring) are never
         treated as a cache entry. ``image_digest`` is normalized
         before the identity is computed, so bare-hex and OCI forms
-        bind identically.
+        bind identically. A set-but-missing ``target_pdb`` fails
+        closed (see :func:`_validate_target_file`) — the probe would
+        otherwise consult an identity with no source-content binding.
         """
+        _validate_target_file(config)
         directory = self._design_dir(config, image_digest=image_digest)
         if not directory.exists():
             return False
@@ -311,12 +396,18 @@ class RFdiffusionRunner:
             duration, and S2 provenance.
 
         The cache is keyed by the canonical identity over the full
-        requested-config digest + the normalized ``image_digest``
-        (when supplied) + the content digest of ``config.target_pdb``
-        (when the file exists): ``<output_root>/<name>/<identity>/``.
-        Two runs that differ in any config field, in the image digest,
-        or in the source-backbone bytes never share a directory, so a
-        cache hit can only ever return this exact identity's outputs.
+        requested-config digest + the derived execution payload
+        (contract version + exact CLI mapping) + the normalized
+        ``image_digest`` (when supplied) + the content digest of
+        ``config.target_pdb`` (when set):
+        ``<output_root>/<name>/<identity>/``.
+        Two runs that differ in any config field, in the execution
+        mapping, in the image digest, or in the source-backbone bytes
+        never share a directory, so a cache hit can only ever return
+        this exact identity's outputs.
+        A set-but-missing ``target_pdb`` file fails closed (see
+        :func:`_validate_target_file`) before any directory or
+        subprocess work.
         """
         # Canonicalise the caller-supplied image digest BEFORE any
         # subprocess work so downstream manifest comparison sees a
@@ -326,6 +417,7 @@ class RFdiffusionRunner:
         cfg = config or self._config_override
         if cfg is None:
             raise ValueError("RFdiffusionConfig is required: pass it to run() or the runner")
+        _validate_target_file(cfg)
 
         design_dir = self._design_dir(cfg, image_digest=image_digest)
         design_dir.mkdir(parents=True, exist_ok=True)
@@ -411,7 +503,7 @@ class RFdiffusionRunner:
         :func:`_cache_identity_token` — the canonical cache identity
         over the requested config digest, the normalized image digest
         (when supplied), and the ``target_pdb`` content digest (when
-        the file exists). ``run()`` and ``is_complete`` use this same
+        set). ``run()`` and ``is_complete`` use this same
         function, so the cache lookup and the write target always
         agree.
         """
@@ -435,22 +527,18 @@ class RFdiffusionRunner:
         """Assemble the S2 provenance record for ``cfg``.
 
         The ``target_pdb`` field on the config is the source backbone
-        for RFdiffusion. When unset, the manifest records ``None``
-        rather than fabricating a digest — absence is a signal. When
-        set but the file is absent, we warn at the logger so a
-        operator notices but still record ``None`` in the manifest
-        (the audit can correlate the warning with the config).
+        for RFdiffusion; its content digest is recorded as
+        ``source_backbone_digest``. The file is guaranteed to exist
+        here — ``run()`` fails closed on a set-but-missing target
+        (see :func:`_validate_target_file`). When ``target_pdb`` is
+        unset (unconditional generation) the manifest records ``None``
+        rather than fabricating a digest — absence is intent.
+        ``executed_config_digest`` is :func:`_executed_digest` — the
+        derived execution payload (contract version + exact CLI
+        mapping), describing what upstream actually received; the
+        ``requested_config_digest`` stays config-based.
         """
-        if cfg.target_pdb:
-            target = Path(cfg.target_pdb)
-            if not target.exists():
-                logger.warning(
-                    "RFdiffusionConfig.target_pdb=%s does not exist; "
-                    "provenance.source_backbone_digest will be None",
-                    cfg.target_pdb,
-                )
-        else:
-            target = None
+        target = Path(cfg.target_pdb) if cfg.target_pdb else None
         return ProvenanceMetadata(
             model_identifier=cfg.checkpoint,
             temperature=None,
@@ -467,11 +555,7 @@ class RFdiffusionRunner:
             else RNG_INTENT_NON_DETERMINISTIC,
             canonical_output=(),
             requested_config_digest=compute_config_digest(cfg),
-            executed_config_digest=compute_executed_config_digest(
-                cfg, exclude_fields=_executed_digest_excluded_fields(cfg)
-            )
-            if executed
-            else None,
+            executed_config_digest=_executed_digest(cfg) if executed else None,
             executed=executed,
             cache_hit=cache_hit,
         )
@@ -481,7 +565,12 @@ def _config_to_cli(config: RFdiffusionConfig) -> dict[str, str]:
     """Translate :class:`RFdiffusionConfig` into the upstream CLI kwargs.
 
     Returns a flat ``key -> str`` mapping consumed by
-    :func:`biolab_runners.rfdiffusion.utils._invoke_with_metadata`.
+    :func:`biolab_runners.rfdiffusion.utils._invoke_with_metadata`,
+    which emits ``--<dotted.key> <value>`` flags for the in-package
+    ``rfdiffusion`` console script (it re-translates list-typed keys
+    to Hydra list syntax). The mapping is also the derived execution
+    payload bound into the cache identity and the executed-config
+    digest (:func:`_execution_payload` / :func:`_executed_digest`).
 
     Notes on what's deliberately **not** forwarded:
 
@@ -502,20 +591,31 @@ def _config_to_cli(config: RFdiffusionConfig) -> dict[str, str]:
       sampling temperature. Mapping ``config.temperature`` to
       ``noise_scale_ca`` would silently change upstream behaviour
       and is intentionally avoided.
+    * ``inference.cyclic`` / ``inference.cyc_chains`` — forwarded
+      only for the head-to-tail modes. Stock RFdiffusion uses them
+      to cyclize named **chains** head-to-tail; it has no notion of
+      residue-pair disulfides, so ``mode="disulfide"`` forwards
+      neither flag (the pairs stay in config/provenance as
+      downstream closure intent).
 
     ``config.extra`` may not override the canonical keys the runner
     emits (``inference.num_designs`` / ``inference.design_startnum`` /
-    ``inference.deterministic`` / ``inference.cyclic`` /
-    ``inference.cyc_chains`` / ``contigmap.contigs`` /
-    ``ppi.hotspot_res``), nor forward unsupported keys such as
-    ``inference.seed`` — :class:`RFdiffusionConfig` rejects all of
-    these at construction time (fail closed), so the merge below
-    cannot silently clobber a forwarded field.
+    ``inference.deterministic`` / ``inference.input_pdb`` /
+    ``inference.cyclic`` / ``inference.cyc_chains`` /
+    ``contigmap.contigs`` / ``ppi.hotspot_res``), nor forward
+    unsupported keys such as ``inference.seed`` —
+    :class:`RFdiffusionConfig` rejects all of these at construction
+    time (fail closed), so the merge below cannot silently clobber a
+    forwarded field.
     """
     payload: dict[str, str] = {
         "inference.num_designs": str(config.task_count),
         "contigmap.contigs": config.contigs,
     }
+    if config.target_pdb:
+        # Canonical stock key: target-conditioned design parses the
+        # chains referenced by ``contigmap.contigs`` from this file.
+        payload["inference.input_pdb"] = config.target_pdb
     if config.deterministic:
         # Upstream seeds each design with its index (see
         # RFdiffusion/scripts/run_inference.py):
@@ -527,15 +627,20 @@ def _config_to_cli(config: RFdiffusionConfig) -> dict[str, str]:
         # start at ``seed``.
         payload["inference.design_startnum"] = str(config.seed)
         payload["inference.deterministic"] = "True"
-    if config.mode == "head_to_tail":
+    if config.mode in {"head_to_tail", "head_to_tail_and_disulfide"}:
         payload["inference.cyclic"] = "True"
-        payload["inference.cyc_chains"] = "a"
-    elif config.mode == "disulfide":
-        payload["inference.cyclic"] = "True"
-        # Disulfide pairs are encoded as a comma-separated chain
-        # specifier; the upstream parser turns ``X,Y`` into a Cys
-        # pair between positions X and Y.
-        payload["inference.cyc_chains"] = ",".join(f"{a},{b}" for a, b in config.disulfide_pairs)
+        # Stock ``inference.cyc_chains`` names the OUTPUT chains to
+        # cyclize head-to-tail. Generated (inpainted) chains are
+        # emitted first as ``A``, ``B``, ... ahead of receptor
+        # fragments (RFdiffusion/contigs.py), so the configured chain
+        # (default ``"a"``) is the generated binder; upstream
+        # uppercases it internally (_init_cyclic_reses).
+        payload["inference.cyc_chains"] = config.cyc_chains
+    # mode="disulfide": NOT cyclic. Stock inference.cyclic/cyc_chains
+    # express only head-to-tail chain cyclization and cannot encode
+    # residue-pair disulfides; ``disulfide_pairs`` remains in
+    # config/provenance as downstream topology intent (closure is
+    # applied/validated by peptide_prep, not by RFdiffusion).
     if config.hotspots:
         payload["ppi.hotspot_res"] = ",".join(config.hotspots)
     for key, value in config.extra.items():

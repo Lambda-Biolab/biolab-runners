@@ -20,6 +20,13 @@ classifiers = [
 
 dependencies = []
 
+[project.scripts]
+# In-package stock-RFdiffusion adapter: translates the
+# RFdiffusionRunner's ``--output_dir`` + dotted/key-value flag contract
+# into Hydra positional overrides for the upstream
+# ``scripts/run_inference.py`` located under ``RFDIFFUSION_HOME``.
+rfdiffusion = "biolab_runners.rfdiffusion.cli:main"
+
 [project.optional-dependencies]
 boltz2 = [
     "boltz>=2.2",

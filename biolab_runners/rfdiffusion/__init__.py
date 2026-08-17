@@ -6,10 +6,13 @@ Thin subprocess wrapper around the upstream
 with ``submit`` / ``dry-run`` / idempotency semantics, and a utils
 module with availability probes and result parsing.
 
-RFdiffusion is not pip-installable. Consumers are expected to mount
-the upstream Docker image (or build a pinned one) and point the
-runner at the container via the ``RFDIFFUSION_BIN`` env var or a
-``container://`` URI.
+RFdiffusion is not pip-installable. The installed wheel ships the
+``rfdiffusion`` console script (``biolab_runners.rfdiffusion.cli``),
+which adapts the runner's flag contract to the stock upstream
+``scripts/run_inference.py`` located under ``RFDIFFUSION_HOME``
+(default ``~/tools/RFdiffusion``; model weights required). Custom
+binaries implementing the same contract can be supplied via the
+``RFDIFFUSION_BIN`` env var.
 
 Backbone generation emits one PDB file per design; the runner parses
 each into a structured :class:`RecordData` result. Failures are

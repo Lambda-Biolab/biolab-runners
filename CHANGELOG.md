@@ -6,6 +6,80 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- **RFdiffusion execution contract (target-conditioned binders)**:
+  `RFdiffusionConfig.target_pdb` is now forwarded as the canonical
+  stock Hydra key `inference.input_pdb` (added to
+  `RESERVED_CANONICAL_KEYS` — `extra` cannot override), so binder
+  design actually reaches upstream instead of silently falling back
+  to the bundled example PDB. Removed the scientifically false
+  disulfide→cyclic mapping: `mode="disulfide"` emits **no** cyclic
+  flags (`inference.cyclic`/`cyc_chains` express only head-to-tail
+  chain cyclization); `disulfide_pairs` remains in config/provenance
+  as downstream topology intent, applied by
+  `biolab_runners.peptide_prep`. Added explicit
+  `mode="head_to_tail_and_disulfide"` and a validated `cyc_chains`
+  field (default `"a"` = first generated chain, per stock contig
+  output semantics). Fail-closed validation: chain-referencing
+  binder contigs **and hotspots** require `target_pdb`, and a
+  set-but-missing target file is a hard error at run time. The #199
+  cache-identity *mechanism* is preserved (target content,
+  path-normalized image, and config variants still isolate); docs no
+  longer call generic unconditional generation a binder.
+
+- **In-package stock-RFdiffusion adapter**: the installed wheel now
+  ships a `rfdiffusion` console script
+  (`biolab_runners.rfdiffusion.cli`) implementing the runner's
+  `--output_dir` + dotted/key-value flag contract — it validates the
+  pairs, translates `contigmap.contigs` / `ppi.hotspot_res` to Hydra
+  list syntax, owns `inference.output_prefix=<output_dir>/design`,
+  and executes stock `scripts/run_inference.py` with positional
+  `key=value` overrides (no shell; exit code/stdout/stderr
+  propagate). Upstream is located via `RFDIFFUSION_HOME` (default
+  `~/tools/RFdiffusion` — the org bootstrap clone location); `--help`
+  is cheap and needs no model files. The legacy broken
+  `container://` `RFDIFFUSION_BIN` fallback (which handed Hydra
+  `--key value` flags and hardcoded an image-internal path) is
+  **removed** — the availability probe reports it unavailable and
+  resolution raises a clear error.
+
+  **Final review-fix pass**:
+
+  - The resolved clone root is **prepended to `PYTHONPATH`** (the
+    existing value is preserved) so a clone-only deployment can
+    `import rfdiffusion` inside `run_inference.py`; runtime deps are
+    documented as Python + PyTorch/CUDA + model weights.
+  - String scalars are **Hydra-quoted only when needed** — paths with
+    whitespace / quotes / commas / `#` / `~` etc. are wrapped with a
+    deterministic escape-safe transform that Hydra's own unescaper
+    round-trips, while numeric / bool / plain-path tokens stay
+    unquoted (types preserved). Verified against a real Hydra 1.3
+    parser.
+  - **Hydra's own metadata is confined** under the identity output
+    directory via owned overrides (`hydra.run.dir=<outdir>/hydra`,
+    `hydra.output_subdir=null`, `hydra.job.chdir=False`) — no
+    `outputs/` / `.hydra/` pollution in the caller's CWD; PDB output
+    parsing is unaffected.
+  - `inference.output_prefix` is now a **reserved canonical key** —
+    `extra` cannot override it (the CLI owns it); arbitrary dotted
+    Hydra `extra` keys remain supported.
+  - `EXECUTION_CONTRACT_VERSION` moved to the translation-owning CLI
+    module and is imported by the runner — one authoritative bump
+    location for the whole translation (config→flag mapping +
+    flag→Hydra quoting + owned overrides), which is bound into the
+    cache identity and executed digest.
+
+- **Execution payload bound to cache identity + executed digest**:
+  the cache identity now also covers the *derived execution payload*
+  (runner-execution contract version `EXECUTION_CONTRACT_VERSION` +
+  the exact `_config_to_cli` mapping) and `executed_config_digest`
+  is the digest of that payload — a mapping-only change (same
+  requested config, different forwarded flags) invalidates cached
+  outputs and re-provenances; the `requested_config_digest` stays
+  config-based, and the non-deterministic seed remains omitted from
+  the executed mapping. **Intentional one-time token change**: cache
+  tokens from earlier runner versions are not reproduced (pre-1.0
+  behavior change; the identity mechanism itself is unchanged).
+
 - **Peptide preparation (CHEM-001 / Activin E3 prerequisite)**:
   new `biolab_runners.peptide_prep` package materialises
   simulation-ready structures from a backbone PDB + designed

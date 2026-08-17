@@ -5,8 +5,42 @@ uses. Every field has a conservative default so a bare-minimum
 campaign still produces a valid result.
 
 The runner accepts the upstream ``contigmap.contigs`` syntax
-(e.g. ``"12-18 A3-117/0 50-50"``) so callers familiar with
-RFdiffusion can use the documentation directly.
+(e.g. ``"12-18 A3-117/0"``) so callers familiar with
+RFdiffusion can use the documentation directly. ``contigs`` is
+forwarded **byte-for-byte** to the CLI — the runner never parses or
+rewrites it, and it never invents a shorthand chain parser.
+
+Target-conditioned binder design:
+
+* Set ``target_pdb`` to a PDB containing the fixed target chain(s)
+  and use stock contig syntax that references them — e.g.
+  ``contigs="A1-110/0 B1-110/0 14-18"``: two fixed target chains
+  (A, B) followed by a generated 14–18-residue binder segment.
+  ``target_pdb`` is forwarded as the canonical stock Hydra key
+  ``inference.input_pdb``.
+* Binder contigs (those referencing chain IDs) and hotspots
+  (``ppi.hotspot_res`` — input-PDB chain residues) **require**
+  ``target_pdb``. Stock upstream silently substitutes a bundled
+  example PDB when ``inference.input_pdb`` is unset
+  (``rfdiffusion/inference/model_runners.py``), so a chain-
+  referencing contig or hotspot list without a target would design
+  against the wrong structure. The config rejects those
+  combinations (fail closed), and a set-but-missing ``target_pdb``
+  file is a hard error at run time.
+* With an empty ``target_pdb`` the run is generic **unconditional**
+  generation (e.g. the default ``contigs="14-18"``) — backward
+  compatible, but that is **not** a binder.
+
+Topology modes are truthful about what stock RFdiffusion can do:
+``inference.cyclic`` / ``inference.cyc_chains`` only express
+head-to-tail cyclization of named chains — they cannot encode
+residue-pair disulfides. The runner therefore emits cyclic flags
+only for ``mode="head_to_tail"`` and
+``mode="head_to_tail_and_disulfide"``; plain ``mode="disulfide"``
+is **not** cyclic, and ``disulfide_pairs`` is kept in the config /
+provenance as downstream topology intent (closure is applied and
+validated downstream, e.g. by ``biolab_runners.peptide_prep``, not
+by RFdiffusion).
 
 S2 reproducibility fields (per the Activin-E reproducibility plan):
 
@@ -52,6 +86,7 @@ canonical contract.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -61,16 +96,19 @@ if TYPE_CHECKING:
 __all__ = ["RESERVED_CANONICAL_KEYS", "UNSUPPORTED_UPSTREAM_KEYS", "ContigMap", "RFdiffusionConfig"]
 
 
-#: Canonical Hydra keys the runner emits itself. ``extra`` may not
-#: override them — a conflict raises ``ValueError`` at config
-#: construction time (fail closed) so a caller cannot silently
+#: Canonical Hydra keys the runner emits itself (or that the in-package
+#: ``rfdiffusion`` console script owns, like ``inference.output_prefix``).
+#: ``extra`` may not override them — a conflict raises ``ValueError`` at
+#: config construction time (fail closed) so a caller cannot silently
 #: change what the runner forwards to upstream.
 RESERVED_CANONICAL_KEYS: tuple[str, ...] = (
     "inference.num_designs",
     "inference.design_startnum",
     "inference.deterministic",
+    "inference.input_pdb",
     "inference.cyclic",
     "inference.cyc_chains",
+    "inference.output_prefix",
     "contigmap.contigs",
     "ppi.hotspot_res",
 )
@@ -112,10 +150,15 @@ class ContigMap:
 class RFdiffusionConfig:
     """Per-invocation configuration for the RFdiffusion runner.
 
-    The defaults correspond to linear 14–18-residue peptide binders
-    with no hotspots — the regime the PDF describes as experimental.
-    Head-to-tail macrocycles and disulfide pairs are opt-in via
-    ``mode`` / ``disulfide_pairs``.
+    The defaults are generic **unconditional** generation: a linear
+    14–18-residue chain with no target PDB and no hotspots. That is
+    **not** a binder — binder design requires ``target_pdb`` plus
+    stock ``contigs`` that reference the target chain IDs (see the
+    module docstring). Head-to-tail macrocycles, disulfides, and
+    their combination are opt-in via ``mode`` / ``disulfide_pairs``;
+    cyclic flags are emitted only for the head-to-tail variants, and
+    ``disulfide_pairs`` is downstream closure intent (RFdiffusion
+    cannot encode disulfides).
     """
 
     name: str = "backbone"
@@ -124,8 +167,14 @@ class RFdiffusionConfig:
     contigs: str = "14-18"
     length_min: int = 14
     length_max: int = 18
-    mode: str = "linear"  # linear | head_to_tail | disulfide
+    mode: str = "linear"  # linear | head_to_tail | disulfide | head_to_tail_and_disulfide
     disulfide_pairs: tuple[tuple[int, int], ...] = ()
+    #: Output chain to cyclize head-to-tail. Stock ``inference.cyc_chains``
+    #: names output chains; generated (inpainted) chains are emitted first
+    #: as ``A``, ``B``, ... so the default ``"a"`` cyclizes the first
+    #: generated chain — the binder in every single-segment binder contig.
+    #: Callers whose binder is a different generated chain set it explicitly.
+    cyc_chains: str = "a"
     hotspots: tuple[str, ...] = ()
     deterministic: bool = True
     seed: int = 0
@@ -133,9 +182,11 @@ class RFdiffusionConfig:
     extra: Mapping[str, Any] = field(default_factory=lambda: {})
 
     def __post_init__(self) -> None:
-        """Validate name + mode + S2 fields + extra keys."""
+        """Validate name + mode + topology + S2 fields + extra keys."""
         _validate_name(self)
         _validate_mode_and_lengths(self)
+        _validate_cyc_chains(self)
+        _validate_target_intent(self)
         _validate_s2_fields(self)
         _validate_extra_keys(self)
 
@@ -164,16 +215,103 @@ def _validate_name(cfg: RFdiffusionConfig) -> None:
         )
 
 
+_VALID_MODES = frozenset({"linear", "head_to_tail", "disulfide", "head_to_tail_and_disulfide"})
+
+
 def _validate_mode_and_lengths(cfg: RFdiffusionConfig) -> None:
-    """Validate the mode / length / disulfide-pair contract."""
-    if cfg.mode not in {"linear", "head_to_tail", "disulfide"}:
-        raise ValueError(f"mode must be one of linear/head_to_tail/disulfide; got {cfg.mode!r}")
+    """Validate the mode / length / disulfide-pair contract.
+
+    Trigger / non-trigger pairs:
+
+    * ``disulfide`` and ``head_to_tail_and_disulfide`` **require** at
+      least one ``disulfide_pairs`` entry (the mode names claim
+      disulfide intent; an empty tuple would silently drop it).
+    * ``linear`` rejects ``disulfide_pairs`` (no closure intent).
+    * ``head_to_tail`` may carry pairs — a combined head-to-tail +
+      disulfide config, preserved for existing consumers; the pairs
+      are downstream closure intent and are never encoded into
+      ``inference.cyc_chains``.
+    """
+    if cfg.mode not in _VALID_MODES:
+        raise ValueError(
+            "mode must be one of linear/head_to_tail/disulfide/"
+            f"head_to_tail_and_disulfide; got {cfg.mode!r}"
+        )
     if cfg.length_min < 1 or cfg.length_max < cfg.length_min:
         raise ValueError(f"length range invalid: min={cfg.length_min} max={cfg.length_max}")
-    if cfg.mode == "disulfide" and not cfg.disulfide_pairs:
-        raise ValueError("mode=disulfide requires at least one configured pair")
+    if cfg.mode in {"disulfide", "head_to_tail_and_disulfide"} and not cfg.disulfide_pairs:
+        raise ValueError(f"mode={cfg.mode} requires at least one configured pair")
     if cfg.mode == "linear" and cfg.disulfide_pairs:
-        raise ValueError("disulfide_pairs only valid when mode=disulfide or head_to_tail")
+        raise ValueError(
+            "disulfide_pairs only valid when mode=disulfide, head_to_tail, "
+            "or head_to_tail_and_disulfide"
+        )
+
+
+def _validate_cyc_chains(cfg: RFdiffusionConfig) -> None:
+    """Validate ``cyc_chains`` as exactly one ASCII chain letter.
+
+    Stock ``inference.cyc_chains`` is a string naming the output
+    chains to cyclize head-to-tail; upstream uppercases it internally
+    and matches ``contigmap`` chain IDs (``_init_cyclic_reses`` in
+    ``rfdiffusion/inference/model_runners.py``). Generated
+    (inpainted) chains are emitted first as ``A``, ``B``, ... (see
+    ``rfdiffusion/contigs.py``), so the default ``"a"`` cyclizes the
+    first generated chain — the binder in every single-segment binder
+    contig. A multi-letter value is rejected here: the runner names
+    exactly one binder chain, and a caller whose binder is a
+    different generated chain must set it explicitly rather than
+    have the runner guess.
+    """
+    value = cfg.cyc_chains
+    if len(value) != 1 or not value.isascii() or not value.isalpha():
+        raise ValueError(
+            "cyc_chains must be exactly one ASCII chain letter (the generated "
+            f"chain to cyclize head-to-tail); got {value!r}"
+        )
+
+
+#: Stock contig syntax uses chain letters (``A1-110``) to reference
+#: fixed chains from ``inference.input_pdb``; pure length contigs are
+#: digits/``-``/``/`` only (e.g. the default ``14-18``).
+_CHAIN_REF_RE = re.compile(r"[A-Za-z]")
+
+
+def _validate_target_intent(cfg: RFdiffusionConfig) -> None:
+    """Target-conditioned fields require ``target_pdb`` (fail closed).
+
+    Two triggers, both rooted in stock upstream behaviour:
+
+    * Chain-referencing contigs (e.g. ``A1-110/0 B1-110/0 14-18``)
+      are target-conditioned: upstream parses ``input_pdb`` to
+      extract those chains.
+    * ``hotspots`` (``ppi.hotspot_res``) reference input-PDB chain
+      residues (``"A51"`` = chain A residue 51) — they are
+      meaningless without an input PDB even when ``contigs`` is a
+      pure length spec like the default ``14-18``.
+
+    When ``inference.input_pdb`` is unset, stock
+    ``rfdiffusion/inference/model_runners.py`` silently substitutes a
+    bundled example PDB — the run would proceed against the wrong
+    structure while the caller believes they designed a binder. Fail
+    closed at construction instead. Pure length contigs with no
+    hotspots are unconditional and remain valid with an empty
+    ``target_pdb``.
+    """
+    if not cfg.target_pdb and _CHAIN_REF_RE.search(cfg.contigs):
+        raise ValueError(
+            "contigs reference chain IDs (target-conditioned binder design) "
+            "but target_pdb is empty; stock RFdiffusion would silently fall "
+            "back to a bundled example PDB — set target_pdb to the target "
+            "structure"
+        )
+    if not cfg.target_pdb and cfg.hotspots:
+        raise ValueError(
+            "hotspots require target_pdb: ppi.hotspot_res references "
+            "input-PDB chain residues, but target_pdb is empty; stock "
+            "RFdiffusion would silently fall back to a bundled example PDB — "
+            "set target_pdb to the target structure"
+        )
 
 
 def _validate_s2_fields(cfg: RFdiffusionConfig) -> None:
@@ -189,9 +327,12 @@ def _validate_extra_keys(cfg: RFdiffusionConfig) -> None:
 
     Fail closed, three ways:
 
-    1. Canonical Hydra keys the runner emits itself
-       (``inference.num_designs`` / ``inference.design_startnum`` /
-       ``inference.deterministic`` / ``contigmap.contigs``, ...) may
+    1. Canonical Hydra keys the runner emits itself (or that the
+       console script owns — ``inference.num_designs`` /
+       ``inference.design_startnum`` / ``inference.deterministic`` /
+       ``inference.input_pdb`` / ``inference.cyclic`` /
+       ``inference.cyc_chains`` / ``inference.output_prefix`` /
+       ``contigmap.contigs`` / ``ppi.hotspot_res``, ...) may
        not be overridden via ``extra`` — a conflict raises
        ``ValueError`` instead of a last-write-wins dict merge.
     2. Keys that do not exist upstream (``inference.seed``) raise a
