@@ -191,6 +191,7 @@ all = [
     { name = "mdtraj" },
     { name = "numpy" },
     { name = "openmm", extra = ["cuda12"] },
+    { name = "parmed" },
     { name = "pdbfixer" },
 ]
 boltz2 = [
@@ -201,6 +202,7 @@ openmm = [
     { name = "mdtraj" },
     { name = "numpy" },
     { name = "openmm", extra = ["cuda12"] },
+    { name = "parmed" },
     { name = "pdbfixer" },
 ]
 
@@ -226,6 +228,7 @@ requires-dist = [
     { name = "numpy", marker = "extra == 'openmm'", specifier = ">=1.26,<2.0" },
     { name = "openmm", marker = "extra == 'openmm'", specifier = ">=8.5.2" },
     { name = "openmm", extras = ["cuda12"], marker = "extra == 'openmm'" },
+    { name = "parmed", marker = "extra == 'openmm'", specifier = ">=4.3" },
     { name = "pdbfixer", marker = "extra == 'openmm'", specifier = ">=1.9" },
 ]
 provides-extras = ["boltz2", "openmm", "all"]
@@ -1947,6 +1950,12 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/00/2f/b622683e99ec3ce00b0854bac9e80868592c5b051733f2cf3a868e5fea26/pandas-3.0.2-cp314-cp314t-win_amd64.whl", hash = "sha256:57a07209bebcbcf768d2d13c9b78b852f9a15978dac41b9e6421a81ad4cdd276", size = 10888530, upload-time = "2026-03-31T06:48:25.806Z" },
     { url = "https://files.pythonhosted.org/packages/cb/2b/f8434233fab2bd66a02ec014febe4e5adced20e2693e0e90a07d118ed30e/pandas-3.0.2-cp314-cp314t-win_arm64.whl", hash = "sha256:5371b72c2d4d415d08765f32d689217a43227484e81b2305b52076e328f6f482", size = 9455341, upload-time = "2026-03-31T06:48:28.418Z" },
 ]
+
+[[package]]
+name = "parmed"
+version = "4.3.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/a0/f5/65d3c930767aece106b97443eda3a37de8b9e6a183b7d999a670b50c161f/parmed-4.3.1.tar.gz", hash = "sha256:1f26bfcad2d9e1344fda343fe0199fd36ae9a02f64669010bf47e30f9ce0918c", size = 20197667, upload-time = "2026-02-04T21:08:21.086Z" }
 
 [[package]]
 name = "pdbfixer"

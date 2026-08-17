@@ -17,6 +17,29 @@ Extracted from the [OralBiome-AMP](https://github.com/Lambda-Biolab/OralBiome-AM
 - **ProteinMPNNRunner** — Subprocess wrapper for fixed-backbone sequence design (CLI translation from biolab-runners contract to upstream `protein_mpnn_run.py`)
 - **RosettaRunner** — Subprocess wrapper for Rosetta InterfaceAnalyzer (license-gated; skips when the license is absent)
 - **GROMACSRunner** — Subprocess wrapper for `.xvg` parsing integration
+- **GROMACS protocol** — Checkpoint-resumable `pdb2gmx → box → solvate → ions → minimize → NVT → NPT → production` pipeline
+  (`GromacsProtocolRunner`). Supports a **prebuilt mode**: when
+  `GromacsProtocolConfig.prebuilt_topology` and
+  `prebuilt_coordinates` are both set (e.g. from `PeptidePrepRunner`),
+  the topology stage is skipped and the caller-supplied `.top`/`.gro`
+  are staged into the canonical `topol.top`/`processed.gro` names;
+  source digests are recorded in the stage manifest so a changed
+  prebuilt source invalidates the cached downstream stages.
+- **PeptidePrepRunner** — Local peptide preparation: threads a designed
+  sequence onto a backbone PDB, applies optional D-substitution /
+  head-to-tail / disulfide closure (via engine-neutral callback
+  Protocols), minimises with a backbone restraint, and exports a
+  parity-checked `prepared.pdb` + GROMACS `prepared.top`/`prepared.gro`
+  of the *same* OpenMM system. Idempotent via a digest-bound manifest:
+  the science config digest binds sequence/topology/force-field/
+  physics/callback-identities (D-substitution configs require explicit
+  `coordinate_transformer_identity` / `chirality_validator_identity`),
+  while execution controls (`force`, `dry_run`, paths) are excluded so
+  a force rebuild is reusable and dry-runs never poison production
+  artifacts. Optional deps (OpenMM, PDBFixer, ParmEd) are
+  lazy-imported; the runner fails closed with a structured result when
+  an optional dependency is missing. See
+  `biolab_runners.peptide_prep` for the full contract.
 - Config-driven with dataclasses (no magic strings)
 - Structured result objects (not raw dicts)
 - Full type annotations (pyright-clean)
