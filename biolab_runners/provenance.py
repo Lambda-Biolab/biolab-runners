@@ -10,33 +10,46 @@ Design constraints (per S2 of the Activin-E reproducibility plan):
   same :class:`ProvenanceMetadata` value and therefore the same JSON
   serialisation. The ``requested_config_digest`` always covers the
   full user-supplied config; the ``executed_config_digest`` covers
-  only the fields the runner actually forwarded to upstream (the
-  two are equal for ProteinMPNN; for RFdiffusion the ``seed`` is
-  excluded because the runner does not forward ``inference.seed``).
+  the fields the runner actually forwarded to upstream. For
+  ProteinMPNN the two are equal. For RFdiffusion they are equal in
+  deterministic mode (``seed`` is forwarded as
+  ``inference.design_startnum``) and differ in non-deterministic
+  mode (the base seed is deliberately not forwarded, so a
+  seed-only change must not flip the executed digest).
 * **Different seeds → distinct traceable manifests.** ``base_seed``
-  is the seed the runner actually forwarded (``None`` when none
-  was forwarded); ``requested_seed`` is what the caller asked for.
-  The two together let the audit tell "the user wanted seed=42,
-  but the runner did not forward it to upstream" — which is the
-  honest RFdiffusion story.
+  is the seed the runner actually forwarded (``None`` when the run
+  was non-deterministic — RFdiffusion with ``deterministic=False``,
+  where upstream uses system entropy); ``requested_seed`` is what
+  the caller asked for. For seeded runs the two are equal.
 * **Honest RNG metadata.** The runners in this slice invoke the
   upstream CLI exactly once with ``num_seq_per_target`` /
   ``num_designs`` outputs. They do **not** invoke once per task, so
-  they **must not** claim per-task seeds. The
-  :attr:`ProvenanceMetadata.rng_intent` field names the actual RNG
-  mode: ``"single-stream"`` (ProteinMPNN — one seed drives all
-  outputs), ``"seed-not-forwarded"`` (RFdiffusion deterministic —
-  upstream uses internal seeding) or ``"non-deterministic"``
-  (RFdiffusion without ``deterministic=True`` — upstream uses
-  system entropy).
+  they **must not** claim per-task seeds as separate manifest
+  fields. The :attr:`ProvenanceMetadata.rng_intent` field names the
+  actual RNG mode: ``"single-stream"`` (ProteinMPNN — one seed
+  drives all outputs), ``"per-design-index"`` (RFdiffusion with
+  ``deterministic=True`` — upstream seeds each design with its
+  index, so the per-design seeds are ``base_seed .. base_seed +
+  task_count - 1``, a range fully encoded by the two existing
+  fields, no list fabricated) or ``"non-deterministic"``
+  (RFdiffusion with ``deterministic=False`` — upstream uses system
+  entropy).
 * **Honest cache-hit story.** When the runner returns from an
   on-disk artifact (the idempotent path), ``executed=False`` and
   ``cache_hit=True``. The ``executed_config_digest`` is ``None``
   because the runner does not know which prior call produced the
-  existing files; only ``requested_config_digest`` (and the
-  ``requested_seed`` field) describe what THIS call asked for.
+  existing files. ``requested_config_digest`` (and the
+  ``requested_seed`` / ``base_seed`` / ``rng_intent`` fields)
+  describe what THIS call asked for; where the runner keys its
+  cache by a canonical identity over the requested config, the
+  normalized image digest, and the source-backbone content digest
+  (RFdiffusion), the cached outputs are provably bound to exactly
+  this config+image+source, so reporting ``base_seed`` /
+  ``rng_intent`` on a cache hit is honest — the per-design seed
+  range describes the cached outputs.
 * **Honest dry-run story.** ``executed=False`` and ``cache_hit=False``.
-  The manifest records what *would* have been executed.
+  The manifest records what *would* have been executed — including
+  the intended forwarded ``base_seed``.
 * **No bitwise GPU determinism claimed.** Provenance records the
   *intent* (which checkpoint, which inputs, which exit code) — it
   does not promise that two GPU runs of the same provenance will
@@ -88,6 +101,7 @@ if TYPE_CHECKING:
 __all__ = [
     "EMPTY_PROVENANCE",
     "RNG_INTENT_NON_DETERMINISTIC",
+    "RNG_INTENT_PER_DESIGN_INDEX",
     "RNG_INTENT_SEED_NOT_FORWARDED",
     "RNG_INTENT_SINGLE_STREAM",
     "InvokeResult",
@@ -109,9 +123,18 @@ __all__ = [
 #: ProteinMPNN uses this label.
 RNG_INTENT_SINGLE_STREAM = "single-stream"
 
-#: The runner did not forward a seed to upstream; upstream's internal
-#: deterministic seeding produced the output. RFdiffusion uses this
-#: label when ``deterministic=True``.
+#: Upstream seeds each output with its own index derived from a base
+#: seed: per-design seeds are ``base_seed .. base_seed + task_count - 1``.
+#: RFdiffusion uses this label when ``deterministic=True``: the runner
+#: forwards ``inference.design_startnum=base_seed`` and upstream seeds
+#: design ``i`` (output index) with ``design_startnum + i``.
+RNG_INTENT_PER_DESIGN_INDEX = "per-design-index"
+
+#: Retained for backward compatibility with consumers that imported it
+#: while it was the RFdiffusion deterministic label. No runner in this
+#: slice uses it anymore — RFdiffusion forwards ``inference.design_startnum``
+#: (label :data:`RNG_INTENT_PER_DESIGN_INDEX`) and ProteinMPNN forwards a
+#: single ``--seed`` (label :data:`RNG_INTENT_SINGLE_STREAM`).
 RNG_INTENT_SEED_NOT_FORWARDED = "seed-not-forwarded"
 
 #: The runner did not pin the RNG; upstream used system entropy.
@@ -256,11 +279,12 @@ def compute_executed_config_digest(config: object, *, exclude_fields: tuple[str,
     """Like :func:`compute_config_digest`, but strips ``exclude_fields``.
 
     Used to compute the digest of the config the runner actually
-    forwarded to upstream. For RFdiffusion, the runner does not
-    forward ``inference.seed``, so excluding ``seed`` from the
-    digest keeps it stable across calls that change only the seed —
-    the audit no longer falsely equates "different seed" with
-    "different upstream behaviour".
+    forwarded to upstream. ProteinMPNN forwards every field (empty
+    ``exclude_fields``). RFdiffusion forwards ``seed`` (as
+    ``inference.design_startnum``) only in deterministic mode, so it
+    passes ``("seed",)`` for non-deterministic runs — a seed-only
+    change must not flip the executed digest when the base seed was
+    never forwarded.
 
     Args:
         config: The full requested config (a dataclass, ``Mapping``,
@@ -398,18 +422,30 @@ class ProvenanceMetadata:
             ``errors="replace"``. Captures the upstream message
             operators need to debug a failed run.
         base_seed: The seed the runner *actually forwarded* to
-            upstream. ``None`` when no seed was forwarded (RFdiffusion
-            deterministic / non-deterministic modes). When set, this
-            is the seed the upstream RNG was seeded with.
+            upstream. ``None`` when the run was non-deterministic
+            (RFdiffusion with ``deterministic=False`` — upstream
+            uses system entropy). When set with
+            :data:`RNG_INTENT_PER_DESIGN_INDEX`, the per-design
+            seeds are ``base_seed .. base_seed + task_count - 1``
+            (upstream seeds design index ``i`` with
+            ``design_startnum + i``); the range is fully encoded by
+            ``base_seed`` + ``task_count`` — no per-seed list is
+            fabricated.
         requested_seed: The seed the *caller asked for* in the
-            config. Distinct from ``base_seed`` for RFdiffusion
-            where the runner does not forward ``inference.seed``.
+            config. Equal to ``base_seed`` for seeded runs
+            (ProteinMPNN; RFdiffusion with ``deterministic=True``);
+            ``base_seed`` is ``None`` when the run was
+            non-deterministic.
             ``None`` when the caller did not set one.
         task_count: The number of outputs requested.
         rng_intent: How the runner actually used the RNG. One of
-            :data:`RNG_INTENT_SINGLE_STREAM`,
-            :data:`RNG_INTENT_SEED_NOT_FORWARDED`, or
-            :data:`RNG_INTENT_NON_DETERMINISTIC`.
+            :data:`RNG_INTENT_SINGLE_STREAM` (one seed drives all
+            outputs), :data:`RNG_INTENT_PER_DESIGN_INDEX`
+            (upstream seeds each design with
+            ``base_seed + design_index``), or
+            :data:`RNG_INTENT_NON_DETERMINISTIC` (upstream used
+            system entropy). :data:`RNG_INTENT_SEED_NOT_FORWARDED`
+            is retained for compatibility but used by no runner.
         canonical_output: The runner's canonical raw outputs *before*
             any downstream substitution (ProteinMPNN's FASTA
             sequences before the ``chem_001`` D-residue rewrite).

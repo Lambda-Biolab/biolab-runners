@@ -57,6 +57,10 @@ from pathlib import Path
 
 import pytest
 
+# Pure-Python availability probe (no heavy deps); imported at module level so
+# the skipif decorators below can gate on a real RFdiffusion wrapper existing.
+from biolab_runners.rfdiffusion.utils import rfdiffusion_available
+
 # The tests/ tree has no ``__init__.py`` (pytest discovers by
 # rootdir + conftest.py, not as a package). We add the integration
 # directory to ``sys.path`` so the helper fixtures are importable.
@@ -590,6 +594,82 @@ def test_rfdiffusion_runner_availablity_check_works() -> None:
     assert isinstance(result, bool), (
         f"rfdiffusion_available returned non-bool: {type(result).__name__}"
     )
+
+
+@pytest.mark.skipif(
+    os.environ.get("BIOLAB_RUN_RFDIFFUSION_INTEGRATION") != "1",
+    reason=(
+        "Opt-in real-binary contract: set BIOLAB_RUN_RFDIFFUSION_INTEGRATION=1 "
+        "(with a real RFdiffusion wrapper available) to run. Never runs in the "
+        "default gate — no GPU/CPU design job is launched unless explicitly opted in."
+    ),
+)
+@pytest.mark.skipif(
+    not rfdiffusion_available(),
+    reason=(
+        "requires a real RFdiffusion wrapper (RFDIFFUSION_BIN or 'rfdiffusion' on "
+        "PATH); the wrapper must accept Hydra overrides such as "
+        "inference.design_startnum"
+    ),
+)
+def test_rfdiffusion_wrapper_accepts_design_startnum_and_two_seeds_differ(
+    tmp_path: Path,
+) -> None:
+    """Real-wrapper contract for the deterministic seed mapping.
+
+    Verifies against the actual upstream binary/wrapper (which falls back
+    to CPU when no GPU is present — no GPU job is ever forced):
+
+    * the wrapper **accepts** ``inference.design_startnum`` (a strict
+      Hydra schema that lacked the key would fail before any design is
+      produced, so ``exit_code == 0`` with outputs proves acceptance);
+    * two deterministic runs that differ only in ``seed`` produce
+      **distinct indexed outputs** — upstream names each output
+      ``<prefix>_<i_des>.pdb`` with ``i_des`` starting at
+      ``design_startnum`` (the configured seed), so seed=7 yields a
+      design indexed 7 and seed=8 yields one indexed 8, in separate
+      digest-keyed directories.
+
+    The upstream seeding contract this locks is
+    ``scripts/run_inference.py``:
+
+        for i_des in range(design_startnum, design_startnum + num_designs):
+            if conf.inference.deterministic:
+                make_deterministic(i_des)
+
+    See ``tests/test_rfdiffusion_runner.py::test_upstream_deterministic_per_design_seed_semantics``
+    for the mock-level encoding of the same contract.
+    """
+    from biolab_runners.rfdiffusion import RFdiffusionConfig, RFdiffusionRunner
+    from biolab_runners.rfdiffusion.utils import rfdiffusion_available
+
+    # Double-check at call time: the skipif evaluated at import can race a
+    # wrapper being installed mid-collection.
+    if not rfdiffusion_available():
+        pytest.skip("RFdiffusion wrapper not available at call time")
+
+    runner = RFdiffusionRunner(output_root=tmp_path, timeout_seconds=3600)
+
+    first = runner.run(RFdiffusionConfig(name="seed-7", seed=7, task_count=1))
+    second = runner.run(RFdiffusionConfig(name="seed-8", seed=8, task_count=1))
+
+    # Wrapper accepted inference.design_startnum + inference.deterministic.
+    assert first.exit_code == 0, f"seed=7 run failed: {first.provenance.failure_reason!r}"
+    assert second.exit_code == 0, f"seed=8 run failed: {second.provenance.failure_reason!r}"
+    assert first.provenance.executed is True
+    assert second.provenance.executed is True
+
+    # Distinct indexed outputs: one design each, indexed by the configured seed.
+    assert [r.index for r in first.records] == [7], (
+        f"seed=7 produced indices {[r.index for r in first.records]}, expected [7]"
+    )
+    assert [r.index for r in second.records] == [8], (
+        f"seed=8 produced indices {[r.index for r in second.records]}, expected [8]"
+    )
+    # Digest-keyed layout: different seeds live in different directories.
+    assert Path(first.records[0].path).parent != Path(second.records[0].path).parent
+    assert first.provenance.base_seed == 7
+    assert second.provenance.base_seed == 8
 
 
 # ---------------------------------------------------------------------------

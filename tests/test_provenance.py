@@ -16,9 +16,10 @@ relies on. Tests cover:
   :class:`ProvenanceMetadata`.
 * Manifest divergence — different seeds / checkpoints / backbones /
   image digests → distinct manifests.
-* Honest RNG metadata — ``base_seed`` is ``None`` when the runner
-  did not forward a seed; ``requested_seed`` carries the caller's
-  intent; ``rng_intent`` names the actual upstream behaviour.
+* Honest RNG metadata — ``base_seed`` is ``None`` when the run was
+  non-deterministic (no seed forwarded); ``requested_seed`` carries
+  the caller's intent; ``rng_intent`` names the actual upstream
+  behaviour.
 * Cache / execution honesty — ``cache_hit=True`` clears
   ``executed_config_digest``; ``executed=True`` requires a real
   subprocess invocation.
@@ -39,6 +40,7 @@ import pytest
 from biolab_runners.provenance import (
     EMPTY_PROVENANCE,
     RNG_INTENT_NON_DETERMINISTIC,
+    RNG_INTENT_PER_DESIGN_INDEX,
     RNG_INTENT_SEED_NOT_FORWARDED,
     RNG_INTENT_SINGLE_STREAM,
     InvokeResult,
@@ -178,14 +180,14 @@ def test_compute_config_digest_rejects_non_json_native() -> None:
 
 
 def test_compute_executed_config_digest_excludes_named_fields() -> None:
-    """S2 honesty: changing only the excluded field must NOT flip the digest.
+    """The helper's contract: stripping a field via ``exclude_fields`` keeps
+    the digest stable across calls that change only the stripped field.
 
-    This is the contract for RFdiffusion — ``seed`` is excluded because
-    the runner does not forward ``inference.seed`` to upstream."""
-    from biolab_runners.rfdiffusion.config import RFdiffusionConfig
-
-    cfg_a = RFdiffusionConfig(name="x", seed=1)
-    cfg_b = RFdiffusionConfig(name="x", seed=999)
+    Generic mechanism — RFdiffusion passes ``("seed",)`` in non-deterministic
+    mode (the base seed is not forwarded then), and an empty tuple otherwise.
+    """
+    cfg_a = {"name": "x", "seed": 1}
+    cfg_b = {"name": "x", "seed": 999}
     # Requested digests differ (seed is part of the requested config).
     assert compute_config_digest(cfg_a) != compute_config_digest(cfg_b)
     # Executed digests agree (seed is excluded).
@@ -387,8 +389,18 @@ def test_manifest_records_rng_intent_single_stream() -> None:
     assert p.rng_intent == "single-stream"
 
 
+def test_manifest_records_rng_intent_per_design_index() -> None:
+    """RFdiffusion deterministic: upstream seeds each design with
+    ``design_startnum + i``, so the label names the per-design-index mode."""
+    p = _build_provenance(rng_intent=RNG_INTENT_PER_DESIGN_INDEX, base_seed=42, task_count=3)
+    assert p.rng_intent == "per-design-index"
+    assert p.base_seed == 42
+    assert p.task_count == 3
+
+
 def test_manifest_records_rng_intent_seed_not_forwarded() -> None:
-    """The honest label when the runner did not forward ``--seed`` upstream."""
+    """Compatibility: the historical label remains importable and serialises
+    unchanged, but no runner in this slice emits it anymore."""
     p = _build_provenance(rng_intent=RNG_INTENT_SEED_NOT_FORWARDED, base_seed=None)
     assert p.rng_intent == "seed-not-forwarded"
     assert p.base_seed is None
@@ -509,34 +521,33 @@ def test_from_parts_executed_run_includes_both_digests() -> None:
 
 def test_from_parts_exclude_fields_does_not_alter_requested_digest() -> None:
     """The requested digest always covers the full config; the executed digest
-    is the one that respects ``exclude_fields``."""
-    from biolab_runners.rfdiffusion.config import RFdiffusionConfig
-
-    cfg_a = RFdiffusionConfig(name="x", seed=1)
-    cfg_b = RFdiffusionConfig(name="x", seed=999)
+    is the one that respects ``exclude_fields`` (generic mechanism — RFdiffusion
+    passes ``("seed",)`` in non-deterministic mode)."""
+    cfg_a = {"name": "x", "seed": 1}
+    cfg_b = {"name": "x", "seed": 999}
     p_a = ProvenanceMetadata.from_parts(
         model_identifier="x",
         config=cfg_a,
-        base_seed=None,
+        base_seed=1,
         requested_seed=1,
         task_count=10,
-        rng_intent=RNG_INTENT_SEED_NOT_FORWARDED,
+        rng_intent=RNG_INTENT_SINGLE_STREAM,
         executed=True,
         exclude_fields=("seed",),
     )
     p_b = ProvenanceMetadata.from_parts(
         model_identifier="x",
         config=cfg_b,
-        base_seed=None,
+        base_seed=999,
         requested_seed=999,
         task_count=10,
-        rng_intent=RNG_INTENT_SEED_NOT_FORWARDED,
+        rng_intent=RNG_INTENT_SINGLE_STREAM,
         executed=True,
         exclude_fields=("seed",),
     )
     # Requested digests differ (seed is part of the requested config).
     assert p_a.requested_config_digest != p_b.requested_config_digest
-    # Executed digests agree (seed is excluded — RFdiffusion does not forward it).
+    # Executed digests agree (seed is excluded).
     assert p_a.executed_config_digest == p_b.executed_config_digest
 
 
