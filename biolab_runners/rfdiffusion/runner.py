@@ -33,8 +33,8 @@ Output layout and cache key:
   1. the full canonical requested-config digest
      (:func:`biolab_runners.provenance.compute_config_digest` —
      every field, including ``seed``, ``task_count``, ``contigs``,
-     ``mode``, ``disulfide_pairs``, ``cyc_chains``, ``hotspots``,
-     ``deterministic``, ``checkpoint``, and ``extra``),
+     ``mode``, ``disulfide_pairs``, ``cyc_chains``, ``design_chains``,
+     ``hotspots``, ``deterministic``, ``checkpoint``, and ``extra``),
   2. the **derived execution payload** — the runner-execution
      contract version (:data:`EXECUTION_CONTRACT_VERSION`) plus the
      exact CLI mapping (:func:`_config_to_cli`) — so a mapping-only
@@ -117,7 +117,25 @@ Notes on seed / temperature forwarding (S2 honesty):
   ``noise_scale_frame``, which are tuned per-application and
   upstream-internal). The provenance manifest therefore records
   ``temperature=None`` for RFdiffusion runs.
-* Target-conditioned binder design: ``config.target_pdb`` is
+* **Output parsing mirrors stock chain assignment.** Stock
+  target-conditioned output PDBs contain the generated binder chain(s)
+  **plus** the receptor chains copied from ``inference.input_pdb``.
+  The generated design's output chain is derived exactly as stock
+  assigns it (``RFdiffusionConfig.design_chains`` — the
+  lexicographically first ASCII letter not used by the
+  contig-referenced receptor chains: receptor A+B → ``C``, receptor A
+  → ``B``, unconditional → ``A``), and ``RecordData.sequence`` is
+  parsed from exactly that chain, never target+peptide;
+  ``RecordData.path`` keeps the full complex PDB so downstream
+  interface filtering still has receptor coordinates. An output PDB
+  missing the derived chain — or yielding no parseable residues — is
+  a ``failed`` record (fail closed, never a fake-empty success), on
+  the execute AND cache-hit paths. ``design_chains`` is
+  parse/provenance semantics, not a Hydra flag: it is bound into the
+  cache identity via the requested-config digest but is never
+  forwarded to the CLI (the executed digest is unaffected because the
+  mapping is).
+* **Target-conditioned binder design:** ``config.target_pdb`` is
   forwarded as the canonical stock Hydra key ``inference.input_pdb``
   and bound in the cache identity + provenance by its content digest.
   Stock upstream substitutes a bundled example PDB when
@@ -126,16 +144,19 @@ Notes on seed / temperature forwarding (S2 honesty):
   config construction, and a set-but-missing ``target_pdb`` file
   raises at ``run()`` / ``is_complete()`` time (fail closed).
 * Topology honesty: ``inference.cyclic`` / ``inference.cyc_chains``
-  express **only** head-to-tail cyclization of named chains. The
-  runner emits them for ``mode="head_to_tail"`` and
-  ``mode="head_to_tail_and_disulfide"`` (``cyc_chains`` names the
-  generated binder chain — default ``"a"``, the first generated
-  chain per stock contig output semantics; generated chains are
-  emitted as ``A``, ``B``, ... ahead of receptor fragments).
-  ``mode="disulfide"`` forwards **no** cyclic flags: stock
-  RFdiffusion cannot encode residue-pair disulfides, and
-  ``disulfide_pairs`` remains in config/provenance as downstream
-  topology intent, applied and validated by
+  express **only** head-to-tail cyclization of named chains in **HAL
+  space** — the internal chain-index space of ``rfdiffusion/contigs.py``
+  (generated chains labelled ``A``, ``B``, ... via ``chain_order``
+  ahead of the receptor chain), matched against ``contig_map.hal``
+  with internal uppercasing (``model_runners._init_cyclic_reses``).
+  The runner emits them for ``mode="head_to_tail"`` and
+  ``mode="head_to_tail_and_disulfide"``; ``cyc_chains`` names the
+  generated binder chain (default ``"a"`` — the first generated HAL
+  chain), independent of the output-PDB letter the binder gets (see
+  the output-parsing note above). ``mode="disulfide"`` forwards
+  **no** cyclic flags: stock RFdiffusion cannot encode residue-pair
+  disulfides, and ``disulfide_pairs`` remains in config/provenance as
+  downstream topology intent, applied and validated by
   ``biolab_runners.peptide_prep`` — not by RFdiffusion.
 
 Notes on cache hits (S2 honesty):
@@ -183,6 +204,8 @@ from biolab_runners.rfdiffusion.utils import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from biolab_runners.rfdiffusion.config import RFdiffusionConfig
 
 logger = logging.getLogger(__name__)
@@ -219,8 +242,8 @@ def _cache_identity_token(config: RFdiffusionConfig, *, image_digest: str | None
 
     1. the full canonical requested-config digest (every config field
        — ``seed``, ``task_count``, ``contigs``, ``mode``,
-       ``disulfide_pairs``, ``cyc_chains``, ``hotspots``,
-       ``deterministic``, ``checkpoint``, ``extra``);
+       ``disulfide_pairs``, ``cyc_chains``, ``design_chains``,
+       ``hotspots``, ``deterministic``, ``checkpoint``, ``extra``);
     2. the **derived execution payload** — the runner-execution
        contract version plus the exact CLI mapping
        (:func:`_execution_payload`), so a mapping-only change
@@ -294,6 +317,16 @@ def _executed_digest(config: RFdiffusionConfig) -> str:
 @dataclass(frozen=True)
 class RFdiffusionResult:
     """Outcome of one or more RFdiffusion design runs.
+
+    The counters are **two independent axes**: ``succeeded`` /
+    ``failed`` describe the parse quality of the records (usable vs
+    broken outputs, always summing to ``len(records)``), while
+    ``skipped`` describes the invocation — a cache hit means nothing
+    was invoked, so *every* record (succeeded or failed) is also
+    counted as skipped. On a cache hit ``exit_code`` is 0 only when
+    every cached record parsed; a failed parse of cached output sets
+    it to 1 (honest — a bad cache entry is not success). On the
+    execute path ``exit_code`` is the upstream subprocess exit code.
 
     The ``provenance`` field carries the S2 reproducibility record
     when the runner executed; the idempotent / dry-run / error
@@ -423,20 +456,28 @@ class RFdiffusionRunner:
         design_dir.mkdir(parents=True, exist_ok=True)
 
         if not force and self.is_complete(cfg, image_digest=image_digest):
-            records = _parse_output_dir(design_dir)
+            records = _parse_output_dir(design_dir, chains=cfg.design_chains)
+            succeeded = sum(1 for r in records if r.status == RecordDataStatus.SUCCEEDED)
+            failed = len(records) - succeeded
+            # Honest cache hit: nothing was invoked (every record is also
+            # "skipped"), but a failed parse of the cached output is still
+            # a failure — exit_code stays 0 only when every cached record
+            # is usable.
+            exit_code = 1 if failed else 0
+            failure_reason = f"{failed} cached record(s) failed to parse" if failed else ""
             return RFdiffusionResult(
                 name=cfg.name,
                 output_dir=str(design_dir),
                 records=records,
-                succeeded=len(records),
-                failed=0,
+                succeeded=succeeded,
+                failed=failed,
                 skipped=len(records),
-                exit_code=0,
+                exit_code=exit_code,
                 duration_seconds=0.0,
                 provenance=self._build_provenance(
                     cfg,
-                    exit_code=0,
-                    failure_reason="",
+                    exit_code=exit_code,
+                    failure_reason=failure_reason,
                     stderr_tail="",
                     image_digest=image_digest,
                     executed=False,
@@ -473,7 +514,7 @@ class RFdiffusionRunner:
             binary_prefix=self._binary_prefix,
             timeout_seconds=self._timeout_seconds,
         )
-        records = _parse_output_dir(design_dir)
+        records = _parse_output_dir(design_dir, chains=cfg.design_chains)
         succeeded = sum(1 for r in records if r.status == RecordDataStatus.SUCCEEDED)
         failed = len(records) - succeeded
         return RFdiffusionResult(
@@ -574,6 +615,13 @@ def _config_to_cli(config: RFdiffusionConfig) -> dict[str, str]:
 
     Notes on what's deliberately **not** forwarded:
 
+    * ``design_chains`` — never. It is parse/provenance semantics
+      (which output-PDB chains carry the generated design), not a
+      Hydra flag: upstream always writes the full target+binder
+      complex, and the field only tells the runner how to interpret
+      the output. It is bound into the cache identity via the
+      requested-config digest, but the executed digest / CLI mapping
+      are unaffected.
     * ``inference.seed`` — never. Stock upstream RFdiffusion has no
       such Hydra key (``config/inference/base.yaml``); a wrapper that
       appends it (``+inference.seed=...``) would have it silently
@@ -592,11 +640,13 @@ def _config_to_cli(config: RFdiffusionConfig) -> dict[str, str]:
       ``noise_scale_ca`` would silently change upstream behaviour
       and is intentionally avoided.
     * ``inference.cyclic`` / ``inference.cyc_chains`` — forwarded
-      only for the head-to-tail modes. Stock RFdiffusion uses them
-      to cyclize named **chains** head-to-tail; it has no notion of
-      residue-pair disulfides, so ``mode="disulfide"`` forwards
-      neither flag (the pairs stay in config/provenance as
-      downstream closure intent).
+      only for the head-to-tail modes. Stock RFdiffusion uses them to
+      cyclize named chains head-to-tail in **HAL space** (the internal
+      chain-index space of ``contigs.py``; ``cyc_chains="a"`` = first
+      generated chain = the binder, independent of the output-PDB
+      letter); it has no notion of residue-pair disulfides, so
+      ``mode="disulfide"`` forwards neither flag (the pairs stay in
+      config/provenance as downstream closure intent).
 
     ``config.extra`` may not override the canonical keys the runner
     emits (``inference.num_designs`` / ``inference.design_startnum`` /
@@ -629,12 +679,14 @@ def _config_to_cli(config: RFdiffusionConfig) -> dict[str, str]:
         payload["inference.deterministic"] = "True"
     if config.mode in {"head_to_tail", "head_to_tail_and_disulfide"}:
         payload["inference.cyclic"] = "True"
-        # Stock ``inference.cyc_chains`` names the OUTPUT chains to
-        # cyclize head-to-tail. Generated (inpainted) chains are
-        # emitted first as ``A``, ``B``, ... ahead of receptor
-        # fragments (RFdiffusion/contigs.py), so the configured chain
-        # (default ``"a"``) is the generated binder; upstream
-        # uppercases it internally (_init_cyclic_reses).
+        # Stock ``inference.cyc_chains`` names chains in HAL space —
+        # the internal chain-index space of rfdiffusion/contigs.py,
+        # where generated chains are labelled A, B, ... via
+        # chain_order ahead of the receptor chain — matched against
+        # contig_map.hal with internal uppercasing
+        # (model_runners._init_cyclic_reses). The default "a" is the
+        # first generated chain — the binder — regardless of the
+        # output-PDB letter the binder gets (design_chains).
         payload["inference.cyc_chains"] = config.cyc_chains
     # mode="disulfide": NOT cyclic. Stock inference.cyclic/cyc_chains
     # express only head-to-tail chain cyclization and cannot encode
@@ -676,7 +728,7 @@ def _smallest_unused_index(used: set[int]) -> int:
     return index
 
 
-def _parse_output_dir(design_dir: Path) -> tuple[RecordData, ...]:
+def _parse_output_dir(design_dir: Path, chains: Sequence[str] = ("A",)) -> tuple[RecordData, ...]:
     """Walk ``design_dir`` and parse each PDB file into a :class:`RecordData`.
 
     ``RecordData.index`` is the design's numeric index parsed from the
@@ -688,18 +740,39 @@ def _parse_output_dir(design_dir: Path) -> tuple[RecordData, ...]:
     shape. With ``seed`` mapped to ``inference.design_startnum``, the
     parsed indices equal the per-design seeds
     (``seed .. seed + task_count - 1``).
+
+    Records are returned in **numeric design-index order** (``design_2.pdb``
+    before ``design_10.pdb`` — filename lexicographic order would put 10
+    first once ``task_count > 9``), with the filename as a stable
+    tiebreak for names without an index suffix; fallback indices are
+    assigned in that deterministic order.
+
+    ``chains`` names the output chains that carry the generated design
+    (``config.design_chains``) — ``RecordData.sequence`` is parsed from
+    exactly those chains, so a target-conditioned binder record never
+    mixes in the receptor chains. Fail closed: a PDB that lacks any
+    configured chain, or that yields no parseable residues, is recorded
+    as :attr:`RecordDataStatus.FAILED` with the reason in ``error`` —
+    never a fake success with an empty/truncated sequence.
     """
+    # Deterministic processing order: numeric design index first, then
+    # filename (stable) for names without an index suffix.
+    indexed_paths: list[tuple[int | None, Path]] = [
+        (_design_index_from_name(path), path) for path in design_dir.glob("*.pdb")
+    ]
+    indexed_paths.sort(
+        key=lambda item: (item[0] if item[0] is not None else float("inf"), item[1].name)
+    )
     records: list[RecordData] = []
     used_indices: set[int] = set()
-    for path in sorted(design_dir.glob("*.pdb")):
-        design_index = _design_index_from_name(path)
+    for design_index, path in indexed_paths:
         assigned_index = (
             design_index if design_index is not None else _smallest_unused_index(used_indices)
         )
         used_indices.add(assigned_index)
         try:
-            sequence = parse_backbone_pdb(path)
-        except (OSError, UnicodeDecodeError) as exc:
+            sequence = parse_backbone_pdb(path, chains=chains)
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
             logger.warning("failed to parse %s: %s", path, exc)
             records.append(
                 RecordData(

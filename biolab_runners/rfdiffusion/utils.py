@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 from biolab_runners.provenance import InvokeResult, stderr_tail
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -125,19 +126,59 @@ def _resolved_binary() -> list[str]:
 _PDB_LINE_RE = re.compile(r"^(ATOM|HETATM)\s+")
 
 
-def parse_backbone_pdb(path: Path) -> str:
+def parse_backbone_pdb(path: Path, chains: Sequence[str] | None = None) -> str:
     """Return the poly-glycine backbone sequence encoded in ``path``.
 
     RFdiffusion emits poly-Glycine backbones; we still read the
     residue column so future non-Gly backbones are handled without
     the runner crashing.
+
+    When ``chains`` is given, only those chain IDs contribute to the
+    sequence (case-insensitive, in the order the chains appear in the
+    file, with the existing per-chain residue dedupe). This is how
+    target-conditioned binder outputs are parsed: stock output PDBs
+    carry the generated binder chain(s) **plus** the receptor chains
+    copied from ``inference.input_pdb``, and the runner passes the
+    stock-derived generated output chain(s)
+    (``RFdiffusionConfig.design_chains``) so only the binder belongs
+    in ``RecordData.sequence``. Fail closed: an output missing any
+    configured chain, or yielding no parseable residues, raises
+    ``ValueError`` — never silently returns a truncated or empty
+    sequence.
+
+    When ``chains`` is ``None`` (the default, backward compatible)
+    every chain is concatenated exactly as before.
+    """
+    configured: set[str] | None = (
+        {chain.upper() for chain in chains} if chains is not None else None
+    )
+    residues, found_chains = _collect_backbone_residues(path, configured)
+    if configured is not None:
+        _fail_closed_parse(path, configured, found_chains, residues)
+    return "".join(residues)
+
+
+def _collect_backbone_residues(
+    path: Path, configured: set[str] | None
+) -> tuple[list[str], set[str]]:
+    """Collect (residues, found chains) from ``path``.
+
+    When ``configured`` is not ``None`` only those chain IDs
+    contribute; ``found_chains`` reports which configured chains
+    actually appear (so :func:`_fail_closed_parse` can distinguish
+    "chain missing" from "chain present but unparseable"). Residue
+    order follows the file; one residue per (chain, resseq).
     """
     residues: list[str] = []
     seen_chain_residue: set[tuple[str, int]] = set()
+    found_chains: set[str] = set()
     for line in path.read_text().splitlines():
         if not _PDB_LINE_RE.match(line):
             continue
         chain = line[21:22].strip()
+        if configured is not None and chain.upper() not in configured:
+            continue
+        found_chains.add(chain.upper())
         try:
             resseq = int(line[22:26])
         except ValueError:
@@ -150,7 +191,29 @@ def parse_backbone_pdb(path: Path) -> str:
         # Map 3-letter residue name to 1-letter. Unknown -> X.
         one_letter = _THREE_TO_ONE.get(resname, "X")
         residues.append(one_letter)
-    return "".join(residues)
+    return residues, found_chains
+
+
+def _fail_closed_parse(
+    path: Path, configured: set[str], found_chains: set[str], residues: list[str]
+) -> None:
+    """Raise when a configured-chain parse cannot produce a real sequence.
+
+    Two failure modes, both silent success otherwise: an output PDB
+    missing ANY configured generated chain, or one whose configured
+    chains yield no parseable residues.
+    """
+    missing = sorted(configured - found_chains)
+    if missing:
+        raise ValueError(
+            f"output PDB {path} lacks configured generated chain(s) "
+            f"{', '.join(missing)}; design_chains are {', '.join(sorted(configured))}"
+        )
+    if not residues:
+        raise ValueError(
+            f"output PDB {path} has configured generated chain(s) "
+            f"{', '.join(sorted(configured))} but no parseable residues"
+        )
 
 
 _THREE_TO_ONE: dict[str, str] = {

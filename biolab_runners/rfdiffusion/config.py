@@ -30,12 +30,39 @@ Target-conditioned binder design:
 * With an empty ``target_pdb`` the run is generic **unconditional**
   generation (e.g. the default ``contigs="14-18"``) — backward
   compatible, but that is **not** a binder.
+* **Output parsing mirrors stock chain assignment.** Stock output
+  PDBs carry the generated binder chain(s) **plus** the receptor
+  chains copied from ``inference.input_pdb``. The generated design's
+  output chain ID is derived exactly as stock assigns it
+  (``rfdiffusion/inference/model_runners.py`` ``chain_idx``): the
+  lexicographically first ASCII chain letter not used by the receptor
+  chains referenced in the contigs — receptor A+B → ``C``, receptor A
+  → ``B``, unconditional → ``A``. ``design_chains`` is **resolved**
+  from ``contigs`` at construction (single authoritative source; a
+  caller-supplied value must equal the derived one) and
+  ``RecordData.sequence`` is parsed from exactly that chain, while
+  ``RecordData.path`` keeps the full target+binder complex for
+  downstream interface filtering. An output PDB missing the derived
+  chain — or yielding no parseable residues — is a ``failed`` record
+  (fail closed, never a fake-empty success). The derivation fails
+  closed on malformed/ambiguous contigs (zero or multiple generated
+  segments, motif-style generated blocks). ``design_chains`` is
+  parse/provenance semantics, **not** a Hydra flag: it is bound into
+  the requested-config digest and cache identity, but is never
+  forwarded to the CLI (upstream always writes the full complex).
 
 Topology modes are truthful about what stock RFdiffusion can do:
 ``inference.cyclic`` / ``inference.cyc_chains`` only express
-head-to-tail cyclization of named chains — they cannot encode
-residue-pair disulfides. The runner therefore emits cyclic flags
-only for ``mode="head_to_tail"`` and
+head-to-tail cyclization of chains in **HAL space** — the internal
+chain-index space of ``rfdiffusion/contigs.py``, where generated
+chains are labelled ``A``, ``B``, ... (``chain_order``) ahead of the
+receptor chain, and ``_init_cyclic_reses`` matches ``cyc_chains``
+against ``contig_map.hal`` with internal uppercasing. This is a
+different space from the output-PDB letters (``design_chains``):
+``cyc_chains="a"`` cyclizes the generated binder in HAL space
+regardless of the output letter it gets (``C`` for a two-chain
+target). They cannot encode residue-pair disulfides — the runner
+therefore emits cyclic flags only for ``mode="head_to_tail"`` and
 ``mode="head_to_tail_and_disulfide"``; plain ``mode="disulfide"``
 is **not** cyclic, and ``disulfide_pairs`` is kept in the config /
 provenance as downstream topology intent (closure is applied and
@@ -87,13 +114,20 @@ canonical contract.
 from __future__ import annotations
 
 import re
+import string
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-__all__ = ["RESERVED_CANONICAL_KEYS", "UNSUPPORTED_UPSTREAM_KEYS", "ContigMap", "RFdiffusionConfig"]
+__all__ = [
+    "RESERVED_CANONICAL_KEYS",
+    "UNSUPPORTED_UPSTREAM_KEYS",
+    "ContigMap",
+    "RFdiffusionConfig",
+    "resolve_design_output_chain",
+]
 
 
 #: Canonical Hydra keys the runner emits itself (or that the in-package
@@ -169,12 +203,30 @@ class RFdiffusionConfig:
     length_max: int = 18
     mode: str = "linear"  # linear | head_to_tail | disulfide | head_to_tail_and_disulfide
     disulfide_pairs: tuple[tuple[int, int], ...] = ()
-    #: Output chain to cyclize head-to-tail. Stock ``inference.cyc_chains``
-    #: names output chains; generated (inpainted) chains are emitted first
-    #: as ``A``, ``B``, ... so the default ``"a"`` cyclizes the first
-    #: generated chain — the binder in every single-segment binder contig.
-    #: Callers whose binder is a different generated chain set it explicitly.
+    #: HAL-space chain to cyclize head-to-tail (NOT an output-PDB chain
+    #: letter). Stock ``inference.cyc_chains`` is matched against
+    #: ``contig_map.hal`` (``model_runners._init_cyclic_reses``) — the
+    #: internal chain-index space of ``rfdiffusion/contigs.py``, where
+    #: generated chains are labelled ``A``, ``B``, ... via
+    #: ``chain_order`` (first generated chain = ``a`` after upstream's
+    #: internal uppercasing) ahead of the receptor chain. The default
+    #: ``"a"`` therefore cyclizes the first generated chain — the
+    #: binder — regardless of the output-PDB letter the binder gets
+    #: (see ``design_chains``).
     cyc_chains: str = "a"
+    #: RESOLVED output-PDB chain IDs that carry the generated design
+    #: (the binder). Derived at construction from ``contigs`` exactly
+    #: as stock assigns output chains (``model_runners.py``
+    #: ``chain_idx``): the generated chain gets the lexicographically
+    #: first ASCII letter not used by the receptor chains referenced
+    #: in the contigs — receptor A+B → ``("C",)``, receptor A →
+    #: ``("B",)``, unconditional → ``("A",)``. Single-element in this
+    #: runner's one-generated-chain scope. ``RecordData.sequence`` is
+    #: parsed from exactly this chain. Parse/provenance semantics
+    #: only: bound into the requested-config digest / cache identity,
+    #: **never** forwarded to the CLI (upstream always writes the
+    #: full complex).
+    design_chains: tuple[str, ...] = ()
     hotspots: tuple[str, ...] = ()
     deterministic: bool = True
     seed: int = 0
@@ -185,6 +237,7 @@ class RFdiffusionConfig:
         """Validate name + mode + topology + S2 fields + extra keys."""
         _validate_name(self)
         _validate_mode_and_lengths(self)
+        _resolve_design_chains(self)
         _validate_cyc_chains(self)
         _validate_target_intent(self)
         _validate_s2_fields(self)
@@ -248,20 +301,205 @@ def _validate_mode_and_lengths(cfg: RFdiffusionConfig) -> None:
         )
 
 
+#: A receptor chain reference inside a contig block: one ASCII chain
+#: letter followed by a residue range (stock ``"A1-110"``). The letter
+#: is the input-PDB chain ID the receptor block copies from
+#: ``inference.input_pdb``.
+_RECEPTOR_SEGMENT_RE = re.compile(r"^([A-Za-z])(\d+)-(\d+)$")
+#: A generated (length-only) segment: ``"14-18"`` (a sampled length
+#: range) or a bare concrete length like ``"16"`` — both accepted by
+#: stock ``contigs.get_sampled_mask``.
+_LENGTH_SEGMENT_RE = re.compile(r"^\d+(-\d+)?$")
+
+
+def resolve_design_output_chain(contigs: str) -> str:
+    """Return the stock output-PDB chain ID of the generated design.
+
+    Mirrors stock RFdiffusion's output chain assignment
+    (``rfdiffusion/inference/model_runners.py``, ``chain_idx``): the
+    generated (designed) chain with no fixed residues is assigned the
+    lexicographically first ASCII chain letter NOT used by any
+    receptor chain::
+
+        available = sorted(set(string.ascii_letters) - all_chains)
+        chain_id = available[0]
+
+    so receptor A+B → ``"C"``, receptor A → ``"B"``, no receptor
+    (unconditional generation) → ``"A"``.
+
+    The receptor set is derived from the contig string exactly as
+    stock classifies blocks (``rfdiffusion/contigs.py``
+    ``get_sampled_mask``): whitespace-separated blocks whose
+    sub-segments all start with a chain letter and whose last segment
+    is ``"0"`` are receptor chains (a trailing bare chain block is
+    auto-appended ``/0`` by stock); every other block is a generated
+    (inpainted) chain. Receptor chain letters must be **uppercase**
+    single letters (the PDB/RF production contract) — a lowercase
+    reference is rejected explicitly instead of being normalized to a
+    stock-divergent assignment.
+
+    This runner's scope is exactly one generated chain, so the
+    derivation fails closed on: zero generated blocks, more than one
+    generated block (ambiguous), a generated block carrying fixed
+    residues (motif design), lowercase chain references, or any
+    malformed segment (including empty segments / trailing slashes).
+    """
+    blocks = contigs.strip().split()
+    if not blocks:
+        raise ValueError("contigs is empty; cannot derive the generated output chain")
+    # Stock: allow the receptor chain to be last in the contig string —
+    # a trailing block of pure chain references gets "/0" appended.
+    # Guard empty segments BEFORE indexing them (trailing slash must
+    # raise a clean ValueError, not an IndexError).
+    trailing = blocks[-1].split("/")
+    if any(not seg for seg in trailing):
+        raise ValueError(f"malformed contig block {blocks[-1]!r}: empty segment")
+    if all(seg[0].isalpha() for seg in trailing):
+        blocks[-1] = f"{blocks[-1]}/0"
+    receptor_chains, generated_blocks = _classify_contig_blocks(blocks)
+    if generated_blocks != 1:
+        raise ValueError(
+            f"contigs must contain exactly one generated (binder) segment; "
+            f"found {generated_blocks} in {contigs!r}"
+        )
+    available = sorted(set(string.ascii_letters) - receptor_chains)
+    if not available:
+        raise ValueError(
+            f"no output chain letter available: every ASCII letter is used by "
+            f"receptor chain(s) {sorted(receptor_chains)}"
+        )
+    return available[0]
+
+
+def _classify_contig_blocks(blocks: list[str]) -> tuple[set[str], int]:
+    """Classify contig blocks into (receptor chain letters, generated count).
+
+    Mirrors stock ``contigs.get_sampled_mask``: a whitespace-separated
+    block whose sub-segments all start with a chain letter and whose
+    last segment is ``"0"`` is a receptor chain; every other block is
+    a generated (inpainted) chain. Fail closed on malformed segments
+    and on generated blocks that carry fixed residues (motif design —
+    outside this runner's one-generated-chain scope).
+    """
+    receptor_chains: set[str] = set()
+    generated_blocks = 0
+    for block in blocks:
+        segments = block.split("/")
+        if any(not seg for seg in segments):
+            raise ValueError(f"malformed contig block {block!r}: empty segment")
+        if _is_receptor_block(segments):
+            receptor_chains |= _receptor_block_chains(block, segments[:-1])
+            continue
+        generated_blocks += 1
+        for seg in segments:
+            _validate_generated_segment(block, seg)
+    return receptor_chains, generated_blocks
+
+
+def _is_receptor_block(segments: list[str]) -> bool:
+    """Stock receptor-block classification.
+
+    All sub-segments except the last start with a chain letter and the
+    last segment is exactly ``"0"`` (``contigs.get_sampled_mask``).
+    """
+    return all(seg[0].isalpha() for seg in segments[:-1]) and segments[-1] == "0"
+
+
+def _receptor_block_chains(block: str, segments: list[str]) -> set[str]:
+    """Chain letters of one receptor block.
+
+    Stock asserts every fragment in a receptor block derives from the
+    same chain (``contigs.py``); mirrored here (fail closed).
+    """
+    block_chains = {_chain_letter(seg) for seg in segments}
+    if len(block_chains) != 1:
+        raise ValueError(
+            f"receptor block {block!r} must reference a single chain; got {sorted(block_chains)}"
+        )
+    return block_chains
+
+
+def _validate_generated_segment(block: str, seg: str) -> None:
+    """Validate one segment of a generated (inpainted) block; fail closed.
+
+    ``"0"`` placeholders and pure length ranges / bare lengths are
+    accepted; a chain-like segment is a motif block (outside the
+    runner's one-generated-chain scope) and anything else is
+    malformed.
+    """
+    if seg == "0":
+        return
+    if seg[0].isalpha():
+        if _RECEPTOR_SEGMENT_RE.match(seg):
+            _chain_letter(seg)  # lowercase chain references are rejected explicitly
+            raise ValueError(
+                f"generated segment {seg!r} carries fixed residues (motif "
+                "design); the runner supports a single pure-length generated chain"
+            )
+        raise ValueError(f"malformed contig segment {seg!r} in block {block!r}")
+    if not _LENGTH_SEGMENT_RE.match(seg):
+        raise ValueError(f"malformed contig segment {seg!r} in block {block!r}")
+
+
+def _chain_letter(segment: str) -> str:
+    """Return the chain letter of a validated ``"A1-110"``-style segment.
+
+    Mirrors stock ``contigs.get_sampled_mask``, which parses the chain
+    letter and range as ``int(subcon.split("-")[0][1:])``; anything
+    malformed is rejected here (fail closed) instead of crashing
+    upstream later. Chain letters must be **uppercase** single letters
+    (the PDB/RF production contract): a lowercase reference is
+    rejected explicitly rather than silently normalized to an
+    assignment stock would not produce.
+    """
+    match = _RECEPTOR_SEGMENT_RE.match(segment)
+    if match is None:
+        raise ValueError(f"malformed receptor segment {segment!r}; expected <chain><start>-<end>")
+    letter = match.group(1)
+    if not letter.isupper():
+        raise ValueError(
+            f"lowercase chain references are not supported: PDB/RF production "
+            f"chain IDs are uppercase single letters; got {segment!r}"
+        )
+    return letter
+
+
+def _resolve_design_chains(cfg: RFdiffusionConfig) -> None:
+    """Derive + bind the generated-chain output parse semantics.
+
+    The output-PDB chain(s) carrying the generated design are derived
+    from ``contigs`` exactly as stock assigns output chains
+    (:func:`resolve_design_output_chain`); the resolved value is
+    stored on ``design_chains`` so it participates in the
+    requested-config digest and cache identity. Parse/provenance
+    semantics only — never forwarded to the CLI. A caller-supplied
+    ``design_chains`` must equal the derived value (fail closed on
+    divergence; the derivation is the single authoritative source).
+    """
+    derived = (resolve_design_output_chain(cfg.contigs),)
+    if cfg.design_chains and cfg.design_chains != derived:
+        raise ValueError(
+            f"design_chains={cfg.design_chains} does not match the derived output "
+            f"chain {derived} for contigs={cfg.contigs!r}; design_chains is resolved "
+            "from contigs (stock output-chain assignment) and cannot be overridden"
+        )
+    object.__setattr__(cfg, "design_chains", derived)
+
+
 def _validate_cyc_chains(cfg: RFdiffusionConfig) -> None:
     """Validate ``cyc_chains`` as exactly one ASCII chain letter.
 
-    Stock ``inference.cyc_chains`` is a string naming the output
-    chains to cyclize head-to-tail; upstream uppercases it internally
-    and matches ``contigmap`` chain IDs (``_init_cyclic_reses`` in
-    ``rfdiffusion/inference/model_runners.py``). Generated
-    (inpainted) chains are emitted first as ``A``, ``B``, ... (see
-    ``rfdiffusion/contigs.py``), so the default ``"a"`` cyclizes the
-    first generated chain — the binder in every single-segment binder
-    contig. A multi-letter value is rejected here: the runner names
-    exactly one binder chain, and a caller whose binder is a
-    different generated chain must set it explicitly rather than
-    have the runner guess.
+    Stock ``inference.cyc_chains`` names chains in **HAL space** — the
+    internal chain-index space of ``rfdiffusion/contigs.py``, where
+    generated chains are labelled ``A``, ``B``, ... via ``chain_order``
+    ahead of the receptor chain — and is matched against
+    ``contig_map.hal`` with internal uppercasing
+    (``model_runners._init_cyclic_reses``). The default ``"a"`` is the
+    first generated chain — the binder — regardless of the output-PDB
+    letter the binder gets (``design_chains`` is a different space). A
+    multi-letter value is rejected here: the runner names exactly one
+    binder chain, and a caller whose binder is a different generated
+    chain must set it explicitly rather than have the runner guess.
     """
     value = cfg.cyc_chains
     if len(value) != 1 or not value.isascii() or not value.isalpha():

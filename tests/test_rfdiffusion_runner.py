@@ -27,6 +27,7 @@ from biolab_runners.rfdiffusion import (
 from biolab_runners.rfdiffusion.config import (
     RESERVED_CANONICAL_KEYS,
     RFdiffusionConfig,
+    resolve_design_output_chain,
 )
 from biolab_runners.rfdiffusion.runner import (
     EXECUTION_CONTRACT_VERSION,
@@ -65,6 +66,71 @@ TER
 END
 """
 
+
+def _atom_line(serial: int, resname: str, chain: str, resseq: int) -> str:
+    """One ATOM line in the exact fixed-width layout ``parse_backbone_pdb``
+    reads (resName cols 18-20, chainID col 22, resSeq cols 23-26)."""
+    return (
+        f"ATOM  {serial:5d}  N   {resname} {chain}{resseq:4d}"
+        f"       {serial / 10.0:8.3f}   0.000   0.000  1.00  0.00           N"
+    )
+
+
+#: Stock target-conditioned binder output PDB for a TWO-chain receptor:
+#: receptor chain A ("AAA" — three ALA) and receptor chain B ("GGG" —
+#: three GLY) copied from ``inference.input_pdb``, plus the generated
+#: binder chain C ("GAG" — GLY-ALA-GLY). Per stock output-chain
+#: assignment (``model_runners.py`` ``chain_idx``), the generated chain
+#: gets the lexicographically first ASCII letter not used by the
+#: receptors → C for receptors A+B. Every chain's residue sequence is
+#: distinct, so a parsing mixup between chains is detectable.
+BINDER_COMPLEX_AB_C = "\n".join(
+    [
+        "HEADER    RFdiffusion binder design 0",
+        _atom_line(1, "ALA", "A", 1),
+        _atom_line(2, "ALA", "A", 2),
+        _atom_line(3, "ALA", "A", 3),
+        _atom_line(4, "GLY", "B", 1),
+        _atom_line(5, "GLY", "B", 2),
+        _atom_line(6, "GLY", "B", 3),
+        _atom_line(7, "GLY", "C", 1),
+        _atom_line(8, "ALA", "C", 2),
+        _atom_line(9, "GLY", "C", 3),
+        "END",
+    ]
+)
+
+#: Single-receptor variant: receptor chain A ("AAA"), generated binder
+#: chain B ("GAG") — the stock-derived output chain for a one-chain
+#: receptor (first ASCII letter not used by receptor A).
+BINDER_COMPLEX_A_B = "\n".join(
+    [
+        "HEADER    RFdiffusion binder design 0",
+        _atom_line(1, "ALA", "A", 1),
+        _atom_line(2, "ALA", "A", 2),
+        _atom_line(3, "ALA", "A", 3),
+        _atom_line(4, "GLY", "B", 1),
+        _atom_line(5, "ALA", "B", 2),
+        _atom_line(6, "GLY", "B", 3),
+        "END",
+    ]
+)
+
+#: A receptor-only PDB (chains A "AAA" + B "GGG", NO generated chain) —
+#: the fail-closed case when the derived binder output chain is missing.
+RECEPTOR_ONLY_PDB = "\n".join(
+    [
+        "HEADER    receptor only",
+        _atom_line(1, "ALA", "A", 1),
+        _atom_line(2, "ALA", "A", 2),
+        _atom_line(3, "ALA", "A", 3),
+        _atom_line(4, "GLY", "B", 1),
+        _atom_line(5, "GLY", "B", 2),
+        _atom_line(6, "GLY", "B", 3),
+        "END",
+    ]
+)
+
 #: A canonical image digest in OCI form (the form the runner normalises to).
 VALID_OCI_DIGEST = "sha256:" + "ab" * 32  # 64 hex chars
 #: The same digest in bare-hex form — must be accepted and normalised to the OCI form.
@@ -97,6 +163,9 @@ def test_config_defaults_pass_validation() -> None:
     assert config.seed == 0
     assert config.deterministic is True
     assert config.checkpoint == "RFdiffusion"
+    # Parse semantics: first generated chain (single binder), backward
+    # compatible with unconditional single-chain output.
+    assert config.design_chains == ("A",)
 
 
 def test_config_rejects_inverted_length_range() -> None:
@@ -137,10 +206,143 @@ def test_disulfide_mode_requires_pairs_non_trigger() -> None:
 
 @pytest.mark.parametrize("bad_cyc_chains", ["", "aa", "ab", "12", "A B", "a1"])
 def test_config_rejects_invalid_cyc_chains(bad_cyc_chains: str) -> None:
-    """``cyc_chains`` names exactly ONE output chain to cyclize — a
+    """``cyc_chains`` names exactly ONE chain to cyclize — a
     multi-letter or non-letter value is rejected rather than guessed."""
     with pytest.raises(ValueError, match="cyc_chains must be exactly one"):
         RFdiffusionConfig(mode="head_to_tail", cyc_chains=bad_cyc_chains)
+
+
+@pytest.mark.parametrize(
+    ("contigs", "expected"),
+    [
+        ("14-18", "A"),  # unconditional → A
+        ("14-18/0", "A"),  # generated-only with trailing 0
+        ("A1-110/0 14-18", "B"),  # receptor A → B
+        ("A1-110/0 B1-110/0 14-18", "C"),  # receptors A+B → C
+        ("A1-110/0 B1-110/0 C1-110/0 14-18", "D"),  # receptors A+B+C → D
+        ("14-18 B1-110", "A"),  # trailing bare receptor auto-/0
+        ("B1-110/0 14-18 A1-110", "C"),  # receptors on both sides
+    ],
+)
+def test_resolve_design_output_chain_matches_stock_assignment(contigs: str, expected: str) -> None:
+    """Output-chain assignment mirrors stock ``model_runners.py``
+    ``chain_idx``: the generated chain gets the lexicographically first
+    ASCII letter not used by the contig-referenced receptor chains
+    (uppercase stock parity)."""
+    assert resolve_design_output_chain(contigs) == expected
+
+
+@pytest.mark.parametrize(
+    "bad_contigs",
+    [
+        "",
+        "   ",
+        "A1-110/0",  # zero generated segments
+        "A1-110/0 B1-110/0",  # zero generated segments
+        "14-18/0 10-12",  # two generated segments (ambiguous)
+        "A1-110/0 14-18/0 10-12",  # receptor + two generated segments
+        "A1-110 14-18",  # motif-style generated block
+        "A1-110/0 14-18 xyz",  # malformed segment (trailing block → receptor)
+        "14-18 xyz A1-110/0",  # malformed alpha segment in a generated block
+        "14-18 1.5 A1-110/0",  # malformed numeric segment
+        "A1-110//0 14-18",  # empty segment
+        "14-18/",  # trailing slash → empty segment
+        "A1-110/0 14-18/",  # trailing slash on a generated block
+        "A1-110/0 14-18 A-110",  # malformed receptor range (trailing bare)
+        "A1-110/0 14-18 A5-10/B7-20/0",  # receptor block referencing two chains
+        "a1-110/0 14-18",  # lowercase receptor reference
+        "A1-110/0 a1-110/0 14-18",  # lowercase receptor reference
+        "14-18 a1-110",  # lowercase trailing bare receptor
+        "A1-110/0 a5-10 14-18",  # lowercase chain reference in a generated block
+    ],
+)
+def test_resolve_design_output_chain_fails_closed(bad_contigs: str) -> None:
+    """Malformed or ambiguous contigs fail closed — the derivation must
+    never guess a binder output chain."""
+    with pytest.raises(ValueError):
+        resolve_design_output_chain(bad_contigs)
+
+
+def test_resolve_design_output_chain_fails_closed_for_ambiguous_contigs() -> None:
+    """Two generated segments cannot name THE binder — fail closed with a
+    clear reason; zero generated segments is equally invalid."""
+    with pytest.raises(ValueError, match="exactly one generated"):
+        resolve_design_output_chain("14-18/0 10-12")
+    with pytest.raises(ValueError, match="exactly one generated"):
+        resolve_design_output_chain("A1-110/0")
+
+
+def test_resolve_design_output_chain_rejects_lowercase_receptor_chains() -> None:
+    """PDB/RF production chain IDs are uppercase single letters —
+    lowercase receptor references are rejected explicitly (fail closed,
+    clear message) instead of being normalized to a stock-divergent
+    assignment."""
+    with pytest.raises(ValueError, match="uppercase"):
+        resolve_design_output_chain("a1-110/0 14-18")
+    with pytest.raises(ValueError, match="uppercase"):
+        resolve_design_output_chain("A1-110/0 a1-110/0 14-18")
+    with pytest.raises(ValueError, match="uppercase"):
+        resolve_design_output_chain("A1-110/0 14-18 a5-10")
+
+
+def test_resolve_design_output_chain_guards_empty_segments_before_indexing() -> None:
+    """A trailing slash / empty segment must raise a clean ValueError —
+    never an IndexError from segment indexing."""
+    with pytest.raises(ValueError, match="empty segment"):
+        resolve_design_output_chain("14-18/")
+    with pytest.raises(ValueError, match="empty segment"):
+        resolve_design_output_chain("A1-110/0 14-18/")
+
+
+def test_config_resolves_design_chains_from_contigs(tmp_path: Path) -> None:
+    """``design_chains`` is RESOLVED from ``contigs`` at construction
+    exactly as stock assigns output chains — the derivation is the
+    single authoritative source (no default-to-A)."""
+    target = tmp_path / "t.pdb"
+    target.write_text(SAMPLE_PDB)
+    assert RFdiffusionConfig().design_chains == ("A",)  # unconditional → A
+    assert RFdiffusionConfig(contigs="A1-110/0 14-18", target_pdb=str(target)).design_chains == (
+        "B",
+    )
+    assert RFdiffusionConfig(
+        contigs="A1-110/0 B1-110/0 14-18", target_pdb=str(target)
+    ).design_chains == ("C",)
+
+
+def test_config_rejects_design_chains_override_mismatch(tmp_path: Path) -> None:
+    """The derivation is the single authoritative source: a caller-
+    supplied ``design_chains`` that diverges is rejected (fail closed),
+    while a value equal to the derived one is accepted."""
+    target = tmp_path / "t.pdb"
+    target.write_text(SAMPLE_PDB)
+    contigs = "A1-110/0 B1-110/0 14-18"
+    with pytest.raises(ValueError, match="cannot be overridden"):
+        RFdiffusionConfig(contigs=contigs, target_pdb=str(target), design_chains=("B",))
+    assert RFdiffusionConfig(
+        contigs=contigs, target_pdb=str(target), design_chains=("C",)
+    ).design_chains == ("C",)
+
+
+def test_cyc_chains_is_hal_space_independent_of_output_design_chain(
+    tmp_path: Path,
+) -> None:
+    """``cyc_chains`` is HAL space (the internal chain-index space of
+    contigs.py), NOT output-PDB space: a two-chain receptor config
+    resolves its output design chain to C while the cyclic HAL chain
+    stays ``"a"`` (the first generated chain, forwarded unchanged), and
+    the two spaces are never cross-validated."""
+    target = tmp_path / "t.pdb"
+    target.write_text(SAMPLE_PDB)
+    cfg = RFdiffusionConfig(
+        mode="head_to_tail",
+        target_pdb=str(target),
+        contigs="A1-110/0 B1-110/0 14-18",
+    )
+    assert cfg.design_chains == ("C",)  # output-PDB space
+    assert cfg.cyc_chains == "a"  # HAL space
+    assert _config_to_cli(cfg)["inference.cyc_chains"] == "a"  # HAL letter forwarded unchanged
+    # No membership cross-check between the two spaces:
+    RFdiffusionConfig(mode="head_to_tail", cyc_chains="b")
 
 
 def test_config_rejects_binder_contigs_without_target_pdb() -> None:
@@ -235,6 +437,56 @@ def test_parse_backbone_pdb_extracts_three_residues(tmp_path: Path) -> None:
 def test_parse_backbone_pdb_handles_missing_file(tmp_path: Path) -> None:
     with pytest.raises(OSError):
         parse_backbone_pdb(tmp_path / "absent.pdb")
+
+
+def test_parse_backbone_pdb_filters_to_configured_design_chains(tmp_path: Path) -> None:
+    """Trigger/non-trigger for stock-grounded output-chain parsing: in a
+    target-conditioned output PDB (receptor chains A/B, generated binder
+    C), only the configured design chain contributes to the sequence —
+    never receptor+peptide. Per-chain residues are distinct ("AAA" /
+    "GGG" / "GAG") so any chain mixup is detectable. Unfiltered parsing
+    (backward compatibility) still concatenates every chain."""
+    pdb = tmp_path / "design.pdb"
+    pdb.write_text(BINDER_COMPLEX_AB_C)
+    assert parse_backbone_pdb(pdb, chains=("C",)) == "GAG"  # binder only
+    assert parse_backbone_pdb(pdb, chains=("c",)) == "GAG"  # case-insensitive
+    assert parse_backbone_pdb(pdb, chains=("A",)) == "AAA"  # receptor alone — mixup detectable
+    assert parse_backbone_pdb(pdb, chains=("B",)) == "GGG"
+    assert parse_backbone_pdb(pdb, chains=("A", "B")) == "AAAGGG"  # file order preserved
+    assert parse_backbone_pdb(pdb) == "AAAGGGGAG"  # unfiltered: all chains (legacy)
+
+
+def test_parse_backbone_pdb_fails_closed_when_configured_chain_missing(tmp_path: Path) -> None:
+    """Fail closed: an output PDB that lacks ANY configured generated chain
+    raises ValueError — never a truncated sequence passed on as success."""
+    pdb = tmp_path / "design.pdb"
+    pdb.write_text(BINDER_COMPLEX_AB_C)
+    with pytest.raises(ValueError, match="lacks configured generated chain"):
+        parse_backbone_pdb(pdb, chains=("Z",))
+    with pytest.raises(ValueError, match="lacks configured generated chain"):
+        parse_backbone_pdb(pdb, chains=("C", "Z"))  # partial presence is still a failure
+    # A single-receptor output (binder in B) has no chain C — the derived
+    # chain for a two-chain receptor config is missing.
+    single = tmp_path / "single.pdb"
+    single.write_text(BINDER_COMPLEX_A_B)
+    with pytest.raises(ValueError, match="lacks configured generated chain"):
+        parse_backbone_pdb(single, chains=("C",))
+    # A receptor-only PDB (no generated chain at all) fails too.
+    receptor_only = tmp_path / "receptor.pdb"
+    receptor_only.write_text(RECEPTOR_ONLY_PDB)
+    with pytest.raises(ValueError, match="lacks configured generated chain"):
+        parse_backbone_pdb(receptor_only, chains=("C",))
+
+
+def test_parse_backbone_pdb_fails_closed_when_no_parseable_residues(tmp_path: Path) -> None:
+    """Fail closed: the configured chain is present but no residue is
+    parseable (broken residue column) raises ValueError."""
+    pdb = tmp_path / "design.pdb"
+    pdb.write_text(
+        "ATOM      1  N   GLY A  xx       0.000   0.000   0.000  1.00  0.00           N\n"
+    )
+    with pytest.raises(ValueError, match="no parseable residues"):
+        parse_backbone_pdb(pdb, chains=("A",))
 
 
 def test_record_data_to_dict_round_trip() -> None:
@@ -346,17 +598,19 @@ def test_config_to_cli_never_emits_inference_seed(kwargs: dict[str, Any]) -> Non
 
 
 def test_config_to_cli_head_to_tail_triggers_cyclic_with_first_generated_chain() -> None:
-    """Head-to-tail cyclization names the generated binder chain.
+    """Head-to-tail cyclization names the generated binder chain in HAL
+    space.
 
     Verified against stock upstream: ``inference.cyc_chains`` is a
-    string naming the OUTPUT chains to cyclize; generated (inpainted)
-    chains are emitted first as ``A``, ``B``, ... ahead of receptor
-    fragments (``RFdiffusion/rfdiffusion/contigs.py``), and upstream
-    uppercases the value internally
-    (``model_runners._init_cyclic_reses``). The stock-canonical
-    lowercase ``"a"`` (the ``config/inference/base.yaml`` default)
-    therefore cyclizes the first generated chain — the binder in a
-    single-segment binder contig.
+    string naming chains in the internal HAL space of
+    ``RFdiffusion/rfdiffusion/contigs.py`` — generated (inpainted)
+    chains are labelled ``A``, ``B``, ... via ``chain_order`` ahead of
+    the receptor chain — and ``model_runners._init_cyclic_reses``
+    matches it against ``contig_map.hal`` with internal uppercasing.
+    The stock-canonical lowercase ``"a"`` (the
+    ``config/inference/base.yaml`` default) therefore cyclizes the
+    first generated chain — the binder — regardless of the output-PDB
+    letter the binder gets.
     """
     cli = _config_to_cli(RFdiffusionConfig(mode="head_to_tail"))
     assert cli["inference.cyclic"] == "True"
@@ -366,7 +620,8 @@ def test_config_to_cli_head_to_tail_triggers_cyclic_with_first_generated_chain()
 def test_config_to_cli_head_to_tail_uses_configured_cyc_chains() -> None:
     """A caller whose binder is NOT the first generated chain names it
     explicitly via ``cyc_chains`` — the runner forwards it byte-for-byte
-    instead of hardcoding the chain."""
+    instead of hardcoding the chain (HAL space; no output-chain
+    cross-check)."""
     cli = _config_to_cli(RFdiffusionConfig(mode="head_to_tail", cyc_chains="b"))
     assert cli["inference.cyclic"] == "True"
     assert cli["inference.cyc_chains"] == "b"
@@ -676,6 +931,7 @@ def test_runner_idempotent_when_output_exists(
     result = runner.run(config)
     assert result.skipped == 1
     assert result.succeeded == 1
+    assert result.exit_code == 0  # good cached parse → honest success
     assert result.provenance.cache_hit is True
     assert result.provenance.executed is False
 
@@ -731,6 +987,137 @@ def test_runner_handles_unparseable_pdb(output_root: Path, monkeypatch: pytest.M
     assert all(r.path for r in result.records)
     assert not any("ghost" in r.path for r in result.records)
     assert any(r.status == _Status.SUCCEEDED for r in result.records)
+
+
+def test_runner_sequence_is_binder_only_and_path_keeps_full_complex(
+    output_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Target-conditioned output: the record's sequence is the generated
+    binder chain only — stock output-chain assignment gives the binder
+    chain C for a two-chain receptor (A+B) — never receptor+peptide, and
+    the record path keeps the full complex PDB so downstream interface
+    filtering still has the receptor coordinates."""
+    target = tmp_path / "target.pdb"
+    target.write_text(SAMPLE_PDB)
+
+    def fake_invoke(*, output_dir: Path, **_: Any) -> InvokeResult:
+        (output_dir / "design_0.pdb").write_text(BINDER_COMPLEX_AB_C)
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", fake_invoke)
+    runner = RFdiffusionRunner(output_root=output_root)
+    result = runner.run(
+        RFdiffusionConfig(
+            name="binder",
+            target_pdb=str(target),
+            contigs="A1-110/0 B1-110/0 14-18",
+        )
+    )
+    assert result.succeeded == 1
+    record = result.records[0]
+    assert record.sequence == "GAG"  # binder only — never AAAGGGGAG (receptor+peptide)
+    # The raw PDB is the full complex: the record points at the multi-chain file.
+    raw = Path(record.path)
+    assert raw.name == "design_0.pdb"
+    raw_text = raw.read_text()
+    assert "ALA A" in raw_text and "GLY B" in raw_text and "GLY C" in raw_text
+
+
+@pytest.mark.parametrize(
+    ("contigs", "pdb_content", "missing_chain"),
+    [
+        (
+            "14-18",  # unconditional generation → derived chain A
+            "\n".join(["HEADER    no chain A", _atom_line(1, "GLY", "B", 1), "END"]),
+            "A",
+        ),
+        (
+            "A1-110/0 B1-110/0 14-18",  # two-chain receptor → derived chain C
+            RECEPTOR_ONLY_PDB,
+            "C",
+        ),
+    ],
+)
+def test_runner_fails_closed_when_output_lacks_generated_chain(
+    output_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    contigs: str,
+    pdb_content: str,
+    missing_chain: str,
+) -> None:
+    """Fail closed at the runner: an output PDB without the stock-derived
+    generated chain is a FAILED record — never a fake success."""
+    kwargs: dict[str, Any] = {"name": "missing-binder", "contigs": contigs}
+    if "A1-110" in contigs:
+        target = tmp_path / "t.pdb"
+        target.write_text(SAMPLE_PDB)
+        kwargs["target_pdb"] = str(target)
+
+    def fake_invoke(*, output_dir: Path, **_: Any) -> InvokeResult:
+        (output_dir / "design_0.pdb").write_text(pdb_content)
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", fake_invoke)
+    runner = RFdiffusionRunner(output_root=output_root)
+    result = runner.run(RFdiffusionConfig(**kwargs))
+    assert result.succeeded == 0
+    assert result.failed == 1
+    record = result.records[0]
+    assert record.status == _Status.FAILED
+    assert record.sequence == ""
+    assert "lacks configured generated chain" in record.error
+    assert missing_chain in record.error
+
+
+def test_runner_fails_closed_when_output_has_no_parseable_residues(
+    output_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail closed at the runner: the configured chain is present but no
+    residue is parseable → FAILED record, not a fake-empty success."""
+
+    def fake_invoke(*, output_dir: Path, **_: Any) -> InvokeResult:
+        (output_dir / "design_0.pdb").write_text(
+            "ATOM      1  N   GLY A  xx       0.000   0.000   0.000  1.00  0.00           N\n"
+        )
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", fake_invoke)
+    runner = RFdiffusionRunner(output_root=output_root)
+    result = runner.run(RFdiffusionConfig(name="empty-binder"))
+    assert result.failed == 1
+    record = result.records[0]
+    assert record.status == _Status.FAILED
+    assert "no parseable residues" in record.error
+
+
+def test_runner_cache_hit_is_honest_when_cached_output_fails_parse(
+    output_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cache hit whose stored output lacks the derived generated chain
+    is honest: exit_code is nonzero (1), the record is FAILED, and the
+    counters split across two independent axes — ``skipped`` counts the
+    not-invoked cache entry while ``failed`` counts the broken parse."""
+    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", _fake_invoke_ok)
+    name = "bad-cache"
+    config = RFdiffusionConfig(name=name)
+    design_dir = output_root / name / _cache_identity_token(config, image_digest=None)
+    design_dir.mkdir(parents=True, exist_ok=True)
+    (design_dir / "design_0.pdb").write_text(
+        "\n".join(["HEADER    no chain A", _atom_line(1, "GLY", "B", 1), "END"])
+    )
+
+    runner = RFdiffusionRunner(output_root=output_root)
+    result = runner.run(config)
+    assert result.provenance.cache_hit is True
+    assert result.provenance.executed is False
+    assert result.succeeded == 0
+    assert result.failed == 1
+    assert result.skipped == 1  # invocation axis: not invoked, independent of parse quality
+    assert result.exit_code == 1  # honest: a broken cached parse is not success
+    assert result.provenance.exit_code == 1
+    assert "failed to parse" in result.provenance.failure_reason
+    assert result.records[0].status == _Status.FAILED
 
 
 def test_runner_propagates_nonzero_exit_code(
@@ -840,6 +1227,69 @@ def test_identity_binds_contract_version(
         EXECUTION_CONTRACT_VERSION + 1,
     )
     assert _cache_identity_token(cfg, image_digest=None) != identity_before
+
+
+def test_resolved_design_chain_binds_requested_and_cache_identity_not_executed(
+    tmp_path: Path,
+) -> None:
+    """The resolved output chain is a config field → bound into the
+    requested-config digest and cache identity (a parse-semantics
+    variant must never serve another derivation's cached records),
+    while the CLI mapping — and therefore the executed digest — is
+    unaffected because ``design_chains`` is never forwarded."""
+    target = tmp_path / "t.pdb"
+    target.write_text(SAMPLE_PDB)
+    uncond = RFdiffusionConfig(name="chains", contigs="14-18")
+    ab = RFdiffusionConfig(name="chains", contigs="A1-110/0 B1-110/0 14-18", target_pdb=str(target))
+    assert uncond.design_chains == ("A",)
+    assert ab.design_chains == ("C",)
+    assert compute_config_digest(uncond) != compute_config_digest(ab)
+    assert _cache_identity_token(uncond, image_digest=None) != _cache_identity_token(
+        ab, image_digest=None
+    )
+    # Parse semantics: never forwarded → absent from the CLI/executed payload.
+    for cfg in (uncond, ab):
+        cli = _execution_payload(cfg)["cli"]
+        assert isinstance(cli, dict)
+        assert not any("design_chains" in key for key in cli)
+
+
+def test_runner_design_chain_variant_does_not_hit_cache(
+    output_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Runner-level: contigs that resolve to different output chains must
+    NOT cross-hit — the cached records were parsed under the other
+    derivation; the variant run re-invokes and honestly reports its own
+    parse outcome."""
+    target = tmp_path / "t.pdb"
+    target.write_text(SAMPLE_PDB)
+    invoked_dirs: list[Path] = []
+
+    def fake_invoke(*, output_dir: Path, **_: Any) -> InvokeResult:
+        invoked_dirs.append(output_dir)
+        # Single-receptor output: binder in chain B.
+        (output_dir / "design_0.pdb").write_text(BINDER_COMPLEX_A_B)
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", fake_invoke)
+    runner = RFdiffusionRunner(output_root=output_root)
+    name = "parse-semantics"
+
+    first = runner.run(
+        RFdiffusionConfig(name=name, target_pdb=str(target), contigs="A1-110/0 14-18")
+    )  # derived B → succeeds
+    second = runner.run(
+        RFdiffusionConfig(name=name, target_pdb=str(target), contigs="A1-110/0 B1-110/0 14-18")
+    )  # derived C → not a cache hit, honestly fails (fake output has no C)
+
+    assert len(invoked_dirs) == 2  # different resolved chain → not a cache hit
+    assert invoked_dirs[0] != invoked_dirs[1]
+    assert first.provenance.executed is True
+    assert first.records[0].sequence == "GAG"  # parsed under derivation B
+    assert second.provenance.executed is True
+    assert second.provenance.cache_hit is False
+    assert second.records[0].status == _Status.FAILED
+    assert "lacks configured generated chain" in second.records[0].error
 
 
 def test_runner_same_name_different_seed_does_not_hit_cache(
@@ -1177,6 +1627,43 @@ def test_parse_output_dir_falls_back_honestly_for_nonstandard_names(tmp_path: Pa
     other_records = _parse_output_dir(other)
     indices2 = sorted(r.index for r in other_records)
     assert indices2 == [0, 42]
+
+
+def test_parse_output_dir_sorts_by_numeric_index_not_filename(tmp_path: Path) -> None:
+    """Records are returned in numeric design-index order: ``design_2.pdb``
+    before ``design_10.pdb`` — filename lexicographic order would put 10
+    first once ``task_count > 9``, breaking deterministic seed order."""
+    design_dir = tmp_path / "designs"
+    design_dir.mkdir(parents=True, exist_ok=True)
+    (design_dir / "design_10.pdb").write_text(SAMPLE_PDB)
+    (design_dir / "design_2.pdb").write_text(SAMPLE_PDB)
+
+    records = _parse_output_dir(design_dir)
+    assert [r.index for r in records] == [2, 10]
+    assert [Path(r.path).name for r in records] == ["design_2.pdb", "design_10.pdb"]
+
+
+def test_parse_output_dir_fallback_is_stable_with_numeric_sort(tmp_path: Path) -> None:
+    """Malformed-name fallback indices are assigned in the deterministic
+    numeric+filename order: numeric-indexed files first (ascending), then
+    nonstandard names in filename order filling the smallest unused
+    index."""
+    design_dir = tmp_path / "designs"
+    design_dir.mkdir(parents=True, exist_ok=True)
+    (design_dir / "design_10.pdb").write_text(SAMPLE_PDB)
+    (design_dir / "design_2.pdb").write_text(SAMPLE_PDB)
+    (design_dir / "weird.pdb").write_text(SAMPLE_PDB)
+
+    records = _parse_output_dir(design_dir)
+    # Named files first in numeric order; the malformed name fills the
+    # lowest unused index (0) and trails as the stable fallback.
+    assert [r.index for r in records] == [2, 10, 0]
+    assert sorted(r.index for r in records) == [0, 2, 10]
+    assert [Path(r.path).name for r in records] == [
+        "design_2.pdb",
+        "design_10.pdb",
+        "weird.pdb",
+    ]
 
 
 def test_runner_records_seed_offset_design_indices(
