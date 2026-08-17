@@ -7,14 +7,17 @@ during CI.
 
 from __future__ import annotations
 
+import json
 import logging
+import unittest.mock as mock_mod
 from pathlib import Path
 from typing import Any
 
 import pytest
 from biolab_runners.provenance import (
     RNG_INTENT_NON_DETERMINISTIC,
-    RNG_INTENT_SEED_NOT_FORWARDED,
+    RNG_INTENT_PER_DESIGN_INDEX,
+    compute_config_digest,
     compute_file_digest,
 )
 from biolab_runners.rfdiffusion import (
@@ -22,14 +25,20 @@ from biolab_runners.rfdiffusion import (
     RecordDataStatus,
     rfdiffusion_available,
 )
-from biolab_runners.rfdiffusion.config import RFdiffusionConfig
+from biolab_runners.rfdiffusion.config import (
+    RESERVED_CANONICAL_KEYS,
+    RFdiffusionConfig,
+)
 from biolab_runners.rfdiffusion.runner import (
-    EXCLUDED_FROM_EXECUTED_DIGEST,
     RFdiffusionRunner,
+    _cache_identity_token,
     _config_to_cli,
+    _executed_digest_excluded_fields,
+    _parse_output_dir,
 )
 from biolab_runners.rfdiffusion.utils import (
     InvokeResult,
+    _invoke_with_metadata,
     parse_backbone_pdb,
 )
 from biolab_runners.rfdiffusion.utils import (
@@ -58,6 +67,8 @@ END
 VALID_OCI_DIGEST = "sha256:" + "ab" * 32  # 64 hex chars
 #: The same digest in bare-hex form — must be accepted and normalised to the OCI form.
 VALID_BARE_DIGEST = "ab" * 32
+#: A second, distinct canonical digest — used to prove image-bound cache isolation.
+OTHER_OCI_DIGEST = "sha256:" + "cd" * 32
 
 
 def _fake_invoke_ok(**_: Any) -> InvokeResult:
@@ -116,10 +127,18 @@ def test_config_rejects_empty_checkpoint() -> None:
         RFdiffusionConfig(checkpoint="")
 
 
-def test_excluded_from_executed_digest_constant_contains_seed() -> None:
-    """S2 contract: ``seed`` must be in the exclude list because RFdiffusion
-    does not forward ``inference.seed`` to upstream."""
-    assert "seed" in EXCLUDED_FROM_EXECUTED_DIGEST
+def test_executed_digest_exclusion_is_mode_dependent() -> None:
+    """S2 contract: ``seed`` maps to ``inference.design_startnum`` which is
+    forwarded ONLY when ``deterministic=True``.
+
+    * deterministic — nothing excluded: a seed-only change flips the
+      executed digest (the seed changes what upstream ran).
+    * non-deterministic — ``seed`` excluded: the base seed is not
+      forwarded, so a seed-only change must NOT flip the executed digest.
+    """
+    assert _executed_digest_excluded_fields(RFdiffusionConfig()) == ()
+    assert _executed_digest_excluded_fields(RFdiffusionConfig(seed=42)) == ()
+    assert _executed_digest_excluded_fields(RFdiffusionConfig(deterministic=False)) == ("seed",)
 
 
 # ---------------------------------------------------------------------------
@@ -193,12 +212,45 @@ def test_config_to_cli_non_deterministic_omits_deterministic_flag() -> None:
     assert "inference.deterministic" not in cli
 
 
-def test_config_to_cli_does_not_forward_seed_flag() -> None:
-    """The runner must NOT forward ``inference.seed`` — that flag is supported
-    only in recent RFdiffusion versions and silently breaks older wrappers.
-    The user's seed is recorded in the provenance manifest, not on the CLI."""
-    cli = _config_to_cli(RFdiffusionConfig(seed=42))
+def test_config_to_cli_forwards_design_startnum() -> None:
+    """Deterministic mode MUST forward ``inference.design_startnum=<seed>`` —
+    the supported external base for upstream's per-design seeding — plus
+    ``inference.deterministic=True``, alongside ``inference.num_designs``."""
+    cli = _config_to_cli(RFdiffusionConfig(seed=42, task_count=5))
+    assert cli["inference.design_startnum"] == "42"
+    assert cli["inference.num_designs"] == "5"
+    assert cli["inference.deterministic"] == "True"
     assert "inference.seed" not in cli
+
+
+def test_config_to_cli_non_deterministic_omits_design_startnum_and_deterministic_flags() -> None:
+    """``deterministic=False`` must NOT forward ``inference.design_startnum``
+    OR ``inference.deterministic`` — upstream uses system entropy, so a
+    forwarded base seed would be inert and the manifest records
+    ``rng_intent="non-deterministic"`` with ``base_seed=None``."""
+    cli = _config_to_cli(RFdiffusionConfig(seed=42, deterministic=False))
+    assert "inference.design_startnum" not in cli
+    assert "inference.deterministic" not in cli
+    assert "inference.seed" not in cli
+    assert cli["inference.num_designs"] == "1000"  # still forwarded
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},  # default: deterministic
+        {"seed": 7, "task_count": 3},
+        {"deterministic": False},
+        {"mode": "head_to_tail"},
+        {"mode": "disulfide", "disulfide_pairs": ((3, 9),)},
+    ],
+)
+def test_config_to_cli_never_emits_inference_seed(kwargs: dict[str, Any]) -> None:
+    """Stock upstream has no ``inference.seed`` Hydra key — the runner must
+    never emit it, in any mode."""
+    cli = _config_to_cli(RFdiffusionConfig(**kwargs))
+    assert "inference.seed" not in cli
+    assert not any(key.startswith("inference.seed") for key in cli)
 
 
 def test_config_to_cli_head_to_tail_triggers_cyclic_with_chain_a() -> None:
@@ -240,6 +292,120 @@ def test_config_to_cli_extra_kwargs_are_forwarded() -> None:
     assert cli["inference.noise_scale_ca"] == "0.5"
 
 
+@pytest.mark.parametrize(
+    "reserved_key",
+    [
+        "inference.design_startnum",
+        "inference.num_designs",
+        "inference.deterministic",
+        "inference.cyclic",
+        "inference.cyc_chains",
+        "contigmap.contigs",
+        "ppi.hotspot_res",
+    ],
+)
+def test_config_rejects_extra_override_of_reserved_canonical_keys(reserved_key: str) -> None:
+    """Fail closed: ``extra`` must not silently override a canonical Hydra key
+    the runner emits itself — the conflict raises ValueError at construction."""
+    with pytest.raises(ValueError, match="reserved canonical keys"):
+        RFdiffusionConfig(extra={reserved_key: "sneaky"})
+
+
+def test_config_rejects_unsupported_inference_seed_extra_key() -> None:
+    """``inference.seed`` does not exist in stock upstream; passing it via
+    ``extra`` must fail with a clear error naming the supported alternative —
+    never silently forward a key upstream cannot parse."""
+    with pytest.raises(ValueError, match=r"inference\.seed.*not supported.*design_startnum"):
+        RFdiffusionConfig(extra={"inference.seed": "42"})
+
+
+def test_config_rejects_non_string_extra_keys() -> None:
+    """Non-string ``extra`` keys would produce unusable CLI flags — reject
+    them at construction."""
+    with pytest.raises(ValueError, match="extra keys must be strings"):
+        RFdiffusionConfig(extra={123: "x"})  # type: ignore[dict-item]
+
+
+def test_reserved_and_unsupported_key_sets_are_disjoint_and_exhaustive() -> None:
+    """Every key the runner emits is reserved; the unsupported set contains
+    keys upstream lacks (notably ``inference.seed``). Callers can inspect
+    both sets."""
+    from biolab_runners.rfdiffusion.config import UNSUPPORTED_UPSTREAM_KEYS
+
+    emitted = _config_to_cli(RFdiffusionConfig()).keys()
+    assert all(key in RESERVED_CANONICAL_KEYS for key in emitted)
+    assert "inference.design_startnum" in RESERVED_CANONICAL_KEYS
+    assert "inference.num_designs" in RESERVED_CANONICAL_KEYS
+    assert "inference.deterministic" in RESERVED_CANONICAL_KEYS
+    assert "contigmap.contigs" in RESERVED_CANONICAL_KEYS
+    assert "inference.seed" not in RESERVED_CANONICAL_KEYS  # not a key we emit
+    assert "inference.seed" in UNSUPPORTED_UPSTREAM_KEYS
+    assert not set(RESERVED_CANONICAL_KEYS) & set(UNSUPPORTED_UPSTREAM_KEYS)
+
+
+def test_invoke_with_metadata_receives_forwarded_design_startnum(tmp_path: Path) -> None:
+    """End-to-end CLI path: the base seed lands in the argv handed to
+    ``subprocess.run`` as ``--inference.design-startnum <value>`` (underscores
+    are hyphenated for argv), and ``inference.seed`` is never emitted."""
+    captured_argv: list[str] = []
+
+    def fake_run(cmd: list[str], **_: Any) -> mock_mod.Mock:
+        captured_argv.extend(cmd)
+        result = mock_mod.Mock()
+        result.returncode = 0
+        result.stderr = ""
+        return result
+
+    config_dict = _config_to_cli(RFdiffusionConfig(seed=42))
+    with mock_mod.patch("biolab_runners.rfdiffusion.utils.subprocess.run", side_effect=fake_run):
+        result = _invoke_with_metadata(
+            config_dict=config_dict,
+            output_dir=tmp_path,
+            binary_prefix=["fake-rfdiffusion"],
+        )
+
+    assert result.exit_code == 0
+    assert "--inference.design-startnum" in captured_argv
+    assert captured_argv[captured_argv.index("--inference.design-startnum") + 1] == "42"
+    # Underscores in Hydra keys are hyphenated for argv (num_designs -> num-designs).
+    assert "--inference.num-designs" in captured_argv
+    assert "--inference.deterministic" in captured_argv
+    assert "--inference.seed" not in captured_argv
+
+
+def test_upstream_deterministic_per_design_seed_semantics() -> None:
+    """Encode the stock upstream contract (RosettaCommons/RFdiffusion,
+    ``scripts/run_inference.py``):
+
+        if conf.inference.deterministic:
+            make_deterministic()
+        for i_des in range(design_startnum, design_startnum + num_designs):
+            if conf.inference.deterministic:
+                make_deterministic(i_des)
+            out_prefix = f"{output_prefix}_{i_des}"   # -> <name>_<i_des>.pdb
+
+    The runner maps ``RFdiffusionConfig.seed`` → ``inference.design_startnum``
+    and ``task_count`` → ``inference.num_designs``, so the per-design RNG
+    seeds are ``seed .. seed + task_count - 1`` and the emitted output
+    indices/names start at ``seed``.
+    """
+    seed, task_count = 42, 3
+    cli = _config_to_cli(RFdiffusionConfig(seed=seed, task_count=task_count))
+    assert cli["inference.deterministic"] == "True"
+
+    # Mirror upstream's loop verbatim.
+    design_startnum = int(cli["inference.design_startnum"])
+    num_designs = int(cli["inference.num_designs"])
+    per_design_seeds = list(range(design_startnum, design_startnum + num_designs))
+    output_names = [f"design_{i_des}.pdb" for i_des in per_design_seeds]
+
+    assert per_design_seeds == [42, 43, 44]
+    assert output_names == ["design_42.pdb", "design_43.pdb", "design_44.pdb"]
+    # Provenance encodes the range via base_seed + task_count — no list field.
+    assert len(per_design_seeds) == task_count
+    assert per_design_seeds[-1] == seed + task_count - 1
+
+
 # ---------------------------------------------------------------------------
 # Runner behaviour (with a fake invoke)
 # ---------------------------------------------------------------------------
@@ -267,13 +433,19 @@ def test_runner_idempotent_when_output_exists(
     monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", _fake_invoke_ok)
     runner = RFdiffusionRunner(output_root=output_root)
     name = "idem"
-    design_dir = output_root / name
+    # The cache is keyed by the canonical identity (config + image + source):
+    # outputs must live at <output_root>/<name>/<identity>/ for the idempotent
+    # path to hit. No image and no target → identity over the config alone.
+    config = RFdiffusionConfig(name=name)
+    design_dir = output_root / name / _cache_identity_token(config, image_digest=None)
     design_dir.mkdir(parents=True, exist_ok=True)
     (design_dir / "design_0.pdb").write_text(SAMPLE_PDB)
 
-    result = runner.run(RFdiffusionConfig(name=name))
+    result = runner.run(config)
     assert result.skipped == 1
     assert result.succeeded == 1
+    assert result.provenance.cache_hit is True
+    assert result.provenance.executed is False
 
 
 def test_runner_force_re_runs(output_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -287,11 +459,12 @@ def test_runner_force_re_runs(output_root: Path, monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", fake_invoke)
     runner = RFdiffusionRunner(output_root=output_root)
     name = "force"
-    design_dir = output_root / name
+    config = RFdiffusionConfig(name=name)
+    design_dir = output_root / name / _cache_identity_token(config, image_digest=None)
     design_dir.mkdir(parents=True, exist_ok=True)
     (design_dir / "design_0.pdb").write_text(SAMPLE_PDB)
 
-    result = runner.run(RFdiffusionConfig(name=name), force=True)
+    result = runner.run(config, force=True)
     assert calls == [design_dir]
     assert result.exit_code == 0
 
@@ -348,6 +521,382 @@ def test_runner_requires_config() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Digest-keyed output layout / cache isolation
+# ---------------------------------------------------------------------------
+
+
+def test_runner_design_dir_is_keyed_by_canonical_identity(
+    output_root: Path, tmp_path: Path
+) -> None:
+    """The on-disk layout is ``<output_root>/<name>/<identity>/`` where the
+    identity binds the config digest, the normalized image digest (when
+    supplied), and the target content digest (when the file exists)."""
+    runner = RFdiffusionRunner(output_root=output_root)
+    name = "layout"
+
+    a = RFdiffusionConfig(name=name, seed=1)
+    b = RFdiffusionConfig(name=name, seed=2)
+
+    assert runner._design_dir(a) == output_root / name / _cache_identity_token(a, image_digest=None)
+    assert runner._design_dir(a) != runner._design_dir(b)
+    # Image digest binds: bare-hex and OCI forms of the SAME digest agree;
+    # a different digest isolates.
+    assert runner._design_dir(a, image_digest=VALID_BARE_DIGEST) == runner._design_dir(
+        a, image_digest=VALID_OCI_DIGEST
+    )
+    assert runner._design_dir(a, image_digest=None) != runner._design_dir(
+        a, image_digest=VALID_OCI_DIGEST
+    )
+    assert runner._design_dir(a, image_digest=VALID_OCI_DIGEST) != runner._design_dir(
+        a, image_digest=OTHER_OCI_DIGEST
+    )
+    # Target content binds: same path, different bytes → different identity.
+    target = tmp_path / "t.pdb"
+    target.write_text(SAMPLE_PDB)
+    c1 = RFdiffusionConfig(name=name, target_pdb=str(target))
+    identity_before = _cache_identity_token(c1, image_digest=None)
+    target.write_text(SAMPLE_PDB.replace("0.000", "1.234"))
+    assert _cache_identity_token(c1, image_digest=None) != identity_before
+    # result.name is preserved even though the on-disk path is nested.
+    result = runner.run(a, dry_run=True)
+    assert result.name == name
+
+
+def test_runner_same_name_different_seed_does_not_hit_cache(
+    output_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """seed/task_count/contigs/mode/hotspots/extra variants must not cross-hit:
+    same name + different seed → the second run re-invokes upstream and its
+    outputs are isolated in its own digest directory."""
+    invoked_dirs: list[Path] = []
+
+    def fake_invoke(*, output_dir: Path, **_: Any) -> InvokeResult:
+        invoked_dirs.append(output_dir)
+        (output_dir / "design_1.pdb").write_text(SAMPLE_PDB)
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", fake_invoke)
+    runner = RFdiffusionRunner(output_root=output_root)
+    name = "seed-isolation"
+
+    first = runner.run(RFdiffusionConfig(name=name, seed=1))
+    second = runner.run(RFdiffusionConfig(name=name, seed=2))
+
+    assert len(invoked_dirs) == 2  # both seeds executed — no cross-hit
+    assert invoked_dirs[0] != invoked_dirs[1]
+    assert first.provenance.executed is True
+    assert second.provenance.executed is True
+    assert second.provenance.cache_hit is False
+    # Each run's records come only from its own digest directory.
+    assert Path(first.records[0].path).parent == invoked_dirs[0]
+    assert Path(second.records[0].path).parent == invoked_dirs[1]
+
+
+@pytest.mark.parametrize(
+    "variant_kwargs",
+    [
+        {"task_count": 2},
+        {"contigs": "20-24"},
+        {"mode": "head_to_tail"},
+        {"hotspots": ("A12",)},
+        {"deterministic": False},
+        {"checkpoint": "custom-ckpt"},
+        {"extra": {"inference.noise_scale_ca": "0.5"}},
+    ],
+)
+def test_runner_config_variants_do_not_cross_hit(
+    output_root: Path, monkeypatch: pytest.MonkeyPatch, variant_kwargs: dict[str, Any]
+) -> None:
+    """Every config dimension that changes upstream behaviour gets its own
+    digest directory — a variant must never satisfy another variant's cache."""
+    invoked_dirs: list[Path] = []
+
+    def fake_invoke(*, output_dir: Path, **_: Any) -> InvokeResult:
+        invoked_dirs.append(output_dir)
+        (output_dir / "design_0.pdb").write_text(SAMPLE_PDB)
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", fake_invoke)
+    runner = RFdiffusionRunner(output_root=output_root)
+    name = "variant"
+
+    base = RFdiffusionConfig(name=name, seed=0)
+    variant = RFdiffusionConfig(name=name, seed=0, **variant_kwargs)
+    assert compute_config_digest(base) != compute_config_digest(variant)
+
+    runner.run(base)
+    variant_result = runner.run(variant)
+
+    assert len(invoked_dirs) == 2  # the variant was NOT served from base's cache
+    assert variant_result.provenance.cache_hit is False
+    assert variant_result.provenance.executed is True
+
+
+def test_runner_same_full_config_hits_cache(
+    output_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same name AND same full config → the second run is a cache hit: no
+    invocation, ``executed=False``, ``cache_hit=True``."""
+    invoked_dirs: list[Path] = []
+
+    def fake_invoke(*, output_dir: Path, **_: Any) -> InvokeResult:
+        invoked_dirs.append(output_dir)
+        (output_dir / "design_0.pdb").write_text(SAMPLE_PDB)
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", fake_invoke)
+    runner = RFdiffusionRunner(output_root=output_root)
+    config = RFdiffusionConfig(name="same-cfg", seed=3, task_count=1)
+
+    first = runner.run(config)
+    second = runner.run(config)
+
+    assert len(invoked_dirs) == 1  # one invocation total
+    assert first.provenance.executed is True
+    assert second.provenance.executed is False
+    assert second.provenance.cache_hit is True
+    assert second.provenance.executed_config_digest is None
+    assert second.provenance.base_seed == 3  # digest-bound cache: seed is provable
+    assert Path(second.records[0].path).parent == invoked_dirs[0]
+
+
+def test_runner_legacy_name_only_outputs_are_not_cache_hits(
+    output_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pre-digest-layout outputs at ``<output_root>/<name>/*.pdb`` carry no
+    proof of which config produced them — the runner must NOT treat them as a
+    cache hit and must never mix them into results. They are left untouched."""
+    invoked_dirs: list[Path] = []
+
+    def fake_invoke(*, output_dir: Path, **_: Any) -> InvokeResult:
+        invoked_dirs.append(output_dir)
+        (output_dir / "design_0.pdb").write_text(SAMPLE_PDB)
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", fake_invoke)
+    name = "legacy"
+    legacy_dir = output_root / name
+    legacy_dir.mkdir(parents=True, exist_ok=True)
+    (legacy_dir / "design_0.pdb").write_text(SAMPLE_PDB)
+
+    runner = RFdiffusionRunner(output_root=output_root)
+    result = runner.run(RFdiffusionConfig(name=name))
+
+    assert invoked_dirs  # NOT served from the legacy name-only outputs
+    assert result.provenance.cache_hit is False
+    # The record comes from the identity-keyed dir, not the legacy flat dir.
+    assert len(result.records) == 1
+    assert Path(result.records[0].path).parent == invoked_dirs[0]
+    assert (legacy_dir / "design_0.pdb").exists()  # legacy files left untouched
+
+
+def test_runner_image_digest_change_isolates_outputs(
+    output_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same config, different (normalized) image digest → no cross-hit: the
+    second run re-invokes upstream into its own identity directory."""
+    invoked_dirs: list[Path] = []
+
+    def fake_invoke(*, output_dir: Path, **_: Any) -> InvokeResult:
+        invoked_dirs.append(output_dir)
+        (output_dir / "design_0.pdb").write_text(SAMPLE_PDB)
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", fake_invoke)
+    runner = RFdiffusionRunner(output_root=output_root)
+    config = RFdiffusionConfig(name="img-iso")
+
+    first = runner.run(config, image_digest=VALID_OCI_DIGEST)
+    second = runner.run(config, image_digest=OTHER_OCI_DIGEST)
+
+    assert len(invoked_dirs) == 2  # image change → not a cache hit
+    assert invoked_dirs[0] != invoked_dirs[1]
+    assert first.provenance.executed is True
+    assert second.provenance.executed is True
+    assert second.provenance.cache_hit is False
+    assert second.provenance.image_digest == OTHER_OCI_DIGEST
+    assert first.provenance.image_digest == VALID_OCI_DIGEST
+
+
+def test_runner_target_content_change_isolates_outputs(
+    output_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same config + same target PATH but changed bytes → no cross-hit: the
+    source-backbone content digest is part of the cache identity."""
+    target = tmp_path / "t.pdb"
+    target.write_text(SAMPLE_PDB)
+    invoked_dirs: list[Path] = []
+
+    def fake_invoke(*, output_dir: Path, **_: Any) -> InvokeResult:
+        invoked_dirs.append(output_dir)
+        (output_dir / "design_0.pdb").write_text(SAMPLE_PDB)
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", fake_invoke)
+    runner = RFdiffusionRunner(output_root=output_root)
+    config = RFdiffusionConfig(name="src-iso", target_pdb=str(target))
+
+    first = runner.run(config)
+    first_source = first.provenance.source_backbone_digest
+    assert first_source is not None
+
+    # Change the bytes at the same path — the config digest is unchanged.
+    target.write_text(SAMPLE_PDB.replace("0.000", "9.999"))
+    second = runner.run(config)
+
+    assert len(invoked_dirs) == 2  # content change → not a cache hit
+    assert invoked_dirs[0] != invoked_dirs[1]
+    assert second.provenance.executed is True
+    assert second.provenance.cache_hit is False
+    assert second.provenance.source_backbone_digest is not None
+    assert second.provenance.source_backbone_digest != first_source
+
+
+def test_runner_same_config_image_source_hits(
+    output_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same config + same image digest + same source bytes → the second run is
+    a cache hit (identity fully bound, no re-invocation)."""
+    target = tmp_path / "t.pdb"
+    target.write_text(SAMPLE_PDB)
+    invoked_dirs: list[Path] = []
+
+    def fake_invoke(*, output_dir: Path, **_: Any) -> InvokeResult:
+        invoked_dirs.append(output_dir)
+        (output_dir / "design_0.pdb").write_text(SAMPLE_PDB)
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", fake_invoke)
+    runner = RFdiffusionRunner(output_root=output_root)
+    config = RFdiffusionConfig(name="full-identity", seed=5, target_pdb=str(target))
+
+    first = runner.run(config, image_digest=VALID_OCI_DIGEST)
+    second = runner.run(config, image_digest=VALID_BARE_DIGEST)  # same normalized form
+
+    assert len(invoked_dirs) == 1  # one invocation total
+    assert first.provenance.executed is True
+    assert second.provenance.executed is False
+    assert second.provenance.cache_hit is True
+    assert second.provenance.executed_config_digest is None
+    # The hit's provenance corresponds to the exact bound identity.
+    assert second.provenance.image_digest == VALID_OCI_DIGEST
+    assert second.provenance.source_backbone_digest == compute_file_digest(target)
+    assert second.provenance.base_seed == 5
+    assert Path(second.records[0].path).parent == invoked_dirs[0]
+
+
+def test_runner_missing_then_present_source_does_not_cross_hit(
+    output_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing source stays soft (warning + None digest + run proceeds), and
+    a later run once the file exists gets a different identity — the
+    no-binding run can never satisfy the bound run's cache."""
+    missing = tmp_path / "late.pdb"
+    invoked_dirs: list[Path] = []
+
+    def fake_invoke(*, output_dir: Path, **_: Any) -> InvokeResult:
+        invoked_dirs.append(output_dir)
+        (output_dir / "design_0.pdb").write_text(SAMPLE_PDB)
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", fake_invoke)
+    runner = RFdiffusionRunner(output_root=output_root)
+    config = RFdiffusionConfig(name="late-src", target_pdb=str(missing))
+
+    first = runner.run(config)
+    assert first.provenance.executed is True
+    assert first.provenance.source_backbone_digest is None  # missing → soft signal
+
+    missing.write_text(SAMPLE_PDB)
+    second = runner.run(config)
+
+    assert len(invoked_dirs) == 2  # present source → different identity → re-run
+    assert second.provenance.executed is True
+    assert second.provenance.cache_hit is False
+    assert second.provenance.source_backbone_digest is not None
+
+
+# ---------------------------------------------------------------------------
+# RecordData.index — parsed from the design filename
+# ---------------------------------------------------------------------------
+
+
+def test_parse_output_dir_extracts_design_index_from_filename(tmp_path: Path) -> None:
+    """``RecordData.index`` is the design's numeric index parsed from the
+    filename's final ``_<digits>`` segment (``design_42.pdb`` -> ``42``),
+    matching upstream's ``<prefix>_<i_des>.pdb`` naming."""
+    design_dir = tmp_path / "designs"
+    design_dir.mkdir(parents=True, exist_ok=True)
+    (design_dir / "design_42.pdb").write_text(SAMPLE_PDB)
+    (design_dir / "design_0.pdb").write_text(SAMPLE_PDB)
+
+    records = _parse_output_dir(design_dir)
+    by_name = {Path(r.path).name: r.index for r in records}
+    assert by_name["design_42.pdb"] == 42
+    assert by_name["design_0.pdb"] == 0
+
+
+def test_parse_output_dir_falls_back_honestly_for_nonstandard_names(tmp_path: Path) -> None:
+    """Nonstandard filenames (no final ``_<digits>``) get the smallest
+    non-negative index not already used — never a collision with a parsed
+    design index."""
+    design_dir = tmp_path / "designs"
+    design_dir.mkdir(parents=True, exist_ok=True)
+    # Parsed indices 0 and 1 are taken; the nonstandard file must not collide.
+    (design_dir / "design_0.pdb").write_text(SAMPLE_PDB)
+    (design_dir / "design_1.pdb").write_text(SAMPLE_PDB)
+    (design_dir / "weird.pdb").write_text(SAMPLE_PDB)
+
+    records = _parse_output_dir(design_dir)
+    indices = sorted(r.index for r in records)
+    assert indices == [0, 1, 2]
+    weird = next(r for r in records if r.path.endswith("weird.pdb"))
+    assert weird.index == 2
+
+    # With only a high parsed index, the fallback fills the low hole.
+    other = tmp_path / "other"
+    other.mkdir(parents=True, exist_ok=True)
+    (other / "design_42.pdb").write_text(SAMPLE_PDB)
+    (other / "weird.pdb").write_text(SAMPLE_PDB)
+    other_records = _parse_output_dir(other)
+    indices2 = sorted(r.index for r in other_records)
+    assert indices2 == [0, 42]
+
+
+def test_runner_records_seed_offset_design_indices(
+    output_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With seed mapped to ``inference.design_startnum``, upstream emits
+    ``<prefix>_<i_des>.pdb`` for i_des in seed..seed+task_count-1; the parsed
+    RecordData indices equal the per-design seeds."""
+    seed, task_count = 7, 2
+
+    def fake_invoke(*, output_dir: Path, **_: Any) -> InvokeResult:
+        for i_des in range(seed, seed + task_count):
+            (output_dir / f"design_{i_des}.pdb").write_text(SAMPLE_PDB)
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", fake_invoke)
+    runner = RFdiffusionRunner(output_root=output_root)
+    result = runner.run(RFdiffusionConfig(name="offset", seed=seed, task_count=task_count))
+
+    assert sorted(r.index for r in result.records) == [seed, seed + 1]
+    assert result.provenance.base_seed == seed
+    assert result.provenance.task_count == task_count
+
+
+@pytest.mark.parametrize(
+    "unsafe_name",
+    ["", ".", "..", "a/b", "a\\b", "a\x00b", "a\nb"],
+)
+def test_config_rejects_unsafe_name(unsafe_name: str) -> None:
+    """Names that would escape the per-name output directory are rejected at
+    construction (fail closed) — the digest layout cannot be subverted."""
+    with pytest.raises(ValueError, match="safe path component"):
+        RFdiffusionConfig(name=unsafe_name)
+
+
+# ---------------------------------------------------------------------------
 # S2 provenance (reproducibility)
 # ---------------------------------------------------------------------------
 
@@ -358,14 +907,13 @@ def test_runner_records_honest_provenance_on_real_run(
     """A real (non-dry-run, non-cached) invocation attaches a ProvenanceMetadata
     carrying the honest RFdiffusion contract:
 
-    * ``base_seed`` is ``None`` — the runner did NOT forward ``inference.seed``.
-    * ``requested_seed`` is the caller's value.
-    * ``rng_intent`` is ``"seed-not-forwarded"`` for the default
-      deterministic mode.
-    * ``executed_config_digest`` excludes ``seed`` so the digest is
-      stable across calls that change only the seed.
-    * ``requested_config_digest`` covers the full config — the audit
-      can still see what the caller asked for.
+    * ``base_seed`` == ``requested_seed`` == the forwarded base seed.
+    * ``rng_intent`` is ``"per-design-index"`` for the default
+      deterministic mode — upstream seeds design ``i`` with
+      ``design_startnum + i``, so per-design seeds are
+      ``base_seed .. base_seed + task_count - 1``.
+    * ``executed_config_digest`` includes ``seed`` (nothing excluded
+      in deterministic mode), so it equals the requested digest.
     """
     target = tmp_path / "target.pdb"
     target.write_text(SAMPLE_PDB)
@@ -380,31 +928,67 @@ def test_runner_records_honest_provenance_on_real_run(
     assert prov.temperature is None  # RFdiffusion does not expose temperature
     assert prov.image_digest == VALID_OCI_DIGEST
     assert prov.source_backbone_digest == compute_file_digest(target)
-    # S2 honesty: the runner did NOT forward seed, so base_seed is None.
-    assert prov.base_seed is None
+    # S2 honesty: the runner forwarded the base seed, so base_seed == requested_seed.
+    assert prov.base_seed == 7
     assert prov.requested_seed == 7
     assert prov.task_count == 3
-    assert prov.rng_intent == RNG_INTENT_SEED_NOT_FORWARDED
+    assert prov.rng_intent == RNG_INTENT_PER_DESIGN_INDEX
     assert prov.exit_code == 0
     assert prov.failure_reason == ""
     assert prov.executed is True
     assert prov.cache_hit is False
     assert prov.executed_config_digest is not None
     assert prov.requested_config_digest is not None
-    # The two digests differ for RFdiffusion — seed is in the requested
-    # digest but excluded from the executed digest.
-    assert prov.requested_config_digest != prov.executed_config_digest
+    # The two digests are equal — seed is part of the executed config.
+    assert prov.requested_config_digest == prov.executed_config_digest
 
 
 def test_runner_records_non_deterministic_rng_intent(
     output_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``deterministic=False`` → ``rng_intent="non-deterministic"``."""
+    """``deterministic=False`` → ``rng_intent="non-deterministic"`` and
+    ``base_seed=None`` — the runner forwards neither
+    ``inference.design_startnum`` nor ``inference.deterministic``, so no
+    pinned seed may be claimed even though the caller supplied one."""
     monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", _fake_invoke_ok)
     runner = RFdiffusionRunner(output_root=output_root)
-    result = runner.run(RFdiffusionConfig(name="nd", seed=0, deterministic=False), dry_run=True)
+    result = runner.run(RFdiffusionConfig(name="nd", seed=42, deterministic=False))
     assert result.provenance.rng_intent == RNG_INTENT_NON_DETERMINISTIC
     assert result.provenance.base_seed is None
+    assert result.provenance.requested_seed == 42  # the caller's intent is still audited
+    assert result.provenance.executed is True
+    assert result.provenance.executed_config_digest is not None
+
+
+def test_runner_executed_config_digest_stable_for_non_deterministic_seed_changes(
+    output_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S2 honesty: with ``deterministic=False`` the base seed is NOT forwarded,
+    so a seed-only change must flip ONLY the requested digest — the executed
+    digest stays stable (upstream's RNG did not depend on it)."""
+    target = tmp_path / "t.pdb"
+    target.write_text(SAMPLE_PDB)
+    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", _fake_invoke_ok)
+    runner = RFdiffusionRunner(output_root=output_root)
+
+    a = runner.run(
+        RFdiffusionConfig(name="nd-seed-test", seed=1, target_pdb=str(target), deterministic=False)
+    ).provenance
+    b = runner.run(
+        RFdiffusionConfig(
+            name="nd-seed-test", seed=999, target_pdb=str(target), deterministic=False
+        )
+    ).provenance
+
+    assert a.executed is True and b.executed is True
+    assert a.executed_config_digest is not None and b.executed_config_digest is not None
+    # Executed digest stable across non-deterministic seed-only changes.
+    assert a.executed_config_digest == b.executed_config_digest
+    # Requested digest flips — the caller did ask for different seeds.
+    assert a.requested_config_digest != b.requested_config_digest
+    # No pinned seed claimed in either run.
+    assert a.base_seed is None and b.base_seed is None
+    assert a.rng_intent == b.rng_intent == RNG_INTENT_NON_DETERMINISTIC
 
 
 def test_runner_provenance_does_not_contain_per_task_seeds(
@@ -415,19 +999,29 @@ def test_runner_provenance_does_not_contain_per_task_seeds(
     runner = RFdiffusionRunner(output_root=output_root)
     result = runner.run(RFdiffusionConfig(name="x", seed=42, task_count=8), dry_run=True)
     assert not hasattr(result.provenance, "per_task_seeds")
-    assert result.provenance.base_seed is None
+    assert result.provenance.base_seed == 42  # the seed this call would forward
     assert result.provenance.requested_seed == 42
     assert result.provenance.task_count == 8
+    # The per-design seed range (42..49) is encoded by base_seed + task_count.
+    assert result.provenance.rng_intent == RNG_INTENT_PER_DESIGN_INDEX
+    assert list(
+        range(
+            result.provenance.base_seed,
+            result.provenance.base_seed + result.provenance.task_count,
+        )
+    ) == list(range(42, 50))
 
 
-def test_runner_executed_config_digest_stable_across_seed_only_changes(
+def test_runner_executed_config_digest_differs_across_seed_only_changes(
     output_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """S2 honesty: changing only ``seed`` MUST NOT flip the executed config digest
-    because the runner does not forward ``inference.seed`` to upstream.
+    """S2 honesty: changing only ``seed`` MUST flip the executed config digest
+    in deterministic mode because the runner forwards it as
+    ``inference.design_startnum`` — the per-design seeds start there, so the
+    seed changes what upstream actually ran.
 
-    The ``requested_config_digest`` (full config) DOES flip — that's the
-    audit trail for "the caller asked for different seeds".
+    The ``requested_config_digest`` (full config) also flips, and
+    ``base_seed`` differs between the two runs.
 
     Both calls use the same ``name`` and ``target_pdb`` so the only
     field that varies is ``seed`` — which is the field under test.
@@ -444,12 +1038,13 @@ def test_runner_executed_config_digest_stable_across_seed_only_changes(
     assert a.executed is True and b.executed is True
     assert a.executed_config_digest is not None
     assert b.executed_config_digest is not None
-    # Executed digest stable across seed-only changes.
-    assert a.executed_config_digest == b.executed_config_digest
-    # Requested digest flips — the caller did ask for different seeds.
+    # Executed digest flips across seed-only changes — the base seed was forwarded.
+    assert a.executed_config_digest != b.executed_config_digest
+    # Requested digest flips too — the caller asked for different seeds.
     assert a.requested_config_digest != b.requested_config_digest
-    # base_seed stays None for both (seed not forwarded).
-    assert a.base_seed is None and b.base_seed is None
+    # base_seed equals the forwarded base seed for both runs.
+    assert a.base_seed == 1 and b.base_seed == 999
+    assert a.rng_intent == b.rng_intent == RNG_INTENT_PER_DESIGN_INDEX
     assert a.requested_seed != b.requested_seed
 
 
@@ -459,26 +1054,36 @@ def test_runner_cache_hit_records_honest_cache_provenance(
     """On a cache hit, ``executed=False``, ``cache_hit=True``,
     ``executed_config_digest=None`` — the runner does not know which
     prior call produced the existing files, so it does not fabricate
-    a digest. Only the *requested* digest (what THIS call asked for)
-    is recorded.
+    an executed digest. ``base_seed`` / ``requested_seed`` /
+    ``rng_intent`` ARE reported because the cache is digest-bound:
+    the cache key is the full requested-config digest (which includes
+    ``seed``), so the cached outputs provably correspond to exactly
+    this config and the per-design seed range describes them.
     """
     monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", _fake_invoke_ok)
     name = "cache-hit"
-    design_dir = output_root / name
+    config = RFdiffusionConfig(name=name, seed=11)
+    # Identity-bound cache: outputs must live under <name>/<identity(config,
+    # VALID_OCI_DIGEST)>/ — the run below supplies exactly this image digest.
+    design_dir = output_root / name / _cache_identity_token(config, image_digest=VALID_OCI_DIGEST)
     design_dir.mkdir(parents=True, exist_ok=True)
-    (design_dir / "design_0.pdb").write_text(SAMPLE_PDB)
+    (design_dir / "design_11.pdb").write_text(SAMPLE_PDB)
 
     runner = RFdiffusionRunner(output_root=output_root)
-    config = RFdiffusionConfig(name=name, seed=11)
     result = runner.run(config, image_digest=VALID_OCI_DIGEST)
     prov = result.provenance
 
     assert prov.cache_hit is True
     assert prov.executed is False
     assert prov.executed_config_digest is None
-    # The audit can still see what THIS call requested.
+    # Identity-bound cache: the seed semantics describe the cached outputs.
     assert prov.requested_config_digest != ""
     assert prov.requested_seed == 11
+    assert prov.base_seed == 11
+    assert prov.rng_intent == RNG_INTENT_PER_DESIGN_INDEX
+    assert prov.image_digest == VALID_OCI_DIGEST
+    # The record's index is parsed from the design filename (design_11.pdb -> 11).
+    assert [r.index for r in result.records] == [11]
     # The records on disk are the cached records — the runner counts
     # them as "skipped" (we did NOT re-invoke) but also as "succeeded"
     # (they are usable outputs).
@@ -488,7 +1093,9 @@ def test_runner_cache_hit_records_honest_cache_provenance(
 
 def test_runner_dry_run_records_requested_digest_only(output_root: Path) -> None:
     """dry_run: ``executed=False``, ``cache_hit=False``,
-    ``executed_config_digest=None``."""
+    ``executed_config_digest=None``. The intended forwarded ``base_seed``
+    IS recorded (what would have been executed); the executed digest stays
+    ``None`` because nothing ran."""
     runner = RFdiffusionRunner(output_root=output_root)
     result = runner.run(RFdiffusionConfig(name="dry", seed=5, task_count=3), dry_run=True)
     prov = result.provenance
@@ -496,9 +1103,9 @@ def test_runner_dry_run_records_requested_digest_only(output_root: Path) -> None
     assert prov.cache_hit is False
     assert prov.executed_config_digest is None
     assert prov.requested_config_digest != ""
-    # ``base_seed`` is what was forwarded to upstream — RFdiffusion does
-    # not forward ``inference.seed``, so it stays ``None`` even in dry_run.
-    assert prov.base_seed is None
+    # ``base_seed`` records the intended forwarded seed for a deterministic
+    # dry run — the manifest describes what WOULD have been executed.
+    assert prov.base_seed == 5
     assert prov.requested_seed == 5
     assert prov.task_count == 3
 
@@ -565,6 +1172,60 @@ def test_runner_equivalent_rerun_produces_equivalent_provenance(
     first = runner.run(config, image_digest=VALID_OCI_DIGEST).provenance.to_dict()
     second = runner.run(config, image_digest=VALID_OCI_DIGEST).provenance.to_dict()
     assert first == second
+
+
+def test_runner_provenance_json_roundtrip(
+    output_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The provenance record serialises to JSON and back without loss — the
+    seed fields and both digests survive the roundtrip."""
+    target = tmp_path / "target.pdb"
+    target.write_text(SAMPLE_PDB)
+    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", _fake_invoke_ok)
+    runner = RFdiffusionRunner(output_root=output_root)
+    config = RFdiffusionConfig(name="roundtrip", seed=123, task_count=2, target_pdb=str(target))
+    payload = runner.run(config, image_digest=VALID_OCI_DIGEST).provenance.to_dict()
+
+    roundtripped = json.loads(json.dumps(payload))
+    assert roundtripped == payload
+    # The seed semantics are JSON-visible, not Python-object-only.
+    assert roundtripped["base_seed"] == 123
+    assert roundtripped["requested_seed"] == 123
+    assert roundtripped["rng_intent"] == RNG_INTENT_PER_DESIGN_INDEX
+    assert roundtripped["executed"] is True
+    assert roundtripped["executed_config_digest"] == roundtripped["requested_config_digest"]
+    # The per-design seed range is encoded by base_seed + task_count, not a list.
+    assert set(roundtripped) == set(payload)
+    assert "per_task_seeds" not in roundtripped
+
+
+def test_runner_output_indices_start_at_seed(
+    output_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Output-index side effect of ``inference.design_startnum``: upstream names
+    each output ``<prefix>_<i_des>.pdb`` with ``i_des`` starting at
+    ``design_startnum`` (the configured seed). The runner parses every PDB in
+    the design dir regardless of name, so with seed=42 / task_count=3 the
+    parsed records are ``design_42.pdb`` .. ``design_44.pdb`` — not
+    ``design_0.pdb``..``design_2.pdb``."""
+    seed, task_count = 42, 3
+
+    def fake_invoke(*, output_dir: Path, **_: Any) -> InvokeResult:
+        # Mirror upstream: out_prefix = f"{output_prefix}_{i_des}" for
+        # i_des in range(design_startnum, design_startnum + num_designs).
+        for i_des in range(seed, seed + task_count):
+            (output_dir / f"design_{i_des}.pdb").write_text(SAMPLE_PDB)
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", fake_invoke)
+    runner = RFdiffusionRunner(output_root=output_root)
+    result = runner.run(RFdiffusionConfig(name="indexed", seed=seed, task_count=task_count))
+
+    assert result.succeeded == task_count
+    names = [Path(r.path).name for r in result.records]
+    assert names == [f"design_{i_des}.pdb" for i_des in range(seed, seed + task_count)]
+    assert result.provenance.base_seed == seed
+    assert result.provenance.task_count == task_count
 
 
 def test_runner_normalises_image_digest_to_oci_form(
