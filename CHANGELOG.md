@@ -6,6 +6,106 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- **Peptide preparation (CHEM-001 / Activin E3 prerequisite)**:
+  new `biolab_runners.peptide_prep` package materialises
+  simulation-ready structures from a backbone PDB + designed
+  sequence — optional D-substitution / head-to-tail / disulfide
+  closure via engine-neutral callback Protocols, restrained
+  backbone minimization, and a parity-checked PDB + GROMACS
+  export (`prepared.pdb` / `prepared.top` / `prepared.gro`)
+  of the same OpenMM system. Idempotent via digest-bound
+  manifest (reuse / force-quarantine / provenance-drift
+  detection). Optional deps (OpenMM, PDBFixer, ParmEd) are
+  lazy-imported and fail closed as structured results when
+  missing.
+
+  **Review-fix pass** (science-digest correctness):
+
+  - The science config digest now excludes execution / location
+    controls (`force`, `dry_run`, `name`, `output_root`,
+    `backbone_pdb`) while the source CONTENT stays bound as
+    `source_backbone_sha256`. A `force=True` rebuild is therefore
+    reusable by the next normal invocation, and a dry-run never
+    overwrites / poisons a production manifest.
+  - D-substitution configs now REQUIRE explicit callback
+    identities (`coordinate_transformer_identity` /
+    `chirality_validator_identity`) so the science digest binds
+    which transform / validator produced the geometry; changing an
+    identity invalidates the cached run. Non-D configs remain
+    ergonomic (identities optional, empty by default).
+  - Reused runs reconstruct typed `TopologyBondRecord` /
+    `ChiralityReport` instances from the manifest (previously
+    plain dicts), so `PeptidePrepResult.to_dict()` round-trips
+    identically on fresh and reused results.
+  - The D-transform callback contract is enforced fail-closed:
+    N/CA/C backbone coordinates must be invariant (side-chain-only
+    mirror) within a documented 1e-3 Å tolerance; a transform that
+    moves or drops a backbone atom is rejected with a clear error.
+  - PRO at the head of a head-to-tail cyclic peptide is now
+    supported: the audit expects 0 head-N hydrogens for PRO (the
+    ring N is a tertiary amide after closure) vs exactly 1 for
+    other residues.
+
+  **Robustness pass** (callback seams, platform resolution,
+  dry-run source validation, digest canonicalisation):
+
+  - The external callback seams (coordinate transformer + chirality
+    validator) now catch ``Exception`` — NOT ``BaseException`` —
+    so an ``AttributeError`` / ``IndexError`` from a buggy adapter
+    becomes a typed ``PeptidePrepResult`` failure with provenance
+    instead of an uncaught exception escaping ``run()``.
+  - The OpenMM platform is resolved ONCE per run (runner
+    constructor override wins over ``config.openmm_platform``) and
+    threaded through the initial energy read and the minimization
+    identically. A valid override supersedes an invalid config
+    platform; the manifest and the science digest record the
+    EFFECTIVE platform (a changed override invalidates the cache).
+  - A D-coordinate transform that omits ANY input atom (not just
+    backbone N/CA/C) fails closed: the returned mapping must carry
+    every atom it was given, or the residue would silently mix
+    pre/post-transform side-chain coordinates.
+  - Dry-run fails closed on a missing / unreadable backbone PDB
+    (same error as the real path) without producing any heavy
+    artifacts.
+  - The science config digest canonicalises only the validated
+    topology fields (position/residue, head/tail, first/second) to
+    JSON-native values, so an accepted descriptor carrying extra
+    non-JSON attributes (e.g. upstream ``summary`` helpers) can no
+    longer leak an uncaught serialization ``TypeError``.
+  - ``GromacsProtocolRunner`` prebuilt staging reuses the digest
+    metadata returned by ``stage_prebuilt_topology`` instead of
+    re-reading the source files a second time.
+
+  **Final pass** (dry-run preservation, engine seam, reuse schema):
+
+  - A dry-run with a missing / unreadable backbone now returns the
+    structured failure INLINE — it no longer routes through the
+    failure-manifest writer, so a dry-run after source deletion
+    preserves the production manifest (and the next normal
+    invocation still reuses).
+  - The external OpenMM minimization call fails closed on ANY
+    exception (not just ``RuntimeError``): OpenMM's
+    ``OpenMMException`` is not a ``RuntimeError`` subclass, so a
+    mid-minimization engine failure (context init, force
+    evaluation, platform plugin) becomes a typed result with
+    provenance. The catch stays localized to the engine call and
+    never touches ``BaseException``.
+  - Reuse rejects a manifest whose ``schema_version`` does not
+    match the supported version (treated as not-reusable → fresh
+    run) instead of attempting dataclass reconstruction on an
+    unknown shape. Reused ``net_charge`` is cast to ``float`` for
+    typed API consistency.
+
+- **GROMACS protocol prebuilt mode**: `GromacsProtocolConfig`
+  accepts a `prebuilt_topology` + `prebuilt_coordinates` pair
+  (both-or-neither validated). When set, the runner skips
+  `pdb2gmx` and stages the caller's `.top` / `.gro` into
+  `topol.top` / `processed.gro`; source digests are bound in
+  the stage manifest so a changed prebuilt source invalidates
+  the cached downstream stages (outputs quarantined to
+  `.stale/<UTC>/`, manifest reset to PENDING) while the legacy
+  `input_pdb` path stays byte-identical.
+
 - **GROMACS interrupted-stage handling (slice S4, post-merge
   hotfix)**: a stage with a RUNNING manifest or an on-disk
   `.cpt` is never silently promoted to `COMPLETED` from disk

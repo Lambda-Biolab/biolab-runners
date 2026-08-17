@@ -44,6 +44,13 @@ openmm = [
     # conflicts with boltz's numpy<2.0 constraint. 1.11.0 is the last
     # release compatible with the numpy 1.x line.
     "mdtraj>=1.10,<1.11.1",
+    # ParmEd for the GROMACS topology export path
+    # (biolab_runners.peptide_prep). Loads the prepared OpenMM
+    # topology + system + positions and writes prepared.top /
+    # prepared.gro preserving charges and bonds. Optional under
+    # the [openmm] extra — the GROMACS export is conditional on
+    # this dependency being installed.
+    "parmed>=4.3",
     # CUDA platform plugin for OpenMM 8.5+. The [cuda12] extra installs
     # the prebuilt C++ plugin against CUDA 12.x; openmm ships matching
     # extras for CUDA 12 and CUDA 13 — pin whichever matches the host's

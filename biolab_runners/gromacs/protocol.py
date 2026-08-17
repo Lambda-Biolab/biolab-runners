@@ -53,6 +53,8 @@ from typing import TYPE_CHECKING
 from biolab_runners.gromacs.paths import GromacsFiles
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from biolab_runners.gromacs.config import GromacsProtocolConfig
 
 
@@ -570,7 +572,7 @@ _MINIMUM_OUTPUTS: dict[StageKind, tuple[str, ...]] = {
 }
 
 
-def stage_minimum_outputs(kind: StageKind, prefix: str = "") -> tuple[str, ...]:  # noqa: ARG001 — prefix reserved for future customisation
+def stage_minimum_outputs(kind: StageKind, prefix: str = "") -> tuple[str, ...]:  # noqa: ARG001
     """Return the minimum on-disk outputs required for the disk fallback.
 
     This is a STRICT SUBSET of :func:`stage_outputs_for`. Used by
@@ -600,6 +602,23 @@ def build_stage_plan_resolved() -> tuple[StageSpec, ...]:
 def _setup_topology_commands(
     config: GromacsProtocolConfig,
 ) -> list[list[str]]:
+    """Build the ``gmx pdb2gmx`` command for the TOPOLOGY stage.
+
+    Empty list (``[]``) signals that the TOPOLOGY stage is a
+    no-op — the runner skips ``pdb2gmx`` and uses a
+    caller-supplied prebuilt topology / coordinates pair
+    (staged into ``topol.top`` / ``processed.gro`` by
+    :func:`stage_prebuilt_topology`).
+
+    The prebuilt condition is the existence of
+    ``config.prebuilt_topology`` AND
+    ``config.prebuilt_coordinates`` (both, per the config
+    validator). The runner reads this flag from the
+    command list and skips the stage accordingly.
+    """
+    if config.prebuilt_topology and config.prebuilt_coordinates:
+        # Prebuilt mode — ``pdb2gmx`` is skipped.
+        return []
     return [
         [
             "gmx",
@@ -617,6 +636,71 @@ def _setup_topology_commands(
             "-ignh",
         ]
     ]
+
+
+def stage_prebuilt_topology(
+    config: GromacsProtocolConfig,
+    work_dir: Path,
+) -> dict[str, str]:
+    """Materialise the caller-supplied prebuilt files into canonical names.
+
+    Returns a dict mapping ``topology`` / ``coordinates`` to
+    absolute source paths so the runner can bind them into
+    the stage manifest for provenance. The destination files
+    are written atomically via ``shutil.copy2`` (no shell,
+    no text rewriting — the prebuilt ``.top`` and ``.gro``
+    are byte-identical to the source).
+
+    Args:
+        config: Protocol config (must have BOTH
+            ``prebuilt_topology`` and ``prebuilt_coordinates``
+            set; the runner calls this only after validating
+            the pair).
+        work_dir: The runner's work directory.
+
+    Returns:
+        ``{"topology": str, "coordinates": str, "sha256_topology": str, "sha256_coordinates": str}``
+        — the absolute SOURCE paths and their digests (so the
+        manifest binds the prebuilt source, not the staged
+        copy).
+
+    Raises:
+        FileNotFoundError: When either source path is missing.
+        ValueError: When the prebuilt pair is incomplete.
+    """
+    import shutil
+    from pathlib import Path as _Path
+
+    if not (config.prebuilt_topology and config.prebuilt_coordinates):
+        raise ValueError(
+            "stage_prebuilt_topology called with incomplete prebuilt pair; "
+            "the runner must check the config validator before calling"
+        )
+    src_top = _Path(config.prebuilt_topology)
+    src_xyz = _Path(config.prebuilt_coordinates)
+    if not src_top.is_file():
+        raise FileNotFoundError(f"prebuilt topology not found: {src_top}")
+    if not src_xyz.is_file():
+        raise FileNotFoundError(f"prebuilt coordinates not found: {src_xyz}")
+
+    dst_top = work_dir / GromacsFiles.TOPOLOGY_TOP
+    dst_xyz = work_dir / GromacsFiles.TOPOLOGY_GRO
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    shutil.copy2(src_top, dst_top)
+    shutil.copy2(src_xyz, dst_xyz)
+
+    # Compute digests on the SOURCE (the prebuilt files are
+    # immutable as far as this runner is concerned; the runner
+    # binds the source digest, not the staged copy's).
+    from biolab_runners.provenance import compute_file_digest
+
+    return {
+        "topology": str(src_top),
+        "coordinates": str(src_xyz),
+        "sha256_topology": compute_file_digest(src_top) or "",
+        "sha256_coordinates": compute_file_digest(src_xyz) or "",
+    }
 
 
 def _setup_box_commands(config: GromacsProtocolConfig) -> list[list[str]]:
