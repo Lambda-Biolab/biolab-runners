@@ -6,6 +6,53 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- **Generated-chain-aware output parsing (stock assignment)**:
+  stock output PDBs carry the generated binder chain(s) **plus** the
+  receptor chains copied from `inference.input_pdb`, and
+  `parse_backbone_pdb` previously concatenated every chain — so
+  `RecordData.sequence` was target+peptide and downstream
+  length/filter logic failed. The generated design's output chain is
+  now derived exactly as stock assigns it (`model_runners.py`
+  `chain_idx`): the lexicographically first ASCII chain letter not
+  used by the contig-referenced receptor chains — receptor A+B →
+  `C`, receptor A → `B`, unconditional → `A` —
+  `RFdiffusionConfig.design_chains` is resolved from `contigs` at
+  construction (single authoritative source; a caller-supplied value
+  must equal the derived one, else fail closed; lowercase receptor
+  chain references are rejected — PDB/RF production chain IDs are
+  uppercase single letters). `RecordData.sequence`
+  now includes only that chain (file order, per-chain residue dedupe
+  preserved), while `RecordData.path` keeps the full target+binder
+  complex so interface filtering still has receptor coordinates.
+  Fail closed: an output PDB missing the derived chain — or with no
+  parseable residues — is a `failed` record on the execute AND
+  cache-hit paths (never a fake-empty success); the derivation itself
+  fails closed on malformed/ambiguous contigs (zero or multiple
+  generated segments, motif-style generated blocks). `design_chains`
+  is parse/provenance semantics, not a Hydra flag: it is bound into
+  the requested-config digest and cache identity but never forwarded
+  to the CLI (executed digest unaffected). Unconditional single-chain
+  output remains backward compatible (`A`). Parsed records are
+  returned in numeric design-index order (`design_2` before
+  `design_10` — filename order would misorder once `task_count > 9`),
+  with filename-stable fallback indices for nonstandard names.
+- **`cyc_chains` is HAL space, not output-PDB space**: it names the
+  chain to cyclize in the internal chain-index space of `contigs.py`
+  (generated chains labelled `A`, `B`, ... via `chain_order` ahead of
+  the receptor chain; `model_runners._init_cyclic_reses` matches it
+  against `contig_map.hal` with internal uppercasing), so
+  `cyc_chains="a"` cyclizes the first generated chain — the binder —
+  regardless of the output-PDB letter it gets (`C` for a two-chain
+  target). The previous round's cross-validation between
+  `cyc_chains` and `design_chains` is removed (the two spaces are
+  independent).
+- **Honest cache hits with broken cached output**: on the idempotent
+  path, a cached output that fails to parse is now a `failed` record
+  with `exit_code=1` (and matching provenance) instead of a fake
+  success; the counters are documented as two independent axes —
+  `succeeded`/`failed` describe parse quality, `skipped` describes
+  the not-invoked cache entry.
+
 - **RFdiffusion execution contract (target-conditioned binders)**:
   `RFdiffusionConfig.target_pdb` is now forwarded as the canonical
   stock Hydra key `inference.input_pdb` (added to
@@ -18,8 +65,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   as downstream topology intent, applied by
   `biolab_runners.peptide_prep`. Added explicit
   `mode="head_to_tail_and_disulfide"` and a validated `cyc_chains`
-  field (default `"a"` = first generated chain, per stock contig
-  output semantics). Fail-closed validation: chain-referencing
+  field (default `"a"` = first generated chain in stock HAL space).
+  Fail-closed validation: chain-referencing
   binder contigs **and hotspots** require `target_pdb`, and a
   set-but-missing target file is a hard error at run time. The #199
   cache-identity *mechanism* is preserved (target content,

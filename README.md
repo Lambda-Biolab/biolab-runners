@@ -212,6 +212,26 @@ result = runner.run(config, dry_run=True)  # validate inputs without a GPU
   all fail closed so a run can never silently design against the
   wrong structure. With an empty `target_pdb`, `contigs="14-18"` is
   generic **unconditional** generation — not a binder.
+- **Generated-chain-aware output parsing (stock assignment)**: stock
+  output PDBs carry the generated binder chain(s) **plus** the
+  receptor chains copied from the target. The generated design's
+  output chain is derived exactly as stock assigns it
+  (`model_runners.py` `chain_idx`) — the lexicographically first
+  ASCII letter not used by the contig-referenced receptor chains
+  (receptor A+B → `C`, receptor A → `B`, unconditional → `A`) — and
+  `RecordData.sequence` is parsed from that chain alone
+  (`config.design_chains`, resolved from `contigs`; single source of
+  truth, no override), never target+peptide. `RecordData.path` keeps
+  the full target+binder complex so downstream interface filtering
+  still has receptor coordinates. An output PDB missing the derived
+  chain — or with no parseable residues — is a `failed` record (fail
+  closed, never a fake-empty success), and the derivation itself
+  fails closed on malformed/ambiguous contigs. `design_chains` is
+  parse/provenance semantics, not a Hydra flag: it is bound into the
+  cache identity but never forwarded upstream. `cyc_chains` lives in
+  a separate **HAL space** (the internal chain-index space of
+  `contigs.py`): `"a"` cyclizes the first generated chain — the
+  binder — regardless of the output-PDB letter the binder gets.
 - Runtime requirement: `RFDIFFUSION_HOME` must point at the upstream
   clone root (`~/tools/RFdiffusion` by default) with the model
   weights downloaded — the wheel's `rfdiffusion` console script
