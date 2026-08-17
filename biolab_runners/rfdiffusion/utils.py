@@ -1,10 +1,13 @@
 """CLI + availability helpers for the RFdiffusion runner.
 
-RFdiffusion is invoked via the ``run_inference.py`` script bundled
-with the upstream Docker image. The runner resolves the executable
-through :func:`rfdiffusion_available`, which honours the
-``RFDIFFUSION_BIN`` env var and falls back to a ``rfdiffusion``
-binary on the system PATH.
+RFdiffusion is invoked through the in-package ``rfdiffusion`` console
+script (``biolab_runners.rfdiffusion.cli``), which translates the
+runner's ``--output_dir`` + dotted/key-value flag contract into Hydra
+positional overrides for the stock ``scripts/run_inference.py`` under
+``RFDIFFUSION_HOME``. The runner resolves the executable through
+:func:`rfdiffusion_available`, which honours the ``RFDIFFUSION_BIN``
+env var (a custom binary implementing the same contract) and falls
+back to the installed ``rfdiffusion`` script on the system PATH.
 """
 
 from __future__ import annotations
@@ -65,12 +68,14 @@ class RecordData:
 
 
 def rfdiffusion_available(timeout_seconds: int = 30) -> bool:
-    """Return True when the upstream RFdiffusion CLI can be invoked.
+    """Return True when the RFdiffusion binary can be invoked.
 
-    Honours ``RFDIFFUSION_BIN`` for callers running inside a
-    container (e.g. ``container://rfdiffusion:latest python
-    /app/RFdiffusion/run_inference.py``). Falls back to a
-    ``rfdiffusion`` binary on the system PATH.
+    Honours ``RFDIFFUSION_BIN``; falls back to the in-package
+    ``rfdiffusion`` console script on the system PATH. The probe runs
+    ``--help``, which the console script answers without touching
+    ``RFDIFFUSION_HOME`` or any model files. ``container://`` URIs are
+    no longer supported and report unavailable here (see
+    :func:`_resolved_binary`).
     """
     import os
 
@@ -78,8 +83,7 @@ def rfdiffusion_available(timeout_seconds: int = 30) -> bool:
     # ``which`` is cheap and avoids spawning the real binary just to
     # probe availability.
     if shutil.which(binary) is None:
-        # Allow ``container://`` URIs by parsing the executable part.
-        return bool(binary.startswith("container://"))
+        return False
     try:
         completed = subprocess.run(
             [binary, "--help"],
@@ -94,19 +98,27 @@ def rfdiffusion_available(timeout_seconds: int = 30) -> bool:
 
 
 def _resolved_binary() -> list[str]:
-    """Return the command prefix used to invoke RFdiffusion."""
+    """Return the command prefix used to invoke RFdiffusion.
+
+    ``RFDIFFUSION_BIN`` may point at a custom binary implementing the
+    runner contract; the default is the installed ``rfdiffusion``
+    console script. The legacy ``container://`` URI form is rejected:
+    it invoked ``run_inference.py --key value`` directly (Hydra needs
+    positional ``key=value`` overrides) and hardcoded an image-internal
+    path, so it could never work as written — the in-package console
+    script is the supported way to reach upstream inside a container.
+    """
     import os
 
     binary = os.environ.get("RFDIFFUSION_BIN", "rfdiffusion")
     if binary.startswith("container://"):
-        # container://image[:tag] -> [container_runtime, "run", image, ...]
-        # Caller is expected to set CONTAINER_RUNTIME (e.g. docker,
-        # podman, singularity). ``rfdiffusion`` upstream publishes a
-        # Docker image; the worker wraps it in the GCP Batch
-        # container rather than here.
-        spec = binary[len("container://") :]
-        runtime = os.environ.get("CONTAINER_RUNTIME", "docker")
-        return [runtime, "run", "--rm", spec, "python", "/app/RFdiffusion/run_inference.py"]
+        raise ValueError(
+            "RFDIFFUSION_BIN=container://... is no longer supported: the "
+            "in-package `rfdiffusion` console script adapts to stock "
+            "RFdiffusion via RFDIFFUSION_HOME. Unset RFDIFFUSION_BIN (or "
+            "point it at a custom binary implementing the --output_dir + "
+            "--<dotted.key> <value> contract)."
+        )
     return [binary]
 
 

@@ -183,8 +183,10 @@ def test_compute_executed_config_digest_excludes_named_fields() -> None:
     """The helper's contract: stripping a field via ``exclude_fields`` keeps
     the digest stable across calls that change only the stripped field.
 
-    Generic mechanism — RFdiffusion passes ``("seed",)`` in non-deterministic
-    mode (the base seed is not forwarded then), and an empty tuple otherwise.
+    Generic mechanism — e.g. ProteinMPNN strips execution/location
+    controls via ``exclude_fields``. (RFdiffusion no longer uses this
+    path: its executed digest is derived from the CLI mapping, which
+    omits the seed naturally in non-deterministic mode.)
     """
     cfg_a = {"name": "x", "seed": 1}
     cfg_b = {"name": "x", "seed": 999}
@@ -521,8 +523,9 @@ def test_from_parts_executed_run_includes_both_digests() -> None:
 
 def test_from_parts_exclude_fields_does_not_alter_requested_digest() -> None:
     """The requested digest always covers the full config; the executed digest
-    is the one that respects ``exclude_fields`` (generic mechanism — RFdiffusion
-    passes ``("seed",)`` in non-deterministic mode)."""
+    is the one that respects ``exclude_fields`` (generic mechanism — e.g.
+    ProteinMPNN strips execution controls; RFdiffusion derives its executed
+    digest from the CLI mapping instead)."""
     cfg_a = {"name": "x", "seed": 1}
     cfg_b = {"name": "x", "seed": 999}
     p_a = ProvenanceMetadata.from_parts(

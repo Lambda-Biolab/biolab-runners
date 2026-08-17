@@ -8,7 +8,6 @@ during CI.
 from __future__ import annotations
 
 import json
-import logging
 import unittest.mock as mock_mod
 from pathlib import Path
 from typing import Any
@@ -30,15 +29,18 @@ from biolab_runners.rfdiffusion.config import (
     RFdiffusionConfig,
 )
 from biolab_runners.rfdiffusion.runner import (
+    EXECUTION_CONTRACT_VERSION,
     RFdiffusionRunner,
     _cache_identity_token,
     _config_to_cli,
-    _executed_digest_excluded_fields,
+    _executed_digest,
+    _execution_payload,
     _parse_output_dir,
 )
 from biolab_runners.rfdiffusion.utils import (
     InvokeResult,
     _invoke_with_metadata,
+    _resolved_binary,
     parse_backbone_pdb,
 )
 from biolab_runners.rfdiffusion.utils import (
@@ -117,6 +119,69 @@ def test_linear_mode_rejects_disulfide_pairs() -> None:
         RFdiffusionConfig(mode="linear", disulfide_pairs=((3, 9),))
 
 
+def test_head_to_tail_and_disulfide_mode_requires_pairs() -> None:
+    """Combined mode claims disulfide intent — an empty pair tuple would
+    silently drop it, so it fails closed at construction."""
+    with pytest.raises(ValueError, match="requires at least one configured pair"):
+        RFdiffusionConfig(mode="head_to_tail_and_disulfide")
+
+
+def test_disulfide_mode_requires_pairs_non_trigger() -> None:
+    """Trigger/non-trigger: plain disulfide REQUIRES pairs, combined
+    REQUIRES pairs, head_to_tail does NOT (pairs optional there)."""
+    RFdiffusionConfig(mode="head_to_tail")  # no pairs required
+    RFdiffusionConfig(mode="head_to_tail", disulfide_pairs=((3, 9),))  # optional pairs OK
+    with pytest.raises(ValueError, match="requires at least one configured pair"):
+        RFdiffusionConfig(mode="disulfide", disulfide_pairs=())
+
+
+@pytest.mark.parametrize("bad_cyc_chains", ["", "aa", "ab", "12", "A B", "a1"])
+def test_config_rejects_invalid_cyc_chains(bad_cyc_chains: str) -> None:
+    """``cyc_chains`` names exactly ONE output chain to cyclize — a
+    multi-letter or non-letter value is rejected rather than guessed."""
+    with pytest.raises(ValueError, match="cyc_chains must be exactly one"):
+        RFdiffusionConfig(mode="head_to_tail", cyc_chains=bad_cyc_chains)
+
+
+def test_config_rejects_binder_contigs_without_target_pdb() -> None:
+    """Trigger: chain-referencing contigs (target-conditioned binder
+    intent) without ``target_pdb`` fail closed — stock upstream would
+    silently substitute its bundled example PDB and design against the
+    wrong structure."""
+    with pytest.raises(ValueError, match="target_pdb is empty"):
+        RFdiffusionConfig(contigs="A1-110/0 B1-110/0 14-18")
+
+
+def test_config_binder_contigs_with_target_pdb_are_valid(tmp_path: Path) -> None:
+    """Non-trigger: the same binder contigs WITH a target are valid, and
+    pure length contigs (unconditional generation) never require one."""
+    target = tmp_path / "t.pdb"
+    target.write_text(SAMPLE_PDB)
+    RFdiffusionConfig(contigs="A1-110/0 B1-110/0 14-18", target_pdb=str(target))
+    RFdiffusionConfig(contigs="14-18")  # unconditional — no target needed
+    RFdiffusionConfig()  # defaults: unconditional, backward compatible
+
+
+def test_config_rejects_hotspots_without_target_pdb() -> None:
+    """Trigger: hotspots (``ppi.hotspot_res`` — input-PDB chain residues)
+    require ``target_pdb`` even when ``contigs`` is a pure length spec —
+    stock upstream would resolve them against its bundled example PDB."""
+    with pytest.raises(ValueError, match="hotspots require target_pdb"):
+        RFdiffusionConfig(contigs="14-18", hotspots=("A51",))
+    with pytest.raises(ValueError, match="hotspots require target_pdb"):
+        RFdiffusionConfig(hotspots=("A51",))
+
+
+def test_config_hotspots_with_target_pdb_are_valid(tmp_path: Path) -> None:
+    """Non-trigger: hotspots WITH a target are valid; no hotspots never
+    requires one."""
+    target = tmp_path / "t.pdb"
+    target.write_text(SAMPLE_PDB)
+    RFdiffusionConfig(contigs="14-18", hotspots=("A51",), target_pdb=str(target))
+    RFdiffusionConfig(contigs="A1-110/0 B1-110/0 14-18", hotspots=("A51",), target_pdb=str(target))
+    RFdiffusionConfig(hotspots=())  # empty → no trigger
+
+
 def test_config_rejects_negative_seed() -> None:
     with pytest.raises(ValueError, match="seed must be"):
         RFdiffusionConfig(seed=-1)
@@ -127,18 +192,33 @@ def test_config_rejects_empty_checkpoint() -> None:
         RFdiffusionConfig(checkpoint="")
 
 
-def test_executed_digest_exclusion_is_mode_dependent() -> None:
-    """S2 contract: ``seed`` maps to ``inference.design_startnum`` which is
-    forwarded ONLY when ``deterministic=True``.
+def test_executed_digest_omits_seed_when_non_deterministic() -> None:
+    """S2 contract: the executed digest covers the DERIVED execution
+    payload (contract version + exact CLI mapping). Non-deterministic
+    runs omit ``inference.design_startnum`` from the mapping, so a
+    seed-only change must NOT flip the executed digest; deterministic
+    runs forward it, so the same change MUST flip it."""
 
-    * deterministic — nothing excluded: a seed-only change flips the
-      executed digest (the seed changes what upstream ran).
-    * non-deterministic — ``seed`` excluded: the base seed is not
-      forwarded, so a seed-only change must NOT flip the executed digest.
-    """
-    assert _executed_digest_excluded_fields(RFdiffusionConfig()) == ()
-    assert _executed_digest_excluded_fields(RFdiffusionConfig(seed=42)) == ()
-    assert _executed_digest_excluded_fields(RFdiffusionConfig(deterministic=False)) == ("seed",)
+    def cli_payload(cfg: RFdiffusionConfig) -> dict[str, str]:
+        """The typed CLI mapping inside the execution payload."""
+        cli = _execution_payload(cfg)["cli"]
+        assert isinstance(cli, dict)
+        return cli
+
+    assert _executed_digest(RFdiffusionConfig()) == compute_config_digest(
+        _execution_payload(RFdiffusionConfig())
+    )
+    # Non-deterministic: mapping has no seed-dependent key.
+    nd_a = RFdiffusionConfig(seed=1, deterministic=False)
+    nd_b = RFdiffusionConfig(seed=999, deterministic=False)
+    assert cli_payload(nd_a) == cli_payload(nd_b)
+    assert _executed_digest(nd_a) == _executed_digest(nd_b)
+    assert "design_startnum" not in cli_payload(nd_a)
+    # Deterministic: the seed lands in the mapping as design_startnum.
+    det_a = RFdiffusionConfig(seed=1)
+    det_b = RFdiffusionConfig(seed=999)
+    assert cli_payload(det_a)["inference.design_startnum"] == "1"
+    assert _executed_digest(det_a) != _executed_digest(det_b)
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +250,18 @@ def test_rfdiffusion_available_returns_false_when_binary_missing(
 ) -> None:
     monkeypatch.setenv("RFDIFFUSION_BIN", "/nonexistent/rfdiffusion")
     assert rfdiffusion_available() is False
+
+
+def test_rfdiffusion_available_returns_false_for_container_uri(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The legacy ``container://`` URI form is no longer supported: it
+    reports unavailable (the probe never crashes) and resolution raises
+    a clear error instead of invoking a broken docker command."""
+    monkeypatch.setenv("RFDIFFUSION_BIN", "container://rfdiffusion:latest")
+    assert rfdiffusion_available() is False
+    with pytest.raises(ValueError, match="container://"):
+        _resolved_binary()
 
 
 def test_invoke_with_metadata_returns_structured_result() -> None:
@@ -253,20 +345,62 @@ def test_config_to_cli_never_emits_inference_seed(kwargs: dict[str, Any]) -> Non
     assert not any(key.startswith("inference.seed") for key in cli)
 
 
-def test_config_to_cli_head_to_tail_triggers_cyclic_with_chain_a() -> None:
+def test_config_to_cli_head_to_tail_triggers_cyclic_with_first_generated_chain() -> None:
+    """Head-to-tail cyclization names the generated binder chain.
+
+    Verified against stock upstream: ``inference.cyc_chains`` is a
+    string naming the OUTPUT chains to cyclize; generated (inpainted)
+    chains are emitted first as ``A``, ``B``, ... ahead of receptor
+    fragments (``RFdiffusion/rfdiffusion/contigs.py``), and upstream
+    uppercases the value internally
+    (``model_runners._init_cyclic_reses``). The stock-canonical
+    lowercase ``"a"`` (the ``config/inference/base.yaml`` default)
+    therefore cyclizes the first generated chain — the binder in a
+    single-segment binder contig.
+    """
     cli = _config_to_cli(RFdiffusionConfig(mode="head_to_tail"))
     assert cli["inference.cyclic"] == "True"
     assert cli["inference.cyc_chains"] == "a"
 
 
-def test_config_to_cli_disulfide_triggers_cyclic_with_pairs() -> None:
-    cli = _config_to_cli(RFdiffusionConfig(mode="disulfide", disulfide_pairs=((3, 9), (5, 12))))
+def test_config_to_cli_head_to_tail_uses_configured_cyc_chains() -> None:
+    """A caller whose binder is NOT the first generated chain names it
+    explicitly via ``cyc_chains`` — the runner forwards it byte-for-byte
+    instead of hardcoding the chain."""
+    cli = _config_to_cli(RFdiffusionConfig(mode="head_to_tail", cyc_chains="b"))
     assert cli["inference.cyclic"] == "True"
-    assert cli["inference.cyc_chains"] == "3,9,5,12"
+    assert cli["inference.cyc_chains"] == "b"
 
 
-def test_config_to_cli_hotspots_triggers_ppi_hotspot_res() -> None:
-    cli = _config_to_cli(RFdiffusionConfig(hotspots=("A12", "B17")))
+def test_config_to_cli_disulfide_is_not_cyclic() -> None:
+    """Plain ``mode="disulfide"`` must NOT emit cyclic flags.
+
+    Stock ``inference.cyclic`` / ``inference.cyc_chains`` express only
+    head-to-tail chain cyclization — they cannot encode residue-pair
+    disulfides, and upstream has no disulfide support. Forwarding the
+    pairs as ``cyc_chains`` (the old comma-joined "3,9,5,12" mapping)
+    was scientifically false. The pairs stay in config/provenance as
+    downstream topology intent only.
+    """
+    cli = _config_to_cli(RFdiffusionConfig(mode="disulfide", disulfide_pairs=((3, 9), (5, 12))))
+    assert "inference.cyclic" not in cli
+    assert "inference.cyc_chains" not in cli
+
+
+def test_config_to_cli_head_to_tail_and_disulfide_is_cyclic() -> None:
+    """Combined mode cyclizes the binder chain head-to-tail (the pairs
+    are downstream closure intent — never encoded into cyc_chains)."""
+    cli = _config_to_cli(
+        RFdiffusionConfig(mode="head_to_tail_and_disulfide", disulfide_pairs=((3, 9),))
+    )
+    assert cli["inference.cyclic"] == "True"
+    assert cli["inference.cyc_chains"] == "a"
+
+
+def test_config_to_cli_hotspots_triggers_ppi_hotspot_res(tmp_path: Path) -> None:
+    target = tmp_path / "t.pdb"
+    target.write_text(SAMPLE_PDB)
+    cli = _config_to_cli(RFdiffusionConfig(hotspots=("A12", "B17"), target_pdb=str(target)))
     assert cli["ppi.hotspot_res"] == "A12,B17"
 
 
@@ -292,14 +426,99 @@ def test_config_to_cli_extra_kwargs_are_forwarded() -> None:
     assert cli["inference.noise_scale_ca"] == "0.5"
 
 
+def test_config_to_cli_forwards_target_pdb_as_input_pdb(tmp_path: Path) -> None:
+    """``target_pdb`` is forwarded as the canonical stock Hydra key
+    ``inference.input_pdb`` — target-conditioned design must actually
+    reach upstream (previously the path was provenance-only)."""
+    target = tmp_path / "target.pdb"
+    target.write_text(SAMPLE_PDB)
+    cli = _config_to_cli(RFdiffusionConfig(target_pdb=str(target)))
+    assert cli["inference.input_pdb"] == str(target)
+
+
+def test_config_to_cli_omits_input_pdb_without_target() -> None:
+    """Empty ``target_pdb`` (unconditional generation) must NOT forward
+    ``inference.input_pdb`` — absence is intent, and stock upstream
+    would otherwise substitute its bundled example PDB."""
+    cli = _config_to_cli(RFdiffusionConfig())
+    assert "inference.input_pdb" not in cli
+
+
+def test_config_to_cli_binder_invocation_reaches_one_call(tmp_path: Path) -> None:
+    """The full binder contract lands in ONE CLI payload: target input +
+    binder contigs (byte-for-byte) + seed + count.
+
+    ``contigs`` is caller-supplied canonical stock syntax
+    (``A1-110/0 B1-110/0 14-18`` — two fixed target chains followed
+    by a generated 14-18-residue binder segment) and is forwarded
+    verbatim; the runner never parses or rewrites it.
+    """
+    target = tmp_path / "target.pdb"
+    target.write_text(SAMPLE_PDB)
+    contigs = "A1-110/0 B1-110/0 14-18"
+    cli = _config_to_cli(
+        RFdiffusionConfig(
+            target_pdb=str(target),
+            contigs=contigs,
+            seed=42,
+            task_count=3,
+            mode="head_to_tail",
+        )
+    )
+    assert cli["inference.input_pdb"] == str(target)
+    assert cli["contigmap.contigs"] == contigs  # byte-for-byte, not rewritten
+    assert cli["inference.design_startnum"] == "42"
+    assert cli["inference.num_designs"] == "3"
+    assert cli["inference.deterministic"] == "True"
+    assert cli["inference.cyclic"] == "True"
+    assert cli["inference.cyc_chains"] == "a"
+
+
+def test_invoke_with_metadata_receives_binder_flags_in_one_call(tmp_path: Path) -> None:
+    """End-to-end argv: target input + binder contigs + seed + count all
+    reach the single ``subprocess.run`` invocation as hyphenated Hydra
+    flags (``inference.input-pdb`` etc.)."""
+    target = tmp_path / "target.pdb"
+    target.write_text(SAMPLE_PDB)
+    contigs = "A1-110/0 B1-110/0 14-18"
+    captured_argv: list[str] = []
+
+    def fake_run(cmd: list[str], **_: Any) -> mock_mod.Mock:
+        captured_argv.extend(cmd)
+        result = mock_mod.Mock()
+        result.returncode = 0
+        result.stderr = ""
+        return result
+
+    config_dict = _config_to_cli(
+        RFdiffusionConfig(target_pdb=str(target), contigs=contigs, seed=42, task_count=3)
+    )
+    with mock_mod.patch("biolab_runners.rfdiffusion.utils.subprocess.run", side_effect=fake_run):
+        result = _invoke_with_metadata(
+            config_dict=config_dict,
+            output_dir=tmp_path,
+            binary_prefix=["fake-rfdiffusion"],
+        )
+
+    assert result.exit_code == 0
+    assert "--inference.input-pdb" in captured_argv
+    assert captured_argv[captured_argv.index("--inference.input-pdb") + 1] == str(target)
+    assert "--contigmap.contigs" in captured_argv
+    assert captured_argv[captured_argv.index("--contigmap.contigs") + 1] == contigs
+    assert "--inference.design-startnum" in captured_argv
+    assert "--inference.num-designs" in captured_argv
+
+
 @pytest.mark.parametrize(
     "reserved_key",
     [
         "inference.design_startnum",
         "inference.num_designs",
         "inference.deterministic",
+        "inference.input_pdb",
         "inference.cyclic",
         "inference.cyc_chains",
+        "inference.output_prefix",
         "contigmap.contigs",
         "ppi.hotspot_res",
     ],
@@ -309,6 +528,18 @@ def test_config_rejects_extra_override_of_reserved_canonical_keys(reserved_key: 
     the runner emits itself — the conflict raises ValueError at construction."""
     with pytest.raises(ValueError, match="reserved canonical keys"):
         RFdiffusionConfig(extra={reserved_key: "sneaky"})
+
+
+def test_config_rejects_extra_output_prefix_behavioral() -> None:
+    """``inference.output_prefix`` is owned by the in-package console script
+    (derived from ``--output_dir``) — a caller override via ``extra`` must be
+    rejected at construction, while arbitrary dotted Hydra ``extra`` keys
+    (e.g. noise scales) remain supported."""
+    with pytest.raises(ValueError, match="reserved canonical keys"):
+        RFdiffusionConfig(extra={"inference.output_prefix": "sneaky"})
+    # Arbitrary dotted extra keys stay supported.
+    config = RFdiffusionConfig(extra={"inference.noise_scale_ca": "0.5"})
+    assert config.extra == {"inference.noise_scale_ca": "0.5"}
 
 
 def test_config_rejects_unsupported_inference_seed_extra_key() -> None:
@@ -337,6 +568,7 @@ def test_reserved_and_unsupported_key_sets_are_disjoint_and_exhaustive() -> None
     assert "inference.design_startnum" in RESERVED_CANONICAL_KEYS
     assert "inference.num_designs" in RESERVED_CANONICAL_KEYS
     assert "inference.deterministic" in RESERVED_CANONICAL_KEYS
+    assert "inference.input_pdb" in RESERVED_CANONICAL_KEYS
     assert "contigmap.contigs" in RESERVED_CANONICAL_KEYS
     assert "inference.seed" not in RESERVED_CANONICAL_KEYS  # not a key we emit
     assert "inference.seed" in UNSUPPORTED_UPSTREAM_KEYS
@@ -562,6 +794,54 @@ def test_runner_design_dir_is_keyed_by_canonical_identity(
     assert result.name == name
 
 
+def test_identity_and_executed_digest_bind_execution_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The derived execution payload (contract version + exact CLI mapping)
+    is bound into the cache identity AND the executed digest: a
+    mapping-only change — same requested config — invalidates the cache
+    and flips the executed digest. The requested digest stays config-based.
+
+    See :func:`_execution_payload` / :func:`_executed_digest`; the
+    mapping is monkeypatched to simulate a runner upgrade that changes
+    what it forwards (e.g. a renamed flag) without any config change.
+    """
+    cfg = RFdiffusionConfig(name="payload", seed=3, task_count=2)
+    identity_before = _cache_identity_token(cfg, image_digest=None)
+    executed_before = _executed_digest(cfg)
+    assert _execution_payload(cfg)["contract_version"] == EXECUTION_CONTRACT_VERSION
+    # The executed digest IS the digest of the exact execution payload.
+    assert executed_before == compute_config_digest(_execution_payload(cfg))
+    # Requested digest is config-based — independent of the mapping.
+    requested_before = compute_config_digest(cfg)
+
+    altered_mapping = dict(_config_to_cli(cfg), **{"inference.some_new_flag": "x"})
+    monkeypatch.setattr(
+        "biolab_runners.rfdiffusion.runner._config_to_cli",
+        lambda _config: altered_mapping,
+    )
+
+    assert _cache_identity_token(cfg, image_digest=None) != identity_before
+    assert _executed_digest(cfg) != executed_before
+    assert _execution_payload(cfg)["cli"] == altered_mapping
+    # Requested digest untouched by the mapping change.
+    assert compute_config_digest(cfg) == requested_before
+
+
+def test_identity_binds_contract_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bumping EXECUTION_CONTRACT_VERSION (a runner contract change)
+    invalidates the cache identity even with an identical config."""
+    cfg = RFdiffusionConfig(name="version", seed=1)
+    identity_before = _cache_identity_token(cfg, image_digest=None)
+    monkeypatch.setattr(
+        "biolab_runners.rfdiffusion.runner.EXECUTION_CONTRACT_VERSION",
+        EXECUTION_CONTRACT_VERSION + 1,
+    )
+    assert _cache_identity_token(cfg, image_digest=None) != identity_before
+
+
 def test_runner_same_name_different_seed_does_not_hit_cache(
     output_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -605,7 +885,10 @@ def test_runner_same_name_different_seed_does_not_hit_cache(
     ],
 )
 def test_runner_config_variants_do_not_cross_hit(
-    output_root: Path, monkeypatch: pytest.MonkeyPatch, variant_kwargs: dict[str, Any]
+    output_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    variant_kwargs: dict[str, Any],
 ) -> None:
     """Every config dimension that changes upstream behaviour gets its own
     digest directory — a variant must never satisfy another variant's cache."""
@@ -619,9 +902,13 @@ def test_runner_config_variants_do_not_cross_hit(
     monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", fake_invoke)
     runner = RFdiffusionRunner(output_root=output_root)
     name = "variant"
+    # A shared target keeps the hotspots variant valid (hotspots require
+    # target_pdb — fail closed) without changing the variant semantics.
+    target = tmp_path / "t.pdb"
+    target.write_text(SAMPLE_PDB)
 
-    base = RFdiffusionConfig(name=name, seed=0)
-    variant = RFdiffusionConfig(name=name, seed=0, **variant_kwargs)
+    base = RFdiffusionConfig(name=name, seed=0, target_pdb=str(target))
+    variant = RFdiffusionConfig(name=name, seed=0, target_pdb=str(target), **variant_kwargs)
     assert compute_config_digest(base) != compute_config_digest(variant)
 
     runner.run(base)
@@ -785,12 +1072,37 @@ def test_runner_same_config_image_source_hits(
     assert Path(second.records[0].path).parent == invoked_dirs[0]
 
 
-def test_runner_missing_then_present_source_does_not_cross_hit(
+def test_runner_fails_closed_when_target_pdb_missing(
     output_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A missing source stays soft (warning + None digest + run proceeds), and
-    a later run once the file exists gets a different identity — the
-    no-binding run can never satisfy the bound run's cache."""
+    """A set-but-missing ``target_pdb`` is a hard error (fail closed).
+
+    ``target_pdb`` is forwarded as ``inference.input_pdb`` — a
+    dangling path would crash upstream at best, and with the file
+    absent the cache identity would lose its source-content binding.
+    Applies to the real path AND dry_run (which validates inputs),
+    and raises BEFORE any directory or subprocess work.
+    """
+    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", _fake_invoke_ok)
+    runner = RFdiffusionRunner(output_root=output_root)
+    missing = tmp_path / "absent.pdb"
+    config = RFdiffusionConfig(name="missing-target", target_pdb=str(missing))
+    with pytest.raises(ValueError, match="does not exist"):
+        runner.run(config)
+    with pytest.raises(ValueError, match="does not exist"):
+        runner.run(config, dry_run=True)
+    with pytest.raises(ValueError, match="does not exist"):
+        runner.is_complete(config)
+    assert not runner.output_root.exists()  # no directory side effects
+
+
+def test_runner_missing_then_present_source_never_cross_hits(
+    output_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#199 identity property preserved at the identity level: a missing
+    target yields a no-content-binding identity that can NEVER satisfy
+    a later present-file run's cache — the tokens differ, and the
+    present run re-executes into its own directory."""
     missing = tmp_path / "late.pdb"
     invoked_dirs: list[Path] = []
 
@@ -803,17 +1115,21 @@ def test_runner_missing_then_present_source_does_not_cross_hit(
     runner = RFdiffusionRunner(output_root=output_root)
     config = RFdiffusionConfig(name="late-src", target_pdb=str(missing))
 
-    first = runner.run(config)
-    assert first.provenance.executed is True
-    assert first.provenance.source_backbone_digest is None  # missing → soft signal
+    # Missing → run() fails closed; the identity has no content binding.
+    with pytest.raises(ValueError, match="does not exist"):
+        runner.run(config)
+    missing_identity = _cache_identity_token(config, image_digest=None)
 
+    # Present → a DIFFERENT identity (content-bound): the no-binding
+    # token can never satisfy this run's cache.
     missing.write_text(SAMPLE_PDB)
-    second = runner.run(config)
+    assert _cache_identity_token(config, image_digest=None) != missing_identity
 
-    assert len(invoked_dirs) == 2  # present source → different identity → re-run
-    assert second.provenance.executed is True
-    assert second.provenance.cache_hit is False
-    assert second.provenance.source_backbone_digest is not None
+    result = runner.run(config)
+    assert invoked_dirs == [runner._design_dir(config)]
+    assert result.provenance.executed is True
+    assert result.provenance.cache_hit is False
+    assert result.provenance.source_backbone_digest == compute_file_digest(missing)
 
 
 # ---------------------------------------------------------------------------
@@ -912,8 +1228,10 @@ def test_runner_records_honest_provenance_on_real_run(
       deterministic mode — upstream seeds design ``i`` with
       ``design_startnum + i``, so per-design seeds are
       ``base_seed .. base_seed + task_count - 1``.
-    * ``executed_config_digest`` includes ``seed`` (nothing excluded
-      in deterministic mode), so it equals the requested digest.
+    * ``executed_config_digest`` covers the DERIVED execution payload
+      (contract version + exact CLI mapping, including
+      ``design_startnum`` in deterministic mode) — it differs from the
+      config-based ``requested_config_digest``.
     """
     target = tmp_path / "target.pdb"
     target.write_text(SAMPLE_PDB)
@@ -939,8 +1257,11 @@ def test_runner_records_honest_provenance_on_real_run(
     assert prov.cache_hit is False
     assert prov.executed_config_digest is not None
     assert prov.requested_config_digest is not None
-    # The two digests are equal — seed is part of the executed config.
-    assert prov.requested_config_digest == prov.executed_config_digest
+    # The executed digest covers the DERIVED execution payload (contract
+    # version + exact CLI mapping); the requested digest stays config-based.
+    assert prov.executed_config_digest == _executed_digest(config)
+    assert prov.requested_config_digest == compute_config_digest(config)
+    assert prov.executed_config_digest != prov.requested_config_digest
 
 
 def test_runner_records_non_deterministic_rng_intent(
@@ -1193,7 +1514,11 @@ def test_runner_provenance_json_roundtrip(
     assert roundtripped["requested_seed"] == 123
     assert roundtripped["rng_intent"] == RNG_INTENT_PER_DESIGN_INDEX
     assert roundtripped["executed"] is True
-    assert roundtripped["executed_config_digest"] == roundtripped["requested_config_digest"]
+    # Both digests survive: executed = derived execution payload, requested
+    # = config — they differ (the mapping is a different canonical form).
+    assert roundtripped["executed_config_digest"] == _executed_digest(config)
+    assert roundtripped["requested_config_digest"] == compute_config_digest(config)
+    assert roundtripped["executed_config_digest"] != roundtripped["requested_config_digest"]
     # The per-design seed range is encoded by base_seed + task_count, not a list.
     assert set(roundtripped) == set(payload)
     assert "per_task_seeds" not in roundtripped
@@ -1255,27 +1580,3 @@ def test_runner_validates_malformed_image_digest(
     runner = RFdiffusionRunner(output_root=output_root)
     with pytest.raises(ValueError, match="image_digest must be"):
         runner.run(RFdiffusionConfig(name="bad"), image_digest="not-a-digest")
-
-
-def test_runner_warns_when_target_pdb_missing(
-    output_root: Path,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A ``target_pdb`` that does not exist on disk must produce a warning
-    AND still record ``source_backbone_digest=None`` in the manifest.
-    Missing path is a signal, not a hard error."""
-    monkeypatch.setattr("biolab_runners.rfdiffusion.runner._invoke_with_metadata", _fake_invoke_ok)
-    missing = tmp_path / "absent.pdb"
-    runner = RFdiffusionRunner(output_root=output_root)
-    with caplog.at_level(logging.WARNING, logger="biolab_runners.rfdiffusion.runner"):
-        result = runner.run(
-            RFdiffusionConfig(name="missing-target", target_pdb=str(missing)),
-            dry_run=True,
-        )
-    assert result.provenance.source_backbone_digest is None
-    assert any(
-        "target_pdb" in record.message and "does not exist" in record.message
-        for record in caplog.records
-    ), f"expected target_pdb warning, got: {[r.message for r in caplog.records]}"

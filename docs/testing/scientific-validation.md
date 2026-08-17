@@ -41,7 +41,7 @@ exercises 8 tests across 4 runners:
 | `test_gromacs_parse_nthcol_returns_first_data_row` | GROMACS | fixture `.xvg` | `parse_nthcol` correctly extracts the first non-comment data row |
 | `test_gromacs_parse_nthcol_handles_comment_lines` | GROMACS | fixture `.xvg` | Parser correctly skips `@` / `#` comment lines |
 | `test_proteinmpnn_parse_fasta_returns_both_records_with_protein_alpha` | ProteinMPNN | fixture `.fa` | `parse_fasta_sequences` returns both design records when the input has 2 |
-| `test_rfdiffusion_runner_availablity_check_works` | RFdiffusion | environment probe | `rfdiffusion_available()` returns True iff the wrapper is on `$PATH` and exits 0 on `--help` |
+| `test_rfdiffusion_runner_availablity_check_works` | RFdiffusion | environment probe | `rfdiffusion_available()` returns True iff the `rfdiffusion` console script (or `${RFDIFFUSION_BIN}`) is on `$PATH` and exits 0 on `--help` |
 
 Tools that **fail** binary-availability checks (Rosetta requires
 commercial license; GPU-dependent weights missing) **skip gracefully**
@@ -108,28 +108,46 @@ both `/dev/nvidia0` is reachable AND the env var is set.
 
 ### Tool wrappers
 
-The ProteinMPNN and RFdiffusion runners expect a `proteinmpnn` /
-`rfdiffusion` binary on `$PATH` (or `${PROTEINMPNN_BIN}` /
-`${RFDIFFUSION_BIN}`) that accepts the biolab-runners CLI:
+The ProteinMPNN runner expects a `proteinmpnn` binary on `$PATH` (or
+`${PROTEINMPNN_BIN}`). The RFdiffusion runner ships its adapter **in
+the package**: the installed wheel provides a `rfdiffusion` console
+script (`biolab_runners.rfdiffusion.cli`) that accepts the runner's
+fixed flag contract:
 
 | Flag | Meaning |
 |---|---|
-| `--input_path DIR` | Directory containing a `.pdb` file |
-| `--output_path DIR` | Where to write results |
-| `--batch_size N`, `--seed N`, `--sampling_temp F` | Pass-through |
-| `--num_seq_per_target N`, `--model_name CHECKPOINT` | ProteinMPNN |
-| `--num_designs N`, `--length MINMAX`, `--contig_map SPEC` | RFdiffusion |
+| `--output_dir DIR` | Where to write the design PDBs (owns `inference.output_prefix=DIR/design`) |
+| `--<dotted.hydra.key> <value>` | Hydra overrides with underscores hyphenated, e.g. `--inference.num-designs 10`, `--contigmap.contigs 'A1-110/0 B1-110/0 14-18'`, `--inference.input-pdb target.pdb`, `--ppi.hotspot-res A51,A52` |
+
+The console script validates the pairs, translates list-typed keys to
+Hydra list syntax (`contigmap.contigs=[...]`, `ppi.hotspot_res=['A51','A52']`),
+quotes string scalars only when needed (numeric/bool types preserved),
+prepends the clone root to `PYTHONPATH` (existing value preserved), and
+executes the stock `scripts/run_inference.py` with positional
+`key=value` overrides (no shell; Hydra's own metadata is confined under
+the output directory). Runtime requirements:
+
+* `RFDIFFUSION_HOME` — path to the upstream clone root
+  (`~/tools/RFdiffusion` by default), containing
+  `scripts/run_inference.py` and the model weights.
+* A Python with **PyTorch + CUDA** in the interpreter that runs the
+  console script (upstream's `run_inference.py` imports torch and uses
+  a GPU when available).
+* `--help` needs none of these and stays cheap for the availability
+  probe.
+* The legacy `container://` `RFDIFFUSION_BIN` form is **removed**
+  (it passed `--key value` flags straight to Hydra and hardcoded an
+  image-internal path); inside a container, install the wheel and set
+  `RFDIFFUSION_HOME` to the mounted clone.
 
 A host-level bootstrap script
 (`~/.local/bin/install-proteinmpnn-rfdiffusion.sh`) clones the upstream
-repos shallowly into `~/tools/ProteinMPNN` and `~/tools/RFdiffusion`,
-then writes thin Python wrappers that adapt the biolab-runners CLI to
-upstream's expected one (`--pdb_path` / `--out_folder` for ProteinMPNN;
-Hydra `contigmap.contigs=...` for RFdiffusion). After running the
-script, `biolab_runners.proteinmpnn.utils.proteinmpnn_available()` and
-`biolab_runners.rfdiffusion.utils.rfdiffusion_available()` both return
-True, and `pytest -m integration` exercises the real wrappers instead
-of skipping.
+repos shallowly into `~/tools/ProteinMPNN` and `~/tools/RFdiffusion`
+(the default `RFDIFFUSION_HOME`). After the clone + weights are
+present, `biolab_runners.rfdiffusion.utils.rfdiffusion_available()`
+returns True, and `pytest -m integration` exercises the real pipeline
+instead of skipping (still opt-in via
+`BIOLAB_RUN_RFDIFFUSION_INTEGRATION=1`).
 
 Real backbone design with RFdiffusion still requires a GPU and
 ~10 GB of model weights (downloaded on first run from the upstream

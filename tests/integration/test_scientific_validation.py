@@ -607,9 +607,9 @@ def test_rfdiffusion_runner_availablity_check_works() -> None:
 @pytest.mark.skipif(
     not rfdiffusion_available(),
     reason=(
-        "requires a real RFdiffusion wrapper (RFDIFFUSION_BIN or 'rfdiffusion' on "
-        "PATH); the wrapper must accept Hydra overrides such as "
-        "inference.design_startnum"
+        "requires the RFdiffusion execution environment: the in-package "
+        "`rfdiffusion` console script on PATH (or RFDIFFUSION_BIN) plus "
+        "RFDIFFUSION_HOME pointing at the upstream clone with model weights"
     ),
 )
 def test_rfdiffusion_wrapper_accepts_design_startnum_and_two_seeds_differ(

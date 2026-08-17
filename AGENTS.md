@@ -9,7 +9,7 @@ Standalone, modular Python library containing the computational biology runners 
 
 1. **Boltz2Runner** — Runs Boltz-2 structure predictions for peptide-protein complexes
 2. **OpenMMRunner** — Runs OpenMM molecular dynamics simulations with multi-stage equilibration
-3. **RFdiffusionRunner** — Runs RFdiffusion for unconditional / motif-scaffolding backbone generation
+3. **RFdiffusionRunner** — Runs RFdiffusion for target-conditioned peptide binder / unconditional backbone generation
 4. **ProteinMPNNRunner** — Runs ProteinMPNN for fixed-backbone sequence design
 5. **RosettaRunner** — Runs Rosetta InterfaceAnalyzer (license-gated)
 6. **GROMACSRunner** — GROMACS integration via subprocess for production-scale MD
@@ -116,7 +116,7 @@ The checkpoint invariants (atomic save, manifest binding, terminal schema, force
 
 - **Boltz-2:** `boltz` CLI on PATH, GPU with 24 GB VRAM (RTX 4090)
 - **OpenMM:** Best via conda (`conda install -c conda-forge openmm pdbfixer`); pip only provides OpenCL
-- **RFdiffusion:** upstream clone at `~/tools/RFdiffusion` + wrapper at `~/.local/bin/rfdiffusion` (installed via `~/.local/bin/install-proteinmpnn-rfdiffusion.sh`); GPU with ~10 GB VRAM for design
+- **RFdiffusion:** upstream clone at `~/tools/RFdiffusion` (the default `RFDIFFUSION_HOME`) + the in-package `rfdiffusion` console script from the installed wheel (or a `${RFDIFFUSION_BIN}` custom binary); Python with PyTorch + CUDA in the runner interpreter, GPU with ~10 GB VRAM for design. The bootstrap (`~/.local/bin/install-proteinmpnn-rfdiffusion.sh`) clones the repo; model weights are downloaded on first run
 - **ProteinMPNN:** upstream clone at `~/tools/ProteinMPNN` + wrapper at `~/.local/bin/proteinmpnn` (same bootstrap script)
 - **Rosetta:** license-gated; the runner skips when the license is absent
 - **GROMACS:** heavy install; parse_nthcol tested via fixture `.xvg` files
