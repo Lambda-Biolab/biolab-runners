@@ -74,7 +74,7 @@ class RosettaRunner:
 
     def is_complete(self, config: RosettaConfig) -> bool:
         """Return True if at least one scored output already exists."""
-        directory = self._design_dir(config)
+        directory = self._effective_output_dir(config)
         if not directory.exists():
             return False
         return any(directory.glob("score.sc"))
@@ -91,7 +91,9 @@ class RosettaRunner:
         if cfg is None:
             raise ValueError("RosettaConfig is required: pass it to run() or the runner")
 
-        output_dir = self._design_dir(cfg)
+        config_dict = _config_to_cli(cfg)
+        output_dir = self._effective_output_dir(cfg, config_dict)
+        config_dict["out:path:all"] = str(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         if not force and self.is_complete(cfg):
@@ -129,9 +131,6 @@ class RosettaRunner:
                 duration_seconds=0.0,
             )
 
-        config_dict = _config_to_cli(cfg)
-        if not cfg.output_dir:
-            config_dict["out:path:all"] = str(output_dir)
         started = time.monotonic()
         exit_code = invoke(
             config=config_dict,
@@ -155,6 +154,15 @@ class RosettaRunner:
 
     def _design_dir(self, config: RosettaConfig) -> Path:
         return Path(config.output_dir) if config.output_dir else self._output_root / config.name
+
+    def _effective_output_dir(
+        self,
+        config: RosettaConfig,
+        config_dict: dict[str, Any] | None = None,
+    ) -> Path:
+        cli_config = config_dict if config_dict is not None else _config_to_cli(config)
+        output_dir = cli_config.get("out:path:all")
+        return Path(str(output_dir)) if output_dir else self._design_dir(config)
 
 
 def _config_to_cli(config: RosettaConfig) -> dict[str, Any]:
@@ -231,7 +239,7 @@ def _apply_extra_mapping(
                 # explicit ``["k1=v1", "k2=v2"]`` form interchangeably.
                 script_vars.extend(user_value.split())
             continue
-        payload[str(key)] = str(value)
+        payload[_canonical_cli_key(key)] = str(value)
 
 
 def _apply_extra_flags(
@@ -266,9 +274,14 @@ def _apply_extra_flags(
             continue
         if "=" in flag:
             key, _, value = flag.partition("=")
-            payload[key] = value
+            payload[_canonical_cli_key(key)] = value
         else:
-            payload[flag] = ""
+            payload[_canonical_cli_key(flag)] = ""
+
+
+def _canonical_cli_key(key: object) -> str:
+    text = str(key)
+    return {"s": "parser:protocol"}.get(text, text)
 
 
 def _structured_script_vars(config: RosettaConfig) -> tuple[str, ...]:

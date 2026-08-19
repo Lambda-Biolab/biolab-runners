@@ -734,6 +734,72 @@ def test_config_to_cli_includes_required_flags() -> None:
     assert cli["nstruct"] == "1"
 
 
+@pytest.mark.parametrize(
+    ("extra", "extra_flags", "expected_protocol"),
+    [
+        ({"s": "/legacy.xml"}, (), "/legacy.xml"),
+        ({}, ("s=/legacy.xml",), "/legacy.xml"),
+        (
+            {"parser:protocol": "/first.xml", "s": "/legacy.xml"},
+            (),
+            "/legacy.xml",
+        ),
+        ({"s": "/legacy.xml"}, ("parser:protocol=/final.xml",), "/final.xml"),
+    ],
+)
+def test_config_to_cli_normalizes_legacy_protocol_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    extra: dict[str, Any],
+    extra_flags: tuple[str, ...],
+    expected_protocol: str,
+) -> None:
+    output_dir = tmp_path / "output"
+    cli = _config_to_cli(
+        _valid_config(
+            output_dir=str(output_dir),
+            extra=extra,
+            extra_flags=extra_flags,
+        )
+    )
+    assert cli == {
+        "parser:protocol": expected_protocol,
+        "in:file:s": "/tmp/input.pdb",
+        "out:path:all": str(output_dir),
+        "nstruct": "1",
+    }
+
+    captured_argv: list[str] = []
+
+    def fake_run(cmd: list[str], **_: Any) -> mock_mod.Mock:
+        captured_argv.extend(cmd)
+        result = mock_mod.Mock()
+        result.returncode = 0
+        return result
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    assert (
+        invoke(
+            config=cli,
+            output_dir=output_dir,
+            binary_prefix=["rosetta_scripts"],
+            timeout_seconds=10,
+        )
+        == 0
+    )
+    assert captured_argv == [
+        "rosetta_scripts",
+        "-parser:protocol",
+        expected_protocol,
+        "-in:file:s",
+        "/tmp/input.pdb",
+        "-out:path:all",
+        str(output_dir),
+        "-nstruct",
+        "1",
+    ]
+
+
 def test_config_to_cli_includes_extra_flags() -> None:
     cfg = _valid_config(
         extra_flags=("beta=1.0", "no_output"),
@@ -949,6 +1015,47 @@ def test_runner_uses_configured_output_dir_for_invocation_and_parsing(
     assert result.output_dir == str(configured_output)
     assert result.succeeded == 1
     assert result.records[0].path == str(configured_output / "score.sc")
+
+
+@pytest.mark.parametrize("override_channel", ["extra", "extra_flags", "extra_then_extra_flags"])
+def test_runner_uses_effective_output_override_for_all_operations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    override_channel: str,
+) -> None:
+    configured_output = tmp_path / "configured-output"
+    overridden_output = tmp_path / f"{override_channel}-output"
+    final_output = tmp_path / "extra-flags-output"
+    invoked_output_dirs: list[Path] = []
+
+    def fake_invoke(*, config: dict[str, Any], output_dir: Path, **_: Any) -> int:
+        invoked_output_dirs.append(output_dir)
+        rosetta_output = Path(str(config["out:path:all"]))
+        (rosetta_output / "score.sc").write_text(SCORE_MINIMAL)
+        return 0
+
+    monkeypatch.setattr("biolab_runners.rosetta.runner.invoke", fake_invoke)
+    if override_channel == "extra":
+        overrides: dict[str, Any] = {"extra": {"out:path:all": str(overridden_output)}}
+    elif override_channel == "extra_flags":
+        overrides = {"extra_flags": (f"out:path:all={overridden_output}",)}
+    else:
+        overrides = {
+            "extra": {"out:path:all": str(overridden_output)},
+            "extra_flags": (f"out:path:all={final_output}",),
+        }
+        overridden_output = final_output
+    config = _valid_config(output_dir=str(configured_output), **overrides)
+    runner = RosettaRunner(output_root=tmp_path / "unrelated-root", config=config)
+
+    result = runner.run(force=True)
+    cached_result = runner.run()
+
+    assert invoked_output_dirs == [overridden_output]
+    assert result.output_dir == str(overridden_output)
+    assert result.records[0].path == str(overridden_output / "score.sc")
+    assert cached_result.output_dir == str(overridden_output)
+    assert cached_result.skipped == 1
 
 
 def test_runner_records_count_failed_by_status(
