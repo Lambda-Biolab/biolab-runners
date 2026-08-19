@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import unittest.mock as mock_mod
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,7 @@ from biolab_runners.proteinmpnn.runner import (
 )
 from biolab_runners.proteinmpnn.utils import (
     InvokeResult,
+    invoke,
     parse_fasta_sequences,
 )
 
@@ -131,6 +133,64 @@ def test_invoke_result_round_trips_through_dataclass() -> None:
         failure_reason="timeout after 3600s",
     )
     assert json.loads(json.dumps(dataclasses.asdict(payload)))
+
+
+def test_invoke_preserves_wrapper_flag_names_and_paths(tmp_path: Path) -> None:
+    captured_argv: list[str] = []
+    input_pdb = tmp_path / "backbone.pdb"
+    output_dir = tmp_path / "output"
+
+    def fake_run(cmd: list[str], **_: Any) -> mock_mod.Mock:
+        captured_argv.extend(cmd)
+        result = mock_mod.Mock()
+        result.returncode = 0
+        result.stderr = ""
+        return result
+
+    with mock_mod.patch("subprocess.run", side_effect=fake_run):
+        exit_code = invoke(
+            config_dict={
+                "model_name": "v_48_020",
+                "num_seq_per_target": "4",
+                "sampling_temp": "0.2",
+                "seed": "42",
+                "ca_only": "True",
+                "fixed_positions": "2,6",
+                "omit_AA": "CDF",
+                "pdb_path": input_pdb.name,
+            },
+            input_pdb=input_pdb,
+            output_dir=output_dir,
+            binary_prefix=["proteinmpnn"],
+            timeout_seconds=10,
+        )
+
+    assert exit_code == 0
+    assert captured_argv == [
+        "proteinmpnn",
+        "--input_path",
+        str(tmp_path),
+        "--output_path",
+        str(output_dir),
+        "--batch_size",
+        "1",
+        "--model_name",
+        "v_48_020",
+        "--num_seq_per_target",
+        "4",
+        "--sampling_temp",
+        "0.2",
+        "--seed",
+        "42",
+        "--ca_only",
+        "True",
+        "--fixed_positions",
+        "2,6",
+        "--omit_AA",
+        "CDF",
+        "--pdb_path",
+        "backbone.pdb",
+    ]
 
 
 # ---------------------------------------------------------------------------

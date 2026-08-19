@@ -130,6 +130,8 @@ class RosettaRunner:
             )
 
         config_dict = _config_to_cli(cfg)
+        if not cfg.output_dir:
+            config_dict["out:path:all"] = str(output_dir)
         started = time.monotonic()
         exit_code = invoke(
             config=config_dict,
@@ -152,7 +154,7 @@ class RosettaRunner:
         )
 
     def _design_dir(self, config: RosettaConfig) -> Path:
-        return self._output_root / config.name
+        return Path(config.output_dir) if config.output_dir else self._output_root / config.name
 
 
 def _config_to_cli(config: RosettaConfig) -> dict[str, Any]:
@@ -183,7 +185,7 @@ def _config_to_cli(config: RosettaConfig) -> dict[str, Any]:
     use last-write-wins on the dict (the v0.5 contract).
     """
     payload: dict[str, Any] = {
-        "s": config.script_file,
+        "parser:protocol": config.script_file,
         "in:file:s": config.input_pdb,
         "out:path:all": config.output_dir,
         "nstruct": str(config.nstruct),
