@@ -541,12 +541,14 @@ def invoke(
     """
     prefix = binary_prefix if binary_prefix is not None else _resolved_binary()
     output_dir.mkdir(parents=True, exist_ok=True)
-    args: list[str] = [
-        *prefix,
-        "--parser",
-        "protocol",
-    ]
+    args: list[str] = [*prefix]
     for key, value in config.items():
+        if key == "s":
+            if "parser:protocol" in config:
+                continue
+            # ``s`` was the legacy internal key. Keep accepting it while
+            # emitting Rosetta's canonical protocol flag.
+            key = "parser:protocol"
         args.extend(_config_value_to_argv(key, value))
     started = time.monotonic()
     try:

@@ -159,7 +159,7 @@ def _invoke_with_metadata(
     output_dir.mkdir(parents=True, exist_ok=True)
     extra_args: list[str] = []
     for key, value in config_dict.items():
-        extra_args.append(f"--{key.replace('_', '-')}")
+        extra_args.append(f"--{key}")
         extra_args.append(str(value))
     args = [
         *prefix,

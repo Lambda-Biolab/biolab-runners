@@ -671,24 +671,23 @@ def test_invoke_repeats_parser_script_vars_per_token(tmp_path: Path) -> None:
         )
     assert exit_code == 0
 
-    assert captured_argv[0] == "rosetta_scripts"
-    assert "--parser" in captured_argv
-    assert "protocol" in captured_argv
-
-    # Three occurrences of -parser:script_vars, one per token.
-    occurrences = [i for i, tok in enumerate(captured_argv) if tok == "-parser:script_vars"]
-    assert len(occurrences) == 3, captured_argv
-    # Each token immediately follows its flag.
-    assert captured_argv[occurrences[0] + 1] == "prep_mode=cyclic"
-    assert captured_argv[occurrences[1] + 1] == "constrain_to_start_coords=1"
-    assert captured_argv[occurrences[2] + 1] == "relax_cycles=4"
-    # No element contains whitespace (no space-joined args).
-    for tok in captured_argv:
-        assert " " not in tok, (
-            f"argv element {tok!r} contains whitespace — the "
-            "script_vars tokens were space-joined instead of "
-            "flattened into separate argv elements"
-        )
+    assert captured_argv == [
+        "rosetta_scripts",
+        "-parser:protocol",
+        "/x.xml",
+        "-in:file:s",
+        "/x.pdb",
+        "-out:path:all",
+        str(tmp_path),
+        "-nstruct",
+        "1",
+        "-parser:script_vars",
+        "prep_mode=cyclic",
+        "-parser:script_vars",
+        "constrain_to_start_coords=1",
+        "-parser:script_vars",
+        "relax_cycles=4",
+    ]
 
 
 def test_invoke_string_value_emits_single_argv_token(tmp_path: Path) -> None:
@@ -730,9 +729,75 @@ def test_invoke_string_value_emits_single_argv_token(tmp_path: Path) -> None:
 
 def test_config_to_cli_includes_required_flags() -> None:
     cli = _config_to_cli(_valid_config())
-    assert cli["s"] == "/opt/rosetta/scripts/relax.xml"
+    assert cli["parser:protocol"] == "/opt/rosetta/scripts/relax.xml"
     assert cli["in:file:s"] == "/tmp/input.pdb"
     assert cli["nstruct"] == "1"
+
+
+@pytest.mark.parametrize(
+    ("extra", "extra_flags", "expected_protocol"),
+    [
+        ({"s": "/legacy.xml"}, (), "/legacy.xml"),
+        ({}, ("s=/legacy.xml",), "/legacy.xml"),
+        (
+            {"parser:protocol": "/first.xml", "s": "/legacy.xml"},
+            (),
+            "/legacy.xml",
+        ),
+        ({"s": "/legacy.xml"}, ("parser:protocol=/final.xml",), "/final.xml"),
+    ],
+)
+def test_config_to_cli_normalizes_legacy_protocol_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    extra: dict[str, Any],
+    extra_flags: tuple[str, ...],
+    expected_protocol: str,
+) -> None:
+    output_dir = tmp_path / "output"
+    cli = _config_to_cli(
+        _valid_config(
+            output_dir=str(output_dir),
+            extra=extra,
+            extra_flags=extra_flags,
+        )
+    )
+    assert cli == {
+        "parser:protocol": expected_protocol,
+        "in:file:s": "/tmp/input.pdb",
+        "out:path:all": str(output_dir),
+        "nstruct": "1",
+    }
+
+    captured_argv: list[str] = []
+
+    def fake_run(cmd: list[str], **_: Any) -> mock_mod.Mock:
+        captured_argv.extend(cmd)
+        result = mock_mod.Mock()
+        result.returncode = 0
+        return result
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    assert (
+        invoke(
+            config=cli,
+            output_dir=output_dir,
+            binary_prefix=["rosetta_scripts"],
+            timeout_seconds=10,
+        )
+        == 0
+    )
+    assert captured_argv == [
+        "rosetta_scripts",
+        "-parser:protocol",
+        expected_protocol,
+        "-in:file:s",
+        "/tmp/input.pdb",
+        "-out:path:all",
+        str(output_dir),
+        "-nstruct",
+        "1",
+    ]
 
 
 def test_config_to_cli_includes_extra_flags() -> None:
@@ -918,11 +983,79 @@ def test_runner_records_per_design(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         return 0
 
     monkeypatch.setattr("biolab_runners.rosetta.runner.invoke", fake_invoke)
-    runner = RosettaRunner(output_root=tmp_path, config=_valid_config(name="batch"))
+    runner = RosettaRunner(
+        output_root=tmp_path,
+        config=_valid_config(name="batch", output_dir=str(tmp_path / "batch-output")),
+    )
     result = runner.run()
     assert result.succeeded == 1
     assert result.records[0].total_score == pytest.approx(-123.456)
     assert result.records[0].score.interface_dSASA == pytest.approx(-212.004)
+
+
+def test_runner_uses_configured_output_dir_for_invocation_and_parsing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configured_output = tmp_path / "configured-output"
+    invoked_output_dirs: list[Path] = []
+
+    def fake_invoke(*, config: dict[str, Any], output_dir: Path, **_: Any) -> int:
+        invoked_output_dirs.append(output_dir)
+        assert config["out:path:all"] == str(configured_output)
+        (output_dir / "score.sc").write_text(SCORE_MINIMAL)
+        return 0
+
+    monkeypatch.setattr("biolab_runners.rosetta.runner.invoke", fake_invoke)
+    config = _valid_config(output_dir=str(configured_output))
+    runner = RosettaRunner(output_root=tmp_path / "unrelated-root", config=config)
+
+    result = runner.run(force=True)
+
+    assert invoked_output_dirs == [configured_output]
+    assert result.output_dir == str(configured_output)
+    assert result.succeeded == 1
+    assert result.records[0].path == str(configured_output / "score.sc")
+
+
+@pytest.mark.parametrize("override_channel", ["extra", "extra_flags", "extra_then_extra_flags"])
+def test_runner_uses_effective_output_override_for_all_operations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    override_channel: str,
+) -> None:
+    configured_output = tmp_path / "configured-output"
+    overridden_output = tmp_path / f"{override_channel}-output"
+    final_output = tmp_path / "extra-flags-output"
+    invoked_output_dirs: list[Path] = []
+
+    def fake_invoke(*, config: dict[str, Any], output_dir: Path, **_: Any) -> int:
+        invoked_output_dirs.append(output_dir)
+        rosetta_output = Path(str(config["out:path:all"]))
+        (rosetta_output / "score.sc").write_text(SCORE_MINIMAL)
+        return 0
+
+    monkeypatch.setattr("biolab_runners.rosetta.runner.invoke", fake_invoke)
+    if override_channel == "extra":
+        overrides: dict[str, Any] = {"extra": {"out:path:all": str(overridden_output)}}
+    elif override_channel == "extra_flags":
+        overrides = {"extra_flags": (f"out:path:all={overridden_output}",)}
+    else:
+        overrides = {
+            "extra": {"out:path:all": str(overridden_output)},
+            "extra_flags": (f"out:path:all={final_output}",),
+        }
+        overridden_output = final_output
+    config = _valid_config(output_dir=str(configured_output), **overrides)
+    runner = RosettaRunner(output_root=tmp_path / "unrelated-root", config=config)
+
+    result = runner.run(force=True)
+    cached_result = runner.run()
+
+    assert invoked_output_dirs == [overridden_output]
+    assert result.output_dir == str(overridden_output)
+    assert result.records[0].path == str(overridden_output / "score.sc")
+    assert cached_result.output_dir == str(overridden_output)
+    assert cached_result.skipped == 1
 
 
 def test_runner_records_count_failed_by_status(
