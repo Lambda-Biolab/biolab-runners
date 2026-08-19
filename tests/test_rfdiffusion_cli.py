@@ -289,6 +289,30 @@ def test_cli_uses_explicit_executable_runtime(
     assert json.loads(fake_upstream.read_text())["argv"][:2] == ["--config-name", "base"]
 
 
+def test_cli_runs_bare_relative_runtime_with_spaces(
+    fake_upstream: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A relative runtime filename is made absolute before shell-free launch."""
+    marker = tmp_path / "runtime-used"
+    runtime = tmp_path / "python runtime"
+    runtime.write_text(
+        "#!" + sys.executable + "\n"
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['RUNTIME_MARKER']).write_text('used')\n"
+        "os.execv(sys.executable, [sys.executable, *sys.argv[1:]])\n"
+    )
+    runtime.chmod(0o755)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", str(tmp_path / "path-only"))
+    monkeypatch.setenv("RFDIFFUSION_PYTHON", runtime.name)
+    monkeypatch.setenv("RUNTIME_MARKER", str(marker))
+
+    assert str(Path.cwd()) not in os.environ["PATH"].split(os.pathsep)
+    assert main(["--output_dir", str(tmp_path / "d")]) == 0
+    assert marker.read_text() == "used"
+
+
 def test_cli_quotes_scalar_paths_and_preserves_types(fake_upstream: Path, tmp_path: Path) -> None:
     """Hydra-quoting: paths with whitespace / quote characters are wrapped
     in quotes with deterministic escaping (exact argv bytes), while

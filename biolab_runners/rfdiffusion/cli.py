@@ -310,7 +310,7 @@ def _resolve_python() -> str:
         )
     if not runtime.stat().st_mode & 0o111 or not os.access(runtime, os.X_OK):
         raise RuntimeError(f"RFDIFFUSION_PYTHON is not executable: {configured!r}")
-    return configured
+    return str(runtime.absolute())
 
 
 def main(argv: list[str] | None = None) -> int:
