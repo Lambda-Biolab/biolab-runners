@@ -37,10 +37,12 @@ Contract rules:
 * ``inference.seed`` is rejected — the key is inert upstream; the
   runner maps ``seed`` to ``inference.design_startnum``.
 * No shell is involved. ``RFDIFFUSION_HOME`` is a directory path
-  (never a command); the upstream script is resolved as a path under
-  it and executed with the current interpreter, so arbitrary wrapper
-  commands cannot be injected. Exit code / stdout / stderr propagate
-  to the caller.
+  (never a command), and ``RFDIFFUSION_PYTHON`` is one executable
+  filesystem path (never a command plus arguments). The upstream script is
+  resolved as a path under ``RFDIFFUSION_HOME`` and executed with
+  ``RFDIFFUSION_PYTHON`` when set, otherwise the current interpreter, so
+  arbitrary wrapper commands cannot be injected. Exit code / stdout / stderr
+  propagate to the caller.
 * The resolved clone root is prepended to ``PYTHONPATH`` (the existing
   value is preserved), so a clone-only deployment can ``import
   rfdiffusion`` inside ``run_inference.py`` without installing the
@@ -55,6 +57,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -111,6 +114,10 @@ Runtime requirements:
     RFDIFFUSION_HOME   path to the upstream RFdiffusion clone
                        (default: ~/tools/RFdiffusion) containing
                        scripts/run_inference.py and the model weights.
+    RFDIFFUSION_PYTHON optional path to an executable Python runtime for
+                       stock RFdiffusion (default: current interpreter).
+                       It must be one filesystem path, not shell text or
+                       a command with arguments.
     --help needs neither.
 """
 
@@ -268,13 +275,51 @@ def _resolve_run_inference() -> Path:
     return script
 
 
+def _has_unsupported_command_shape(value: str) -> bool:
+    """Return whether an invalid runtime value looks like shell text."""
+    if any(char in value for char in ";&|<>$`'\"~\r\n\t"):
+        return True
+    try:
+        parts = shlex.split(value)
+    except ValueError:
+        return True
+    return len(parts) != 1 or parts[0] != value
+
+
+def _resolve_python() -> str:
+    """Resolve and validate the optional stock RFdiffusion Python runtime."""
+    configured = os.environ.get("RFDIFFUSION_PYTHON")
+    if configured is None:
+        return sys.executable
+    if not configured:
+        raise RuntimeError(
+            "RFDIFFUSION_PYTHON must be a single executable filesystem path, not shell text"
+        )
+
+    runtime = Path(configured)
+    if not runtime.exists():
+        if _has_unsupported_command_shape(configured):
+            raise RuntimeError(
+                "RFDIFFUSION_PYTHON must be a single executable filesystem path, "
+                f"not shell text or a command with arguments: {configured!r}"
+            )
+        raise RuntimeError(f"RFDIFFUSION_PYTHON path does not exist: {configured!r}")
+    if not runtime.is_file():
+        raise RuntimeError(
+            f"RFDIFFUSION_PYTHON must point to a regular executable file: {configured!r}"
+        )
+    if not runtime.stat().st_mode & 0o111 or not os.access(runtime, os.X_OK):
+        raise RuntimeError(f"RFDIFFUSION_PYTHON is not executable: {configured!r}")
+    return configured
+
+
 def main(argv: list[str] | None = None) -> int:
     """Console entry point; returns the process exit code.
 
-    ``--help``/``-h`` prints usage and returns ``0`` without touching
-    ``RFDIFFUSION_HOME`` or any model files, so the availability probe
-    stays cheap. On success the upstream exit code / stdout / stderr
-    propagate to the caller unchanged.
+    ``--help``/``-h`` prints usage and returns ``0`` without validating
+    ``RFDIFFUSION_HOME`` or ``RFDIFFUSION_PYTHON`` or touching model files,
+    so the availability probe stays cheap. On success the upstream exit code
+    / stdout / stderr propagate to the caller unchanged.
     """
     args = list(sys.argv[1:] if argv is None else argv)
     if not args or "-h" in args or "--help" in args:
@@ -285,6 +330,11 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(f"rfdiffusion: {exc}", file=sys.stderr)
         print("run 'rfdiffusion --help' for usage", file=sys.stderr)
+        return 2
+    try:
+        python_runtime = _resolve_python()
+    except (OSError, RuntimeError) as exc:
+        print(f"rfdiffusion: {exc}", file=sys.stderr)
         return 2
     if "inference.input_pdb" in overrides:
         target = Path(overrides["inference.input_pdb"])
@@ -317,7 +367,7 @@ def main(argv: list[str] | None = None) -> int:
     overrides["hydra.output_subdir"] = "null"
     overrides["hydra.job.chdir"] = "False"
     command = [
-        sys.executable,
+        python_runtime,
         str(script),
         "--config-name",
         "base",
@@ -333,7 +383,7 @@ def main(argv: list[str] | None = None) -> int:
         clone_root if not existing_pythonpath else clone_root + os.pathsep + existing_pythonpath
     )
     try:
-        completed = subprocess.run(command, check=False, env=run_env)
+        completed = subprocess.run(command, check=False, env=run_env, shell=False)
     except OSError as exc:
         print(f"rfdiffusion: failed to launch {script}: {exc}", file=sys.stderr)
         return 127

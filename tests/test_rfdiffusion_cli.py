@@ -92,8 +92,10 @@ def test_help_is_cheap_and_requires_no_clone(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``--help`` exits 0 and prints usage WITHOUT ``RFDIFFUSION_HOME`` or
-    any model files — the availability probe stays cheap."""
+    ``RFDIFFUSION_PYTHON`` or any model files — the availability probe stays
+    cheap."""
     monkeypatch.setenv("RFDIFFUSION_HOME", str(tmp_path / "no-such-clone"))
+    monkeypatch.setenv("RFDIFFUSION_PYTHON", str(tmp_path / "no-such-python"))
     completed = subprocess.run(
         [sys.executable, "-m", "biolab_runners.rfdiffusion.cli", "--help"],
         capture_output=True,
@@ -103,6 +105,7 @@ def test_help_is_cheap_and_requires_no_clone(
     assert completed.returncode == 0
     assert "rfdiffusion" in completed.stdout
     assert "RFDIFFUSION_HOME" in completed.stdout
+    assert "RFDIFFUSION_PYTHON" in completed.stdout
     # In-process form returns 0 too.
     assert main(["--help"]) == 0
     assert main(["-h"]) == 0
@@ -242,6 +245,48 @@ def test_cli_prepends_clone_root_to_pythonpath(
     pythonpath = payload["pythonpath"]
     assert pythonpath is not None and pythonpath.startswith(str(clone_home))
     assert pythonpath.endswith(os.pathsep + "/some/existing/path")  # preserved
+
+
+def test_cli_uses_current_interpreter_by_default(
+    fake_upstream: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without ``RFDIFFUSION_PYTHON``, the adapter uses ``sys.executable``."""
+    calls: list[list[str]] = []
+    original_run = subprocess.run
+
+    def record_run(*args: Any, **kwargs: Any) -> Any:
+        calls.append(args[0])
+        return original_run(*args, **kwargs)
+
+    monkeypatch.delenv("RFDIFFUSION_PYTHON", raising=False)
+    monkeypatch.setattr("biolab_runners.rfdiffusion.cli.subprocess.run", record_run)
+
+    assert main(["--output_dir", str(tmp_path / "d")]) == 0
+    assert calls[0][0] == sys.executable
+    assert calls[0][1].endswith("scripts/run_inference.py")
+    assert json.loads(fake_upstream.read_text())["argv"][:2] == ["--config-name", "base"]
+
+
+def test_cli_uses_explicit_executable_runtime(
+    fake_upstream: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A configured executable runs the upstream script without shell parsing."""
+    marker = tmp_path / "runtime-used"
+    runtime = tmp_path / "python-runtime"
+    runtime.write_text(
+        "#!" + sys.executable + "\n"
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['RUNTIME_MARKER']).write_text('used')\n"
+        "os.execv(sys.executable, [sys.executable, *sys.argv[1:]])\n"
+    )
+    runtime.chmod(0o755)
+    monkeypatch.setenv("RFDIFFUSION_PYTHON", str(runtime))
+    monkeypatch.setenv("RUNTIME_MARKER", str(marker))
+
+    assert main(["--output_dir", str(tmp_path / "d")]) == 0
+    assert marker.read_text() == "used"
+    assert json.loads(fake_upstream.read_text())["argv"][:2] == ["--config-name", "base"]
 
 
 def test_cli_quotes_scalar_paths_and_preserves_types(fake_upstream: Path, tmp_path: Path) -> None:
@@ -387,6 +432,59 @@ def test_cli_propagates_exit_code_stdout_stderr(
 # ---------------------------------------------------------------------------
 # Fail-closed / validation
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("runtime_value", "expected_error"),
+    [
+        ("missing-runtime", "path does not exist"),
+        ("runtime -u", "single executable filesystem path"),
+    ],
+)
+def test_cli_rejects_missing_or_command_runtime(
+    runtime_value: str,
+    expected_error: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Missing paths and command-shaped values fail before upstream launch."""
+    monkeypatch.setenv("RFDIFFUSION_PYTHON", runtime_value)
+
+    assert main(["--output_dir", str(tmp_path / "d")]) == 2
+    assert expected_error in capsys.readouterr().err
+
+
+def test_cli_rejects_non_executable_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An existing non-executable file cannot be selected as the runtime."""
+    runtime = tmp_path / "not-executable"
+    runtime.write_text("not a runtime")
+    runtime.chmod(0o644)
+    monkeypatch.setenv("RFDIFFUSION_PYTHON", str(runtime))
+
+    assert main(["--output_dir", str(tmp_path / "d")]) == 2
+    assert "not executable" in capsys.readouterr().err
+
+
+def test_cli_disables_shell_execution_for_upstream_launch(
+    fake_upstream: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The runtime and script are passed as argv with shell execution disabled."""
+    calls: list[dict[str, Any]] = []
+    original_run = subprocess.run
+
+    def record_run(*args: Any, **kwargs: Any) -> Any:
+        calls.append({"command": args[0], **kwargs})
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr("biolab_runners.rfdiffusion.cli.subprocess.run", record_run)
+    assert main(["--output_dir", str(tmp_path / "d")]) == 0
+    assert calls[0]["command"][0] == sys.executable
+    assert calls[0]["shell"] is False
 
 
 def test_cli_fails_clearly_when_upstream_script_missing(
