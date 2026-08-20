@@ -1,6 +1,6 @@
 """Configuration for an RFdiffusion backbone generation.
 
-Mirrors the upstream CLI flags that the Activin-E pipeline actually
+Mirrors the upstream CLI flags used by the runner
 uses. Every field has a conservative default so a bare-minimum
 campaign still produces a valid result.
 
@@ -69,7 +69,7 @@ provenance as downstream topology intent (closure is applied and
 validated downstream, e.g. by ``biolab_runners.peptide_prep``, not
 by RFdiffusion).
 
-S2 reproducibility fields (per the Activin-E reproducibility plan):
+Reproducibility fields:
 
 * ``seed`` — the user-facing non-negative base seed. Stock upstream
   RFdiffusion has **no** ``inference.seed`` key (a wrapper that
@@ -234,7 +234,7 @@ class RFdiffusionConfig:
     extra: Mapping[str, Any] = field(default_factory=lambda: {})
 
     def __post_init__(self) -> None:
-        """Validate name + mode + topology + S2 fields + extra keys."""
+        """Validate name + mode + topology + reproducibility fields + extra keys."""
         _validate_name(self)
         _validate_mode_and_lengths(self)
         _resolve_design_chains(self)
@@ -553,7 +553,7 @@ def _validate_target_intent(cfg: RFdiffusionConfig) -> None:
 
 
 def _validate_s2_fields(cfg: RFdiffusionConfig) -> None:
-    """Validate the S2 reproducibility fields (seed / checkpoint)."""
+    """Validate the reproducibility fields (seed / checkpoint)."""
     if cfg.seed < 0:
         raise ValueError(f"seed must be ≥ 0; got {cfg.seed}")
     if not cfg.checkpoint:

@@ -20,7 +20,7 @@ recorded per-task so downstream consumers can short-circuit.
 """
 
 from biolab_runners.rfdiffusion.config import RFdiffusionConfig
-from biolab_runners.rfdiffusion.runner import RFdiffusionRunner
+from biolab_runners.rfdiffusion.runner import RFdiffusionResult, RFdiffusionRunner
 from biolab_runners.rfdiffusion.utils import (
     RecordData,
     RecordDataStatus,
@@ -30,6 +30,7 @@ from biolab_runners.rfdiffusion.utils import (
 
 __all__ = [
     "RFdiffusionConfig",
+    "RFdiffusionResult",
     "RFdiffusionRunner",
     "RecordData",
     "RecordDataStatus",

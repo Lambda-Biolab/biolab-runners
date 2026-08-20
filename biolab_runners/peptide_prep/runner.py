@@ -7,7 +7,7 @@ I/O together. The single public entry point is
 
 The runner is deliberately conservative: every failure mode is
 surfaced as a ``PeptidePrepResult(success=False, error=...)``
-record so callers (e.g. the Activin orchestrator) can branch on
+record so callers can branch on
 ``result.success`` rather than on whether a ``RuntimeError``
 raised. The runner never silently overwrites provenance — a
 ``force=True`` invocation QUARANTINES the prior artifacts into
@@ -54,6 +54,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from biolab_runners.contracts import ArtifactReference, ExecutionMode, ExecutionStatus
 from biolab_runners.peptide_prep.protocols import ChiralityReport
 from biolab_runners.peptide_prep.utils import (
     THREE_LETTER,
@@ -63,6 +64,7 @@ from biolab_runners.peptide_prep.utils import (
     manifest_load,
     manifest_save,
 )
+from biolab_runners.provenance import ProvenanceMetadata, build_execution_provenance
 
 if TYPE_CHECKING:
     from biolab_runners.peptide_prep.config import PeptidePrepConfig
@@ -202,6 +204,43 @@ class PeptidePrepResult:
 
     no_nan: bool = True
 
+    @property
+    def status(self) -> ExecutionStatus:
+        """Return the normalized status without changing legacy fields."""
+        if self.dry_run:
+            return ExecutionStatus.DRY_RUN if self.success else ExecutionStatus.FAILED
+        if self.success and any(not artifact.exists for artifact in self.artifacts):
+            return ExecutionStatus.INCOMPLETE
+        return ExecutionStatus.SUCCEEDED if self.success else ExecutionStatus.FAILED
+
+    @property
+    def execution_mode(self) -> ExecutionMode:
+        """Peptide preparation runs in-process through optional libraries."""
+        return ExecutionMode.IN_PROCESS
+
+    @property
+    def artifacts(self) -> tuple[ArtifactReference, ...]:
+        """Return references for the required materialized files."""
+        return tuple(
+            ArtifactReference.from_path(path, kind=kind)
+            for path, kind in (
+                (self.prepared_pdb, "structure"),
+                (self.gromacs_top, "topology"),
+                (self.gromacs_gro, "coordinates"),
+            )
+            if path
+        )
+
+    @property
+    def provenance(self) -> ProvenanceMetadata:
+        """Return shared execution provenance for this result."""
+        return build_execution_provenance(
+            runner_name="peptide_prep",
+            execution_mode=self.execution_mode,
+            status=self.status,
+            artifacts=self.artifacts,
+        )
+
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a JSON-safe dictionary."""
         return {
@@ -236,6 +275,10 @@ class PeptidePrepResult:
             "potential_energy_before_kjmol": self.potential_energy_before_kjmol,
             "potential_energy_after_kjmol": self.potential_energy_after_kjmol,
             "no_nan": self.no_nan,
+            "status": self.status,
+            "execution_mode": self.execution_mode,
+            "artifacts": [artifact.to_dict() for artifact in self.artifacts],
+            "provenance": self.provenance.to_dict(),
         }
 
 
@@ -1408,7 +1451,7 @@ class PeptidePrepRunner:
                 coordinates to validate.
             sequence: 1-letter sequence matching the topology
                 residues, used to skip Glycine (which is achiral
-                and excluded from CHEM-001 validation).
+                and excluded from sequence validation).
             topology_descriptor: :class:`PeptideTopologyDescriptor`
                 whose ``d_substitutions`` declare which residues
                 are D. The annotation is only applied at
@@ -1428,7 +1471,7 @@ class PeptidePrepRunner:
                 breaks the contract silently when the stage order
                 changes; therefore the seam is explicit.
 
-        The validator is invoked per-residue (CHEM-001 requires
+        The validator is invoked per-residue (the preparation contract requires
         per-residue validation, not bulk validation). Any
         exception raised by the validator (a bug in the upstream
         bioml-tools math) is caught by the runner's caller and

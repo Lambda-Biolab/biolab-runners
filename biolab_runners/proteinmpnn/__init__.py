@@ -6,14 +6,17 @@ Thin subprocess wrapper around the upstream ProteinMPNN
 runner class with ``submit`` / ``dry-run`` / idempotency semantics,
 and a utils module with availability probes and result parsing.
 
-ProteinMPNN is published as a git repository, not a pip package.
-The runner resolves the executable through ``PROTEINMPNN_BIN`` (or
-falls back to a ``proteinmpnn`` binary on the PATH) and supports
-the ``container://`` URI form for GCP Batch workers.
+ProteinMPNN is published as a git repository, not a pip package. The
+installed ``proteinmpnn`` console adapter forwards the runner's argv
+contract directly to ``protein_mpnn_run.py``. A custom executable can
+still be supplied through ``PROTEINMPNN_BIN``.
+The binary setting may be a ``container://`` URI; the runner records that
+mode without requiring a container for the normal local path.
 """
 
+from biolab_runners.proteinmpnn.cli import build_command, main, resolve_script
 from biolab_runners.proteinmpnn.config import ProteinMPNNConfig
-from biolab_runners.proteinmpnn.runner import ProteinMPNNRunner
+from biolab_runners.proteinmpnn.runner import ProteinMPNNResult, ProteinMPNNRunner
 from biolab_runners.proteinmpnn.utils import (
     DesignRecord,
     DesignRecordStatus,
@@ -25,7 +28,11 @@ __all__ = [
     "DesignRecord",
     "DesignRecordStatus",
     "ProteinMPNNConfig",
+    "ProteinMPNNResult",
     "ProteinMPNNRunner",
+    "build_command",
+    "main",
     "parse_fasta_sequences",
     "proteinmpnn_available",
+    "resolve_script",
 ]

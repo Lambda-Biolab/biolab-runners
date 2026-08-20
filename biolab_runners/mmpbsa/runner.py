@@ -12,11 +12,13 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from biolab_runners.contracts import ArtifactReference, ExecutionMode, ExecutionStatus
 from biolab_runners.mmpbsa._parser import (
     GmxMMPBSARecord,
     parse_residue_decomposition,
 )
 from biolab_runners.openmm.config import OpenMMConfig  # noqa: TC001 — runtime use as field type
+from biolab_runners.provenance import build_execution_provenance
 
 logger = logging.getLogger(__name__)
 
@@ -106,13 +108,14 @@ class GmxMMPBSARunner:
         from biolab_runners.mmpbsa.utils import gmx_mmpbsa_available
 
         if not gmx_mmpbsa_available(binary=self.mmpbsa_binary):
-            return {
-                "status": GmxMMPBSAStatus.UNSUPPORTED,
-                "binary": self.mmpbsa_binary,
-                "prefix": self.prefix,
-                "per_residue_records": [],
-                "error": f"{self.mmpbsa_binary} not on PATH",
-            }
+            return self._result(
+                status=GmxMMPBSAStatus.UNSUPPORTED,
+                binary=self.mmpbsa_binary,
+                prefix=self.prefix,
+                per_residue_records=[],
+                error=f"{self.mmpbsa_binary} not on PATH",
+                exit_code=127,
+            )
         cmd = self._build_command()
         try:
             completed = subprocess.run(
@@ -124,25 +127,68 @@ class GmxMMPBSARunner:
                 cwd=self.config.output_dir,
             )
         except subprocess.TimeoutExpired:
-            return {
-                "status": GmxMMPBSAStatus.FAILED,
-                "binary": self.mmpbsa_binary,
-                "prefix": self.prefix,
-                "per_residue_records": [],
-                "error": f"gmx_MMPBSA timed out after {self.timeout_seconds}s",
-            }
+            return self._result(
+                status=ExecutionStatus.TIMEOUT,
+                binary=self.mmpbsa_binary,
+                prefix=self.prefix,
+                per_residue_records=[],
+                error=f"gmx_MMPBSA timed out after {self.timeout_seconds}s",
+                exit_code=124,
+            )
         if completed.returncode != 0:
-            return {
-                "status": GmxMMPBSAStatus.FAILED,
-                "binary": self.mmpbsa_binary,
-                "prefix": self.prefix,
-                "per_residue_records": [],
-                "error": (completed.stderr or completed.stdout).strip()[-2000:],
-            }
+            return self._result(
+                status=GmxMMPBSAStatus.FAILED,
+                binary=self.mmpbsa_binary,
+                prefix=self.prefix,
+                per_residue_records=[],
+                error=(completed.stderr or completed.stdout).strip()[-2000:],
+            )
         records = self._load_records()
-        return {
-            "status": GmxMMPBSAStatus.SUCCEEDED,
-            "binary": self.mmpbsa_binary,
-            "prefix": self.prefix,
-            "per_residue_records": [r.to_dict() for r in records],
-        }
+        status = ExecutionStatus.SUCCEEDED if records else ExecutionStatus.INCOMPLETE
+        error = "" if records else "required decomposition output is missing or empty"
+        return self._result(
+            status=status,
+            binary=self.mmpbsa_binary,
+            prefix=self.prefix,
+            per_residue_records=[r.to_dict() for r in records],
+            error=error,
+        )
+
+    def _result(self, **payload: object) -> dict[str, object]:
+        """Add shared execution fields while preserving the legacy dict shape."""
+        status = str(payload.get("status", ExecutionStatus.FAILED))
+        raw_exit_code = payload.get("exit_code", 0)
+        exit_code = raw_exit_code if isinstance(raw_exit_code, int) else 0
+        artifacts = self._artifacts()
+        mode = (
+            ExecutionMode.CONTAINER_URI
+            if self.mmpbsa_binary.startswith("container://")
+            else ExecutionMode.SUBPROCESS
+        )
+        result = dict(payload)
+        result["execution_mode"] = mode
+        result["exit_code"] = exit_code
+        result["artifacts"] = [artifact.to_dict() for artifact in artifacts]
+        result["provenance"] = build_execution_provenance(
+            runner_name="gmx_mmpbsa",
+            execution_mode=mode,
+            status=status,
+            exit_code=exit_code,
+            artifacts=artifacts,
+        ).to_dict()
+        return result
+
+    def _artifacts(self) -> tuple[ArtifactReference, ...]:
+        """Return references to decomposition files that exist."""
+        candidate_names = (
+            "residue_decomposition_finite.dat",
+            "residue_decomposition.dat",
+            "FINAL_RESULTS_MMPBSA.dat",
+        )
+        return tuple(
+            ArtifactReference.from_path(path, kind="decomposition")
+            for path in (
+                Path(self.config.output_dir) / f"{self.prefix}_{name}" for name in candidate_names
+            )
+            if path.is_file()
+        )

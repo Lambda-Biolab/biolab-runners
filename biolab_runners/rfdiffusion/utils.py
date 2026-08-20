@@ -252,7 +252,7 @@ def _invoke_with_metadata(
     Returns an :class:`InvokeResult` carrying the exit code, a
     512-char stderr tail, the timeout flag, and a short failure
     reason. Public callers use the legacy :func:`invoke` wrapper
-    (which discards everything except the exit code); the S2
+    (which discards everything except the exit code); the provenance
     provenance wiring uses this helper directly.
     """
     prefix = binary_prefix if binary_prefix is not None else _resolved_binary()

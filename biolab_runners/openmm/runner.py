@@ -636,7 +636,7 @@ class OpenMMRunner:
         np: object,
     ) -> None:
         """Measure peptide-receptor Ca min distance after equilibration and write metadata."""
-        # OralBiome-AMP#175: match the gate path — use OpenMM's internal
+        # Match the gate path — use OpenMM's internal
         # unwrapped coordinates (enforcePeriodicBox=False, default). The
         # downstream min_pbc_distance does its own PBC-correct min-image
         # math, so the input convention here only needs to stay consistent
@@ -706,7 +706,7 @@ class OpenMMRunner:
         steps_box = [0]
         self._install_sigterm_handler(simulation, output_dir, start_step, steps_box, config)
 
-        # OralBiome-AMP task #10: the early-abort gate is an offline mdtraj
+        # The early-abort gate is an offline mdtraj
         # evaluation of the partial trajectory.dcd, not an inside-OpenMM
         # callback. After each sub-chunk we poll ``evaluate_trajectory``
         # on the replicate directory; it re-derives the reference pose
@@ -886,12 +886,12 @@ class OpenMMRunner:
         AFTER the atomic save. The manifest's ``terminal`` payload
         is authoritative for terminal classification; this file
         exists for downstream consumers
-        (``oral_amp.cloud.openmm_cloud``) and is moved by the
+        (downstream cloud consumers) and is moved by the
         ``force=True`` quarantine together with the manifest so a
         stale marker cannot mis-classify a subsequent fresh run.
         """
         # Schema matches the pre-task-#10 inside-OpenMM abort contract
-        # consumed by ``oral_amp.cloud.openmm_cloud``.
+        # consumed by downstream cloud consumers.
         primary_rmsd = (
             verdict.rmsd_5ns
             if verdict.reason == "early_dissociation" and verdict.rmsd_5ns is not None

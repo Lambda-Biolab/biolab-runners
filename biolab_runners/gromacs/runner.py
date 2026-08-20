@@ -37,6 +37,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from biolab_runners.contracts import ArtifactReference, ExecutionMode, ExecutionStatus
 from biolab_runners.gromacs.protocol import (
     GENION_INPUT,
     ProtocolStage,
@@ -61,6 +62,11 @@ from biolab_runners.gromacs.utils import (
     parse_nthcol_energy,
     record_stage_status,
     save_stage_manifest,
+)
+from biolab_runners.provenance import (
+    EMPTY_PROVENANCE,
+    ProvenanceMetadata,
+    build_execution_provenance,
 )
 
 if TYPE_CHECKING:
@@ -99,6 +105,10 @@ class GromacsResult:
     exit_code: int = 0
     duration_seconds: float = 0.0
     metrics: dict[str, float] = field(default_factory=_empty_metrics_dict)
+    provenance: ProvenanceMetadata = EMPTY_PROVENANCE
+    status: ExecutionStatus = ExecutionStatus.INCOMPLETE
+    artifacts: tuple[ArtifactReference, ...] = ()
+    execution_mode: ExecutionMode = ExecutionMode.SUBPROCESS
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the result into a JSON-safe dictionary."""
@@ -112,6 +122,10 @@ class GromacsResult:
             "exit_code": self.exit_code,
             "duration_seconds": self.duration_seconds,
             "metrics": dict(self.metrics),
+            "provenance": self.provenance.to_dict(),
+            "status": self.status,
+            "artifacts": [artifact.to_dict() for artifact in self.artifacts],
+            "execution_mode": self.execution_mode,
         }
 
 
@@ -161,6 +175,47 @@ class GromacsProtocolResult:
     exit_code: int = 0
     duration_seconds: float = 0.0
     error: str = ""
+    execution_mode: ExecutionMode = ExecutionMode.SUBPROCESS
+
+    @property
+    def status(self) -> ExecutionStatus:
+        """Return the normalized status for the whole protocol invocation."""
+        if self.dry_run:
+            return ExecutionStatus.DRY_RUN
+        if self.interrupted:
+            return ExecutionStatus.INTERRUPTED
+        if self.failed or self.error:
+            return ExecutionStatus.FAILED
+        if self.succeeded == 0 and self.skipped > 0:
+            return ExecutionStatus.CACHED
+        if self.succeeded == 0 and self.skipped == 0:
+            return ExecutionStatus.INCOMPLETE
+        return ExecutionStatus.SUCCEEDED
+
+    @property
+    def artifacts(self) -> tuple[ArtifactReference, ...]:
+        """Return references for files present in the protocol output."""
+        output = Path(self.output_dir)
+        return (
+            tuple(
+                ArtifactReference.from_path(path, required=False, kind="simulation")
+                for path in sorted(output.iterdir())
+                if path.is_file()
+            )
+            if output.is_dir()
+            else ()
+        )
+
+    @property
+    def provenance(self) -> ProvenanceMetadata:
+        """Return shared execution provenance for this protocol result."""
+        return build_execution_provenance(
+            runner_name="gromacs_protocol",
+            execution_mode=self.execution_mode,
+            status=self.status,
+            exit_code=self.exit_code,
+            artifacts=self.artifacts,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the result into a JSON-safe dictionary."""
@@ -179,6 +234,10 @@ class GromacsProtocolResult:
             "exit_code": self.exit_code,
             "duration_seconds": self.duration_seconds,
             "error": self.error,
+            "status": self.status,
+            "execution_mode": self.execution_mode,
+            "artifacts": [artifact.to_dict() for artifact in self.artifacts],
+            "provenance": self.provenance.to_dict(),
         }
 
 
@@ -400,12 +459,15 @@ class GromacsRunner:
         cfg = config or self._config_override
         if cfg is None:
             raise ValueError("GromacsConfig is required: pass it to run() or the runner")
+        execution_mode = _gromacs_execution_mode(self._binary_prefix)
 
         output_dir = self._design_dir(cfg)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         if not force and self.is_complete(cfg):
             records = self._collect_records(output_dir, cfg)
+            status = _status_from_gromacs_records(0, records, cached=True)
+            artifacts = _artifacts_for_records(records)
             return GromacsResult(
                 name=cfg.name,
                 output_dir=str(output_dir),
@@ -415,9 +477,14 @@ class GromacsRunner:
                 skipped=len(records),
                 exit_code=0,
                 duration_seconds=0.0,
+                provenance=_gromacs_provenance(status, 0, artifacts, execution_mode),
+                status=status,
+                artifacts=artifacts,
+                execution_mode=execution_mode,
             )
 
         if dry_run:
+            status = ExecutionStatus.DRY_RUN
             return GromacsResult(
                 name=cfg.name,
                 output_dir=str(output_dir),
@@ -427,6 +494,9 @@ class GromacsRunner:
                 skipped=0,
                 exit_code=0,
                 duration_seconds=0.0,
+                provenance=_gromacs_provenance(status, 0, (), execution_mode),
+                status=status,
+                execution_mode=execution_mode,
             )
 
         config_dict = _config_to_cli(cfg)
@@ -441,6 +511,8 @@ class GromacsRunner:
         records = self._collect_records(output_dir, cfg)
         succeeded = sum(1 for r in records if r.status == GromacsRecordStatus.SUCCEEDED)
         failed = len(records) - succeeded
+        status = _status_from_gromacs_records(exit_code, records)
+        artifacts = _artifacts_for_records(records)
         return GromacsResult(
             name=cfg.name,
             output_dir=str(output_dir),
@@ -450,6 +522,10 @@ class GromacsRunner:
             skipped=0,
             exit_code=exit_code,
             duration_seconds=time.monotonic() - started,
+            provenance=_gromacs_provenance(status, exit_code, artifacts, execution_mode),
+            status=status,
+            artifacts=artifacts,
+            execution_mode=execution_mode,
         )
 
     def _design_dir(self, config: GromacsConfig) -> Path:
@@ -483,6 +559,59 @@ class GromacsRunner:
             )
         )
         return records
+
+
+def _artifacts_for_records(records: list[GromacsRecord]) -> tuple[ArtifactReference, ...]:
+    """Describe energy artifacts that were actually produced."""
+    return tuple(
+        ArtifactReference.from_path(record.path, kind="energy") for record in records if record.path
+    )
+
+
+def _status_from_gromacs_records(
+    exit_code: int,
+    records: list[GromacsRecord],
+    *,
+    cached: bool = False,
+) -> ExecutionStatus:
+    """Map the legacy one-shot result to the shared status vocabulary."""
+    if exit_code == 124:
+        return ExecutionStatus.TIMEOUT
+    if exit_code < 0:
+        return ExecutionStatus.INTERRUPTED
+    if exit_code != 0:
+        return ExecutionStatus.FAILED
+    if not records:
+        return ExecutionStatus.INCOMPLETE
+    if any(record.status != GromacsRecordStatus.SUCCEEDED for record in records):
+        return ExecutionStatus.MALFORMED
+    return ExecutionStatus.CACHED if cached else ExecutionStatus.SUCCEEDED
+
+
+def _gromacs_provenance(
+    status: ExecutionStatus,
+    exit_code: int,
+    artifacts: tuple[ArtifactReference, ...],
+    mode: ExecutionMode = ExecutionMode.SUBPROCESS,
+) -> ProvenanceMetadata:
+    """Build the generic one-shot GROMACS execution record."""
+    return build_execution_provenance(
+        runner_name="gromacs",
+        execution_mode=mode,
+        status=status,
+        exit_code=exit_code,
+        artifacts=artifacts,
+    )
+
+
+def _gromacs_execution_mode(binary_prefix: list[str] | None) -> ExecutionMode:
+    """Identify direct or container-backed GROMACS execution."""
+    configured = os.environ.get("GROMACS_BIN", "")
+    if configured.startswith("container://") or (
+        binary_prefix and binary_prefix[0].startswith("container://")
+    ):
+        return ExecutionMode.CONTAINER_URI
+    return ExecutionMode.SUBPROCESS
 
 
 def _config_to_cli(config: GromacsConfig) -> dict[str, str]:
@@ -612,6 +741,7 @@ class GromacsProtocolRunner:
         work_dir = _work_dir(config)
         work_dir.mkdir(parents=True, exist_ok=True)
         started = time.monotonic()
+        execution_mode = _gromacs_execution_mode(self._binary_prefix)
         stage_statuses: dict[str, str] = {}
         succeeded = 0
         skipped = 0
@@ -670,6 +800,7 @@ class GromacsProtocolRunner:
             exit_code=exit_code,
             duration_seconds=time.monotonic() - started,
             error=error,
+            execution_mode=execution_mode,
         )
 
     def _run_single_stage(

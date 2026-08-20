@@ -1,7 +1,7 @@
 # biolab-runners
 
-> Standalone, modular Python runners for Boltz-2 structure prediction
-> and OpenMM molecular dynamics simulations.
+> Standalone, modular scientific runners with shared execution, artifact,
+> error, and provenance contracts.
 
 ## Documentation
 
@@ -14,7 +14,9 @@
 
 ### Core
 
-- [biolab_runners/__init__.py](https://github.com/Lambda-Biolab/biolab-runners/blob/main/biolab_runners/__init__.py): Package root and version (`0.1.0`)
+- [biolab_runners/__init__.py](https://github.com/Lambda-Biolab/biolab-runners/blob/main/biolab_runners/__init__.py): Package root and version (`0.6.0`)
+- [biolab_runners/contracts.py](https://github.com/Lambda-Biolab/biolab-runners/blob/main/biolab_runners/contracts.py): Normalized statuses, execution modes, typed errors, and artifact references
+- [biolab_runners/provenance.py](https://github.com/Lambda-Biolab/biolab-runners/blob/main/biolab_runners/provenance.py): Shared execution provenance and digest conventions
 
 ### Boltz-2 structure prediction (boltz2/)
 
@@ -40,3 +42,19 @@ Public API: `OpenMMConfig`, `OpenMMRunner`, `GateVerdict`, `evaluate_trajectory`
 - [openmm/geometry.py](https://github.com/Lambda-Biolab/biolab-runners/blob/main/biolab_runners/openmm/geometry.py): Pure-numpy PBC helpers — `pbc_correct`, `min_pbc_distance`, `collect_chain_ca_positions`
 - [openmm/paths.py](https://github.com/Lambda-Biolab/biolab-runners/blob/main/biolab_runners/openmm/paths.py): `FileNames` — centralized production filenames
 - [openmm/utils.py](https://github.com/Lambda-Biolab/biolab-runners/blob/main/biolab_runners/openmm/utils.py): Availability checks (`openmm_available`, `pdbfixer_available`) + diagnostic reporter (`verify_production_outputs`)
+
+### Contracted tool runners
+
+- `rfdiffusion/`: `RFdiffusionConfig`, `RFdiffusionRunner`, and
+  `RFdiffusionResult`; direct subprocess via the package `rfdiffusion` adapter.
+- `proteinmpnn/`: `ProteinMPNNConfig`, `ProteinMPNNRunner`,
+  `ProteinMPNNResult`; direct subprocess or optional container URI via the
+  package `proteinmpnn` adapter.
+- `peptide_prep/`: `PeptidePrepConfig`, `PeptidePrepRunner`, and
+  `PeptidePrepResult`; in-process optional scientific dependencies.
+- `rosetta/`: `RosettaConfig`, `RosettaRunner`, and `RosettaResult`; direct
+  subprocess with an optional container URI.
+- `gromacs/`: `GromacsRunner`, `GromacsProtocolRunner`, and their result
+  records; direct subprocess with an optional container URI.
+- `mmpbsa/`: `GmxMMPBSARunner`; optional direct subprocess or container URI,
+  returning `unsupported` when the optional tool is unavailable.

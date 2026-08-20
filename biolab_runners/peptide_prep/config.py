@@ -1,9 +1,9 @@
 """Configuration for the peptide preparation runner.
 
 The peptide-prep slice is the ``biolab-runners`` half of the cross-repo
-Activin CHEM-001 prerequisite. It owns the filesystem / OpenMM /
+peptide-preparation prerequisite. It owns the filesystem / OpenMM /
 PDBFixer / ParmEd execution that turns a candidate peptide backbone +
-designed sequence into the per-candidate local artifacts E3 (the
+designed sequence into local artifacts (the
 downstream MD step) consumes:
 
 * ``prepared.pdb`` — minimized, hydrogen-complete structure.
@@ -11,13 +11,13 @@ downstream MD step) consumes:
   OpenMM system/bond graph / net charge.
 
 Inputs/outputs are GENERIC runner data; this module deliberately does
-NOT reference Activin target policy or any consumer-project types.
+NOT reference consumer target policy or any consumer-project types.
 The topology descriptor type aliases the upstream
 :mod:`bioml_tools.chem.cyclic_topology` dataclasses under
 ``TYPE_CHECKING`` so pyright narrows correctly without forcing a
 runtime dependency on bioml-tools at import time — the actual
-DESCRIPTOR VALUES are passed in by the caller (Activin constructs them
-from the same data Activin already uses for design validation).
+DESCRIPTOR VALUES are passed in by the caller from its own validation
+layer.
 
 The dataclasses are intentionally frozen and ``__post_init__``
 validating: every failure mode is a :class:`ValueError` with a
@@ -82,7 +82,7 @@ class PeptideTopologyDescriptor:
     designed sequence) and the human ``summary`` string (the runner
     records its own structured manifest). Each field defaults to the
     empty / ``None`` value so the descriptor is a no-op for linear
-    all-L preparation (the common case for ``chem_001``-design
+    all-L preparation (the common case for sequence-design
     peptides that don't need D-substitution / head-to-tail /
     disulfide closure).
 
@@ -98,7 +98,7 @@ class PeptideTopologyDescriptor:
             cysteine-free peptides.
 
     Runtime coupling to bioml-tools is forbidden; the actual VALUES
-    are typed loosely so the caller (Activin) can pass instances
+    are typed loosely so callers can pass instances
     constructed by ``bioml_tools.chem.cyclic_topology`` without a
     package-level import.
     """
@@ -119,7 +119,7 @@ class PeptideTopologyDescriptor:
 
 # Canonical amino-acid 1-letter alphabet. ``X`` is rejected (ambiguous);
 # ``U`` (selenocysteine) and ``O`` (pyrrolysine) are out of scope for
-# ``chem_001``-era design.
+# sequence-design era compatibility.
 _CANONICAL_AA_ALPHABET: frozenset[str] = frozenset("ACDEFGHIKLMNPQRSTVWY")
 
 
@@ -159,7 +159,7 @@ class PeptidePrepConfig:
         protein_ff: OpenMM protein force-field XML filename. The
             runner loads this via ``app.ForceField``. Default
             ``"amber99sbildn.xml"`` matches the OpenMM extra and
-            is what the Activin upstream pipeline uses.
+            is a common production setting.
         water_ff_xml: Water force-field XML for the ForceField
             loader. NOT used to solvate (the runner is unsolvated);
             the file is included so ``createSystem`` has the
@@ -340,7 +340,7 @@ class PeptidePrepConfig:
         The runner delegates the ``bioml_tools.chem.cyclic_topology``
         style validation (e.g. ``_mutually_exclusive_termini``) to
         the upstream ``build_prepared_topology`` call site in
-        Activin; this validator only enforces the invariants that
+        callers; this validator only enforces the invariants that
         affect the runner's correctness directly — namely, that
         every 1-indexed position falls inside the sequence, and
         for cyclic closures that head/tail are the true terminal

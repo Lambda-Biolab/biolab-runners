@@ -1,7 +1,8 @@
 # Scientific Validation Plan — biolab-runners
 
 This document defines the **tool-level smoke validation** that proves
-each scientific runner (OpenMM, RFdiffusion, ProteinMPNN, GROMACS)
+each scientific runner (OpenMM, RFdiffusion, ProteinMPNN, peptide preparation,
+Rosetta, GROMACS, and gmx_MMPBSA)
 produces biologically plausible outputs on known reference inputs.
 Pure plumbing tests are not enough.
 
@@ -30,7 +31,7 @@ do not guarantee bit-exact reproduction across versions; we assert
 ## What this plan covers
 
 The integration suite (`tests/integration/test_scientific_validation.py`)
-exercises 8 tests across 4 runners:
+exercises the available lightweight checks across the runner packages:
 
 | Test | Runner | Reference input | What we assert |
 |---|---|---|---|
@@ -108,8 +109,10 @@ both `/dev/nvidia0` is reachable AND the env var is set.
 
 ### Tool wrappers
 
-The ProteinMPNN runner expects a `proteinmpnn` binary on `$PATH` (or
-`${PROTEINMPNN_BIN}`). The RFdiffusion runner ships its adapter **in
+The ProteinMPNN runner uses the package-provided `proteinmpnn` console adapter
+(or `${PROTEINMPNN_BIN}`). The adapter forwards argv directly to
+`protein_mpnn_run.py` and can be tested with a fake script; it does not use a
+shell. The RFdiffusion runner ships its adapter **in
 the package**: the installed wheel provides a `rfdiffusion` console
 script (`biolab_runners.rfdiffusion.cli`) that accepts the runner's
 fixed flag contract:
@@ -154,6 +157,16 @@ Real backbone design with RFdiffusion still requires a GPU and
 RFdiffusion repo); the OpenMM heavy runner test requires
 `/dev/nvidia0` *and* `BIOLAB_RUN_HEAVY_CUDA_TESTS=1` (see the
 `@pytest.mark.skipif` on `test_openmm_runner_completes_short_vacuum_simulation`).
+
+### Execution modes and contract checks
+
+RFdiffusion, ProteinMPNN, Rosetta, GROMACS, and gmx_MMPBSA use direct
+subprocess execution. Peptide preparation is in-process through optional
+scientific libraries. GROMACS and gmx_MMPBSA can accept an optional
+`container://` binary URI; no runner implicitly launches a container. The
+shared contract tests verify normalized statuses, typed errors, artifact
+digests, provenance serialization, the ProteinMPNN adapter, and legacy result
+fields.
 
 ## When a test fails
 

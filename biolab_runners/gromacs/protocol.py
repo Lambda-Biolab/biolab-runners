@@ -6,7 +6,7 @@ command-line arguments for every ``gmx`` invocation. It does **not**
 execute subprocesses; the runner in :mod:`biolab_runners.gromacs.runner`
 consumes the plan and orchestrates execution.
 
-The protocol is the canonical "oral_amp" pipeline recipe:
+The protocol is the canonical multi-stage production recipe:
 
 1. **Topology** — ``gmx pdb2gmx -f input.pdb -o processed.gro``
 2. **Box** — ``gmx editconf -f processed.gro -o boxed.gro -bt cubic -d <buffer>``
