@@ -2,6 +2,9 @@
 
 > Standalone, modular scientific runners with shared execution, artifact,
 > error, and provenance contracts.
+>
+> Release status: `0.6.0` release candidate on commit
+> `5b51dc387474bf03318aed853e8c415ad1a58d58`; not published or tagged.
 
 ## Documentation
 
@@ -14,9 +17,19 @@
 
 ### Core
 
-- [biolab_runners/__init__.py](https://github.com/Lambda-Biolab/biolab-runners/blob/main/biolab_runners/__init__.py): Package root and version (`0.6.0`)
+- [biolab_runners/__init__.py](https://github.com/Lambda-Biolab/biolab-runners/blob/main/biolab_runners/__init__.py): Package root and code version (`0.6.0`; release candidate, not yet published/tagged)
 - [biolab_runners/contracts.py](https://github.com/Lambda-Biolab/biolab-runners/blob/main/biolab_runners/contracts.py): Normalized statuses, execution modes, typed errors, and artifact references
 - [biolab_runners/provenance.py](https://github.com/Lambda-Biolab/biolab-runners/blob/main/biolab_runners/provenance.py): Shared execution provenance and digest conventions
+
+Shared contract names: `ExecutionStatus`, `ExecutionMode`,
+`ArtifactReference`, `RunnerError` and its typed subclasses,
+`ProvenanceMetadata`, `artifact_from_path()`, `require_artifact()`, and
+`validate_artifact_digest()`. Runner configs/results remain tool-specific; no
+universal `Runner` base class exists. Required artifacts fail closed. The
+status vocabulary is `pending`, `running`, `succeeded`, `failed`,
+`unsupported`, `timeout`, `interrupted`, `malformed`, `incomplete`, `cached`,
+and `dry_run`; execution modes are `in_process`, `subprocess`, and
+`container_uri`.
 
 ### Boltz-2 structure prediction (boltz2/)
 
@@ -48,13 +61,19 @@ Public API: `OpenMMConfig`, `OpenMMRunner`, `GateVerdict`, `evaluate_trajectory`
 - `rfdiffusion/`: `RFdiffusionConfig`, `RFdiffusionRunner`, and
   `RFdiffusionResult`; direct subprocess via the package `rfdiffusion` adapter.
 - `proteinmpnn/`: `ProteinMPNNConfig`, `ProteinMPNNRunner`,
-  `ProteinMPNNResult`; direct subprocess or optional container URI via the
-  package `proteinmpnn` adapter.
-- `peptide_prep/`: `PeptidePrepConfig`, `PeptidePrepRunner`, and
-  `PeptidePrepResult`; in-process optional scientific dependencies.
+  `ProteinMPNNResult`; direct subprocess via the package `proteinmpnn`
+  adapter, or container URI through `${PROTEINMPNN_BIN}`.
+- `peptide_prep/`: `PeptidePrepConfig`, `PeptideTopologyDescriptor`,
+  `PeptidePrepRunner`, and `PeptidePrepResult`; in-process optional scientific
+  dependencies, with required `prepared.pdb`, `prepared.top`, and
+  `prepared.gro` artifacts.
 - `rosetta/`: `RosettaConfig`, `RosettaRunner`, and `RosettaResult`; direct
   subprocess with an optional container URI.
 - `gromacs/`: `GromacsRunner`, `GromacsProtocolRunner`, and their result
   records; direct subprocess with an optional container URI.
-- `mmpbsa/`: `GmxMMPBSARunner`; optional direct subprocess or container URI,
-  returning `unsupported` when the optional tool is unavailable.
+- `mmpbsa/`: `GmxMMPBSARunner`, `GmxMMPBSAStatus`, and
+  `GmxMMPBSARecord`; legacy dict result with shared metadata,
+  returning `unsupported` when the optional tool is unavailable and
+  `incomplete` when required decomposition output is absent. A configured
+  container URI is recorded, but the current command builder does not launch
+  the container.
