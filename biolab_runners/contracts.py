@@ -129,9 +129,25 @@ class ArtifactReference:
         *,
         required: bool = True,
         kind: str | None = None,
+        root: str | Path | None = None,
     ) -> ArtifactReference:
-        """Create a reference and digest an existing regular file."""
+        """Create a reference and digest an existing regular file.
+
+        When ``root`` is supplied, the resolved artifact must remain inside
+        that output boundary and must not be a symlink.  This prevents a
+        manifest from digesting files outside the directory it describes.
+        """
         candidate = Path(path)
+        if candidate.is_symlink():
+            raise RunnerOutputError(f"artifact symlink is not allowed: {candidate}")
+        if root is not None:
+            root_path = Path(root).resolve()
+            try:
+                candidate.resolve().relative_to(root_path)
+            except ValueError as exc:
+                raise RunnerOutputError(
+                    f"artifact escapes output boundary {root_path}: {candidate}"
+                ) from exc
         digest: str | None = None
         if candidate.is_file():
             digest = f"sha256:{_sha256(candidate)}"
@@ -165,9 +181,10 @@ def artifact_from_path(
     *,
     required: bool = True,
     kind: str | None = None,
+    root: str | Path | None = None,
 ) -> ArtifactReference:
     """Compatibility factory for callers that prefer a function API."""
-    return ArtifactReference.from_path(path, required=required, kind=kind)
+    return ArtifactReference.from_path(path, required=required, kind=kind, root=root)
 
 
 def require_artifact(

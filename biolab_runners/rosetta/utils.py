@@ -10,6 +10,12 @@ import time
 from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any
 
+from biolab_runners.contracts import (
+    RunnerInvocationError,
+    RunnerTimeoutError,
+    RunnerUnavailableError,
+)
+
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
     from pathlib import Path
@@ -21,6 +27,7 @@ __all__ = [
     "RelaxRecord",
     "RelaxRecordStatus",
     "RelaxScore",
+    "build_invocation_command",
     "parse_relax_score",
     "parse_score_file",
     "parse_score_files",
@@ -539,17 +546,13 @@ def invoke(
     upstream expects to receive multiple times — one token per
     variable — not as a single space-joined argument.
     """
-    prefix = binary_prefix if binary_prefix is not None else _resolved_binary()
+    args = list(
+        build_invocation_command(
+            config=config,
+            binary_prefix=binary_prefix,
+        )
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
-    args: list[str] = [*prefix]
-    for key, value in config.items():
-        if key == "s":
-            if "parser:protocol" in config:
-                continue
-            # ``s`` was the legacy internal key. Keep accepting it while
-            # emitting Rosetta's canonical protocol flag.
-            key = "parser:protocol"
-        args.extend(_config_value_to_argv(key, value))
     started = time.monotonic()
     try:
         completed = subprocess.run(
@@ -559,15 +562,40 @@ def invoke(
             timeout=timeout_seconds,
             check=False,
         )
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
         logger.error("Rosetta timed out after %ds", timeout_seconds)
-        return 124
+        raise RunnerTimeoutError(
+            f"Rosetta timed out after {timeout_seconds}s", runner="rosetta"
+        ) from exc
+    except FileNotFoundError as exc:
+        raise RunnerUnavailableError(
+            f"Rosetta executable unavailable: {args[0]}", runner="rosetta"
+        ) from exc
+    except OSError as exc:
+        raise RunnerInvocationError(f"Rosetta invocation failed: {exc}", runner="rosetta") from exc
     logger.info(
         "Rosetta run finished rc=%d in %.1fs",
         completed.returncode,
         time.monotonic() - started,
     )
     return completed.returncode
+
+
+def build_invocation_command(
+    *,
+    config: dict[str, FlagArgValue],
+    binary_prefix: list[str] | None = None,
+) -> tuple[str, ...]:
+    """Build the exact argv payload sent to Rosetta."""
+    prefix = binary_prefix if binary_prefix is not None else _resolved_binary()
+    args: list[str] = [*prefix]
+    for key, value in config.items():
+        if key == "s":
+            if "parser:protocol" in config:
+                continue
+            key = "parser:protocol"
+        args.extend(_config_value_to_argv(key, value))
+    return tuple(args)
 
 
 def parse_score_files(score_files: Iterable[Path]) -> list[RelaxRecord]:

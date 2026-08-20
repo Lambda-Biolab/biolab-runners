@@ -19,6 +19,7 @@ requiring an AmberTools install.
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 from biolab_runners.mmpbsa import (
@@ -156,6 +157,37 @@ class TestRunnerUnsupported:
         assert result["status"] == GmxMMPBSAStatus.UNSUPPORTED
         assert result["per_residue_records"] == []
         assert "__nonexistent-binary-for-test__" in str(result.get("error", ""))
+
+    def test_container_uri_is_rejected_before_subprocess(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = _make_config(tmp_path)
+        runner = GmxMMPBSARunner(
+            config=config,
+            prefix="run",
+            mmpbsa_binary="container://ambertools/mmpbsa",
+        )
+        monkeypatch.setattr("subprocess.run", Mock(side_effect=AssertionError("invoked")))
+
+        result = runner.run()
+
+        assert result["status"] == GmxMMPBSAStatus.UNSUPPORTED
+        assert result["execution_mode"] == "container_uri"
+        assert result["exit_code"] == 127
+
+    def test_nonzero_exit_code_is_preserved(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = _make_config(tmp_path)
+        runner = GmxMMPBSARunner(config=config, prefix="run", mmpbsa_binary="gmx_MMPBSA")
+        monkeypatch.setattr("biolab_runners.mmpbsa.utils.gmx_mmpbsa_available", lambda **_: True)
+        completed = Mock(returncode=9, stdout="", stderr="failed")
+        monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: completed)
+
+        result = runner.run()
+
+        assert result["status"] == GmxMMPBSAStatus.FAILED
+        assert result["exit_code"] == 9
 
 
 class TestRunnerStatusConstants:

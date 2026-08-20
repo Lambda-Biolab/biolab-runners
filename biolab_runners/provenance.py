@@ -93,12 +93,14 @@ from collections.abc import Mapping  # used at runtime in isinstance() guard
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NoReturn
 
+from biolab_runners.contracts import ExecutionMode, ExecutionStatus
+
 if TYPE_CHECKING:
     from pathlib import Path
 
     from _typeshed import DataclassInstance
 
-    from biolab_runners.contracts import ArtifactReference, ExecutionMode, ExecutionStatus
+    from biolab_runners.contracts import ArtifactReference
 
 __all__ = [
     "EMPTY_PROVENANCE",
@@ -313,16 +315,35 @@ def build_execution_provenance(
     image_digest: str | None = None,
     artifacts: tuple[ArtifactReference, ...] = (),
     command: tuple[str, ...] = (),
+    source_backbone_digest: str | None = None,
+    requested_config_digest: str = "",
+    executed_config_digest: str | None = None,
+    executed: bool = False,
+    cache_hit: bool = False,
 ) -> ProvenanceMetadata:
-    """Build the generic execution portion of a runner provenance record."""
+    """Build the generic execution portion of a runner provenance record.
+
+    The execution flags and digests are explicit because a generic helper
+    cannot infer whether a caller actually dispatched work or returned a
+    cached / dry-run result.
+    """
+    normalized_status = ExecutionStatus(status)
+    normalized_mode = ExecutionMode(execution_mode)
+    if not executed:
+        executed_config_digest = None
     return dataclasses.replace(
         EMPTY_PROVENANCE,
         model_identifier=runner_name,
         runner_name=runner_name,
-        execution_mode=execution_mode,
-        status=status,
+        execution_mode=normalized_mode,
+        status=normalized_status,
         exit_code=exit_code,
         image_digest=validate_image_digest(image_digest),
+        source_backbone_digest=source_backbone_digest,
+        requested_config_digest=requested_config_digest,
+        executed_config_digest=executed_config_digest,
+        executed=executed,
+        cache_hit=cache_hit,
         artifacts=artifacts,
         command=command,
     )
@@ -393,6 +414,7 @@ class InvokeResult:
     stderr_tail: str = ""
     timed_out: bool = False
     failure_reason: str = ""
+    command: tuple[str, ...] = ()
 
     @staticmethod
     def from_stderr(exit_code: int, stderr: str | bytes | None) -> InvokeResult:

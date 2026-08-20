@@ -46,7 +46,7 @@ def translate_runner_args(args: list[str]) -> list[str]:
     translation. This keeps forward-compatible upstream options available
     without allowing the adapter to interpret them.
     """
-    parser = _ArgumentParser(add_help=False)
+    parser = _ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument("--input_path", required=True)
     parser.add_argument("--output_path", required=True)
     parser.add_argument("--batch_size", default="1")

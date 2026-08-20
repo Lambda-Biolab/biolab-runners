@@ -8,16 +8,25 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from biolab_runners.contracts import ArtifactReference, ExecutionMode, ExecutionStatus
+from biolab_runners.contracts import (
+    ArtifactReference,
+    ExecutionMode,
+    ExecutionStatus,
+    RunnerTimeoutError,
+)
 from biolab_runners.provenance import (
     EMPTY_PROVENANCE,
     ProvenanceMetadata,
     build_execution_provenance,
+    compute_config_digest,
+    compute_executed_config_digest,
+    compute_file_digest,
     validate_image_digest,
 )
 from biolab_runners.rosetta.utils import (
     RelaxRecord,
     RelaxRecordStatus,
+    build_invocation_command,
     invoke,
     parse_score_files,
 )
@@ -93,7 +102,7 @@ class RosettaRunner:
         directory = self._effective_output_dir(config)
         if not directory.exists():
             return False
-        return any(directory.glob("score.sc"))
+        return any(path.is_file() and not path.is_symlink() for path in directory.glob("score.sc"))
 
     def run(
         self,
@@ -114,6 +123,10 @@ class RosettaRunner:
         output_dir = self._effective_output_dir(cfg, config_dict)
         config_dict["out:path:all"] = str(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+        intended_command = build_invocation_command(
+            config=config_dict,
+            binary_prefix=self._binary_prefix,
+        )
 
         if not force and self.is_complete(cfg):
             records = parse_score_files(sorted(output_dir.glob("score.sc")))
@@ -136,7 +149,17 @@ class RosettaRunner:
                 skipped=len(records),
                 exit_code=0,
                 duration_seconds=0.0,
-                provenance=_provenance(status, 0, artifacts, image_digest, execution_mode),
+                provenance=_provenance(
+                    status,
+                    0,
+                    artifacts,
+                    image_digest,
+                    execution_mode,
+                    command=(),
+                    requested_config_digest=compute_config_digest(cfg),
+                    source_backbone_digest=compute_file_digest(Path(cfg.input_pdb)),
+                    cache_hit=True,
+                ),
                 status=status,
                 artifacts=artifacts,
                 execution_mode=execution_mode,
@@ -155,18 +178,30 @@ class RosettaRunner:
                 skipped=0,
                 exit_code=0,
                 duration_seconds=0.0,
-                provenance=_provenance(status, 0, (), image_digest, execution_mode),
+                provenance=_provenance(
+                    status,
+                    0,
+                    (),
+                    image_digest,
+                    execution_mode,
+                    command=intended_command,
+                    requested_config_digest=compute_config_digest(cfg),
+                    source_backbone_digest=compute_file_digest(Path(cfg.input_pdb)),
+                ),
                 status=status,
                 execution_mode=execution_mode,
             )
 
         started = time.monotonic()
-        exit_code = invoke(
-            config=config_dict,
-            output_dir=output_dir,
-            binary_prefix=self._binary_prefix,
-            timeout_seconds=self._timeout_seconds,
-        )
+        try:
+            exit_code = invoke(
+                config=config_dict,
+                output_dir=output_dir,
+                binary_prefix=self._binary_prefix,
+                timeout_seconds=self._timeout_seconds,
+            )
+        except RunnerTimeoutError:
+            exit_code = 124
         records = parse_score_files(sorted(output_dir.glob("score.sc")))
         succeeded = sum(1 for r in records if r.status == RelaxRecordStatus.SUCCEEDED)
         failed = len(records) - succeeded
@@ -181,7 +216,20 @@ class RosettaRunner:
             skipped=0,
             exit_code=exit_code,
             duration_seconds=time.monotonic() - started,
-            provenance=_provenance(status, exit_code, artifacts, image_digest, execution_mode),
+            provenance=_provenance(
+                status,
+                exit_code,
+                artifacts,
+                image_digest,
+                execution_mode,
+                command=intended_command,
+                requested_config_digest=compute_config_digest(cfg),
+                executed_config_digest=compute_executed_config_digest(
+                    {"command": list(intended_command)}
+                ),
+                source_backbone_digest=compute_file_digest(Path(cfg.input_pdb)),
+                executed=True,
+            ),
             status=status,
             artifacts=artifacts,
             execution_mode=execution_mode,
@@ -203,8 +251,9 @@ class RosettaRunner:
 def _artifacts_for_output(output_dir: Path) -> tuple[ArtifactReference, ...]:
     """Describe score outputs that exist on disk."""
     return tuple(
-        ArtifactReference.from_path(path, kind="score")
+        ArtifactReference.from_path(path, kind="score", root=output_dir)
         for path in sorted(output_dir.glob("score.sc"))
+        if not path.is_symlink()
     )
 
 
@@ -234,6 +283,13 @@ def _provenance(
     artifacts: tuple[ArtifactReference, ...],
     image_digest: str | None,
     mode: ExecutionMode = ExecutionMode.SUBPROCESS,
+    *,
+    command: tuple[str, ...] = (),
+    requested_config_digest: str = "",
+    executed_config_digest: str | None = None,
+    source_backbone_digest: str | None = None,
+    executed: bool = False,
+    cache_hit: bool = False,
 ) -> ProvenanceMetadata:
     """Build the generic Rosetta execution record."""
     return build_execution_provenance(
@@ -243,6 +299,12 @@ def _provenance(
         exit_code=exit_code,
         image_digest=image_digest,
         artifacts=artifacts,
+        command=command,
+        requested_config_digest=requested_config_digest,
+        executed_config_digest=executed_config_digest,
+        source_backbone_digest=source_backbone_digest,
+        executed=executed,
+        cache_hit=cache_hit,
     )
 
 

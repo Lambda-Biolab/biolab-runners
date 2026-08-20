@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from biolab_runners.contracts import RunnerUnavailableError
 from biolab_runners.rosetta import (
     METRIC_ALIASES,
     ConstrainedRelaxOptions,
@@ -720,6 +721,16 @@ def test_invoke_string_value_emits_single_argv_token(tmp_path: Path) -> None:
     # ``-nstruct 3`` (single value).
     nidx = captured_argv.index("-nstruct")
     assert captured_argv[nidx + 1] == "3"
+
+
+def test_invoke_maps_missing_executable_to_typed_error(tmp_path: Path) -> None:
+    with mock_mod.patch("subprocess.run", side_effect=FileNotFoundError("missing")):
+        with pytest.raises(RunnerUnavailableError, match="Rosetta executable unavailable"):
+            invoke(
+                config={"nstruct": "1"},
+                output_dir=tmp_path,
+                binary_prefix=["missing-rosetta"],
+            )
 
 
 # ---------------------------------------------------------------------------

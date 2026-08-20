@@ -203,12 +203,15 @@ class PeptidePrepResult:
     potential_energy_after_kjmol: float = 0.0
 
     no_nan: bool = True
+    executed: bool = False
 
     @property
     def status(self) -> ExecutionStatus:
         """Return the normalized status without changing legacy fields."""
         if self.dry_run:
             return ExecutionStatus.DRY_RUN if self.success else ExecutionStatus.FAILED
+        if self.reused:
+            return ExecutionStatus.CACHED
         if self.success and any(not artifact.exists for artifact in self.artifacts):
             return ExecutionStatus.INCOMPLETE
         return ExecutionStatus.SUCCEEDED if self.success else ExecutionStatus.FAILED
@@ -239,6 +242,11 @@ class PeptidePrepResult:
             execution_mode=self.execution_mode,
             status=self.status,
             artifacts=self.artifacts,
+            source_backbone_digest=self.source_backbone_digest or None,
+            requested_config_digest=self.source_config_digest,
+            executed_config_digest=self.source_config_digest if self.executed else None,
+            executed=self.executed,
+            cache_hit=self.reused,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -868,6 +876,7 @@ class PeptidePrepRunner:
             closure_distances_after=closure_distances_after,
             energy_after=energy_after,
             no_nan=no_nan,
+            executed=True,
         )
 
     # ------------------------------------------------------------------ stage helpers
@@ -1303,6 +1312,7 @@ class PeptidePrepRunner:
         closure_distances_after: dict[str, float],
         energy_after: object,
         no_nan: bool,
+        executed: bool = True,
     ) -> PeptidePrepResult:
         """Stage 12 — write the manifest and return the success result."""
         manifest_path = work_dir / "peptide_prep_manifest.json"
@@ -1352,6 +1362,7 @@ class PeptidePrepRunner:
             potential_energy_before_kjmol=artifacts.energy_before_kjmol,
             potential_energy_after_kjmol=float(energy_after),  # type: ignore[arg-type]
             no_nan=no_nan,
+            executed=executed,
         )
 
     # ------------------------------------------------------------------ helpers

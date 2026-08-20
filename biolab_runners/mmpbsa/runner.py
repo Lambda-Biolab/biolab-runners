@@ -12,13 +12,24 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from biolab_runners.contracts import ArtifactReference, ExecutionMode, ExecutionStatus
+from biolab_runners.contracts import (
+    ArtifactReference,
+    ExecutionMode,
+    ExecutionStatus,
+    RunnerInvocationError,
+    RunnerUnavailableError,
+)
 from biolab_runners.mmpbsa._parser import (
     GmxMMPBSARecord,
     parse_residue_decomposition,
 )
 from biolab_runners.openmm.config import OpenMMConfig  # noqa: TC001 — runtime use as field type
-from biolab_runners.provenance import build_execution_provenance
+from biolab_runners.provenance import (
+    build_execution_provenance,
+    compute_config_digest,
+    compute_executed_config_digest,
+    compute_file_digest,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +103,7 @@ class GmxMMPBSARunner:
         )
         for name in candidate_names:
             path = Path(self.config.output_dir) / f"{self.prefix}_{name}"
-            if path.exists():
+            if path.exists() and not path.is_symlink():
                 return parse_residue_decomposition(path)
         return ()
 
@@ -107,6 +118,18 @@ class GmxMMPBSARunner:
         """
         from biolab_runners.mmpbsa.utils import gmx_mmpbsa_available
 
+        if self.mmpbsa_binary.startswith("container://"):
+            return self._result(
+                status=ExecutionStatus.UNSUPPORTED,
+                binary=self.mmpbsa_binary,
+                prefix=self.prefix,
+                per_residue_records=[],
+                error=(
+                    "container:// gmx_MMPBSA execution is unsupported; "
+                    "resolve the image to a host executable before invoking"
+                ),
+                exit_code=127,
+            )
         if not gmx_mmpbsa_available(binary=self.mmpbsa_binary):
             return self._result(
                 status=GmxMMPBSAStatus.UNSUPPORTED,
@@ -134,7 +157,18 @@ class GmxMMPBSARunner:
                 per_residue_records=[],
                 error=f"gmx_MMPBSA timed out after {self.timeout_seconds}s",
                 exit_code=124,
+                command=tuple(cmd),
+                executed=True,
             )
+        except FileNotFoundError as exc:
+            raise RunnerUnavailableError(
+                f"gmx_MMPBSA executable unavailable: {self.mmpbsa_binary}",
+                runner="gmx_mmpbsa",
+            ) from exc
+        except OSError as exc:
+            raise RunnerInvocationError(
+                f"gmx_MMPBSA invocation failed: {exc}", runner="gmx_mmpbsa"
+            ) from exc
         if completed.returncode != 0:
             return self._result(
                 status=GmxMMPBSAStatus.FAILED,
@@ -142,6 +176,9 @@ class GmxMMPBSARunner:
                 prefix=self.prefix,
                 per_residue_records=[],
                 error=(completed.stderr or completed.stdout).strip()[-2000:],
+                exit_code=completed.returncode,
+                command=tuple(cmd),
+                executed=True,
             )
         records = self._load_records()
         status = ExecutionStatus.SUCCEEDED if records else ExecutionStatus.INCOMPLETE
@@ -152,13 +189,22 @@ class GmxMMPBSARunner:
             prefix=self.prefix,
             per_residue_records=[r.to_dict() for r in records],
             error=error,
+            command=tuple(cmd),
+            executed=True,
         )
 
     def _result(self, **payload: object) -> dict[str, object]:
         """Add shared execution fields while preserving the legacy dict shape."""
-        status = str(payload.get("status", ExecutionStatus.FAILED))
+        status = ExecutionStatus(payload.get("status", ExecutionStatus.FAILED)).value
         raw_exit_code = payload.get("exit_code", 0)
         exit_code = raw_exit_code if isinstance(raw_exit_code, int) else 0
+        raw_command = payload.get("command", ())
+        command = (
+            tuple(str(item) for item in raw_command)
+            if isinstance(raw_command, (list, tuple))
+            else ()
+        )
+        executed = bool(payload.get("executed", False))
         artifacts = self._artifacts()
         mode = (
             ExecutionMode.CONTAINER_URI
@@ -175,6 +221,16 @@ class GmxMMPBSARunner:
             status=status,
             exit_code=exit_code,
             artifacts=artifacts,
+            command=command,
+            executed=executed,
+            cache_hit=bool(payload.get("cache_hit", False)),
+            requested_config_digest=compute_config_digest(self.config),
+            executed_config_digest=(
+                compute_executed_config_digest({"command": list(command), "prefix": self.prefix})
+                if executed
+                else None
+            ),
+            source_backbone_digest=compute_file_digest(Path(self.config.receptor_pdb)),
         ).to_dict()
         return result
 
@@ -190,5 +246,5 @@ class GmxMMPBSARunner:
             for path in (
                 Path(self.config.output_dir) / f"{self.prefix}_{name}" for name in candidate_names
             )
-            if path.is_file()
+            if path.is_file() and not path.is_symlink()
         )

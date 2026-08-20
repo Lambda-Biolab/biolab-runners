@@ -38,6 +38,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from biolab_runners.contracts import (
+    MalformedOutputError,
+    RunnerInvocationError,
+    RunnerTimeoutError,
+    RunnerUnavailableError,
+)
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -47,10 +54,12 @@ __all__ = [
     "GromacsRecord",
     "GromacsRecordStatus",
     "StageStatus",
+    "build_invocation_command",
     "gromacs_available",
     "invoke",
     "load_stage_manifest",
     "parse_nthcol_energy",
+    "parse_nthcol_energy_checked",
     "record_stage_status",
     "save_stage_manifest",
 ]
@@ -124,20 +133,26 @@ def parse_nthcol_energy(path: Path, column: int = 1) -> float:
     first line that contains a parseable float in the requested column
     is returned; 0.0 indicates empty or malformed output.
     """
+    try:
+        return parse_nthcol_energy_checked(path, column=column)
+    except MalformedOutputError:
+        return 0.0
+
+
+def parse_nthcol_energy_checked(path: Path, column: int = 1) -> float:
+    """Parse energy and fail closed when no numeric data is present."""
     for line in path.read_text().splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#") or stripped.startswith("@"):
             continue
         tokens = stripped.split()
-        if len(tokens) <= column:
-            continue
-        if not _FLOAT_RE.match(tokens[column]):
+        if len(tokens) <= column or not _FLOAT_RE.match(tokens[column]):
             continue
         try:
             return float(tokens[column])
         except ValueError:
             continue
-    return 0.0
+    raise MalformedOutputError(f"energy output contains no parseable column {column}: {path}")
 
 
 def invoke(
@@ -155,9 +170,52 @@ def invoke(
     install a SIGTERM handler before invoking the child (Spot /
     preemption semantics).
     """
-    prefix = binary_prefix if binary_prefix is not None else _resolved_binary()
+    args = list(
+        build_invocation_command(
+            config_dict=config_dict,
+            mdrun_extra=mdrun_extra,
+            binary_prefix=binary_prefix,
+        )
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
-    args = [
+    started = time.monotonic()
+    try:
+        completed = subprocess.run(
+            args,
+            cwd=str(output_dir),
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        logger.error("GROMACS timed out after %ds", timeout_seconds)
+        raise RunnerTimeoutError(
+            f"GROMACS timed out after {timeout_seconds}s", runner="gromacs"
+        ) from None
+    except FileNotFoundError as exc:
+        raise RunnerUnavailableError(
+            f"GROMACS executable unavailable: {args[0]}", runner="gromacs"
+        ) from exc
+    except OSError as exc:
+        raise RunnerInvocationError(f"GROMACS invocation failed: {exc}", runner="gromacs") from exc
+    logger.info(
+        "GROMACS run finished rc=%d in %.1fs",
+        completed.returncode,
+        time.monotonic() - started,
+    )
+    return completed.returncode
+
+
+def build_invocation_command(
+    *,
+    config_dict: dict[str, str],
+    mdrun_extra: tuple[str, ...],
+    binary_prefix: list[str] | None = None,
+) -> tuple[str, ...]:
+    """Build the exact argv payload sent to ``gmx mdrun``."""
+    prefix = binary_prefix if binary_prefix is not None else _resolved_binary()
+    return (
         *prefix,
         "mdrun",
         "-deffnm",
@@ -175,26 +233,7 @@ def invoke(
         "-cpo",
         f"{config_dict['-deffnm']}.cpt",
         *mdrun_extra,
-    ]
-    started = time.monotonic()
-    try:
-        completed = subprocess.run(
-            args,
-            cwd=str(output_dir),
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        logger.error("GROMACS timed out after %ds", timeout_seconds)
-        return 124
-    logger.info(
-        "GROMACS run finished rc=%d in %.1fs",
-        completed.returncode,
-        time.monotonic() - started,
     )
-    return completed.returncode
 
 
 # ---------------------------------------------------------------------------

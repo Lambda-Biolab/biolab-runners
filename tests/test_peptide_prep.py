@@ -51,12 +51,14 @@ from typing import Any
 
 import openmm.app as app
 import pytest
+from biolab_runners.contracts import ExecutionStatus
 from biolab_runners.peptide_prep import (
     ChiralityReport,
     ChiralityValidator,
     CoordinateTransformer,
     CoordinateTransformResult,
     PeptidePrepConfig,
+    PeptidePrepResult,
     PeptidePrepRunner,
     PeptideTopologyDescriptor,
     extract_coordinate_mapping,
@@ -64,6 +66,22 @@ from biolab_runners.peptide_prep import (
 from pdbfixer import PDBFixer
 
 import openmm
+
+
+def test_reused_peptide_result_is_cached_in_public_contract() -> None:
+    result = PeptidePrepResult(
+        name="cached",
+        output_dir="/tmp/cached",
+        success=True,
+        reused=True,
+        source_config_digest="config-digest",
+        source_backbone_digest="backbone-digest",
+    )
+
+    assert result.status == ExecutionStatus.CACHED
+    assert result.provenance.cache_hit is True
+    assert result.provenance.executed is False
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -1910,6 +1928,11 @@ class TestPeptidePrepReuseTypedRecords:
         first_payload = first.to_dict()
         second_payload = second.to_dict()
         first_payload["reused"] = second_payload["reused"] = True
+        for payload in (first_payload, second_payload):
+            payload["status"] = "execution-control"
+            provenance = payload["provenance"]
+            for key in ("cache_hit", "executed", "executed_config_digest", "status"):
+                provenance[key] = "execution-control"
         assert json.dumps(first_payload, sort_keys=True) == json.dumps(
             second_payload, sort_keys=True
         ), "fresh and reused to_dict() science payloads must be identical"

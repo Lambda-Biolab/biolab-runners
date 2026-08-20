@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import signal
+import subprocess
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
+from biolab_runners.contracts import ExecutionStatus, RunnerTimeoutError
 from biolab_runners.gromacs import (
     GromacsProtocolConfig,
     GromacsProtocolRunner,
@@ -19,8 +21,9 @@ from biolab_runners.gromacs import (
 from biolab_runners.gromacs.config import GromacsConfig
 from biolab_runners.gromacs.paths import GromacsFiles
 from biolab_runners.gromacs.protocol import StageKind, build_stage_plan, stage_minimum_outputs
-from biolab_runners.gromacs.runner import GromacsRunner, _config_to_cli
+from biolab_runners.gromacs.runner import GromacsProtocolResult, GromacsRunner, _config_to_cli
 from biolab_runners.gromacs.utils import (
+    invoke,
     load_stage_manifest,
     now_utc_iso,
     parse_nthcol_energy,
@@ -102,6 +105,54 @@ def test_parse_nthcol_energy_returns_zero_for_garbage(tmp_path: Path) -> None:
     p = tmp_path / "garbage.xvg"
     p.write_text("not a number\n")
     assert parse_nthcol_energy(p) == 0.0
+
+
+def test_runner_rejects_unparseable_energy_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_invoke(**_: Any) -> int:
+        output = tmp_path / "bad"
+        output.mkdir(exist_ok=True)
+        (output / "topol.edr").write_text("not energy\n")
+        return 0
+
+    monkeypatch.setattr("biolab_runners.gromacs.runner.invoke", fake_invoke)
+    result = GromacsRunner(output_root=tmp_path, config=_valid_config(name="bad")).run()
+
+    assert result.status == ExecutionStatus.MALFORMED
+    assert result.succeeded == 0
+    assert result.failed == 1
+
+
+def test_invoke_maps_timeout_to_typed_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("subprocess.run", Mock(side_effect=subprocess.TimeoutExpired("gmx", 1)))
+    with pytest.raises(RunnerTimeoutError):
+        invoke(
+            config_dict={"-deffnm": "topol", "-s": "run.tpr", "-nsteps": "1"},
+            output_dir=tmp_path,
+            mdrun_extra=(),
+            binary_prefix=["gmx"],
+            timeout_seconds=1,
+        )
+
+
+def test_protocol_artifacts_ignore_symlink_escape(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret")
+    output = tmp_path / "output"
+    output.mkdir()
+    (output / "escape.txt").symlink_to(outside)
+
+    result = GromacsProtocolResult(
+        name="escape",
+        output_dir=str(output),
+        replica_index=0,
+        replicas_total=1,
+    )
+
+    assert result.artifacts == ()
 
 
 def test_gromacs_available_returns_false_when_binary_missing(
