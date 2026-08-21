@@ -19,6 +19,7 @@ requiring an AmberTools install.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 from unittest.mock import Mock
 
 import pytest
@@ -39,6 +40,34 @@ def _make_config(tmp_path: Path) -> OpenMMConfig:
         peptide_pdb="pep.pdb",
         output_dir=str(tmp_path),
     )
+
+
+def test_executed_provenance_binds_receptor_and_peptide_contents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    receptor = tmp_path / "receptor.pdb"
+    peptide = tmp_path / "peptide.pdb"
+    receptor.write_text("receptor-v1")
+    peptide.write_text("peptide-v1")
+    config = OpenMMConfig(
+        receptor_pdb=str(receptor),
+        peptide_pdb=str(peptide),
+        output_dir=str(tmp_path),
+    )
+    monkeypatch.setattr("biolab_runners.mmpbsa.utils.gmx_mmpbsa_available", lambda **_: True)
+    monkeypatch.setattr(
+        "subprocess.run", lambda *args, **kwargs: Mock(returncode=9, stdout="", stderr="failed")
+    )
+
+    first = GmxMMPBSARunner(config=config, prefix="run").run()
+    peptide.write_text("peptide-v2")
+    second = GmxMMPBSARunner(config=config, prefix="run").run()
+
+    assert first["status"] == GmxMMPBSAStatus.FAILED
+    first_provenance = cast("dict[str, object]", first["provenance"])
+    second_provenance = cast("dict[str, object]", second["provenance"])
+    assert first_provenance["executed"] is True
+    assert first_provenance["executed_config_digest"] != second_provenance["executed_config_digest"]
 
 
 # ---------------------------------------------------------------------------

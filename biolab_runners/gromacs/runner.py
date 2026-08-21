@@ -26,6 +26,7 @@ This module is the orchestrator that ties them together.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import logging
 import os
 import signal
@@ -68,6 +69,7 @@ from biolab_runners.gromacs.utils import (
     now_utc_iso,
     parse_nthcol_energy_checked,
     record_stage_status,
+    resolve_binary_prefix,
     save_stage_manifest,
 )
 from biolab_runners.provenance import (
@@ -200,6 +202,8 @@ class GromacsProtocolResult:
             return ExecutionStatus.DRY_RUN
         if self.interrupted:
             return ExecutionStatus.INTERRUPTED
+        if self.exit_code == 124:
+            return ExecutionStatus.TIMEOUT
         if self.failed or self.error:
             return ExecutionStatus.FAILED
         if self.succeeded == 0 and self.skipped > 0:
@@ -489,12 +493,13 @@ class GromacsRunner:
             records = self._collect_records(output_dir, cfg)
             status = _status_from_gromacs_records(0, records, cached=True)
             artifacts = _artifacts_for_records(records, output_dir)
+            succeeded, failed = _record_counts(records)
             return GromacsResult(
                 name=cfg.name,
                 output_dir=str(output_dir),
                 records=tuple(records),
-                succeeded=len(records),
-                failed=0,
+                succeeded=succeeded,
+                failed=failed,
                 skipped=len(records),
                 exit_code=0,
                 duration_seconds=0.0,
@@ -659,6 +664,13 @@ def _status_from_gromacs_records(
     return ExecutionStatus.CACHED if cached else ExecutionStatus.SUCCEEDED
 
 
+def _record_counts(records: list[GromacsRecord]) -> tuple[int, int]:
+    """Count one-shot records by their parsed status."""
+    succeeded = sum(1 for record in records if record.status == GromacsRecordStatus.SUCCEEDED)
+    failed = sum(1 for record in records if record.status != GromacsRecordStatus.SUCCEEDED)
+    return succeeded, failed
+
+
 def _gromacs_provenance(
     status: ExecutionStatus,
     exit_code: int,
@@ -688,14 +700,43 @@ def _gromacs_provenance(
     )
 
 
-def _gromacs_execution_mode(binary_prefix: list[str] | None) -> ExecutionMode:
-    """Identify direct or container-backed GROMACS execution."""
-    configured = os.environ.get("GROMACS_BIN", "")
-    if configured.startswith("container://") or (
-        binary_prefix and binary_prefix[0].startswith("container://")
+def _gromacs_execution_mode(
+    binary_prefix: list[str] | None,
+    *,
+    resolved_prefix: tuple[str, ...] | None = None,
+) -> ExecutionMode:
+    """Identify the mode of the resolved command prefix."""
+    prefix = resolved_prefix or resolve_binary_prefix(binary_prefix)
+    runtime = Path(prefix[0]).name
+    if runtime in {"docker", "podman", "nerdctl", "singularity", "apptainer"} and any(
+        token in {"run", "exec"} for token in prefix[1:4]
     ):
         return ExecutionMode.CONTAINER_URI
     return ExecutionMode.SUBPROCESS
+
+
+def _protocol_input_digests(config: GromacsProtocolConfig) -> dict[str, str | None]:
+    """Return content digests for the scientific files a protocol consumes."""
+    if config.prebuilt_topology and config.prebuilt_coordinates:
+        return {
+            "prebuilt_topology": compute_file_digest(Path(config.prebuilt_topology)),
+            "prebuilt_coordinates": compute_file_digest(Path(config.prebuilt_coordinates)),
+        }
+    return {"input_pdb": compute_file_digest(Path(config.input_pdb))}
+
+
+def _protocol_executed_config(config: GromacsProtocolConfig) -> dict[str, object]:
+    """Bind protocol settings and consumed input contents to execution."""
+    payload = dataclasses.asdict(config)
+    payload["input_digests"] = _protocol_input_digests(config)
+    return payload
+
+
+def _protocol_source_digest(config: GromacsProtocolConfig) -> str | None:
+    """Return the legacy source field only for the input actually consumed."""
+    if config.prebuilt_topology and config.prebuilt_coordinates:
+        return None
+    return compute_file_digest(Path(config.input_pdb))
 
 
 def _config_to_cli(config: GromacsConfig) -> dict[str, str]:
@@ -797,6 +838,8 @@ class GromacsProtocolRunner:
         self._binary_prefix = binary_prefix
         self._sigterm_grace_seconds = sigterm_grace_seconds
         self._dry_run = dry_run
+        self._resolved_binary_prefix: tuple[str, ...] | None = None
+        self._last_command: tuple[str, ...] = ()
 
     def run_protocol(
         self,
@@ -823,9 +866,13 @@ class GromacsProtocolRunner:
         ``_stage_already_complete`` short-circuit).
         """
         work_dir = _work_dir(config)
+        self._resolved_binary_prefix = resolve_binary_prefix(self._binary_prefix)
+        self._last_command = ()
         work_dir.mkdir(parents=True, exist_ok=True)
         started = time.monotonic()
-        execution_mode = _gromacs_execution_mode(self._binary_prefix)
+        execution_mode = _gromacs_execution_mode(
+            self._binary_prefix, resolved_prefix=self._resolved_binary_prefix
+        )
         stage_statuses: dict[str, str] = {}
         succeeded = 0
         skipped = 0
@@ -836,7 +883,7 @@ class GromacsProtocolRunner:
         error = ""
 
         # Prebuilt stage (no subprocess — file copy only).
-        prebuilt_failure = self._stage_prebuilt(work_dir, config, started)
+        prebuilt_failure = self._stage_prebuilt(work_dir, config, started, execution_mode)
         if prebuilt_failure is not None:
             return prebuilt_failure
 
@@ -887,15 +934,16 @@ class GromacsProtocolRunner:
             execution_mode=execution_mode,
             requested_config_digest=compute_config_digest(config),
             executed_config_digest=(
-                compute_executed_config_digest(config)
+                compute_executed_config_digest(_protocol_executed_config(config))
                 if not self._dry_run and (succeeded or failed or interrupted)
                 else None
             ),
-            source_backbone_digest=compute_file_digest(Path(config.input_pdb)),
+            source_backbone_digest=_protocol_source_digest(config),
             executed=not self._dry_run and bool(succeeded or failed or interrupted),
             cache_hit=not self._dry_run
             and not bool(succeeded or failed or interrupted)
             and skipped > 0,
+            command=self._last_command,
         )
 
     def _run_single_stage(
@@ -944,6 +992,9 @@ class GromacsProtocolRunner:
             checkpoint_path=checkpoint_path,
             config=config,
         )
+        prefix = self._resolved_binary_prefix or resolve_binary_prefix(self._binary_prefix)
+        if commands:
+            self._last_command = (*prefix, *commands[-1])
 
         if self._dry_run:
             return _DRY_RUN_STATUS, 0, False
@@ -959,6 +1010,7 @@ class GromacsProtocolRunner:
         # --- Execute commands ---
         rc = 0
         for cmd in commands:
+            self._last_command = (*prefix, *cmd)
             rc = self._run_subprocess(cmd, work_dir, config.timeout_seconds)
             if rc != 0:
                 break
@@ -999,6 +1051,7 @@ class GromacsProtocolRunner:
         work_dir: Path,
         config: GromacsProtocolConfig,
         started: float,
+        execution_mode: ExecutionMode,
     ) -> GromacsProtocolResult | None:
         """Stage the caller-supplied prebuilt .top/.gro (B4 + cascade invalidation).
 
@@ -1064,6 +1117,7 @@ class GromacsProtocolRunner:
                 exit_code=2,
                 duration_seconds=time.monotonic() - started,
                 error=f"prebuilt topology staging failed: {exc}",
+                execution_mode=execution_mode,
             )
         return None
 
@@ -1112,8 +1166,9 @@ class GromacsProtocolRunner:
         ``Popen.communicate(input=GENION_INPUT)``. No shell, no
         quoting, no injection.
         """
-        prefix = self._binary_prefix or []
+        prefix = self._resolved_binary_prefix or resolve_binary_prefix(self._binary_prefix)
         full_cmd = [*prefix, *cmd]
+        self._last_command = tuple(full_cmd)
 
         # Detect genion — needs stdin (group selection).
         is_genion = "genion" in cmd

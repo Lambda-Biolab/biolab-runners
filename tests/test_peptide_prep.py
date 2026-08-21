@@ -48,6 +48,7 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import openmm.app as app
 import pytest
@@ -2708,7 +2709,24 @@ class TestPeptidePrepFailureSurface:
         )
         result = PeptidePrepRunner().run(cfg)
         assert result.success is False
+        assert result.executed is False
+        assert result.provenance.executed_config_digest is None
         assert "missing" in result.error.lower() or "not found" in result.error.lower()
+
+    def test_failure_after_topology_work_binds_executed_config(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg = _make_linear_config(str(tmp_path / "out"))
+        monkeypatch.setattr(
+            "biolab_runners.peptide_prep.topology.build_modeller",
+            Mock(side_effect=RuntimeError("topology engine failed")),
+        )
+
+        result = PeptidePrepRunner().run(cfg)
+
+        assert result.success is False
+        assert result.executed is True
+        assert result.provenance.executed_config_digest == result.source_config_digest
 
     def test_residue_count_mismatch_fails_closed(self, tmp_output_dir: Path) -> None:
         cfg = _make_linear_config(

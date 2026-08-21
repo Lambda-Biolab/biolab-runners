@@ -226,7 +226,16 @@ class GmxMMPBSARunner:
             cache_hit=bool(payload.get("cache_hit", False)),
             requested_config_digest=compute_config_digest(self.config),
             executed_config_digest=(
-                compute_executed_config_digest({"command": list(command), "prefix": self.prefix})
+                compute_executed_config_digest(
+                    {
+                        "command": list(command),
+                        "prefix": self.prefix,
+                        "input_digests": {
+                            "receptor_pdb": compute_file_digest(Path(self.config.receptor_pdb)),
+                            "peptide_pdb": compute_file_digest(Path(self.config.peptide_pdb)),
+                        },
+                    }
+                )
                 if executed
                 else None
             ),

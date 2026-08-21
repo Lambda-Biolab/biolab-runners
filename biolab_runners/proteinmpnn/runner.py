@@ -152,11 +152,11 @@ class ProteinMPNNRunner:
         # subprocess work so downstream manifest comparison sees a
         # single form regardless of how the caller wrote it.
         image_digest = validate_image_digest(image_digest)
-        execution_mode = _execution_mode(self._binary_prefix)
-
         cfg = config or self._config_override
         if cfg is None:
             raise ValueError("ProteinMPNNConfig is required: pass it to run() or the runner")
+        binary_prefix = _effective_binary_prefix(self._binary_prefix)
+        execution_mode = _execution_mode(binary_prefix)
 
         output_dir = self._design_dir(cfg, input_pdb)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -165,12 +165,13 @@ class ProteinMPNNRunner:
             records = _parse_records(output_dir)
             status = _status_from_records(0, records, cached=True)
             artifacts = _artifacts_for_records(records, output_dir)
+            succeeded, failed = _record_counts(records)
             return ProteinMPNNResult(
                 name=cfg.name,
                 output_dir=str(output_dir),
                 records=records,
-                succeeded=len(records),
-                failed=0,
+                succeeded=succeeded,
+                failed=failed,
                 skipped=len(records),
                 exit_code=0,
                 duration_seconds=0.0,
@@ -198,7 +199,7 @@ class ProteinMPNNRunner:
             config_dict=config_dict,
             input_pdb=input_pdb,
             output_dir=output_dir,
-            binary_prefix=self._binary_prefix,
+            binary_prefix=binary_prefix,
         )
         if dry_run:
             status = ExecutionStatus.DRY_RUN
@@ -236,7 +237,7 @@ class ProteinMPNNRunner:
             config_dict=config_dict,
             input_pdb=input_pdb,
             output_dir=output_dir,
-            binary_prefix=self._binary_prefix,
+            binary_prefix=binary_prefix,
             timeout_seconds=self._timeout_seconds,
         )
         records = _parse_records(output_dir)
@@ -445,11 +446,22 @@ def _status_from_records(
     return ExecutionStatus.CACHED if cached else ExecutionStatus.SUCCEEDED
 
 
+def _record_counts(records: tuple[DesignRecord, ...]) -> tuple[int, int]:
+    """Count records by their parsed status for cache accounting."""
+    succeeded = sum(1 for record in records if record.status == DesignRecordStatus.SUCCEEDED)
+    failed = sum(1 for record in records if record.status != DesignRecordStatus.SUCCEEDED)
+    return succeeded, failed
+
+
 def _execution_mode(binary_prefix: list[str] | None) -> ExecutionMode:
     """Identify direct or container-backed ProteinMPNN execution."""
-    configured = os.environ.get("PROTEINMPNN_BIN", "")
-    if configured.startswith("container://") or (
-        binary_prefix and binary_prefix[0].startswith("container://")
-    ):
+    if binary_prefix and any(token.startswith("container://") for token in binary_prefix):
         return ExecutionMode.CONTAINER_URI
     return ExecutionMode.SUBPROCESS
+
+
+def _effective_binary_prefix(binary_prefix: list[str] | None) -> list[str]:
+    """Resolve the command prefix used for dispatch and mode reporting."""
+    if binary_prefix is not None:
+        return list(binary_prefix)
+    return [os.environ.get("PROTEINMPNN_BIN", "proteinmpnn")]

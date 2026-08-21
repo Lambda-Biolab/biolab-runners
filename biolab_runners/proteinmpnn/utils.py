@@ -72,7 +72,7 @@ def proteinmpnn_available(timeout_seconds: int = 30) -> bool:
 
     binary = os.environ.get("PROTEINMPNN_BIN", "proteinmpnn")
     if binary.startswith("container://"):
-        return True
+        return False
     if shutil.which(binary) is None:
         return False
     try:
@@ -94,16 +94,10 @@ def _resolved_binary() -> list[str]:
 
     binary = os.environ.get("PROTEINMPNN_BIN", "proteinmpnn")
     if binary.startswith("container://"):
-        spec = binary[len("container://") :]
-        runtime = os.environ.get("CONTAINER_RUNTIME", "docker")
-        return [
-            runtime,
-            "run",
-            "--rm",
-            spec,
-            "python",
-            "/app/ProteinMPNN/protein_mpnn_run.py",
-        ]
+        raise ValueError(
+            "ProteinMPNN container:// execution is unsupported; "
+            "configure PROTEINMPNN_BIN with the proteinmpnn adapter or an executable wrapper"
+        )
     return [binary]
 
 
@@ -127,6 +121,11 @@ def build_invocation_command(
 ) -> tuple[str, ...]:
     """Build the exact argv payload sent to ProteinMPNN."""
     prefix = binary_prefix if binary_prefix is not None else _resolved_binary()
+    if any(token.startswith("container://") for token in prefix):
+        raise ValueError(
+            "ProteinMPNN container:// execution is unsupported; "
+            "configure binary_prefix with an executable command"
+        )
     extra_args: list[str] = []
     for key, value in config_dict.items():
         extra_args.extend((f"--{key}", str(value)))

@@ -122,6 +122,38 @@ def test_proteinmpnn_available_returns_false_when_binary_missing(
     assert proteinmpnn_available() is False
 
 
+def test_container_uri_is_rejected_before_proteinmpnn_dispatch(
+    output_root: Path, pdb_input: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PROTEINMPNN_BIN", "container://proteinmpnn:latest")
+    runner = ProteinMPNNRunner(output_root=output_root)
+
+    with pytest.raises(ValueError, match="container://"):
+        runner.run(pdb_input, ProteinMPNNConfig())
+
+
+def test_custom_binary_prefix_overrides_container_environment(
+    output_root: Path, pdb_input: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: list[list[str] | None] = []
+
+    def fake_invoke(**kwargs: Any) -> InvokeResult:
+        captured.append(kwargs["binary_prefix"])
+        return InvokeResult(exit_code=0, command=("proteinmpnn-local",))
+
+    monkeypatch.setenv("PROTEINMPNN_BIN", "container://proteinmpnn:latest")
+    monkeypatch.setattr("biolab_runners.proteinmpnn.runner._invoke_with_metadata", fake_invoke)
+
+    result = ProteinMPNNRunner(
+        output_root=output_root,
+        binary_prefix=["proteinmpnn-local"],
+    ).run(pdb_input, ProteinMPNNConfig())
+
+    assert captured == [["proteinmpnn-local"]]
+    assert result.execution_mode.value == "subprocess"
+    assert result.provenance.command == ("proteinmpnn-local",)
+
+
 def test_invoke_result_round_trips_through_dataclass() -> None:
     """The structured subprocess result must be JSON-safe."""
     import dataclasses
@@ -328,6 +360,27 @@ def test_runner_reads_stock_seq_directory_layout(
     assert result.status.value == "cached"
     assert result.skipped == 4
     assert {Path(record.path).parent.name for record in result.records} == {"seqs"}
+
+
+def test_runner_cache_counters_reflect_malformed_records(
+    output_root: Path, pdb_input: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = ProteinMPNNConfig(name="malformed-cache")
+    design_dir = output_root / config.name / pdb_input.stem
+    design_dir.mkdir(parents=True)
+    fasta = design_dir / "cached.fa"
+    fasta.write_text(SAMPLE_FASTA)
+    monkeypatch.setattr(
+        "biolab_runners.proteinmpnn.runner.parse_fasta_sequences",
+        mock_mod.Mock(side_effect=OSError("corrupt FASTA")),
+    )
+
+    result = ProteinMPNNRunner(output_root=output_root).run(pdb_input, config)
+
+    assert result.status.value == "malformed"
+    assert result.succeeded == 0
+    assert result.failed == 1
+    assert result.skipped == 1
 
 
 def test_runner_fake_upstream_e2e_reads_stock_layout(output_root: Path, pdb_input: Path) -> None:

@@ -4,8 +4,8 @@ This is the primary instruction file for all AI coding agents working on this pr
 Read this file first. It supersedes any default behavior.
 
 The branch currently carries the `0.6.0` release candidate. It is not a
-published or tagged release; consumer validation should pin commit
-`5b51dc387474bf03318aed853e8c415ad1a58d58` until the release tag exists.
+published or tagged release; use a published release for external consumers
+until the release is published.
 
 ## Project Purpose
 
@@ -101,13 +101,11 @@ fields or compatibility properties; no universal runner base class is used.
 
 Execution modes are explicit and runner-specific: Boltz2, RFdiffusion,
 ProteinMPNN, Rosetta, GROMACS, and gmx_MMPBSA are subprocess integrations;
-OpenMM and peptide preparation are in-process. ProteinMPNN, Rosetta, and
-GROMACS resolve caller-provided container URIs through their tool utilities;
-RFdiffusion rejects the legacy container URI and uses its package adapter.
-gmx_MMPBSA records a `container_uri` mode when configured with that prefix, but
-its current command builder does not launch the container. No runner is
-required to launch a container, and no runner shares a universal container
-behavior.
+OpenMM and peptide preparation are in-process. ProteinMPNN, GROMACS, and
+gmx_MMPBSA reject unsupported `container://` values before subprocess
+dispatch; RFdiffusion rejects the legacy container URI and uses its package
+adapter. Rosetta retains its existing container URI resolution. No runner
+shares a universal container behavior.
 
 The checkpoint invariants (atomic save, manifest binding, terminal schema, force=True quarantine) all describe `biolab_runners.openmm.checkpoint` — that module is the single source of truth for the checkpoint protocol. `system_builder.py` does the system construction only; it does NOT touch the manifest. `biolab_runners.openmm.checkpoint.inspect_checkpoint(output_dir, config)` is the single canonical entry point — it reads the manifest once and returns a fully-classified `CheckpointSnapshot` carrying the absolute step, state filename, last record, structured `CompletionStatus`, completion reason, and validated terminal payload. The previous multi-call pattern (`load_checkpoint` + `is_run_complete` + `load_terminal_payload`) is now a sequence of thin wrappers that delegate to `inspect_checkpoint`.
 

@@ -10,8 +10,8 @@ ProteinMPNN is published as a git repository, not a pip package. The
 installed ``proteinmpnn`` console adapter forwards the runner's argv
 contract directly to ``protein_mpnn_run.py``. A custom executable can
 still be supplied through ``PROTEINMPNN_BIN``.
-The binary setting may be a ``container://`` URI; the runner records that
-mode without requiring a container for the normal local path.
+The runner rejects ``container://`` binary settings before subprocess dispatch;
+use a local executable or an explicit executable command prefix.
 """
 
 from biolab_runners.proteinmpnn.cli import build_command, main, resolve_script

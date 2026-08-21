@@ -162,6 +162,29 @@ def test_gromacs_available_returns_false_when_binary_missing(
     assert gromacs_available() is False
 
 
+def test_custom_binary_prefix_overrides_container_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GROMACS_BIN", "container://gromacs:latest")
+    result = GromacsRunner(
+        output_root=tmp_path,
+        config=_valid_config(name="custom-prefix"),
+        binary_prefix=["gmx-custom"],
+    ).run(dry_run=True)
+
+    assert result.execution_mode.value == "subprocess"
+    assert result.provenance.command[0] == "gmx-custom"
+
+
+def test_container_uri_is_rejected_before_gromacs_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GROMACS_BIN", "container://gromacs:latest")
+
+    with pytest.raises(ValueError, match="container://"):
+        GromacsRunner(output_root=tmp_path, config=_valid_config()).run(dry_run=True)
+
+
 def test_runner_dry_run_does_not_invoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     invoked: list[dict[str, Any]] = []
 
@@ -245,6 +268,22 @@ def test_runner_propagates_nonzero_exit_code(
     runner = GromacsRunner(output_root=tmp_path, config=_valid_config(name="failure"))
     result = runner.run()
     assert result.exit_code == 7
+
+
+def test_runner_cache_counters_reflect_malformed_energy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _valid_config(name="malformed-cache")
+    output_dir = tmp_path / config.name
+    output_dir.mkdir()
+    (output_dir / "topol.edr").write_text("not energy\n")
+
+    result = GromacsRunner(output_root=tmp_path).run(config)
+
+    assert result.status == ExecutionStatus.MALFORMED
+    assert result.succeeded == 0
+    assert result.failed == 1
+    assert result.skipped == 1
 
 
 def test_runner_requires_config() -> None:
@@ -424,3 +463,63 @@ class TestRunnerInterruptedResume:
             f"loop continued past interruption ({call_count[0]} calls > {signal_at}); "
             "a would-be missing-input FAILED was attempted"
         )
+
+
+def test_protocol_timeout_is_reported_as_timeout_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _make_config("timeout", str(tmp_path))
+    monkeypatch.setattr(GromacsProtocolRunner, "_run_subprocess", lambda *_: 124)
+
+    result = GromacsProtocolRunner().run_protocol(config)
+
+    assert result.exit_code == 124
+    assert result.failed == 1
+    assert result.status == ExecutionStatus.TIMEOUT
+
+
+def test_protocol_prebuilt_staging_failure_preserves_container_execution_mode(
+    tmp_path: Path,
+) -> None:
+    topology = tmp_path / "prepared.top"
+    topology.write_text("topology")
+    config = GromacsProtocolConfig(
+        name="prebuilt-staging-failure",
+        input_pdb=str(tmp_path / "ignored.pdb"),
+        output_root=str(tmp_path / "runs"),
+        prebuilt_topology=str(topology),
+        prebuilt_coordinates=str(tmp_path / "missing.gro"),
+    )
+
+    result = GromacsProtocolRunner(
+        binary_prefix=["docker", "run", "--rm", "gromacs:latest", "gmx"]
+    ).run_protocol(config)
+
+    assert result.error.startswith("prebuilt topology staging failed:")
+    assert result.execution_mode.value == "container_uri"
+
+
+def test_protocol_prebuilt_provenance_binds_topology_and_coordinates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    topology = tmp_path / "prepared.top"
+    coordinates = tmp_path / "prepared.gro"
+    topology.write_text("topology-v1")
+    coordinates.write_text("coordinates-v1")
+    config = GromacsProtocolConfig(
+        name="prebuilt-digest",
+        input_pdb=str(tmp_path / "ignored.pdb"),
+        output_root=str(tmp_path / "runs"),
+        prebuilt_topology=str(topology),
+        prebuilt_coordinates=str(coordinates),
+        force=True,
+    )
+    monkeypatch.setattr(GromacsProtocolRunner, "_run_subprocess", lambda *_: 1)
+
+    first = GromacsProtocolRunner().run_protocol(config)
+    topology.write_text("topology-v2")
+    second = GromacsProtocolRunner().run_protocol(config)
+
+    assert first.executed is True
+    assert first.source_backbone_digest is None
+    assert first.executed_config_digest != second.executed_config_digest

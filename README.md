@@ -7,8 +7,7 @@
 Standalone, modular Python runners for **Boltz-2** structure prediction, **OpenMM** molecular dynamics, **RFdiffusion** backbone generation, **ProteinMPNN** sequence design, **Rosetta** InterfaceAnalyzer, **GROMACS** integration, peptide preparation, and **gmx_MMPBSA** per-residue decomposition.
 
 The `0.6.0` release candidate is on this branch. It is not published to
-PyPI and has no `v0.6.0` tag yet; consumers should pin the release-candidate
-commit as described in [Installation](#installation).
+PyPI and has no `v0.6.0` tag yet.
 
 ## Features
 
@@ -89,11 +88,11 @@ actual execution mode and, where applicable, the runner-level CLI contract:
 | `Boltz2Runner` | `subprocess` | `boltz` CLI | Local executable; this result type does not expose the shared execution metadata added to the contracted runners. |
 | `OpenMMRunner` | `in_process` | OpenMM Python library | Runs in the caller's Python process; no subprocess or container URI. |
 | `RFdiffusionRunner` | `subprocess` | Package `rfdiffusion` adapter or a compatible `${RFDIFFUSION_BIN}` executable | `--output_dir DIR` plus `--<dotted.hydra.key> <value>` pairs. `RFDIFFUSION_HOME` points to the upstream clone and weights. `container://` is rejected; RFdiffusion has no container fallback. |
-| `ProteinMPNNRunner` | `subprocess` or `container_uri` | Package `proteinmpnn` adapter, `${PROTEINMPNN_BIN}`, or a caller-supplied prefix | Runner flags include `--input_path`, `--output_path`, `--batch_size`, `--seed`, `--sampling_temp`, `--num_seq_per_target`, `--model_name`, `--ca_only`, `--omit_AA`, and `--fixed_positions`. The adapter rejects non-empty `--fixed_positions` until a chain-aware JSONL contract exists. `${PROTEINMPNN_BIN}=container://...` is resolved through `CONTAINER_RUNTIME`; a custom `binary_prefix` is used verbatim. |
+| `ProteinMPNNRunner` | `subprocess` | Package `proteinmpnn` adapter, `${PROTEINMPNN_BIN}`, or a caller-supplied prefix | Runner flags include `--input_path`, `--output_path`, `--batch_size`, `--seed`, `--sampling_temp`, `--num_seq_per_target`, `--model_name`, `--ca_only`, `--omit_AA`, and `--fixed_positions`. The adapter rejects non-empty `--fixed_positions` until a chain-aware JSONL contract exists. `container://` values are rejected before dispatch; an executable `binary_prefix` is used verbatim. |
 | `RosettaRunner` | `subprocess` or `container_uri` | Licensed `rosetta_scripts` CLI | `RosettaConfig.license_acknowledged=True` is required. `ROSETTA_BIN=container://...` is resolved through `CONTAINER_RUNTIME`; `rosetta_available()` probes local executables and treats a container URI as available. `run()` does not auto-skip an unavailable binary. |
-| `GromacsRunner` / `GromacsProtocolRunner` | `subprocess` or `container_uri` | `gmx` CLI | `GROMACS_BIN=container://...` is resolved through `CONTAINER_RUNTIME`; a `binary_prefix` may also provide a container command. |
+| `GromacsRunner` / `GromacsProtocolRunner` | `subprocess` or `container_uri` | `gmx` CLI | `container://` values are rejected before dispatch because the runner does not provide container mounts and path translation; an executable `binary_prefix` may provide its own complete container command. |
 | `PeptidePrepRunner` | `in_process` | OpenMM, PDBFixer, and ParmEd | Optional dependencies are lazy-loaded; missing dependencies produce a structured failure. No container URI is supported. |
-| `GmxMMPBSARunner` | `subprocess` or recorded `container_uri` | `gmx_MMPBSA` CLI | A missing optional binary returns `unsupported`. A `container://` value is accepted by the availability probe and recorded in the result, but this runner currently passes the configured value to `subprocess.run`; use a working executable wrapper until container launch is implemented here. |
+| `GmxMMPBSARunner` | `subprocess` | `gmx_MMPBSA` CLI | A missing optional binary returns `unsupported`. A `container://` value is rejected before subprocess dispatch; use a working executable wrapper instead. |
 
 The RFdiffusion adapter ships **in the package**: the installed wheel
 provides the `rfdiffusion` console script
@@ -125,9 +124,9 @@ Unknown flags are preserved after the known translation for forward
 compatibility. Set `PROTEINMPNN_HOME` (default `~/tools/ProteinMPNN`),
 `PROTEINMPNN_SCRIPT`, or `PROTEINMPNN_PYTHON` to select the checkout, script,
 or interpreter. The adapter's `--help` works without the upstream
-installation. `${PROTEINMPNN_BIN}=container://...` uses the configured
-`CONTAINER_RUNTIME` and the image path expected by the current container
-launcher; the package adapter itself is the local-script path.
+installation. `${PROTEINMPNN_BIN}=container://...` is rejected before
+dispatch because the adapter does not provide the mounts and path translation
+required by the upstream script; use an executable wrapper instead.
 
 The host-level bootstrap script
 `~/.local/bin/install-proteinmpnn-rfdiffusion.sh` clones the upstream
@@ -142,40 +141,34 @@ return True.
 ### With `uv` (recommended — matches the project's lockfile)
 
 ```bash
-# Clone and install all extras from the 0.6.0 release-candidate commit
+# Clone and install all extras from this checkout
 git clone https://github.com/Lambda-Biolab/biolab-runners
 cd biolab-runners
-git checkout 5b51dc387474bf03318aed853e8c415ad1a58d58
 uv sync --all-extras
 ```
 
 ### With `pip`
 
 ```bash
-# Core (no heavy dependencies), pinned to the release-candidate commit
-pip install "biolab-runners @ git+https://github.com/Lambda-Biolab/biolab-runners.git@5b51dc387474bf03318aed853e8c415ad1a58d58"
+# Core (no heavy dependencies)
+pip install .
 
 # With Boltz-2 support
-pip install "biolab-runners[boltz2] @ git+https://github.com/Lambda-Biolab/biolab-runners.git@5b51dc387474bf03318aed853e8c415ad1a58d58"
+pip install ".[boltz2]"
 
 # With OpenMM support (conda recommended for GPU)
-pip install "biolab-runners[openmm] @ git+https://github.com/Lambda-Biolab/biolab-runners.git@5b51dc387474bf03318aed853e8c415ad1a58d58"
+pip install ".[openmm]"
 
 # Everything
-pip install "biolab-runners[all] @ git+https://github.com/Lambda-Biolab/biolab-runners.git@5b51dc387474bf03318aed853e8c415ad1a58d58"
+pip install ".[all]"
 ```
 
 For OpenMM with CUDA support, use conda:
 
 ```bash
 conda install -c conda-forge openmm pdbfixer
-pip install "biolab-runners @ git+https://github.com/Lambda-Biolab/biolab-runners.git@5b51dc387474bf03318aed853e8c415ad1a58d58"
+pip install .
 ```
-
-Until `v0.6.0` is published and tagged, do not use an unqualified
-`pip install biolab-runners` when you need these contracts; it resolves the
-published package rather than this release candidate. Replace the commit
-above with the eventual release tag after publication.
 
 ## Quick Start
 
@@ -462,10 +455,9 @@ elif result["status"] == GmxMMPBSAStatus.UNSUPPORTED:
 ```
 
 The `mmpbsa_binary` accepts either a bare command name (PATH lookup) or a
-`container://<engine>://<image>` value. The latter is recorded as
-`execution_mode="container_uri"`, but the current runner passes the configured
-value to `subprocess.run` rather than resolving a container runtime; use a
-working executable wrapper until that launch path is implemented.
+`container://<engine>://<image>` value. The latter is rejected before
+subprocess dispatch because this runner does not implement container launch;
+use a working executable wrapper instead.
 `parse_residue_decomposition` exposes the per-residue `.dat` parser for direct
 use without re-running gmx_MMPBSA.
 

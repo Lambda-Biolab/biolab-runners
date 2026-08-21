@@ -3,8 +3,7 @@
 > Standalone, modular scientific runners with shared execution, artifact,
 > error, and provenance contracts.
 >
-> Release status: `0.6.0` release candidate on commit
-> `5b51dc387474bf03318aed853e8c415ad1a58d58`; not published or tagged.
+> Release status: `0.6.0` release candidate; not published or tagged.
 
 ## Documentation
 
@@ -62,7 +61,7 @@ Public API: `OpenMMConfig`, `OpenMMRunner`, `GateVerdict`, `evaluate_trajectory`
   `RFdiffusionResult`; direct subprocess via the package `rfdiffusion` adapter.
 - `proteinmpnn/`: `ProteinMPNNConfig`, `ProteinMPNNRunner`,
   `ProteinMPNNResult`; direct subprocess via the package `proteinmpnn`
-  adapter, or container URI through `${PROTEINMPNN_BIN}`.
+  adapter. `container://` values are rejected before dispatch.
 - `peptide_prep/`: `PeptidePrepConfig`, `PeptideTopologyDescriptor`,
   `PeptidePrepRunner`, and `PeptidePrepResult`; in-process optional scientific
   dependencies, with required `prepared.pdb`, `prepared.top`, and
@@ -70,10 +69,10 @@ Public API: `OpenMMConfig`, `OpenMMRunner`, `GateVerdict`, `evaluate_trajectory`
 - `rosetta/`: `RosettaConfig`, `RosettaRunner`, and `RosettaResult`; direct
   subprocess with an optional container URI.
 - `gromacs/`: `GromacsRunner`, `GromacsProtocolRunner`, and their result
-  records; direct subprocess with an optional container URI.
+  records; direct subprocess. `container://` values are rejected before
+  dispatch.
 - `mmpbsa/`: `GmxMMPBSARunner`, `GmxMMPBSAStatus`, and
   `GmxMMPBSARecord`; legacy dict result with shared metadata,
   returning `unsupported` when the optional tool is unavailable and
   `incomplete` when required decomposition output is absent. A configured
-  container URI is recorded, but the current command builder does not launch
-  the container.
+  `container://` URI is rejected before subprocess dispatch.

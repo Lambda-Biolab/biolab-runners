@@ -140,8 +140,8 @@ Unknown flags are appended unchanged for upstream forward compatibility. Set
 `PROTEINMPNN_HOME` (default `~/tools/ProteinMPNN`), `PROTEINMPNN_SCRIPT`, or
 `PROTEINMPNN_PYTHON` to select the checkout, script, or interpreter. The
 adapter's `--help` needs no upstream installation. `${PROTEINMPNN_BIN}` may
-be a local executable or a `container://` value resolved by the runner's
-container utility. The RFdiffusion runner ships its adapter **in
+be a local executable; ProteinMPNN rejects `container://` values before
+subprocess dispatch. The RFdiffusion runner ships its adapter **in
 the package**: the installed wheel provides a `rfdiffusion` console
 script (`biolab_runners.rfdiffusion.cli`) that accepts the runner's
 fixed flag contract:
@@ -190,11 +190,12 @@ RFdiffusion repo); the OpenMM heavy runner test requires
 
 Boltz2, RFdiffusion, ProteinMPNN, Rosetta, GROMACS, and gmx_MMPBSA use
 subprocess execution; OpenMM and peptide preparation are in-process.
-ProteinMPNN, Rosetta, and GROMACS resolve optional `container://` values
-through their tool utilities. RFdiffusion rejects that legacy form and uses
-its package adapter. gmx_MMPBSA records `container_uri` when configured with
-that prefix, but its current command builder does not launch the container.
-No runner implicitly launches a container. The shared contract tests verify
+ProteinMPNN and GROMACS reject `container://` values before subprocess
+dispatch; Rosetta resolves its optional value through its tool utility.
+RFdiffusion rejects that legacy form and uses its package adapter. gmx_MMPBSA
+records `container_uri` for rejected URI configurations, but its current
+command builder does not launch the container.
+No runner shares a universal container-launch behavior. The shared contract tests verify
 normalized statuses, typed errors, artifact digests, provenance serialization,
 the ProteinMPNN adapter, and legacy result fields.
 

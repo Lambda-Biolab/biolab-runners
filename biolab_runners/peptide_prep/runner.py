@@ -314,6 +314,7 @@ class PeptidePrepRunner:
     ) -> None:
         self._platform_override = platform_name
         self._sigterm_grace_seconds = sigterm_grace_seconds
+        self._execution_started = False
 
     # ------------------------------------------------------------------ public
 
@@ -347,6 +348,7 @@ class PeptidePrepRunner:
         4. ``force=True`` quarantine.
         5. Full pipeline.
         """
+        self._execution_started = False
         work_dir = Path(config.output_root) / config.name
         manifest_path = work_dir / "peptide_prep_manifest.json"
 
@@ -683,6 +685,8 @@ class PeptidePrepRunner:
         # this destructive step is atomicity-safe (blocker #10).
         if config.force:
             self._quarantine_stale(work_dir)
+
+        self._execution_started = True
 
         # Stage 1 — build the prepared topology + restrained system
         # + closed system + initial energy.
@@ -1797,6 +1801,7 @@ class PeptidePrepRunner:
             closure_distances_after=closure_distances_after,
             potential_energy_before_kjmol=float(potential_energy_before_kjmol),  # type: ignore[arg-type]
             potential_energy_after_kjmol=float(potential_energy_after_kjmol),  # type: ignore[arg-type]
+            executed=self._execution_started,
         )
 
 

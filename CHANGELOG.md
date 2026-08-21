@@ -8,9 +8,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### 0.6.0 release candidate
 
-This branch prepares `0.6.0`; it is not yet published or tagged. Consumers
-must pin commit `5b51dc387474bf03318aed853e8c415ad1a58d58` until the release is
-published.
+This branch prepares `0.6.0`; it is not yet published or tagged.
 
 - Added shared execution statuses, execution-mode metadata, typed runner
   errors, artifact references with canonical SHA-256 digests, and generalized

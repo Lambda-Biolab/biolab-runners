@@ -61,6 +61,7 @@ __all__ = [
     "parse_nthcol_energy",
     "parse_nthcol_energy_checked",
     "record_stage_status",
+    "resolve_binary_prefix",
     "save_stage_manifest",
 ]
 
@@ -100,7 +101,7 @@ def gromacs_available(timeout_seconds: int = 30) -> bool:
     """Return True when the GROMACS CLI is callable."""
     binary = os.environ.get("GROMACS_BIN", "gmx")
     if binary.startswith("container://"):
-        return True
+        return False
     if shutil.which(binary) is None:
         return False
     try:
@@ -117,13 +118,30 @@ def gromacs_available(timeout_seconds: int = 30) -> bool:
 
 
 def _resolved_binary() -> list[str]:
-    """Return the command prefix used to invoke ``gmx``."""
+    """Return the configured local GROMACS executable prefix."""
     binary = os.environ.get("GROMACS_BIN", "gmx")
     if binary.startswith("container://"):
-        spec = binary[len("container://") :]
-        runtime = os.environ.get("CONTAINER_RUNTIME", "docker")
-        return [runtime, "run", "--rm", spec, "gmx"]
+        raise ValueError(
+            "GROMACS container:// execution is unsupported; "
+            "configure GROMACS_BIN with an executable command"
+        )
     return [binary]
+
+
+def resolve_binary_prefix(binary_prefix: list[str] | None = None) -> tuple[str, ...]:
+    """Resolve the command prefix shared by all GROMACS entry points.
+
+    ``container://`` values are rejected because this package does not
+    provide the mounts and path translation required by the protocol's
+    working-directory commands.
+    """
+    prefix = tuple(binary_prefix) if binary_prefix is not None else tuple(_resolved_binary())
+    if any(token.startswith("container://") for token in prefix):
+        raise ValueError(
+            "GROMACS container:// execution is unsupported; "
+            "configure GROMACS_BIN or binary_prefix with an executable command"
+        )
+    return prefix
 
 
 def parse_nthcol_energy(path: Path, column: int = 1) -> float:
@@ -214,7 +232,7 @@ def build_invocation_command(
     binary_prefix: list[str] | None = None,
 ) -> tuple[str, ...]:
     """Build the exact argv payload sent to ``gmx mdrun``."""
-    prefix = binary_prefix if binary_prefix is not None else _resolved_binary()
+    prefix = resolve_binary_prefix(binary_prefix)
     return (
         *prefix,
         "mdrun",
