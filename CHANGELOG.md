@@ -6,6 +6,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### 0.6.0 release candidate
+
+This branch prepares `0.6.0`; it is not yet published or tagged.
+
+- Added shared execution statuses, execution-mode metadata, typed runner
+  errors, artifact references with canonical SHA-256 digests, and generalized
+  provenance exports.
+- Applied the contracts to RFdiffusion, ProteinMPNN, peptide preparation,
+  Rosetta, GROMACS protocol execution, and gmx_MMPBSA without removing legacy
+  result fields or call signatures.
+- Added the `proteinmpnn` console adapter. It forwards argv directly to the
+  upstream script without shell execution and remains testable without the
+  scientific executable installed.
+- Documented in-process, subprocess, and optional container-URI execution
+  modes. Missing required artifacts fail closed; unavailable optional tools
+  remain explicitly unsupported.
+
 - **Generated-chain-aware output parsing (stock assignment)**:
   stock output PDBs carry the generated binder chain(s) **plus** the
   receptor chains copied from `inference.input_pdb`, and
@@ -127,7 +144,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   tokens from earlier runner versions are not reproduced (pre-1.0
   behavior change; the identity mechanism itself is unchanged).
 
-- **Peptide preparation (CHEM-001 / Activin E3 prerequisite)**:
+- **Peptide preparation**:
   new `biolab_runners.peptide_prep` package materialises
   simulation-ready structures from a backbone PDB + designed
   sequence — optional D-substitution / head-to-tail / disulfide
@@ -589,7 +606,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `Optional[str]`). The previous `None` value silently serialised
   as `"abort_reason": null` in `md_result.json`, breaking the
   long-standing contract that downstream consumers
-  (`oral_amp.cloud`) rely on. Normal completions now serialise as
+  (downstream cloud consumers) rely on. Normal completions now serialise as
   `"abort_reason": ""`. New runner-level test
   `test_normal_skip_serializes_abort_reason_as_empty_string`
   asserts both `result.abort_reason == ""` AND
@@ -737,7 +754,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.1.0] — 2024
 
-Initial release. Two runners extracted from the OralBiome-AMP pipeline:
+Initial release. Two reusable computational biology runners:
 
 - `Boltz2Runner` — Boltz-2 structure predictions for peptide-protein
   complexes, with pocket constraints, steering potentials, MSA caching,

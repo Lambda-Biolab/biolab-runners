@@ -1,22 +1,23 @@
 # biolab-runners
 
-[![Version](https://img.shields.io/badge/version-0.4.0-8A2BE2)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-0.6.0--rc-8A2BE2)](pyproject.toml)
 [![License](https://img.shields.io/badge/license-Apache_2.0-blue)](LICENSE)
 [![Tests](https://github.com/Lambda-Biolab/biolab-runners/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Lambda-Biolab/biolab-runners/actions/workflows/ci.yml)
 [![Dependabot Updates](https://github.com/Lambda-Biolab/biolab-runners/actions/workflows/dependabot/dependabot-updates/badge.svg?branch=main)](https://github.com/Lambda-Biolab/biolab-runners/actions/workflows/dependabot/dependabot-updates)
-Standalone, modular Python runners for **Boltz-2** structure prediction, **OpenMM** molecular dynamics, **RFdiffusion** backbone generation, **ProteinMPNN** sequence design, **Rosetta** InterfaceAnalyzer, **GROMACS** integration, and **gmx_MMPBSA** per-residue decomposition.
+Standalone, modular Python runners for **Boltz-2** structure prediction, **OpenMM** molecular dynamics, **RFdiffusion** backbone generation, **ProteinMPNN** sequence design, **Rosetta** InterfaceAnalyzer, **GROMACS** integration, peptide preparation, and **gmx_MMPBSA** per-residue decomposition.
 
-Extracted from the [OralBiome-AMP](https://github.com/Lambda-Biolab/OralBiome-AMP) pipeline for use in other research projects.
+The `0.6.0` release candidate is on this branch. It is not published to
+PyPI and has no `v0.6.0` tag yet.
 
 ## Features
 
 - **Boltz2Runner** — Local GPU structure prediction with quality gating, MSA caching, pocket constraints, and dry-run mode
-- **OpenMMRunner** — Full MD pipeline: system building, 3-stage equilibration, production NPT, checkpointing, early abort, SIGTERM handling. `OpenMMConfig.from_md_spec()` is the canonical construction path going forward (slice 12 — projects `bioml_tools.md.system_spec.MDSpec` onto the matching `OpenMMConfig` slot, with fail-closed allowlist for engine-specific overlays)
-- **GmxMMPBSARunner** (slice 14) — Optional gmx_MMPBSA integration for per-residue MM/PBSA decomposition. Gracefully degrades to `status="unsupported"` when the binary is missing
+- **OpenMMRunner** — Full MD pipeline: system building, 3-stage equilibration, production NPT, checkpointing, early abort, and SIGTERM handling. `OpenMMConfig.from_md_spec()` projects the engine-neutral `bioml_tools.md.system_spec.MDSpec` onto the matching `OpenMMConfig` fields, with a fail-closed allowlist for OpenMM-only overlays.
+- **GmxMMPBSARunner** — Optional gmx_MMPBSA integration for per-residue MM/PBSA decomposition. A missing optional binary returns `status="unsupported"` rather than a fabricated value; a successful invocation without its required decomposition output returns `status="incomplete"`.
 - **RFdiffusionRunner** — Subprocess wrapper for RFdiffusion backbone generation (in-package `rfdiffusion` console script; `RFDIFFUSION_HOME` → upstream clone): target-conditioned peptide binder design (`target_pdb` → stock `inference.input_pdb` + chain-referencing `contigs`, byte-for-byte) or generic unconditional generation. Truthful topology modes — `inference.cyclic`/`cyc_chains` are emitted only for the head-to-tail variants; disulfide pairs are recorded as downstream closure intent (RFdiffusion cannot encode them)
 - **ProteinMPNNRunner** — Subprocess wrapper for fixed-backbone sequence design (CLI translation from biolab-runners contract to upstream `protein_mpnn_run.py`)
-- **RosettaRunner** — Subprocess wrapper for Rosetta InterfaceAnalyzer (license-gated; skips when the license is absent)
-- **GROMACSRunner** — Subprocess wrapper for `.xvg` parsing integration
+- **RosettaRunner** — Subprocess wrapper for Rosetta InterfaceAnalyzer. It is license-gated: `RosettaConfig.license_acknowledged=True` is required, and callers should use `rosetta_available()` before invoking; `run()` does not auto-skip an unavailable binary.
+- **GromacsRunner** — Subprocess wrapper for `.xvg` parsing integration
 - **GROMACS protocol** — Checkpoint-resumable `pdb2gmx → box → solvate → ions → minimize → NVT → NPT → production` pipeline
   (`GromacsProtocolRunner`). Supports a **prebuilt mode**: when
   `GromacsProtocolConfig.prebuilt_topology` and
@@ -40,28 +41,58 @@ Extracted from the [OralBiome-AMP](https://github.com/Lambda-Biolab/OralBiome-AM
   lazy-imported; the runner fails closed with a structured result when
   an optional dependency is missing. See
   `biolab_runners.peptide_prep` for the full contract.
+- **Shared execution contracts** — normalized statuses, execution modes,
+  typed runner errors, artifact references with SHA-256 digests, and reusable
+  execution provenance. Required artifacts are validated fail-closed;
+  unavailable optional tools report `unsupported`.
+
 - Config-driven with dataclasses (no magic strings)
-- Structured result objects (not raw dicts)
+- Structured result objects for the typed runners; `GmxMMPBSARunner` retains its legacy dict result and adds shared metadata
 - Full type annotations (pyright-clean)
 - Python logging (no print statements)
-- Dry-run mode for all runners
-- **Scientific-validation integration suite** — 8 tests gated by `@pytest.mark.integration` driving parsers and the OpenMM runner on real reference inputs (barnase chain A, ProteinMPNN FASTA, GROMACS energy.xvg). End-to-end CUDA smoke is opt-in via `BIOLAB_RUN_HEAVY_CUDA_TESTS=1`.
+- Dry-run mode where supported; `GmxMMPBSARunner` has no dry-run argument
+- **Scientific-validation integration suite** — integration tests drive parsers, GROMACS protocol dry-run/minimisation, and the OpenMM runner on real reference inputs (barnase chain A, ProteinMPNN FASTA, GROMACS energy.xvg). The heavy OpenMM CUDA smoke is opt-in via `BIOLAB_RUN_HEAVY_CUDA_TESTS=1`; Rosetta, peptide preparation, and gmx_MMPBSA retain focused unit/parser coverage because their external dependencies are optional or licensed.
 
-### Runner CLI contracts
+The shared `biolab_runners.contracts` module exports `ExecutionStatus`,
+`ExecutionMode`, `ArtifactReference`, `RunnerError` and its typed subclasses,
+`artifact_from_path()`, `require_artifact()`, and
+`validate_artifact_digest()`. `ExecutionStatus` values are `pending`, `running`,
+`succeeded`, `failed`, `unsupported`, `timeout`, `interrupted`, `malformed`,
+`incomplete`, `cached`, and `dry_run`. `ExecutionMode` values are `in_process`,
+`subprocess`, and `container_uri`. The shared execution-provenance record is
+`ProvenanceMetadata`; `build_execution_provenance()` supplies its generic
+execution fields. Required artifacts fail closed through the artifact
+contract; optional external tools report `unsupported` when their runner
+defines that degradation path. Per-runner result fields and configuration
+types remain tool-specific: there is no universal `Runner` base class.
 
-The `Boltz2Runner`, `OpenMMRunner`, `RFdiffusionRunner`, and
-`ProteinMPNNRunner` are pure-Python wrappers around their upstream
-binaries. The runner-level CLI contract is what the biolab-runners
-binary expects:
+### Compatibility
 
-| Runner | Required upstream binary | CLI contract |
-|---|---|---|
-| `Boltz2Runner` | `boltz` (Conda) | upstream CLI passes through directly |
-| `OpenMMRunner` | `python -m openmm` (Python lib) | n/a — no subprocess |
-| `RFdiffusionRunner` | in-package `rfdiffusion` console script (or `${RFDIFFUSION_BIN}`); requires `RFDIFFUSION_HOME` → upstream clone with weights | `--output_dir DIR`, `--<dotted.hydra.key> <value>` pairs (underscores hyphenated), e.g. `--inference.num-designs N`, `--contigmap.contigs SPEC`, `--inference.input-pdb PDB`, `--inference.design-startnum N`, `--inference.cyclic True`, `--ppi.hotspot-res A51,A52` |
-| `ProteinMPNNRunner` | `proteinmpnn` (or `${PROTEINMPNN_BIN}`) | `--input_path DIR`, `--output_path DIR`, `--batch_size N`, `--seed N`, `--sampling_temp F`, `--num_seq_per_target N`, `--model_name CHECKPOINT` (one of `v_48_002`, `v_48_010`, `v_48_020`, `v_48_030`), `--ca_only`, `--omit_AA`, `--fixed_positions` |
-| `RosettaRunner` | Rosetta InterfaceAnalyzer | license-gated; skipped when absent |
-| `GROMACSRunner` | n/a (parser-only) | fixture `.xvg` files |
+The release-candidate contract is additive. Existing runner constructors,
+`run()`/batch call shapes, legacy result fields, and legacy serializers remain
+available. In particular, `proteinmpnn.utils.invoke()` still returns an
+integer exit code, `rosetta.utils.parse_score_file()` still returns the legacy
+float, Rosetta record dictionaries retain `index`, `path`, `total_score`,
+`status`, and `error`, and `GmxMMPBSARunner.run()` retains its legacy dict keys.
+New shared metadata is added alongside those surfaces. A legacy `skipped`
+counter may still describe cache or per-record accounting; `skipped` is not a
+value of the shared `ExecutionStatus` enum.
+
+### Runner execution and CLI contracts
+
+Runner boundaries are intentionally tool-specific. The table records the
+actual execution mode and, where applicable, the runner-level CLI contract:
+
+| Runner | Execution mode | Required tool or adapter | Contract / container behavior |
+|---|---|---|---|
+| `Boltz2Runner` | `subprocess` | `boltz` CLI | Local executable; this result type does not expose the shared execution metadata added to the contracted runners. |
+| `OpenMMRunner` | `in_process` | OpenMM Python library | Runs in the caller's Python process; no subprocess or container URI. |
+| `RFdiffusionRunner` | `subprocess` | Package `rfdiffusion` adapter or a compatible `${RFDIFFUSION_BIN}` executable | `--output_dir DIR` plus `--<dotted.hydra.key> <value>` pairs. `RFDIFFUSION_HOME` points to the upstream clone and weights. `container://` is rejected; RFdiffusion has no container fallback. |
+| `ProteinMPNNRunner` | `subprocess` | Package `proteinmpnn` adapter, `${PROTEINMPNN_BIN}`, or a caller-supplied prefix | Runner flags include `--input_path`, `--output_path`, `--batch_size`, `--seed`, `--sampling_temp`, `--num_seq_per_target`, `--model_name`, `--ca_only`, `--omit_AA`, and `--fixed_positions`. The adapter rejects non-empty `--fixed_positions` until a chain-aware JSONL contract exists. `container://` values are rejected before dispatch; an executable `binary_prefix` is used verbatim. |
+| `RosettaRunner` | `subprocess` or `container_uri` | Licensed `rosetta_scripts` CLI | `RosettaConfig.license_acknowledged=True` is required. `ROSETTA_BIN=container://...` is resolved through `CONTAINER_RUNTIME`; `rosetta_available()` probes local executables and treats a container URI as available. `run()` does not auto-skip an unavailable binary. |
+| `GromacsRunner` / `GromacsProtocolRunner` | `subprocess` or `container_uri` | `gmx` CLI | `container://` values are rejected before dispatch because the runner does not provide container mounts and path translation; an executable `binary_prefix` may provide its own complete container command. |
+| `PeptidePrepRunner` | `in_process` | OpenMM, PDBFixer, and ParmEd | Optional dependencies are lazy-loaded; missing dependencies produce a structured failure. No container URI is supported. |
+| `GmxMMPBSARunner` | `subprocess` | `gmx_MMPBSA` CLI | A missing optional binary returns `unsupported`. A `container://` value is rejected before subprocess dispatch; use a working executable wrapper instead. |
 
 The RFdiffusion adapter ships **in the package**: the installed wheel
 provides the `rfdiffusion` console script
@@ -76,6 +107,27 @@ upstream `RosettaCommons/RFdiffusion` clone root (default
 PyTorch + CUDA** in the interpreter running the console script (the
 clone is auto-prepended to `PYTHONPATH`; Hydra's own metadata is
 confined under the output directory). `--help` needs none of these.
+The ProteinMPNN adapter also ships in the package: the installed wheel
+provides the `proteinmpnn` console script (`biolab_runners.proteinmpnn.cli`).
+It translates the runner contract to the upstream script without a shell:
+
+| Runner flag | Upstream translation |
+|---|---|
+| `--input_path DIR` and `--pdb_path NAME` | `--pdb_path DIR/NAME` |
+| `--output_path DIR` | `--out_folder DIR` |
+| `--batch_size`, `--model_name`, `--num_seq_per_target`, `--sampling_temp`, `--seed` | Forwarded with the same names and values |
+| `--ca_only` | Emits upstream `--ca_only` only for true-like values |
+| `--omit_AA VALUE` | `--omit_AAs VALUE` |
+| `--fixed_positions VALUE` | Rejected when non-empty; a chain-aware JSONL contract is not implemented |
+
+Unknown flags are preserved after the known translation for forward
+compatibility. Set `PROTEINMPNN_HOME` (default `~/tools/ProteinMPNN`),
+`PROTEINMPNN_SCRIPT`, or `PROTEINMPNN_PYTHON` to select the checkout, script,
+or interpreter. The adapter's `--help` works without the upstream
+installation. `${PROTEINMPNN_BIN}=container://...` is rejected before
+dispatch because the adapter does not provide the mounts and path translation
+required by the upstream script; use an executable wrapper instead.
+
 The host-level bootstrap script
 `~/.local/bin/install-proteinmpnn-rfdiffusion.sh` clones the upstream
 `dauparas/ProteinMPNN` and `RosettaCommons/RFdiffusion` repos shallowly
@@ -89,7 +141,7 @@ return True.
 ### With `uv` (recommended — matches the project's lockfile)
 
 ```bash
-# Clone and install all extras
+# Clone and install all extras from this checkout
 git clone https://github.com/Lambda-Biolab/biolab-runners
 cd biolab-runners
 uv sync --all-extras
@@ -99,23 +151,23 @@ uv sync --all-extras
 
 ```bash
 # Core (no heavy dependencies)
-pip install biolab-runners
+pip install .
 
 # With Boltz-2 support
-pip install biolab-runners[boltz2]
+pip install ".[boltz2]"
 
 # With OpenMM support (conda recommended for GPU)
-pip install biolab-runners[openmm]
+pip install ".[openmm]"
 
 # Everything
-pip install biolab-runners[all]
+pip install ".[all]"
 ```
 
 For OpenMM with CUDA support, use conda:
 
 ```bash
 conda install -c conda-forge openmm pdbfixer
-pip install biolab-runners
+pip install .
 ```
 
 ## Quick Start
@@ -275,7 +327,7 @@ print(f"Early abort: {result.early_abort} ({result.abort_reason})")
 config = OpenMMConfig.saliva(
     receptor_pdb="receptor.pdb",
     peptide_pdb="peptide.pdb",
-    output_dir="results/md/oral",
+    output_dir="results/md/saliva",
     production_ns=100.0,
 )
 
@@ -313,7 +365,7 @@ Note: very low pH (e.g. gastric) affects protonation of His/Asp/Glu/N-termini. V
 result = runner.run(dry_run=True)  # Validates config, no GPU needed
 ```
 
-### OpenMM: canonical `MDSpec` → `OpenMMConfig` (slice 12)
+### OpenMM: canonical `MDSpec` → `OpenMMConfig`
 
 For new code, prefer the canonical construction path over the direct
 `OpenMMConfig(...)` keyword form. The `MDSpec` from
@@ -323,18 +375,22 @@ is the engine-neutral source of truth for the MD protocol; pass it to
 
 ```python
 from biolab_runners.openmm import OpenMMRunner
-from biolab_tools.md.system_spec import ACTIVIN_E_PRODUCTION_PROFILE, MDSpec
+from bioml_tools.md.system_spec import MDSpec
 
-# Canonical production profile (Amber99SB-ILDN / TIP3P / cubic / 1.0 nm padding /
-# 0.150 M NaCl / 310 K / PME / 50k-iter minimization cap / 100+100+200 ps
-# equilibration / 200 ns production). Defined in bioml-tools 1.9.0.
-spec = MDSpec.from_profile(
-    ACTIVIN_E_PRODUCTION_PROFILE,
+# MDSpec owns the engine-neutral protocol fields. Construct it directly or
+# load a profile supplied by the consumer of bioml-tools.
+spec = MDSpec(
+    equilibration=(
+        {"name": "NVT", "ensemble": "NVT", "duration_ps": 100.0, "restraint_k": 1000.0},
+        {"name": "NPT-restrained", "ensemble": "NPT", "duration_ps": 100.0, "restraint_k": 100.0},
+        {"name": "NPT-free", "ensemble": "NPT", "duration_ps": 200.0, "restraint_k": 0.0},
+    ),
     receptor_pdb="receptor.pdb",
     peptide_pdb="peptide.pdb",
     output_dir="results/md/demo",
     target="demo",
     peptide_id="PEP001",
+    production_ns=200.0,
 )
 
 # Engine-specific overlays are passed via **engine_overrides; unknown
@@ -356,16 +412,18 @@ The allowlist on `**engine_overrides` is fail-closed: only
 production ns) live on the `MDSpec` and must be changed there, not
 via `from_md_spec`.
 
-### gmx_MMPBSA per-residue decomposition (slice 14)
+### gmx_MMPBSA per-residue decomposition
 
 `GmxMMPBSARunner` (in `biolab_runners.mmpbsa`) drives the
 [gmx_MMPBSA](https://github.com/Valdes-Tresanco-MS/gmx_MMPBSA) CLI
 for per-residue MM/PBSA decomposition of a finished MD trajectory.
 The runner is **opt-in** — when the binary is missing (no AmberTools
-install, no container), `run()` returns `status="unsupported"` and
-an empty `per_residue_records` list, not a fabricated value. This
-matches the slice-14 acceptance contract: missing optional tooling
-must not break the calling pipeline.
+installation and no executable wrapper), `run()` returns
+`status="unsupported"` and an empty `per_residue_records` list, not a
+fabricated value. A successful process with no required decomposition file
+returns `status="incomplete"`. The legacy dict keys remain available, with
+shared `execution_mode`, `artifacts`, `exit_code`, and `provenance` fields
+added.
 
 ```python
 from biolab_runners.mmpbsa import GmxMMPBSARunner, GmxMMPBSAStatus
@@ -382,24 +440,26 @@ config = OpenMMConfig(
 runner = GmxMMPBSARunner(
     config=config,
     prefix="demo_residue_decomposition",
-    mmpbsa_binary="gmx_MMPBSA",  # or "container://docker://valdes-tre/msdocker:latest"
+    mmpbsa_binary="gmx_MMPBSA",
 )
 result = runner.run()
 
 if result["status"] == GmxMMPBSAStatus.SUCCEEDED:
     for record in result["per_residue_records"]:
-        print(f"{record.residue} ({record.chain}): "
-              f"ΔG = {record.total_A:.2f} kcal/mol")
+        total = record["per_energy_term_A"]["total"]
+        print(f"{record['residue']} ({record['chain']}): "
+              f"ΔG = {total:.2f} kcal/mol")
 elif result["status"] == GmxMMPBSAStatus.UNSUPPORTED:
-    # gmx_MMPBSA not on PATH; slice 14 graceful-degradation path.
+    # gmx_MMPBSA not on PATH; optional-tool degradation path.
     logger.info("Per-residue decomposition skipped: gmx_MMPBSA not installed")
 ```
 
-The `mmpbsa_binary` accepts either a bare command name (PATH lookup)
-or a `container://<engine>://<image>` URL (delegated to whichever
-container runtime you've configured). `parse_residue_decomposition`
-exposes the per-residue `.dat` parser for direct use without
-re-running gmx_MMPBSA.
+The `mmpbsa_binary` accepts either a bare command name (PATH lookup) or a
+`container://<engine>://<image>` value. The latter is rejected before
+subprocess dispatch because this runner does not implement container launch;
+use a working executable wrapper instead.
+`parse_residue_decomposition` exposes the per-residue `.dat` parser for direct
+use without re-running gmx_MMPBSA.
 
 ## Quality Gates (Boltz-2)
 
@@ -443,21 +503,24 @@ pip install -e ".[all]"
 # Full validation gate (lint + type + complexity + tests)
 make validate
 
-# Auto-fix lint/format issues
+# Check lint/format (use `make format` to modify source files)
 make lint
 
 # Run tests only
 make test
 
-# Integration suite (gated by GPU + binary availability)
-# Verifies scientific contracts on real reference inputs:
+# Integration suite (optional tools skip; heavy GPU test is opt-in)
+# Verifies available scientific contracts on real reference inputs:
 #   - ProteinMPNN FASTA parser
 #   - GROMACS energy.xvg parser
 #   - OpenMM minimization physics on barnase chain A
 #   - OpenMM CUDA Plugin registration
 #   - OpenMMRunner construction smoke
 #   - Heavy runner pipeline (set BIOLAB_RUN_HEAVY_CUDA_TESTS=1 for 90-s CUDA end-to-end)
-pytest -m integration
+uv run pytest -m integration tests/integration/ -v
+
+# Markdown documentation gate
+make markdownlint
 ```
 
 See `docs/testing/scientific-validation.md` for the validation plan,

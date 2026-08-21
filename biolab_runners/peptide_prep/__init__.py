@@ -1,10 +1,8 @@
 """Peptide preparation runner.
 
-The ``biolab_runners.peptide_prep`` package is the cross-repo
-prerequisite for Activin CHEM-001 / E3. It owns the filesystem /
+The ``biolab_runners.peptide_prep`` package owns the filesystem /
 OpenMM / PDBFixer / ParmEd execution that turns a candidate
-peptide backbone + designed sequence into the per-candidate local
-artifacts E3 consumes:
+  peptide backbone + designed sequence into local artifacts:
 
 * ``prepared.pdb`` — minimized, hydrogen-complete structure.
 * ``prepared.top`` / ``prepared.gro`` — GROMACS export of the SAME
@@ -27,7 +25,7 @@ Public surface:
 The package MUST NOT runtime-import ``bioml_tools``. The
 :class:`PeptideTopologyDescriptor` field types are loose enough to
 accept the upstream ``bioml_tools.chem.cyclic_topology`` dataclasses
-WITHOUT importing them — Activin constructs those instances
+WITHOUT importing them — callers construct those instances
 itself and passes them in.
 """
 
@@ -46,7 +44,7 @@ from biolab_runners.peptide_prep.protocols import (
 )
 from biolab_runners.peptide_prep.runner import PeptidePrepResult, PeptidePrepRunner
 
-# Common alias used in the Activin orchestrator.
+# Compatibility alias retained for callers using the longer name.
 PeptidePrepTopologyDescriptor = PeptideTopologyDescriptor
 
 __all__ = [

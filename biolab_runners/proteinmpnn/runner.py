@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from biolab_runners.contracts import ArtifactReference, ExecutionMode, ExecutionStatus
 from biolab_runners.proteinmpnn.utils import (
     DesignRecord,
     DesignRecordStatus,
     _invoke_with_metadata,
+    build_invocation_command,
     parse_fasta_sequences,
 )
 from biolab_runners.provenance import (
@@ -45,12 +48,12 @@ EXCLUDED_FROM_EXECUTED_DIGEST: tuple[str, ...] = ()
 class ProteinMPNNResult:
     """Outcome of one or more ProteinMPNN sequence designs.
 
-    The ``provenance`` field carries the S2 reproducibility record
+    The ``provenance`` field carries the reproducibility record
     when the runner executed; the idempotent / dry-run paths
     initialise it to :data:`EMPTY_PROVENANCE`. ``provenance.canonical_output``
     is the tuple of raw FASTA sequences *before* any downstream
-    D-residue substitution (``chem_001``) — preserving the canonical
-    output is a hard requirement of the S2 plan.
+    D-residue substitution — preserving the canonical output keeps the
+    upstream result auditable.
     """
 
     name: str
@@ -62,6 +65,9 @@ class ProteinMPNNResult:
     exit_code: int = 0
     duration_seconds: float = 0.0
     provenance: ProvenanceMetadata = EMPTY_PROVENANCE
+    status: ExecutionStatus = ExecutionStatus.INCOMPLETE
+    artifacts: tuple[ArtifactReference, ...] = ()
+    execution_mode: ExecutionMode = ExecutionMode.SUBPROCESS
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the result into a JSON-safe dictionary."""
@@ -75,6 +81,9 @@ class ProteinMPNNResult:
             "exit_code": self.exit_code,
             "duration_seconds": self.duration_seconds,
             "provenance": self.provenance.to_dict(),
+            "status": self.status,
+            "artifacts": [artifact.to_dict() for artifact in self.artifacts],
+            "execution_mode": self.execution_mode,
         }
 
 
@@ -104,7 +113,7 @@ class ProteinMPNNRunner:
         target = self._design_dir(config, input_pdb)
         if not target.exists():
             return False
-        return any(target.glob("*.fa"))
+        return bool(_fasta_paths(target))
 
     def run(
         self,
@@ -135,30 +144,34 @@ class ProteinMPNNRunner:
 
         Returns:
             :class:`ProteinMPNNResult` with parsed records, exit code,
-            duration, and S2 provenance. ``provenance.canonical_output``
+            duration, and shared provenance. ``provenance.canonical_output``
             holds the raw FASTA sequences *before* downstream
-            D-residue substitution — that is the S2 contract.
+            D-residue substitution — that is the shared provenance contract.
         """
         # Canonicalise the caller-supplied image digest BEFORE any
         # subprocess work so downstream manifest comparison sees a
         # single form regardless of how the caller wrote it.
         image_digest = validate_image_digest(image_digest)
-
         cfg = config or self._config_override
         if cfg is None:
             raise ValueError("ProteinMPNNConfig is required: pass it to run() or the runner")
+        binary_prefix = _effective_binary_prefix(self._binary_prefix)
+        execution_mode = _execution_mode(binary_prefix)
 
         output_dir = self._design_dir(cfg, input_pdb)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         if not force and self.is_complete(cfg, input_pdb):
             records = _parse_records(output_dir)
+            status = _status_from_records(0, records, cached=True)
+            artifacts = _artifacts_for_records(records, output_dir)
+            succeeded, failed = _record_counts(records)
             return ProteinMPNNResult(
                 name=cfg.name,
                 output_dir=str(output_dir),
                 records=records,
-                succeeded=len(records),
-                failed=0,
+                succeeded=succeeded,
+                failed=failed,
                 skipped=len(records),
                 exit_code=0,
                 duration_seconds=0.0,
@@ -172,11 +185,24 @@ class ProteinMPNNRunner:
                     image_digest=image_digest,
                     executed=False,
                     cache_hit=True,
+                    status=status,
+                    artifacts=artifacts,
+                    execution_mode=execution_mode,
                 ),
+                status=status,
+                artifacts=artifacts,
+                execution_mode=execution_mode,
             )
 
         config_dict = _config_to_cli(cfg, input_pdb)
+        intended_command = build_invocation_command(
+            config_dict=config_dict,
+            input_pdb=input_pdb,
+            output_dir=output_dir,
+            binary_prefix=binary_prefix,
+        )
         if dry_run:
+            status = ExecutionStatus.DRY_RUN
             return ProteinMPNNResult(
                 name=cfg.name,
                 output_dir=str(output_dir),
@@ -196,7 +222,12 @@ class ProteinMPNNRunner:
                     image_digest=image_digest,
                     executed=False,
                     cache_hit=False,
+                    status=status,
+                    execution_mode=execution_mode,
+                    command=intended_command,
                 ),
+                status=status,
+                execution_mode=execution_mode,
             )
 
         import time
@@ -206,12 +237,14 @@ class ProteinMPNNRunner:
             config_dict=config_dict,
             input_pdb=input_pdb,
             output_dir=output_dir,
-            binary_prefix=self._binary_prefix,
+            binary_prefix=binary_prefix,
             timeout_seconds=self._timeout_seconds,
         )
         records = _parse_records(output_dir)
         succeeded = sum(1 for r in records if r.status == DesignRecordStatus.SUCCEEDED)
         failed = len(records) - succeeded
+        status = _status_from_records(result.exit_code, records)
+        artifacts = _artifacts_for_records(records, output_dir)
         return ProteinMPNNResult(
             name=cfg.name,
             output_dir=str(output_dir),
@@ -231,7 +264,14 @@ class ProteinMPNNRunner:
                 image_digest=image_digest,
                 executed=True,
                 cache_hit=False,
+                status=status,
+                artifacts=artifacts,
+                execution_mode=execution_mode,
+                command=result.command or intended_command,
             ),
+            status=status,
+            artifacts=artifacts,
+            execution_mode=execution_mode,
         )
 
     def run_batch(
@@ -264,12 +304,16 @@ class ProteinMPNNRunner:
         image_digest: str | None,
         executed: bool,
         cache_hit: bool,
+        status: ExecutionStatus = ExecutionStatus.SUCCEEDED,
+        artifacts: tuple[ArtifactReference, ...] = (),
+        execution_mode: ExecutionMode = ExecutionMode.SUBPROCESS,
+        command: tuple[str, ...] = (),
     ) -> ProvenanceMetadata:
-        """Assemble the S2 provenance record for a ProteinMPNN run.
+        """Assemble the provenance record for a ProteinMPNN run.
 
         ``canonical_output`` captures the raw FASTA sequences *before*
-        the downstream ``chem_001`` D-residue rewrite. Preserving the
-        canonical output is the S2 contract — once ``chem_001`` runs,
+        the downstream D-residue rewrite. Preserving the canonical
+        output is the provenance contract — once downstream chemistry runs,
         the raw sequences are lost from the design path but must
         remain visible in the manifest for audit.
 
@@ -299,6 +343,11 @@ class ProteinMPNNRunner:
             else None,
             executed=executed,
             cache_hit=cache_hit,
+            runner_name="proteinmpnn",
+            execution_mode=execution_mode,
+            status=status,
+            artifacts=artifacts,
+            command=command,
         )
 
 
@@ -325,7 +374,7 @@ def _config_to_cli(config: ProteinMPNNConfig, input_pdb: Path) -> dict[str, str]
 def _parse_records(output_dir: Path) -> tuple[DesignRecord, ...]:
     """Parse every FASTA in ``output_dir`` into a :class:`DesignRecord`."""
     records: list[DesignRecord] = []
-    for path in sorted(output_dir.glob("*.fa")):
+    for path in _fasta_paths(output_dir):
         try:
             fasta = parse_fasta_sequences(path)
         except (OSError, UnicodeDecodeError) as exc:
@@ -353,3 +402,66 @@ def _parse_records(output_dir: Path) -> tuple[DesignRecord, ...]:
             )
             _ = record_index
     return tuple(records)
+
+
+def _artifacts_for_records(
+    records: tuple[DesignRecord, ...], output_dir: Path | None = None
+) -> tuple[ArtifactReference, ...]:
+    """Describe parsed FASTA outputs without fabricating absent files."""
+    return tuple(
+        ArtifactReference.from_path(record.path, kind="sequence", root=output_dir)
+        for record in records
+        if record.path and not Path(record.path).is_symlink()
+    )
+
+
+def _fasta_paths(output_dir: Path) -> tuple[Path, ...]:
+    """Return legacy top-level and stock ``seqs/`` FASTA outputs."""
+    return tuple(
+        sorted(
+            path
+            for path in {*output_dir.glob("*.fa"), *output_dir.glob("seqs/*.fa")}
+            if not path.is_symlink()
+        )
+    )
+
+
+def _status_from_records(
+    exit_code: int,
+    records: tuple[DesignRecord, ...],
+    *,
+    cached: bool = False,
+) -> ExecutionStatus:
+    """Map legacy ProteinMPNN result fields to the shared status vocabulary."""
+    if exit_code == 124:
+        return ExecutionStatus.TIMEOUT
+    if exit_code < 0:
+        return ExecutionStatus.INTERRUPTED
+    if exit_code != 0:
+        return ExecutionStatus.FAILED
+    if not records:
+        return ExecutionStatus.INCOMPLETE
+    if any(record.status != DesignRecordStatus.SUCCEEDED for record in records):
+        return ExecutionStatus.MALFORMED
+    return ExecutionStatus.CACHED if cached else ExecutionStatus.SUCCEEDED
+
+
+def _record_counts(records: tuple[DesignRecord, ...]) -> tuple[int, int]:
+    """Count records by their parsed status for cache accounting."""
+    succeeded = sum(1 for record in records if record.status == DesignRecordStatus.SUCCEEDED)
+    failed = sum(1 for record in records if record.status != DesignRecordStatus.SUCCEEDED)
+    return succeeded, failed
+
+
+def _execution_mode(binary_prefix: list[str] | None) -> ExecutionMode:
+    """Identify direct or container-backed ProteinMPNN execution."""
+    if binary_prefix and any(token.startswith("container://") for token in binary_prefix):
+        return ExecutionMode.CONTAINER_URI
+    return ExecutionMode.SUBPROCESS
+
+
+def _effective_binary_prefix(binary_prefix: list[str] | None) -> list[str]:
+    """Resolve the command prefix used for dispatch and mode reporting."""
+    if binary_prefix is not None:
+        return list(binary_prefix)
+    return [os.environ.get("PROTEINMPNN_BIN", "proteinmpnn")]

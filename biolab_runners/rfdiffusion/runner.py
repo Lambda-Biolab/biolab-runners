@@ -13,7 +13,7 @@ CLI. The runner owns:
   layout and cache key" below);
 * ``force`` to bypass idempotency;
 * structured result parsing into :class:`RecordData` objects;
-* S2 provenance — every invocation attaches a
+* Shared provenance — every invocation attaches a
   :class:`biolab_runners.provenance.ProvenanceMetadata` record so
   downstream consumers can audit the inputs.
 
@@ -50,7 +50,7 @@ Output layout and cache key:
 * **Cache identity binding is what it covers.** When ``image_digest``
   is absent the identity has no image binding — two local runs with
   the same config and source but different container images could
-  cross-hit. This is a documented local-compat limitation; Activin
+  cross-hit. This is a documented local-compatibility limitation; callers
   production supplies ``image_digest``, which makes the binding
   complete. A set-but-missing ``target_pdb`` is a hard error at
   run time (fail closed): the file is forwarded as
@@ -80,7 +80,7 @@ Output layout and cache key:
   runs or replicas must vary ``seed`` explicitly — each seed also
   gets its own identity-keyed output directory.
 
-Notes on seed / temperature forwarding (S2 honesty):
+Notes on seed / temperature forwarding:
 
 * Stock upstream RFdiffusion has **no** ``inference.seed`` key —
   ``config/inference/base.yaml`` defines ``inference.deterministic``
@@ -159,7 +159,7 @@ Notes on seed / temperature forwarding (S2 honesty):
   downstream topology intent, applied and validated by
   ``biolab_runners.peptide_prep`` — not by RFdiffusion.
 
-Notes on cache hits (S2 honesty):
+Notes on cache hits:
 
 * On the idempotent path the runner returns existing files without
   invoking upstream. The provenance record sets ``executed=False``
@@ -186,6 +186,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from biolab_runners.contracts import ArtifactReference, ExecutionMode, ExecutionStatus
 from biolab_runners.provenance import (
     EMPTY_PROVENANCE,
     RNG_INTENT_NON_DETERMINISTIC,
@@ -250,7 +251,7 @@ def _cache_identity_token(config: RFdiffusionConfig, *, image_digest: str | None
        invalidates the cache;
     3. the **normalized** image digest, when the caller supplied one
        (``None``/absent → the identity has no image binding — local
-       compatibility; Activin production supplies it);
+       compatibility; production supplies it);
     4. the content digest of ``target_pdb`` **when set** (the file
        must exist — ``run()``/``is_complete()`` fail closed
        otherwise; an empty ``target_pdb`` is unconditional
@@ -328,7 +329,7 @@ class RFdiffusionResult:
     it to 1 (honest — a bad cache entry is not success). On the
     execute path ``exit_code`` is the upstream subprocess exit code.
 
-    The ``provenance`` field carries the S2 reproducibility record
+    The ``provenance`` field carries the reproducibility record
     when the runner executed; the idempotent / dry-run / error
     paths initialise it to :data:`EMPTY_PROVENANCE` so the field is
     always present and the JSON serialisation is stable.
@@ -343,6 +344,9 @@ class RFdiffusionResult:
     exit_code: int = 0
     duration_seconds: float = 0.0
     provenance: ProvenanceMetadata = EMPTY_PROVENANCE
+    status: ExecutionStatus = ExecutionStatus.INCOMPLETE
+    artifacts: tuple[ArtifactReference, ...] = ()
+    execution_mode: ExecutionMode = ExecutionMode.SUBPROCESS
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the result into a JSON-safe dictionary."""
@@ -356,6 +360,9 @@ class RFdiffusionResult:
             "exit_code": self.exit_code,
             "duration_seconds": self.duration_seconds,
             "provenance": self.provenance.to_dict(),
+            "status": self.status,
+            "artifacts": [artifact.to_dict() for artifact in self.artifacts],
+            "execution_mode": self.execution_mode,
         }
 
 
@@ -426,7 +433,7 @@ class RFdiffusionRunner:
 
         Returns:
             :class:`RFdiffusionResult` with parsed records, exit code,
-            duration, and S2 provenance.
+            duration, and shared provenance.
 
         The cache is keyed by the canonical identity over the full
         requested-config digest + the derived execution payload
@@ -465,6 +472,8 @@ class RFdiffusionRunner:
             # is usable.
             exit_code = 1 if failed else 0
             failure_reason = f"{failed} cached record(s) failed to parse" if failed else ""
+            status = _cache_status(failed)
+            artifacts = _artifacts_for_records(records)
             return RFdiffusionResult(
                 name=cfg.name,
                 output_dir=str(design_dir),
@@ -482,11 +491,17 @@ class RFdiffusionRunner:
                     image_digest=image_digest,
                     executed=False,
                     cache_hit=True,
+                    status=status,
+                    artifacts=artifacts,
                 ),
+                status=status,
+                artifacts=artifacts,
+                execution_mode=ExecutionMode.SUBPROCESS,
             )
 
         config_dict = _config_to_cli(cfg)
         if dry_run:
+            status = ExecutionStatus.DRY_RUN
             return RFdiffusionResult(
                 name=cfg.name,
                 output_dir=str(design_dir),
@@ -504,7 +519,10 @@ class RFdiffusionRunner:
                     image_digest=image_digest,
                     executed=False,
                     cache_hit=False,
+                    status=status,
                 ),
+                status=status,
+                execution_mode=ExecutionMode.SUBPROCESS,
             )
 
         started = time.monotonic()
@@ -517,6 +535,8 @@ class RFdiffusionRunner:
         records = _parse_output_dir(design_dir, chains=cfg.design_chains)
         succeeded = sum(1 for r in records if r.status == RecordDataStatus.SUCCEEDED)
         failed = len(records) - succeeded
+        status = _status_from_invocation(result.exit_code, records)
+        artifacts = _artifacts_for_records(records)
         return RFdiffusionResult(
             name=cfg.name,
             output_dir=str(design_dir),
@@ -534,7 +554,12 @@ class RFdiffusionRunner:
                 image_digest=image_digest,
                 executed=True,
                 cache_hit=False,
+                status=status,
+                artifacts=artifacts,
             ),
+            status=status,
+            artifacts=artifacts,
+            execution_mode=ExecutionMode.SUBPROCESS,
         )
 
     def _design_dir(self, config: RFdiffusionConfig, *, image_digest: str | None = None) -> Path:
@@ -564,8 +589,10 @@ class RFdiffusionRunner:
         image_digest: str | None,
         executed: bool,
         cache_hit: bool,
+        status: ExecutionStatus = ExecutionStatus.SUCCEEDED,
+        artifacts: tuple[ArtifactReference, ...] = (),
     ) -> ProvenanceMetadata:
-        """Assemble the S2 provenance record for ``cfg``.
+        """Assemble the provenance record for ``cfg``.
 
         The ``target_pdb`` field on the config is the source backbone
         for RFdiffusion; its content digest is recorded as
@@ -599,6 +626,10 @@ class RFdiffusionRunner:
             executed_config_digest=_executed_digest(cfg) if executed else None,
             executed=executed,
             cache_hit=cache_hit,
+            runner_name="rfdiffusion",
+            execution_mode=ExecutionMode.SUBPROCESS,
+            status=status,
+            artifacts=artifacts,
         )
 
 
@@ -698,6 +729,37 @@ def _config_to_cli(config: RFdiffusionConfig) -> dict[str, str]:
     for key, value in config.extra.items():
         payload[key] = str(value)
     return payload
+
+
+def _artifacts_for_records(records: tuple[RecordData, ...]) -> tuple[ArtifactReference, ...]:
+    """Describe parsed PDB outputs without inventing missing artifacts."""
+    return tuple(
+        ArtifactReference.from_path(record.path, kind="structure")
+        for record in records
+        if record.path
+    )
+
+
+def _status_from_invocation(exit_code: int, records: tuple[RecordData, ...]) -> ExecutionStatus:
+    """Map the legacy exit/parse surface to the shared status vocabulary."""
+    if exit_code == 124:
+        return ExecutionStatus.TIMEOUT
+    if exit_code < 0:
+        return ExecutionStatus.INTERRUPTED
+    if exit_code != 0:
+        return ExecutionStatus.FAILED
+    if not records:
+        return ExecutionStatus.INCOMPLETE
+    if any(record.status != RecordDataStatus.SUCCEEDED for record in records):
+        return ExecutionStatus.MALFORMED
+    return ExecutionStatus.SUCCEEDED
+
+
+def _cache_status(failed: int) -> ExecutionStatus:
+    """Return the cache status without conflating parse failure and reuse."""
+    if failed:
+        return ExecutionStatus.MALFORMED
+    return ExecutionStatus.CACHED
 
 
 #: Matches upstream's output naming ``<prefix>_<i_des>.pdb`` where

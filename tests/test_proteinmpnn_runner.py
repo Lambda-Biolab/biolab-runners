@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import unittest.mock as mock_mod
 from pathlib import Path
 from typing import Any
@@ -119,6 +120,38 @@ def test_proteinmpnn_available_returns_false_when_binary_missing(
 ) -> None:
     monkeypatch.setenv("PROTEINMPNN_BIN", "/nonexistent/proteinmpnn")
     assert proteinmpnn_available() is False
+
+
+def test_container_uri_is_rejected_before_proteinmpnn_dispatch(
+    output_root: Path, pdb_input: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PROTEINMPNN_BIN", "container://proteinmpnn:latest")
+    runner = ProteinMPNNRunner(output_root=output_root)
+
+    with pytest.raises(ValueError, match="container://"):
+        runner.run(pdb_input, ProteinMPNNConfig())
+
+
+def test_custom_binary_prefix_overrides_container_environment(
+    output_root: Path, pdb_input: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: list[list[str] | None] = []
+
+    def fake_invoke(**kwargs: Any) -> InvokeResult:
+        captured.append(kwargs["binary_prefix"])
+        return InvokeResult(exit_code=0, command=("proteinmpnn-local",))
+
+    monkeypatch.setenv("PROTEINMPNN_BIN", "container://proteinmpnn:latest")
+    monkeypatch.setattr("biolab_runners.proteinmpnn.runner._invoke_with_metadata", fake_invoke)
+
+    result = ProteinMPNNRunner(
+        output_root=output_root,
+        binary_prefix=["proteinmpnn-local"],
+    ).run(pdb_input, ProteinMPNNConfig())
+
+    assert captured == [["proteinmpnn-local"]]
+    assert result.execution_mode.value == "subprocess"
+    assert result.provenance.command == ("proteinmpnn-local",)
 
 
 def test_invoke_result_round_trips_through_dataclass() -> None:
@@ -311,6 +344,84 @@ def test_runner_idempotent_when_fasta_exists(
     result = runner.run(pdb_input, ProteinMPNNConfig(name=name))
     assert result.skipped == 4
     assert result.succeeded == 4
+
+
+def test_runner_reads_stock_seq_directory_layout(
+    output_root: Path, pdb_input: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("biolab_runners.proteinmpnn.runner._invoke_with_metadata", _fake_invoke_ok)
+    config = ProteinMPNNConfig(name="stock")
+    design_dir = output_root / config.name / pdb_input.stem
+    (design_dir / "seqs").mkdir(parents=True)
+    (design_dir / "seqs" / f"{pdb_input.stem}.fa").write_text(SAMPLE_FASTA)
+
+    result = ProteinMPNNRunner(output_root=output_root).run(pdb_input, config)
+
+    assert result.status.value == "cached"
+    assert result.skipped == 4
+    assert {Path(record.path).parent.name for record in result.records} == {"seqs"}
+
+
+def test_runner_cache_counters_reflect_malformed_records(
+    output_root: Path, pdb_input: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = ProteinMPNNConfig(name="malformed-cache")
+    design_dir = output_root / config.name / pdb_input.stem
+    design_dir.mkdir(parents=True)
+    fasta = design_dir / "cached.fa"
+    fasta.write_text(SAMPLE_FASTA)
+    monkeypatch.setattr(
+        "biolab_runners.proteinmpnn.runner.parse_fasta_sequences",
+        mock_mod.Mock(side_effect=OSError("corrupt FASTA")),
+    )
+
+    result = ProteinMPNNRunner(output_root=output_root).run(pdb_input, config)
+
+    assert result.status.value == "malformed"
+    assert result.succeeded == 0
+    assert result.failed == 1
+    assert result.skipped == 1
+
+
+def test_runner_fake_upstream_e2e_reads_stock_layout(output_root: Path, pdb_input: Path) -> None:
+    script = output_root.parent / "fake_proteinmpnn.py"
+    script.write_text(
+        "from pathlib import Path\n"
+        "import sys\n"
+        "args = sys.argv[1:]\n"
+        "out = Path(args[args.index('--output_path') + 1]) / 'seqs'\n"
+        "out.mkdir(parents=True, exist_ok=True)\n"
+        f"(out / 'stock.fa').write_text({SAMPLE_FASTA!r})\n"
+    )
+
+    result = ProteinMPNNRunner(
+        output_root=output_root,
+        binary_prefix=[sys.executable, str(script)],
+    ).run(pdb_input, ProteinMPNNConfig(name="e2e"))
+
+    assert result.status.value == "succeeded"
+    assert result.succeeded == 4
+    assert result.provenance.executed is True
+    assert result.provenance.command[:2] == (sys.executable, str(script))
+
+
+def test_proteinmpnn_cli_does_not_abbreviate_flags() -> None:
+    from biolab_runners.proteinmpnn.cli import translate_runner_args
+
+    translated = translate_runner_args(
+        [
+            "--input_path",
+            "/tmp/input",
+            "--output_path",
+            "/tmp/output",
+            "--pdb_path",
+            "backbone.pdb",
+            "--sampling_te",
+            "0.2",
+        ]
+    )
+
+    assert translated[-2:] == ["--sampling_te", "0.2"]
 
 
 def test_runner_force_re_runs(

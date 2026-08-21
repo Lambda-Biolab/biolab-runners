@@ -19,6 +19,8 @@ requiring an AmberTools install.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
+from unittest.mock import Mock
 
 import pytest
 from biolab_runners.mmpbsa import (
@@ -38,6 +40,34 @@ def _make_config(tmp_path: Path) -> OpenMMConfig:
         peptide_pdb="pep.pdb",
         output_dir=str(tmp_path),
     )
+
+
+def test_executed_provenance_binds_receptor_and_peptide_contents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    receptor = tmp_path / "receptor.pdb"
+    peptide = tmp_path / "peptide.pdb"
+    receptor.write_text("receptor-v1")
+    peptide.write_text("peptide-v1")
+    config = OpenMMConfig(
+        receptor_pdb=str(receptor),
+        peptide_pdb=str(peptide),
+        output_dir=str(tmp_path),
+    )
+    monkeypatch.setattr("biolab_runners.mmpbsa.utils.gmx_mmpbsa_available", lambda **_: True)
+    monkeypatch.setattr(
+        "subprocess.run", lambda *args, **kwargs: Mock(returncode=9, stdout="", stderr="failed")
+    )
+
+    first = GmxMMPBSARunner(config=config, prefix="run").run()
+    peptide.write_text("peptide-v2")
+    second = GmxMMPBSARunner(config=config, prefix="run").run()
+
+    assert first["status"] == GmxMMPBSAStatus.FAILED
+    first_provenance = cast("dict[str, object]", first["provenance"])
+    second_provenance = cast("dict[str, object]", second["provenance"])
+    assert first_provenance["executed"] is True
+    assert first_provenance["executed_config_digest"] != second_provenance["executed_config_digest"]
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +186,37 @@ class TestRunnerUnsupported:
         assert result["status"] == GmxMMPBSAStatus.UNSUPPORTED
         assert result["per_residue_records"] == []
         assert "__nonexistent-binary-for-test__" in str(result.get("error", ""))
+
+    def test_container_uri_is_rejected_before_subprocess(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = _make_config(tmp_path)
+        runner = GmxMMPBSARunner(
+            config=config,
+            prefix="run",
+            mmpbsa_binary="container://ambertools/mmpbsa",
+        )
+        monkeypatch.setattr("subprocess.run", Mock(side_effect=AssertionError("invoked")))
+
+        result = runner.run()
+
+        assert result["status"] == GmxMMPBSAStatus.UNSUPPORTED
+        assert result["execution_mode"] == "container_uri"
+        assert result["exit_code"] == 127
+
+    def test_nonzero_exit_code_is_preserved(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = _make_config(tmp_path)
+        runner = GmxMMPBSARunner(config=config, prefix="run", mmpbsa_binary="gmx_MMPBSA")
+        monkeypatch.setattr("biolab_runners.mmpbsa.utils.gmx_mmpbsa_available", lambda **_: True)
+        completed = Mock(returncode=9, stdout="", stderr="failed")
+        monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: completed)
+
+        result = runner.run()
+
+        assert result["status"] == GmxMMPBSAStatus.FAILED
+        assert result["exit_code"] == 9
 
 
 class TestRunnerStatusConstants:

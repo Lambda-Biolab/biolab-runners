@@ -1,7 +1,7 @@
 [project]
 name = "biolab-runners"
-version = "0.5.0"
-description = "Standalone modular runners for Boltz-2 structure prediction and OpenMM MD simulations"
+version = "0.6.0"
+description = "Standalone modular scientific runners with shared execution contracts"
 requires-python = ">=3.11"
 authors = [{ name = "Lambda-Biolab" }]
 license = { text = "Apache-2.0" }
@@ -26,6 +26,7 @@ dependencies = []
 # into Hydra positional overrides for the upstream
 # ``scripts/run_inference.py`` located under ``RFDIFFUSION_HOME``.
 rfdiffusion = "biolab_runners.rfdiffusion.cli:main"
+proteinmpnn = "biolab_runners.proteinmpnn.cli:main"
 
 [project.optional-dependencies]
 boltz2 = [

@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from biolab_runners.contracts import RunnerUnavailableError
 from biolab_runners.rosetta import (
     METRIC_ALIASES,
     ConstrainedRelaxOptions,
@@ -722,6 +723,16 @@ def test_invoke_string_value_emits_single_argv_token(tmp_path: Path) -> None:
     assert captured_argv[nidx + 1] == "3"
 
 
+def test_invoke_maps_missing_executable_to_typed_error(tmp_path: Path) -> None:
+    with mock_mod.patch("subprocess.run", side_effect=FileNotFoundError("missing")):
+        with pytest.raises(RunnerUnavailableError, match="Rosetta executable unavailable"):
+            invoke(
+                config={"nstruct": "1"},
+                output_dir=tmp_path,
+                binary_prefix=["missing-rosetta"],
+            )
+
+
 # ---------------------------------------------------------------------------
 # config -> CLI translation
 # ---------------------------------------------------------------------------
@@ -956,6 +967,53 @@ def test_runner_dry_run_does_not_invoke(tmp_path: Path, monkeypatch: pytest.Monk
     assert result.exit_code == 0
 
 
+def test_runner_direct_prefix_overrides_container_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ROSETTA_BIN", "container://rosetta:latest")
+    result = RosettaRunner(
+        output_root=tmp_path,
+        config=_valid_config(name="direct"),
+        binary_prefix=["rosetta-custom"],
+    ).run(dry_run=True)
+
+    assert result.execution_mode.value == "subprocess"
+    assert result.provenance.execution_mode == "subprocess"
+    assert result.provenance.command[0] == "rosetta-custom"
+
+
+def test_runner_container_uri_environment_uses_resolved_runtime_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ROSETTA_BIN", "container://rosetta:latest")
+    monkeypatch.setenv("CONTAINER_RUNTIME", "podman")
+    result = RosettaRunner(output_root=tmp_path, config=_valid_config(name="container")).run(
+        dry_run=True
+    )
+
+    assert result.execution_mode.value == "container_uri"
+    assert result.provenance.execution_mode == "container_uri"
+    assert result.provenance.command[:2] == ("podman", "run")
+
+
+def test_runner_explicit_container_runtime_prefix_reports_container_mode(tmp_path: Path) -> None:
+    result = RosettaRunner(
+        output_root=tmp_path,
+        config=_valid_config(name="explicit-container"),
+        binary_prefix=["/usr/bin/docker", "run", "--rm", "rosetta:latest", "rosetta_scripts"],
+    ).run(dry_run=True)
+
+    assert result.execution_mode.value == "container_uri"
+    assert result.provenance.execution_mode == "container_uri"
+    assert result.provenance.command[:5] == (
+        "/usr/bin/docker",
+        "run",
+        "--rm",
+        "rosetta:latest",
+        "rosetta_scripts",
+    )
+
+
 def test_runner_idempotent_when_score_exists(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -970,11 +1028,14 @@ def test_runner_idempotent_when_score_exists(
     (design_dir / "score.sc").write_text(SCORE_FULL_CANONICAL)
 
     config = _valid_config(name=name, output_dir=str(design_dir))
-    runner = RosettaRunner(output_root=tmp_path, config=config)
+    monkeypatch.setenv("ROSETTA_BIN", "container://rosetta:latest")
+    runner = RosettaRunner(output_root=tmp_path, config=config, binary_prefix=["rosetta-custom"])
     result = runner.run(config)
     assert result.skipped == 1
     assert result.records[0].total_score == pytest.approx(-123.456)
     assert result.records[0].score.total_score == pytest.approx(-123.456)
+    assert result.execution_mode.value == "subprocess"
+    assert result.provenance.execution_mode == "subprocess"
 
 
 def test_runner_records_per_design(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -986,11 +1047,14 @@ def test_runner_records_per_design(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     runner = RosettaRunner(
         output_root=tmp_path,
         config=_valid_config(name="batch", output_dir=str(tmp_path / "batch-output")),
+        binary_prefix=["rosetta-custom"],
     )
     result = runner.run()
     assert result.succeeded == 1
     assert result.records[0].total_score == pytest.approx(-123.456)
     assert result.records[0].score.interface_dSASA == pytest.approx(-212.004)
+    assert result.execution_mode.value == "subprocess"
+    assert result.provenance.execution_mode == "subprocess"
 
 
 def test_runner_uses_configured_output_dir_for_invocation_and_parsing(

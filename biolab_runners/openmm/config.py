@@ -160,7 +160,7 @@ class OpenMMConfig:
     # ``"amber14/tip3p.xml"`` for a water+ions bundle, or leave empty
     # and biolab-runners will fall back to ``{water_model}.xml``
     # (appropriate for CHARMM where the ion templates ship with the
-    # protein XML). OralBiome-AMP's Aib preprocessing sets this via
+    # protein XML). A caller's residue preprocessing can set this via
     # ``force_fields.water_ff_xml`` — see ``augment_system_config_for_aib``.
     water_ff_xml: str = ""
     extra_forcefields: list[str] = field(default_factory=list)

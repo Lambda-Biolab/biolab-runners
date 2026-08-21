@@ -129,7 +129,7 @@ def _find_structure_file(output_dir: Path) -> str:
     sibling file like ``*_model_0.no_caps_backup.pdb`` or
     ``*_model_0_preminimize.pdb``. Those sibling files sort before the
     canonical ``_model_0.pdb`` in a naive alphabetical glob
-    (``n`` < ``p`` in ASCII), which previously caused OralBiome-AMP's
+    (``n`` < ``p`` in ASCII), which previously caused a downstream
     MD stage to re-extract the peptide chain from a pre-cap backup
     after the cohort had been re-predicted with the correct caps —
     producing silently-wrong-molecule Stage-2 verdicts.

@@ -1,6 +1,6 @@
 """Real sequence mutation via PDBFixer.applyMutations.
 
-The CHEM-001 contract requires that an arbitrary same-length
+The preparation contract requires that an arbitrary same-length
 ProteinMPNN sequence becomes a real all-atom per-candidate structure
 on the backbone — NOT a residue-label-only mutation. The previous
 runner renamed ``residue.name`` in place which silently produced

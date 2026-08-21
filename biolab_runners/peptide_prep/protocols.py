@@ -56,7 +56,7 @@ class CoordinateTransformer(Protocol):
     itself (DALA, DLEU, etc.) OR from external state — the runner
     supplies the mapping and asks for the mapping back; the callable
     is free to apply D / not based on whatever heuristic the
-    Activin-side D-detection uses.
+    caller-side D-detection uses.
 
     The runner accepts the returned value as EITHER a bare dict
     (``{atom_name: (x, y, z)}``) OR a :class:`CoordinateTransformResult`
@@ -180,7 +180,7 @@ class ChiralityValidator(Protocol):
     """Validate the chirality of every non-Gly residue in a peptide.
 
     The runner calls the validator THREE times per non-Gly residue
-    (the explicit ``stage=`` kwarg names which), per CHEM-001:
+    (the explicit ``stage=`` kwarg names which):
 
     * ``stage="post_h"`` — post-hydrogenation, pre-D-transform.
       Side-chain / head-N-H orientation that the hydrogen-add
@@ -205,7 +205,7 @@ class ChiralityValidator(Protocol):
     — not as an uncaught exception that escapes the orchestrator.
 
     Any ``ChiralityReport`` with ``valid=False`` fails the run —
-    the runner does NOT waive failures (per the CHEM-001 contract
+    the runner does NOT waive failures (per the preparation contract
     that every residue either passes validation or the run is
     reported as invalid).
 

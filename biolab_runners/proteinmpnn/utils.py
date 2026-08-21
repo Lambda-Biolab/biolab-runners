@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import re
 import shutil
@@ -10,6 +11,11 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from biolab_runners.contracts import (
+    RunnerInvocationError,
+    RunnerTimeoutError,
+    RunnerUnavailableError,
+)
 from biolab_runners.provenance import InvokeResult, stderr_tail
 
 if TYPE_CHECKING:
@@ -20,6 +26,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "DesignRecord",
     "DesignRecordStatus",
+    "build_invocation_command",
     "invoke",
     "parse_fasta_sequences",
     "proteinmpnn_available",
@@ -65,7 +72,7 @@ def proteinmpnn_available(timeout_seconds: int = 30) -> bool:
 
     binary = os.environ.get("PROTEINMPNN_BIN", "proteinmpnn")
     if binary.startswith("container://"):
-        return True
+        return False
     if shutil.which(binary) is None:
         return False
     try:
@@ -87,16 +94,10 @@ def _resolved_binary() -> list[str]:
 
     binary = os.environ.get("PROTEINMPNN_BIN", "proteinmpnn")
     if binary.startswith("container://"):
-        spec = binary[len("container://") :]
-        runtime = os.environ.get("CONTAINER_RUNTIME", "docker")
-        return [
-            runtime,
-            "run",
-            "--rm",
-            spec,
-            "python",
-            "/app/ProteinMPNN/protein_mpnn_run.py",
-        ]
+        raise ValueError(
+            "ProteinMPNN container:// execution is unsupported; "
+            "configure PROTEINMPNN_BIN with the proteinmpnn adapter or an executable wrapper"
+        )
     return [binary]
 
 
@@ -109,6 +110,35 @@ def parse_fasta_sequences(path: Path) -> list[tuple[str, str]]:
     """
     lines = path.read_text().splitlines()
     return _parse_fasta_lines(lines)
+
+
+def build_invocation_command(
+    *,
+    config_dict: dict[str, str],
+    input_pdb: Path,
+    output_dir: Path,
+    binary_prefix: list[str] | None = None,
+) -> tuple[str, ...]:
+    """Build the exact argv payload sent to ProteinMPNN."""
+    prefix = binary_prefix if binary_prefix is not None else _resolved_binary()
+    if any(token.startswith("container://") for token in prefix):
+        raise ValueError(
+            "ProteinMPNN container:// execution is unsupported; "
+            "configure binary_prefix with an executable command"
+        )
+    extra_args: list[str] = []
+    for key, value in config_dict.items():
+        extra_args.extend((f"--{key}", str(value)))
+    return (
+        *prefix,
+        "--input_path",
+        str(input_pdb.parent),
+        "--output_path",
+        str(output_dir),
+        "--batch_size",
+        "1",
+        *extra_args,
+    )
 
 
 def _parse_fasta_lines(lines: list[str]) -> list[tuple[str, str]]:
@@ -152,25 +182,19 @@ def _invoke_with_metadata(
     Returns an :class:`InvokeResult` carrying the exit code, a
     512-char stderr tail, the timeout flag, and a short failure
     reason. Public callers use the legacy :func:`invoke` wrapper
-    (which discards everything except the exit code); the S2
+    (which discards everything except the exit code); the provenance
     provenance wiring uses this helper directly.
     """
     prefix = binary_prefix if binary_prefix is not None else _resolved_binary()
     output_dir.mkdir(parents=True, exist_ok=True)
-    extra_args: list[str] = []
-    for key, value in config_dict.items():
-        extra_args.append(f"--{key}")
-        extra_args.append(str(value))
-    args = [
-        *prefix,
-        "--input_path",
-        str(input_pdb.parent),
-        "--output_path",
-        str(output_dir),
-        "--batch_size",
-        "1",
-        *extra_args,
-    ]
+    args = list(
+        build_invocation_command(
+            config_dict=config_dict,
+            input_pdb=input_pdb,
+            output_dir=output_dir,
+            binary_prefix=prefix,
+        )
+    )
     started = time.monotonic()
     try:
         completed = subprocess.run(
@@ -187,10 +211,20 @@ def _invoke_with_metadata(
             stderr_tail=stderr_tail(exc.stderr),
             timed_out=True,
             failure_reason=f"timeout after {timeout_seconds}s",
+            command=tuple(args),
         )
+    except FileNotFoundError as exc:
+        raise RunnerUnavailableError(
+            f"ProteinMPNN executable unavailable: {args[0]}", runner="proteinmpnn"
+        ) from exc
+    except OSError as exc:
+        raise RunnerInvocationError(
+            f"ProteinMPNN invocation failed: {exc}", runner="proteinmpnn"
+        ) from exc
     elapsed = time.monotonic() - started
     logger.info("ProteinMPNN run finished rc=%d in %.1fs", completed.returncode, elapsed)
-    return InvokeResult.from_stderr(exit_code=completed.returncode, stderr=completed.stderr)
+    result = InvokeResult.from_stderr(exit_code=completed.returncode, stderr=completed.stderr)
+    return dataclasses.replace(result, command=tuple(args))
 
 
 def invoke(
@@ -207,10 +241,13 @@ def invoke(
     New code that needs stderr / timeout metadata should call
     :func:`_invoke_with_metadata` directly.
     """
-    return _invoke_with_metadata(
+    result = _invoke_with_metadata(
         config_dict=config_dict,
         input_pdb=input_pdb,
         output_dir=output_dir,
         binary_prefix=binary_prefix,
         timeout_seconds=timeout_seconds,
-    ).exit_code
+    )
+    if result.timed_out:
+        raise RunnerTimeoutError(result.failure_reason, runner="proteinmpnn")
+    return result.exit_code

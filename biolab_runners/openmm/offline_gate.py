@@ -1,6 +1,6 @@
 r"""Offline mdtraj gate for MD early-abort decisions.
 
-OralBiome-AMP task #10: moves the peptide-Cα RMSD gate out of the OpenMM
+The offline gate moves peptide-Cα RMSD evaluation out of the OpenMM
 production callback and into a pure-Python function that reads stored DCD
 frames via mdtraj. This eliminates the coordinate-convention bug class
 that produced #162, #163, #167, #174, #175 in one week — every failure
@@ -28,9 +28,9 @@ Invariants preserved from the inside-OpenMM gate:
    ``_check_early_abort_5ns`` it replaces).
 2. **10 ns conjunctive slope gate**: abort iff BOTH
    ``rmsd_10ns > threshold`` AND least-squares slope over the 5→10 ns
-   window > 0.05 Å/ns (OralBiome-AMP#167).
-3. **Receptor-Cα Kabsch alignment** (OralBiome-AMP#162).
-4. **Triclinic-aware per-molecule unwrap** (OralBiome-AMP#163) — handles
+   window > 0.05 Å/ns.
+3. **Receptor-Cα Kabsch alignment**.
+4. **Triclinic-aware per-molecule unwrap** — handles
    orthorhombic, triclinic, and dodecahedron cells correctly; the
    pre-#175 online gate fed per-molecule-wrapped coords into Kabsch
    and produced phantom ~50 Å RMSD when receptor/peptide straddled
@@ -71,7 +71,7 @@ FloatArray = npt.NDArray[np.float64]
 
 logger = logging.getLogger(__name__)
 
-# OralBiome-AMP#167 — conjunctive 10 ns slope gate thresholds.
+# Conjunctive 10 ns slope gate thresholds.
 SLOPE_THRESHOLD_A_PER_NS = 0.05
 MIN_SLOPE_WINDOW_NS = 2.0
 
@@ -147,7 +147,7 @@ def _unwrap_to_receptor_image(
     coordinates, rounds each component to the nearest integer, converts
     back to Cartesian. Reduces exactly to the diagonal-only operation for
     orthorhombic boxes while still giving the correct minimum image for
-    triclinic or dodecahedron cells (OralBiome-AMP#163).
+    triclinic or dodecahedron cells.
 
     Args:
         mobile_xyz: (n, 3) positions to shift, in nm.
@@ -271,7 +271,7 @@ def evaluate_trajectory(
     - 10 ns conjunctive slope gate: requires BOTH
       ``rmsd_at_10ns > threshold_a`` AND
       ``slope over 5→10 ns > slope_threshold_a_per_ns``
-      (OralBiome-AMP#167).
+      (the offline gate contract).
 
     The 5 ns check fires first; the 10 ns check only runs if the 5 ns check
     passed (matches the inside-OpenMM runner's short-circuit behaviour).

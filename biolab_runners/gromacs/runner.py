@@ -26,6 +26,7 @@ This module is the orchestrator that ties them together.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import logging
 import os
 import signal
@@ -37,6 +38,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from biolab_runners.contracts import (
+    ArtifactReference,
+    ExecutionMode,
+    ExecutionStatus,
+    MalformedOutputError,
+    RunnerTimeoutError,
+)
 from biolab_runners.gromacs.protocol import (
     GENION_INPUT,
     ProtocolStage,
@@ -55,12 +63,22 @@ from biolab_runners.gromacs.utils import (
     GromacsRecord,
     GromacsRecordStatus,
     StageStatus,
+    build_invocation_command,
     invoke,
     load_stage_manifest,
     now_utc_iso,
-    parse_nthcol_energy,
+    parse_nthcol_energy_checked,
     record_stage_status,
+    resolve_binary_prefix,
     save_stage_manifest,
+)
+from biolab_runners.provenance import (
+    EMPTY_PROVENANCE,
+    ProvenanceMetadata,
+    build_execution_provenance,
+    compute_config_digest,
+    compute_executed_config_digest,
+    compute_file_digest,
 )
 
 if TYPE_CHECKING:
@@ -99,6 +117,10 @@ class GromacsResult:
     exit_code: int = 0
     duration_seconds: float = 0.0
     metrics: dict[str, float] = field(default_factory=_empty_metrics_dict)
+    provenance: ProvenanceMetadata = EMPTY_PROVENANCE
+    status: ExecutionStatus = ExecutionStatus.INCOMPLETE
+    artifacts: tuple[ArtifactReference, ...] = ()
+    execution_mode: ExecutionMode = ExecutionMode.SUBPROCESS
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the result into a JSON-safe dictionary."""
@@ -112,6 +134,10 @@ class GromacsResult:
             "exit_code": self.exit_code,
             "duration_seconds": self.duration_seconds,
             "metrics": dict(self.metrics),
+            "provenance": self.provenance.to_dict(),
+            "status": self.status,
+            "artifacts": [artifact.to_dict() for artifact in self.artifacts],
+            "execution_mode": self.execution_mode,
         }
 
 
@@ -161,6 +187,60 @@ class GromacsProtocolResult:
     exit_code: int = 0
     duration_seconds: float = 0.0
     error: str = ""
+    execution_mode: ExecutionMode = ExecutionMode.SUBPROCESS
+    requested_config_digest: str = ""
+    executed_config_digest: str | None = None
+    source_backbone_digest: str | None = None
+    executed: bool = False
+    cache_hit: bool = False
+    command: tuple[str, ...] = ()
+
+    @property
+    def status(self) -> ExecutionStatus:
+        """Return the normalized status for the whole protocol invocation."""
+        if self.dry_run:
+            return ExecutionStatus.DRY_RUN
+        if self.interrupted:
+            return ExecutionStatus.INTERRUPTED
+        if self.exit_code == 124:
+            return ExecutionStatus.TIMEOUT
+        if self.failed or self.error:
+            return ExecutionStatus.FAILED
+        if self.succeeded == 0 and self.skipped > 0:
+            return ExecutionStatus.CACHED
+        if self.succeeded == 0 and self.skipped == 0:
+            return ExecutionStatus.INCOMPLETE
+        return ExecutionStatus.SUCCEEDED
+
+    @property
+    def artifacts(self) -> tuple[ArtifactReference, ...]:
+        """Return references for files present in the protocol output."""
+        output = Path(self.output_dir)
+        if not output.is_dir():
+            return ()
+        boundary = output.resolve()
+        return tuple(
+            ArtifactReference.from_path(path, required=False, kind="simulation", root=boundary)
+            for path in sorted(output.iterdir())
+            if path.is_file() and not path.is_symlink()
+        )
+
+    @property
+    def provenance(self) -> ProvenanceMetadata:
+        """Return shared execution provenance for this protocol result."""
+        return build_execution_provenance(
+            runner_name="gromacs_protocol",
+            execution_mode=self.execution_mode,
+            status=self.status,
+            exit_code=self.exit_code,
+            artifacts=self.artifacts,
+            requested_config_digest=self.requested_config_digest,
+            executed_config_digest=self.executed_config_digest,
+            source_backbone_digest=self.source_backbone_digest,
+            executed=self.executed,
+            cache_hit=self.cache_hit,
+            command=self.command,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the result into a JSON-safe dictionary."""
@@ -179,6 +259,10 @@ class GromacsProtocolResult:
             "exit_code": self.exit_code,
             "duration_seconds": self.duration_seconds,
             "error": self.error,
+            "status": self.status,
+            "execution_mode": self.execution_mode,
+            "artifacts": [artifact.to_dict() for artifact in self.artifacts],
+            "provenance": self.provenance.to_dict(),
         }
 
 
@@ -400,24 +484,49 @@ class GromacsRunner:
         cfg = config or self._config_override
         if cfg is None:
             raise ValueError("GromacsConfig is required: pass it to run() or the runner")
+        execution_mode = _gromacs_execution_mode(self._binary_prefix)
 
         output_dir = self._design_dir(cfg)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         if not force and self.is_complete(cfg):
             records = self._collect_records(output_dir, cfg)
+            status = _status_from_gromacs_records(0, records, cached=True)
+            artifacts = _artifacts_for_records(records, output_dir)
+            succeeded, failed = _record_counts(records)
             return GromacsResult(
                 name=cfg.name,
                 output_dir=str(output_dir),
                 records=tuple(records),
-                succeeded=len(records),
-                failed=0,
+                succeeded=succeeded,
+                failed=failed,
                 skipped=len(records),
                 exit_code=0,
                 duration_seconds=0.0,
+                provenance=_gromacs_provenance(
+                    status,
+                    0,
+                    artifacts,
+                    execution_mode,
+                    requested_config_digest=compute_config_digest(cfg),
+                    source_backbone_digest=compute_file_digest(Path(cfg.structure_file)),
+                    cache_hit=True,
+                ),
+                status=status,
+                artifacts=artifacts,
+                execution_mode=execution_mode,
             )
 
+        config_dict = _config_to_cli(cfg)
+        command = build_invocation_command(
+            config_dict=config_dict,
+            mdrun_extra=cfg.extra_mdrun_flags,
+            binary_prefix=self._binary_prefix,
+        )
+        requested_digest = compute_config_digest(cfg)
+        source_digest = compute_file_digest(Path(cfg.structure_file))
         if dry_run:
+            status = ExecutionStatus.DRY_RUN
             return GromacsResult(
                 name=cfg.name,
                 output_dir=str(output_dir),
@@ -427,20 +536,35 @@ class GromacsRunner:
                 skipped=0,
                 exit_code=0,
                 duration_seconds=0.0,
+                provenance=_gromacs_provenance(
+                    status,
+                    0,
+                    (),
+                    execution_mode,
+                    command=command,
+                    requested_config_digest=requested_digest,
+                    source_backbone_digest=source_digest,
+                ),
+                status=status,
+                execution_mode=execution_mode,
             )
 
-        config_dict = _config_to_cli(cfg)
         started = time.monotonic()
-        exit_code = invoke(
-            config_dict=config_dict,
-            output_dir=output_dir,
-            mdrun_extra=cfg.extra_mdrun_flags,
-            binary_prefix=self._binary_prefix,
-            timeout_seconds=self._timeout_seconds,
-        )
+        try:
+            exit_code = invoke(
+                config_dict=config_dict,
+                output_dir=output_dir,
+                mdrun_extra=cfg.extra_mdrun_flags,
+                binary_prefix=self._binary_prefix,
+                timeout_seconds=self._timeout_seconds,
+            )
+        except RunnerTimeoutError:
+            exit_code = 124
         records = self._collect_records(output_dir, cfg)
         succeeded = sum(1 for r in records if r.status == GromacsRecordStatus.SUCCEEDED)
         failed = len(records) - succeeded
+        status = _status_from_gromacs_records(exit_code, records)
+        artifacts = _artifacts_for_records(records, output_dir)
         return GromacsResult(
             name=cfg.name,
             output_dir=str(output_dir),
@@ -450,6 +574,20 @@ class GromacsRunner:
             skipped=0,
             exit_code=exit_code,
             duration_seconds=time.monotonic() - started,
+            provenance=_gromacs_provenance(
+                status,
+                exit_code,
+                artifacts,
+                execution_mode,
+                command=command,
+                requested_config_digest=requested_digest,
+                executed_config_digest=compute_executed_config_digest({"command": list(command)}),
+                source_backbone_digest=source_digest,
+                executed=True,
+            ),
+            status=status,
+            artifacts=artifacts,
+            execution_mode=execution_mode,
         )
 
     def _design_dir(self, config: GromacsConfig) -> Path:
@@ -460,10 +598,20 @@ class GromacsRunner:
         energy = output_dir / f"{config.tpr_basename}.edr"
         if not energy.exists():
             return []
+        if energy.is_symlink():
+            return [
+                GromacsRecord(
+                    index=0,
+                    path=str(energy),
+                    potential_energy=0.0,
+                    status=GromacsRecordStatus.FAILED,
+                    error="energy artifact symlink is outside the output boundary",
+                )
+            ]
         records: list[GromacsRecord] = []
         try:
-            potential = parse_nthcol_energy(energy, column=1)
-        except (OSError, UnicodeDecodeError) as exc:
+            potential = parse_nthcol_energy_checked(energy, column=1)
+        except (MalformedOutputError, OSError, UnicodeDecodeError) as exc:
             logger.warning("failed to parse %s: %s", energy, exc)
             records.append(
                 GromacsRecord(
@@ -483,6 +631,112 @@ class GromacsRunner:
             )
         )
         return records
+
+
+def _artifacts_for_records(
+    records: list[GromacsRecord], output_dir: Path | None = None
+) -> tuple[ArtifactReference, ...]:
+    """Describe energy artifacts that were actually produced."""
+    return tuple(
+        ArtifactReference.from_path(record.path, kind="energy", root=output_dir)
+        for record in records
+        if record.path and not Path(record.path).is_symlink()
+    )
+
+
+def _status_from_gromacs_records(
+    exit_code: int,
+    records: list[GromacsRecord],
+    *,
+    cached: bool = False,
+) -> ExecutionStatus:
+    """Map the legacy one-shot result to the shared status vocabulary."""
+    if exit_code == 124:
+        return ExecutionStatus.TIMEOUT
+    if exit_code < 0:
+        return ExecutionStatus.INTERRUPTED
+    if exit_code != 0:
+        return ExecutionStatus.FAILED
+    if not records:
+        return ExecutionStatus.INCOMPLETE
+    if any(record.status != GromacsRecordStatus.SUCCEEDED for record in records):
+        return ExecutionStatus.MALFORMED
+    return ExecutionStatus.CACHED if cached else ExecutionStatus.SUCCEEDED
+
+
+def _record_counts(records: list[GromacsRecord]) -> tuple[int, int]:
+    """Count one-shot records by their parsed status."""
+    succeeded = sum(1 for record in records if record.status == GromacsRecordStatus.SUCCEEDED)
+    failed = sum(1 for record in records if record.status != GromacsRecordStatus.SUCCEEDED)
+    return succeeded, failed
+
+
+def _gromacs_provenance(
+    status: ExecutionStatus,
+    exit_code: int,
+    artifacts: tuple[ArtifactReference, ...],
+    mode: ExecutionMode = ExecutionMode.SUBPROCESS,
+    *,
+    command: tuple[str, ...] = (),
+    requested_config_digest: str = "",
+    executed_config_digest: str | None = None,
+    source_backbone_digest: str | None = None,
+    executed: bool = False,
+    cache_hit: bool = False,
+) -> ProvenanceMetadata:
+    """Build the generic one-shot GROMACS execution record."""
+    return build_execution_provenance(
+        runner_name="gromacs",
+        execution_mode=mode,
+        status=status,
+        exit_code=exit_code,
+        artifacts=artifacts,
+        command=command,
+        requested_config_digest=requested_config_digest,
+        executed_config_digest=executed_config_digest,
+        source_backbone_digest=source_backbone_digest,
+        executed=executed,
+        cache_hit=cache_hit,
+    )
+
+
+def _gromacs_execution_mode(
+    binary_prefix: list[str] | None,
+    *,
+    resolved_prefix: tuple[str, ...] | None = None,
+) -> ExecutionMode:
+    """Identify the mode of the resolved command prefix."""
+    prefix = resolved_prefix or resolve_binary_prefix(binary_prefix)
+    runtime = Path(prefix[0]).name
+    if runtime in {"docker", "podman", "nerdctl", "singularity", "apptainer"} and any(
+        token in {"run", "exec"} for token in prefix[1:4]
+    ):
+        return ExecutionMode.CONTAINER_URI
+    return ExecutionMode.SUBPROCESS
+
+
+def _protocol_input_digests(config: GromacsProtocolConfig) -> dict[str, str | None]:
+    """Return content digests for the scientific files a protocol consumes."""
+    if config.prebuilt_topology and config.prebuilt_coordinates:
+        return {
+            "prebuilt_topology": compute_file_digest(Path(config.prebuilt_topology)),
+            "prebuilt_coordinates": compute_file_digest(Path(config.prebuilt_coordinates)),
+        }
+    return {"input_pdb": compute_file_digest(Path(config.input_pdb))}
+
+
+def _protocol_executed_config(config: GromacsProtocolConfig) -> dict[str, object]:
+    """Bind protocol settings and consumed input contents to execution."""
+    payload = dataclasses.asdict(config)
+    payload["input_digests"] = _protocol_input_digests(config)
+    return payload
+
+
+def _protocol_source_digest(config: GromacsProtocolConfig) -> str | None:
+    """Return the legacy source field only for the input actually consumed."""
+    if config.prebuilt_topology and config.prebuilt_coordinates:
+        return None
+    return compute_file_digest(Path(config.input_pdb))
 
 
 def _config_to_cli(config: GromacsConfig) -> dict[str, str]:
@@ -584,6 +838,8 @@ class GromacsProtocolRunner:
         self._binary_prefix = binary_prefix
         self._sigterm_grace_seconds = sigterm_grace_seconds
         self._dry_run = dry_run
+        self._resolved_binary_prefix: tuple[str, ...] | None = None
+        self._last_command: tuple[str, ...] = ()
 
     def run_protocol(
         self,
@@ -610,8 +866,13 @@ class GromacsProtocolRunner:
         ``_stage_already_complete`` short-circuit).
         """
         work_dir = _work_dir(config)
+        self._resolved_binary_prefix = resolve_binary_prefix(self._binary_prefix)
+        self._last_command = ()
         work_dir.mkdir(parents=True, exist_ok=True)
         started = time.monotonic()
+        execution_mode = _gromacs_execution_mode(
+            self._binary_prefix, resolved_prefix=self._resolved_binary_prefix
+        )
         stage_statuses: dict[str, str] = {}
         succeeded = 0
         skipped = 0
@@ -622,7 +883,7 @@ class GromacsProtocolRunner:
         error = ""
 
         # Prebuilt stage (no subprocess — file copy only).
-        prebuilt_failure = self._stage_prebuilt(work_dir, config, started)
+        prebuilt_failure = self._stage_prebuilt(work_dir, config, started, execution_mode)
         if prebuilt_failure is not None:
             return prebuilt_failure
 
@@ -670,6 +931,19 @@ class GromacsProtocolRunner:
             exit_code=exit_code,
             duration_seconds=time.monotonic() - started,
             error=error,
+            execution_mode=execution_mode,
+            requested_config_digest=compute_config_digest(config),
+            executed_config_digest=(
+                compute_executed_config_digest(_protocol_executed_config(config))
+                if not self._dry_run and (succeeded or failed or interrupted)
+                else None
+            ),
+            source_backbone_digest=_protocol_source_digest(config),
+            executed=not self._dry_run and bool(succeeded or failed or interrupted),
+            cache_hit=not self._dry_run
+            and not bool(succeeded or failed or interrupted)
+            and skipped > 0,
+            command=self._last_command,
         )
 
     def _run_single_stage(
@@ -718,6 +992,9 @@ class GromacsProtocolRunner:
             checkpoint_path=checkpoint_path,
             config=config,
         )
+        prefix = self._resolved_binary_prefix or resolve_binary_prefix(self._binary_prefix)
+        if commands:
+            self._last_command = (*prefix, *commands[-1])
 
         if self._dry_run:
             return _DRY_RUN_STATUS, 0, False
@@ -733,6 +1010,7 @@ class GromacsProtocolRunner:
         # --- Execute commands ---
         rc = 0
         for cmd in commands:
+            self._last_command = (*prefix, *cmd)
             rc = self._run_subprocess(cmd, work_dir, config.timeout_seconds)
             if rc != 0:
                 break
@@ -773,6 +1051,7 @@ class GromacsProtocolRunner:
         work_dir: Path,
         config: GromacsProtocolConfig,
         started: float,
+        execution_mode: ExecutionMode,
     ) -> GromacsProtocolResult | None:
         """Stage the caller-supplied prebuilt .top/.gro (B4 + cascade invalidation).
 
@@ -838,6 +1117,7 @@ class GromacsProtocolRunner:
                 exit_code=2,
                 duration_seconds=time.monotonic() - started,
                 error=f"prebuilt topology staging failed: {exc}",
+                execution_mode=execution_mode,
             )
         return None
 
@@ -886,8 +1166,9 @@ class GromacsProtocolRunner:
         ``Popen.communicate(input=GENION_INPUT)``. No shell, no
         quoting, no injection.
         """
-        prefix = self._binary_prefix or []
+        prefix = self._resolved_binary_prefix or resolve_binary_prefix(self._binary_prefix)
         full_cmd = [*prefix, *cmd]
+        self._last_command = tuple(full_cmd)
 
         # Detect genion — needs stdin (group selection).
         is_genion = "genion" in cmd

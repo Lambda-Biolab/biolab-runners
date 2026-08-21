@@ -1,13 +1,14 @@
 # Scientific Validation Plan — biolab-runners
 
-This document defines the **tool-level smoke validation** that proves
-each scientific runner (OpenMM, RFdiffusion, ProteinMPNN, GROMACS)
-produces biologically plausible outputs on known reference inputs.
-Pure plumbing tests are not enough.
+This document defines the **tool-level smoke validation** available in this
+repository. It covers real-format parsers, lightweight GROMACS/OpenMM paths,
+and environment probes. It does not claim that every runner has a live
+external-tool smoke test: Rosetta is license-gated, peptide preparation has
+optional scientific dependencies, and gmx_MMPBSA is optional.
 
 ## Why this exists
 
-The biolab-runners unit test suite proves that each runner:
+The biolab-runners unit test suite proves the covered runner plumbing:
 
 - Wires config to subprocess args correctly.
 - Idempotently skips already-completed work.
@@ -30,23 +31,36 @@ do not guarantee bit-exact reproduction across versions; we assert
 ## What this plan covers
 
 The integration suite (`tests/integration/test_scientific_validation.py`)
-exercises 8 tests across 4 runners:
+exercises the following available checks:
 
 | Test | Runner | Reference input | What we assert |
 |---|---|---|---|
-| `test_openmm_install_has_cuda_plugin_when_cuda_wheel_present` | OpenMM | environment probe | `pip install "openmm[cuda12]"` lands `openmm-cuda-12` (or `openmm-cuda-11`) with the `CUDA` platform available |
-| `test_openmm_runner_constructs_and_validates` | OpenMM | in-memory `ala5_peptide.pdb` | Constructor accepts a 5-residue test PDB; rejects malformed PDBs |
-| `test_openmm_minimization_produces_physically_plausible_energy` | OpenMM | `ala5_peptide.pdb` (CPU) | Minimization converges; total energy bounded (no NaN, no explosion) |
-| `test_openmm_runner_completes_short_vacuum_simulation` (heavy) | OpenMM MD | `barnase_chainA.pdb` (chain A only) | 1 ps vacuum simulation completes; `total_ns` in `[0.0001, 0.01]` ns; `potential_energy` finite |
-| `test_gromacs_parse_nthcol_returns_first_data_row` | GROMACS | fixture `.xvg` | `parse_nthcol` correctly extracts the first non-comment data row |
-| `test_gromacs_parse_nthcol_handles_comment_lines` | GROMACS | fixture `.xvg` | Parser correctly skips `@` / `#` comment lines |
-| `test_proteinmpnn_parse_fasta_returns_both_records_with_protein_alpha` | ProteinMPNN | fixture `.fa` | `parse_fasta_sequences` returns both design records when the input has 2 |
-| `test_rfdiffusion_runner_availablity_check_works` | RFdiffusion | environment probe | `rfdiffusion_available()` returns True iff the `rfdiffusion` console script (or `${RFDIFFUSION_BIN}`) is on `$PATH` and exits 0 on `--help` |
+| `test_openmm_install_has_cuda_plugin_when_cuda_wheel_present` | OpenMM | environment probe | `openmm[cuda12]` or `openmm[cuda13]` exposes a CUDA platform when the matching plugin is installed |
+| `test_openmm_runner_constructs_and_validates` | OpenMM | in-memory `ala5_peptide.pdb` | Constructor accepts a 5-residue test PDB and rejects malformed PDBs |
+| `test_openmm_minimization_produces_physically_plausible_energy` | OpenMM | `ala5_peptide.pdb` (CPU) | Minimization converges; total energy is finite and bounded |
+| `test_openmm_runner_completes_short_vacuum_simulation` (heavy) | OpenMM MD | `barnase_chainA.pdb` (chain A only) | 1 ps vacuum simulation completes; `total_ns` is in `[0.0001, 0.01]` ns and energy is finite |
+| `test_gromacs_parse_nthcol_returns_first_data_row` | GROMACS | fixture `.xvg` | `parse_nthcol_energy` extracts the first requested data value |
+| `test_gromacs_parse_nthcol_handles_comment_lines` | GROMACS | fixture `.xvg` | Parser skips `@` / `#` comment lines |
+| `test_gromacs_protocol_runner_dry_run_emits_deterministic_mdps` | GROMACS protocol | `ala5_peptide.pdb` | Dry-run emits deterministic stage `.mdp` files without writing a terminal manifest |
+| `test_gromacs_protocol_runner_real_minimization_when_gmx_present` | GROMACS protocol | `ala5_peptide.pdb` | When `gmx` is available, minimisation produces the required `.tpr`, `.gro`, `.edr`, and `.log` outputs |
+| `test_proteinmpnn_parse_fasta_returns_both_records_with_protein_alpha` | ProteinMPNN | fixture `.fa` | `parse_fasta_sequences` returns both design records with canonical amino-acid sequences |
+| `test_rfdiffusion_runner_availablity_check_works` | RFdiffusion | environment probe | `rfdiffusion_available()` checks the package adapter or `${RFDIFFUSION_BIN}` and its `--help` result |
+| `test_rfdiffusion_wrapper_accepts_design_startnum_and_two_seeds_differ` | RFdiffusion adapter | fake upstream script | Adapter accepts the runner contract and forwards deterministic design-start values |
 
-Tools that **fail** binary-availability checks (Rosetta requires
-commercial license; GPU-dependent weights missing) **skip gracefully**
-with a pytest skip message. Tools that **fail** validation tests
-*because the wrapper produces wrong numbers* get fixed.
+Tools that **fail** binary-availability checks (Rosetta requires a commercial
+license; GPU-dependent weights or optional executables may be missing) **skip
+gracefully** with a pytest skip message. Peptide preparation and gmx_MMPBSA
+are covered by focused tests rather than this integration module:
+
+| Runner | Focused coverage | Contract exercised |
+|---|---|---|
+| Peptide preparation | `tests/test_peptide_prep.py` | Required `prepared.pdb`, `prepared.top`, and `prepared.gro` artifacts; optional dependency failures are structured and fail closed; in-process execution mode |
+| gmx_MMPBSA | `tests/test_mmpbsa.py` | Parser, availability probe, `unsupported` result for a missing optional binary, and shared metadata on the legacy dict result |
+| Rosetta | `tests/test_rosetta_runner.py` | Parser/CLI translation and license acknowledgement without invoking the licensed binary |
+
+Tools that **fail** validation tests *because the wrapper produces wrong
+numbers or output* get fixed; a missing optional tool is not a scientific
+success.
 
 ## What this plan does NOT cover
 
@@ -108,8 +122,26 @@ both `/dev/nvidia0` is reachable AND the env var is set.
 
 ### Tool wrappers
 
-The ProteinMPNN runner expects a `proteinmpnn` binary on `$PATH` (or
-`${PROTEINMPNN_BIN}`). The RFdiffusion runner ships its adapter **in
+The ProteinMPNN runner uses the package-provided `proteinmpnn` console adapter
+(or `${PROTEINMPNN_BIN}`). The adapter translates the stable runner argv
+contract to `protein_mpnn_run.py` and can be tested with a fake script; it does
+not use a shell:
+
+| Runner flag | Upstream translation |
+|---|---|
+| `--input_path DIR` + `--pdb_path NAME` | `--pdb_path DIR/NAME` |
+| `--output_path DIR` | `--out_folder DIR` |
+| `--batch_size`, `--model_name`, `--num_seq_per_target`, `--sampling_temp`, `--seed` | Forwarded with the same names and values |
+| `--ca_only` | Emits upstream `--ca_only` for true-like values |
+| `--omit_AA VALUE` | `--omit_AAs VALUE` |
+| non-empty `--fixed_positions` | Rejected: the adapter has no chain-aware JSONL contract |
+
+Unknown flags are appended unchanged for upstream forward compatibility. Set
+`PROTEINMPNN_HOME` (default `~/tools/ProteinMPNN`), `PROTEINMPNN_SCRIPT`, or
+`PROTEINMPNN_PYTHON` to select the checkout, script, or interpreter. The
+adapter's `--help` needs no upstream installation. `${PROTEINMPNN_BIN}` may
+be a local executable; ProteinMPNN rejects `container://` values before
+subprocess dispatch. The RFdiffusion runner ships its adapter **in
 the package**: the installed wheel provides a `rfdiffusion` console
 script (`biolab_runners.rfdiffusion.cli`) that accepts the runner's
 fixed flag contract:
@@ -145,15 +177,27 @@ A host-level bootstrap script
 repos shallowly into `~/tools/ProteinMPNN` and `~/tools/RFdiffusion`
 (the default `RFDIFFUSION_HOME`). After the clone + weights are
 present, `biolab_runners.rfdiffusion.utils.rfdiffusion_available()`
-returns True, and `pytest -m integration` exercises the real pipeline
-instead of skipping (still opt-in via
-`BIOLAB_RUN_RFDIFFUSION_INTEGRATION=1`).
+returns True. The real-wrapper integration test still requires
+`BIOLAB_RUN_RFDIFFUSION_INTEGRATION=1`; otherwise it is skipped.
 
 Real backbone design with RFdiffusion still requires a GPU and
 ~10 GB of model weights (downloaded on first run from the upstream
 RFdiffusion repo); the OpenMM heavy runner test requires
 `/dev/nvidia0` *and* `BIOLAB_RUN_HEAVY_CUDA_TESTS=1` (see the
 `@pytest.mark.skipif` on `test_openmm_runner_completes_short_vacuum_simulation`).
+
+### Execution modes and contract checks
+
+Boltz2, RFdiffusion, ProteinMPNN, Rosetta, GROMACS, and gmx_MMPBSA use
+subprocess execution; OpenMM and peptide preparation are in-process.
+ProteinMPNN and GROMACS reject `container://` values before subprocess
+dispatch; Rosetta resolves its optional value through its tool utility.
+RFdiffusion rejects that legacy form and uses its package adapter. gmx_MMPBSA
+records `container_uri` for rejected URI configurations, but its current
+command builder does not launch the container.
+No runner shares a universal container-launch behavior. The shared contract tests verify
+normalized statuses, typed errors, artifact digests, provenance serialization,
+the ProteinMPNN adapter, and legacy result fields.
 
 ## When a test fails
 

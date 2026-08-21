@@ -7,9 +7,25 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from biolab_runners.contracts import (
+    ArtifactReference,
+    ExecutionMode,
+    ExecutionStatus,
+    RunnerTimeoutError,
+)
+from biolab_runners.provenance import (
+    EMPTY_PROVENANCE,
+    ProvenanceMetadata,
+    build_execution_provenance,
+    compute_config_digest,
+    compute_executed_config_digest,
+    compute_file_digest,
+    validate_image_digest,
+)
 from biolab_runners.rosetta.utils import (
     RelaxRecord,
     RelaxRecordStatus,
+    build_invocation_command,
     invoke,
     parse_score_files,
 )
@@ -36,6 +52,10 @@ class RosettaResult:
     skipped: int = 0
     exit_code: int = 0
     duration_seconds: float = 0.0
+    provenance: ProvenanceMetadata = EMPTY_PROVENANCE
+    status: ExecutionStatus = ExecutionStatus.INCOMPLETE
+    artifacts: tuple[ArtifactReference, ...] = ()
+    execution_mode: ExecutionMode = ExecutionMode.SUBPROCESS
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the result into a JSON-safe dictionary."""
@@ -48,6 +68,10 @@ class RosettaResult:
             "skipped": self.skipped,
             "exit_code": self.exit_code,
             "duration_seconds": self.duration_seconds,
+            "provenance": self.provenance.to_dict(),
+            "status": self.status,
+            "artifacts": [artifact.to_dict() for artifact in self.artifacts],
+            "execution_mode": self.execution_mode,
         }
 
 
@@ -77,7 +101,7 @@ class RosettaRunner:
         directory = self._effective_output_dir(config)
         if not directory.exists():
             return False
-        return any(directory.glob("score.sc"))
+        return any(path.is_file() and not path.is_symlink() for path in directory.glob("score.sc"))
 
     def run(
         self,
@@ -85,16 +109,23 @@ class RosettaRunner:
         *,
         force: bool = False,
         dry_run: bool = False,
+        image_digest: str | None = None,
     ) -> RosettaResult:
         """Run Rosetta and return the parsed result."""
         cfg = config or self._config_override
         if cfg is None:
             raise ValueError("RosettaConfig is required: pass it to run() or the runner")
+        image_digest = validate_image_digest(image_digest)
 
         config_dict = _config_to_cli(cfg)
         output_dir = self._effective_output_dir(cfg, config_dict)
         config_dict["out:path:all"] = str(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+        intended_command = build_invocation_command(
+            config=config_dict,
+            binary_prefix=self._binary_prefix,
+        )
+        execution_mode = _execution_mode(intended_command)
 
         if not force and self.is_complete(cfg):
             records = parse_score_files(sorted(output_dir.glob("score.sc")))
@@ -106,6 +137,8 @@ class RosettaRunner:
             # syntactically readable".
             succeeded = sum(1 for r in records if r.status == RelaxRecordStatus.SUCCEEDED)
             failed = len(records) - succeeded
+            status = _status_from_records(0, records, cached=True)
+            artifacts = _artifacts_for_output(output_dir)
             return RosettaResult(
                 name=cfg.name,
                 output_dir=str(output_dir),
@@ -115,11 +148,26 @@ class RosettaRunner:
                 skipped=len(records),
                 exit_code=0,
                 duration_seconds=0.0,
+                provenance=_provenance(
+                    status,
+                    0,
+                    artifacts,
+                    image_digest,
+                    execution_mode,
+                    command=(),
+                    requested_config_digest=compute_config_digest(cfg),
+                    source_backbone_digest=compute_file_digest(Path(cfg.input_pdb)),
+                    cache_hit=True,
+                ),
+                status=status,
+                artifacts=artifacts,
+                execution_mode=execution_mode,
             )
 
         import time
 
         if dry_run:
+            status = ExecutionStatus.DRY_RUN
             return RosettaResult(
                 name=cfg.name,
                 output_dir=str(output_dir),
@@ -129,18 +177,35 @@ class RosettaRunner:
                 skipped=0,
                 exit_code=0,
                 duration_seconds=0.0,
+                provenance=_provenance(
+                    status,
+                    0,
+                    (),
+                    image_digest,
+                    execution_mode,
+                    command=intended_command,
+                    requested_config_digest=compute_config_digest(cfg),
+                    source_backbone_digest=compute_file_digest(Path(cfg.input_pdb)),
+                ),
+                status=status,
+                execution_mode=execution_mode,
             )
 
         started = time.monotonic()
-        exit_code = invoke(
-            config=config_dict,
-            output_dir=output_dir,
-            binary_prefix=self._binary_prefix,
-            timeout_seconds=self._timeout_seconds,
-        )
+        try:
+            exit_code = invoke(
+                config=config_dict,
+                output_dir=output_dir,
+                binary_prefix=self._binary_prefix,
+                timeout_seconds=self._timeout_seconds,
+            )
+        except RunnerTimeoutError:
+            exit_code = 124
         records = parse_score_files(sorted(output_dir.glob("score.sc")))
         succeeded = sum(1 for r in records if r.status == RelaxRecordStatus.SUCCEEDED)
         failed = len(records) - succeeded
+        status = _status_from_records(exit_code, records)
+        artifacts = _artifacts_for_output(output_dir)
         return RosettaResult(
             name=cfg.name,
             output_dir=str(output_dir),
@@ -150,6 +215,23 @@ class RosettaRunner:
             skipped=0,
             exit_code=exit_code,
             duration_seconds=time.monotonic() - started,
+            provenance=_provenance(
+                status,
+                exit_code,
+                artifacts,
+                image_digest,
+                execution_mode,
+                command=intended_command,
+                requested_config_digest=compute_config_digest(cfg),
+                executed_config_digest=compute_executed_config_digest(
+                    {"command": list(intended_command)}
+                ),
+                source_backbone_digest=compute_file_digest(Path(cfg.input_pdb)),
+                executed=True,
+            ),
+            status=status,
+            artifacts=artifacts,
+            execution_mode=execution_mode,
         )
 
     def _design_dir(self, config: RosettaConfig) -> Path:
@@ -163,6 +245,76 @@ class RosettaRunner:
         cli_config = config_dict if config_dict is not None else _config_to_cli(config)
         output_dir = cli_config.get("out:path:all")
         return Path(str(output_dir)) if output_dir else self._design_dir(config)
+
+
+def _artifacts_for_output(output_dir: Path) -> tuple[ArtifactReference, ...]:
+    """Describe score outputs that exist on disk."""
+    return tuple(
+        ArtifactReference.from_path(path, kind="score", root=output_dir)
+        for path in sorted(output_dir.glob("score.sc"))
+        if not path.is_symlink()
+    )
+
+
+def _status_from_records(
+    exit_code: int,
+    records: list[RelaxRecord],
+    *,
+    cached: bool = False,
+) -> ExecutionStatus:
+    """Map Rosetta's legacy fields to the shared status vocabulary."""
+    if exit_code == 124:
+        return ExecutionStatus.TIMEOUT
+    if exit_code < 0:
+        return ExecutionStatus.INTERRUPTED
+    if exit_code != 0:
+        return ExecutionStatus.FAILED
+    if not records:
+        return ExecutionStatus.INCOMPLETE
+    if any(record.status != RelaxRecordStatus.SUCCEEDED for record in records):
+        return ExecutionStatus.MALFORMED
+    return ExecutionStatus.CACHED if cached else ExecutionStatus.SUCCEEDED
+
+
+def _provenance(
+    status: ExecutionStatus,
+    exit_code: int,
+    artifacts: tuple[ArtifactReference, ...],
+    image_digest: str | None,
+    mode: ExecutionMode = ExecutionMode.SUBPROCESS,
+    *,
+    command: tuple[str, ...] = (),
+    requested_config_digest: str = "",
+    executed_config_digest: str | None = None,
+    source_backbone_digest: str | None = None,
+    executed: bool = False,
+    cache_hit: bool = False,
+) -> ProvenanceMetadata:
+    """Build the generic Rosetta execution record."""
+    return build_execution_provenance(
+        runner_name="rosetta",
+        execution_mode=mode,
+        status=status,
+        exit_code=exit_code,
+        image_digest=image_digest,
+        artifacts=artifacts,
+        command=command,
+        requested_config_digest=requested_config_digest,
+        executed_config_digest=executed_config_digest,
+        source_backbone_digest=source_backbone_digest,
+        executed=executed,
+        cache_hit=cache_hit,
+    )
+
+
+def _execution_mode(command: tuple[str, ...]) -> ExecutionMode:
+    """Identify the mode of the command that Rosetta will receive."""
+    runtime = Path(command[0]).name
+    if runtime in {"docker", "podman", "nerdctl", "singularity", "apptainer"} and any(
+        token in {"run", "exec"} for token in command[1:4]
+    ):
+        return ExecutionMode.CONTAINER_URI
+    return ExecutionMode.SUBPROCESS
 
 
 def _config_to_cli(config: RosettaConfig) -> dict[str, Any]:

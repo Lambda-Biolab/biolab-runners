@@ -1,10 +1,10 @@
 """Provenance / reproducibility primitives for the biolab-runners slice.
 
 Provides the serialization-friendly :class:`ProvenanceMetadata` record
-that the RFdiffusion and ProteinMPNN runners attach to their results so
-that downstream consumers can audit *exactly* what produced a manifest.
+that runners attach to their results so downstream consumers can audit
+what produced a manifest.
 
-Design constraints (per S2 of the Activin-E reproducibility plan):
+Design constraints:
 
 * **Manifest equivalence on exact rerun** — same inputs hash to the
   same :class:`ProvenanceMetadata` value and therefore the same JSON
@@ -93,10 +93,14 @@ from collections.abc import Mapping  # used at runtime in isinstance() guard
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NoReturn
 
+from biolab_runners.contracts import ExecutionMode, ExecutionStatus
+
 if TYPE_CHECKING:
     from pathlib import Path
 
     from _typeshed import DataclassInstance
+
+    from biolab_runners.contracts import ArtifactReference
 
 __all__ = [
     "EMPTY_PROVENANCE",
@@ -106,6 +110,7 @@ __all__ = [
     "RNG_INTENT_SINGLE_STREAM",
     "InvokeResult",
     "ProvenanceMetadata",
+    "build_execution_provenance",
     "compute_config_digest",
     "compute_executed_config_digest",
     "compute_file_digest",
@@ -301,6 +306,49 @@ def compute_executed_config_digest(config: object, *, exclude_fields: tuple[str,
     return hashlib.sha256(encoded).hexdigest()
 
 
+def build_execution_provenance(
+    *,
+    runner_name: str,
+    execution_mode: ExecutionMode | str,
+    status: ExecutionStatus | str,
+    exit_code: int = 0,
+    image_digest: str | None = None,
+    artifacts: tuple[ArtifactReference, ...] = (),
+    command: tuple[str, ...] = (),
+    source_backbone_digest: str | None = None,
+    requested_config_digest: str = "",
+    executed_config_digest: str | None = None,
+    executed: bool = False,
+    cache_hit: bool = False,
+) -> ProvenanceMetadata:
+    """Build the generic execution portion of a runner provenance record.
+
+    The execution flags and digests are explicit because a generic helper
+    cannot infer whether a caller actually dispatched work or returned a
+    cached / dry-run result.
+    """
+    normalized_status = ExecutionStatus(status)
+    normalized_mode = ExecutionMode(execution_mode)
+    if not executed:
+        executed_config_digest = None
+    return dataclasses.replace(
+        EMPTY_PROVENANCE,
+        model_identifier=runner_name,
+        runner_name=runner_name,
+        execution_mode=normalized_mode,
+        status=normalized_status,
+        exit_code=exit_code,
+        image_digest=validate_image_digest(image_digest),
+        source_backbone_digest=source_backbone_digest,
+        requested_config_digest=requested_config_digest,
+        executed_config_digest=executed_config_digest,
+        executed=executed,
+        cache_hit=cache_hit,
+        artifacts=artifacts,
+        command=command,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Structured subprocess capture (shared between runners)
 # ---------------------------------------------------------------------------
@@ -366,6 +414,7 @@ class InvokeResult:
     stderr_tail: str = ""
     timed_out: bool = False
     failure_reason: str = ""
+    command: tuple[str, ...] = ()
 
     @staticmethod
     def from_stderr(exit_code: int, stderr: str | bytes | None) -> InvokeResult:
@@ -448,7 +497,7 @@ class ProvenanceMetadata:
             is retained for compatibility but used by no runner.
         canonical_output: The runner's canonical raw outputs *before*
             any downstream substitution (ProteinMPNN's FASTA
-            sequences before the ``chem_001`` D-residue rewrite).
+            sequences before any downstream D-residue rewrite).
             Empty for runners that have no downstream substitution
             (RFdiffusion) or when the run produced no output.
         requested_config_digest: ``sha256`` of the canonical
@@ -484,6 +533,11 @@ class ProvenanceMetadata:
     executed_config_digest: str | None = None
     executed: bool = False
     cache_hit: bool = False
+    runner_name: str = ""
+    execution_mode: ExecutionMode | str = ""
+    status: ExecutionStatus | str = ""
+    artifacts: tuple[ArtifactReference, ...] = field(default_factory=tuple)
+    command: tuple[str, ...] = field(default_factory=tuple)
 
     def to_dict(self) -> dict[str, object]:
         """Serialise to a JSON-safe dictionary.
@@ -509,6 +563,11 @@ class ProvenanceMetadata:
             "executed_config_digest": self.executed_config_digest,
             "executed": self.executed,
             "cache_hit": self.cache_hit,
+            "runner_name": self.runner_name,
+            "execution_mode": self.execution_mode,
+            "status": self.status,
+            "artifacts": [artifact.to_dict() for artifact in self.artifacts],
+            "command": list(self.command),
         }
 
     @staticmethod
@@ -530,6 +589,11 @@ class ProvenanceMetadata:
         exclude_fields: tuple[str, ...] = (),
         executed: bool = True,
         cache_hit: bool = False,
+        runner_name: str = "",
+        execution_mode: ExecutionMode | str = "",
+        status: ExecutionStatus | str = "",
+        artifacts: tuple[ArtifactReference, ...] = (),
+        command: tuple[str, ...] = (),
     ) -> ProvenanceMetadata:
         """Build a :class:`ProvenanceMetadata` from runner-local pieces.
 
@@ -567,6 +631,11 @@ class ProvenanceMetadata:
             else None,
             executed=executed,
             cache_hit=cache_hit,
+            runner_name=runner_name,
+            execution_mode=execution_mode,
+            status=status,
+            artifacts=artifacts,
+            command=command,
         )
 
 

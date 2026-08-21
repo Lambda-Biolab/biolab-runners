@@ -183,8 +183,7 @@ class GromacsProtocolConfig:
     extra_mdrun_flags: tuple[str, ...] = field(default_factory=_empty_str_tuple)
     timeout_seconds: int = 86_400
     force: bool = False
-    # Slice 14 (E3 prerequisite, CHEM-001 / peptide-prep). When
-    # the peptide was prepared upstream (biolab_runners.peptide_prep)
+    # When a structure was prepared upstream (biolab_runners.peptide_prep)
     # and a GROMACS ``.top`` / ``.gro`` were produced from the
     # SAME OpenMM system, the GROMACS protocol can consume the
     # prebuilt topology + coordinates and skip the

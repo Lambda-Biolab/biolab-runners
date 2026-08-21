@@ -33,7 +33,7 @@ class ProteinMPNNConfig:
     Cyclic and D-residue behaviour is not part of ProteinMPNN's
     vocabulary — the runner exposes positions the consumer can pin
     to Cys / D-residues, but the actual conversion happens in the
-    downstream ``biolam_tools.chem_001`` stage.
+    downstream chemistry stage.
     """
 
     name: str = "sequence"

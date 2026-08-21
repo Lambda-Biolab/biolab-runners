@@ -2,13 +2,15 @@
 
 ## Supported Versions
 
-This project is in early development (`0.1.x`). Only the latest minor
-version receives security fixes.
+Only the latest tagged minor release receives security fixes. The `0.6.0`
+release-candidate branch is supported for pre-release validation but is not a
+published release.
 
 | Version | Supported          |
 |---------|--------------------|
-| 0.1.x   | :white_check_mark: |
-| < 0.1   | :x:                |
+| 0.6.0 release candidate | Pre-release validation |
+| 0.5.x   | :white_check_mark: |
+| < 0.5   | :x:                |
 
 ## Reporting a Vulnerability
 

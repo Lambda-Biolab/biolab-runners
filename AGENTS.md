@@ -3,18 +3,24 @@
 This is the primary instruction file for all AI coding agents working on this project.
 Read this file first. It supersedes any default behavior.
 
+The branch currently carries the `0.6.0` release candidate. It is not a
+published or tagged release; use a published release for external consumers
+until the release is published.
+
 ## Project Purpose
 
-Standalone, modular Python library containing the computational biology runners extracted from the [OralBiome-AMP](https://github.com/Lambda-Biolab/OralBiome-AMP) pipeline:
+Standalone, modular Python library containing reusable computational biology runners:
 
 1. **Boltz2Runner** — Runs Boltz-2 structure predictions for peptide-protein complexes
 2. **OpenMMRunner** — Runs OpenMM molecular dynamics simulations with multi-stage equilibration
 3. **RFdiffusionRunner** — Runs RFdiffusion for target-conditioned peptide binder / unconditional backbone generation
 4. **ProteinMPNNRunner** — Runs ProteinMPNN for fixed-backbone sequence design
 5. **RosettaRunner** — Runs Rosetta InterfaceAnalyzer (license-gated)
-6. **GROMACSRunner** — GROMACS integration via subprocess for production-scale MD
+6. **GromacsRunner** — GROMACS integration via subprocess for production-scale MD
+7. **PeptidePrepRunner** — in-process structure preparation and topology export
+8. **GmxMMPBSARunner** — optional gmx_MMPBSA decomposition
 
-The runners are designed for researchers who want to use these tools in their own pipelines without importing the full OralBiome-AMP codebase.
+The runners are designed for researchers who want to use these tools in their own pipelines without importing a consumer pipeline.
 
 ## Documentation Hierarchy
 
@@ -28,6 +34,8 @@ content from an authority doc into a dependent one.
 | Project purpose, architecture, domain rules, QA | [`AGENTS.md`](AGENTS.md) | AI agents (this file) |
 | Contributor workflow, PR guidelines, code style | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contributors |
 | Version history | [`CHANGELOG.md`](CHANGELOG.md) | All |
+| Scientific validation and test commands | [`docs/testing/scientific-validation.md`](docs/testing/scientific-validation.md) | Contributors and operators |
+| Machine-readable documentation index | [`llms.txt`](llms.txt) | LLM/documentation tooling |
 | Security policy, vulnerability reporting | [`SECURITY.md`](SECURITY.md) | Researchers |
 | Community standards | [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) | Contributors |
 | Agent patterns, incident writeups | [`AGENT_LEARNINGS.md`](AGENT_LEARNINGS.md) | AI agents |
@@ -39,6 +47,8 @@ content from an authority doc into a dependent one.
 
 ```text
 biolab_runners/
+├── contracts.py       # shared status, mode, artifact, and error contracts
+├── provenance.py      # shared digest and execution provenance
 ├── boltz2/
 │   ├── config.py     # Boltz2Config, ConfidenceScores, PredictionResult, QualityGate
 │   ├── runner.py     # Boltz2Runner class + apply_quality_gate()
@@ -65,11 +75,37 @@ biolab_runners/
 │   ├── config.py     # RosettaConfig
 │   ├── runner.py     # RosettaRunner (license-gated)
 │   └── utils.py      # rosetta_available() probe
-└── gromacs/
-    ├── config.py     # GROMACSConfig
-    ├── runner.py     # GROMACSRunner
-    └── utils.py      # parse_nthcol() for `.xvg` files
-```text
+├── gromacs/
+│   ├── config.py     # GromacsConfig, GromacsProtocolConfig
+│   ├── runner.py     # GromacsRunner, GromacsProtocolRunner
+│   └── utils.py      # parse_nthcol_energy() for `.xvg` files
+├── peptide_prep/     # in-process preparation and export
+└── mmpbsa/           # optional gmx_MMPBSA subprocess runner
+```
+
+## Shared runner contracts
+
+`biolab_runners.contracts` is intentionally small. `ExecutionStatus` is the
+normalized result vocabulary; `ExecutionMode` records `in_process`,
+`subprocess`, or `container_uri`; and `ArtifactReference` carries a path,
+required/optional flag, and canonical OCI SHA-256 digest. The public error
+names are `RunnerError`, `RunnerUnavailableError`, `RunnerInvocationError`,
+`RunnerTimeoutError`, `RunnerInterruptedError`, `RunnerOutputError`,
+`MalformedOutputError`, and `IncompleteOutputError`. `artifact_from_path()`,
+`require_artifact()`, and `validate_artifact_digest()` are the artifact helpers.
+`biolab_runners.provenance` remains the single source of truth for execution
+provenance through `ProvenanceMetadata` and
+`build_execution_provenance()`; there is no separate `ExecutionProvenance`
+class. Each selected runner keeps its own config/result type and adds these
+fields or compatibility properties; no universal runner base class is used.
+
+Execution modes are explicit and runner-specific: Boltz2, RFdiffusion,
+ProteinMPNN, Rosetta, GROMACS, and gmx_MMPBSA are subprocess integrations;
+OpenMM and peptide preparation are in-process. ProteinMPNN, GROMACS, and
+gmx_MMPBSA reject unsupported `container://` values before subprocess
+dispatch; RFdiffusion rejects the legacy container URI and uses its package
+adapter. Rosetta retains its existing container URI resolution. No runner
+shares a universal container behavior.
 
 The checkpoint invariants (atomic save, manifest binding, terminal schema, force=True quarantine) all describe `biolab_runners.openmm.checkpoint` — that module is the single source of truth for the checkpoint protocol. `system_builder.py` does the system construction only; it does NOT touch the manifest. `biolab_runners.openmm.checkpoint.inspect_checkpoint(output_dir, config)` is the single canonical entry point — it reads the manifest once and returns a fully-classified `CheckpointSnapshot` carrying the absolute step, state filename, last record, structured `CompletionStatus`, completion reason, and validated terminal payload. The previous multi-call pattern (`load_checkpoint` + `is_run_complete` + `load_terminal_payload`) is now a sequence of thin wrappers that delegate to `inspect_checkpoint`.
 
@@ -101,7 +137,7 @@ The checkpoint invariants (atomic save, manifest binding, terminal schema, force
 - **Force=True quarantine:** `runner.run(force=True)` moves the resumable files (`state*.xml`, `checkpoint.json`, `energy.csv`, `early_abort.json`) into a timestamped `output_dir/.stale/<UTC>/` subdirectory BEFORE any fresh build. This ensures an interrupted forced run cannot leave the directory with a stale `state.xml` that a subsequent non-forced run would pair with a freshly-built topology, AND cannot leave a stale `early_abort.json` that would mis-classify the next run's intermediate checkpoint as terminal. Discarding the checkpoint is opt-in via `force=True` and must be atomic w.r.t. the fresh build.
 - **Atomic checkpoint:** State files are generation-versioned (`state.<absolute_step>_<pid>_<nanos>.xml`) referenced by `checkpoint.json` (the manifest). The manifest's `os.replace` is the **single atomic commit point** — a crash before the rename leaves the previous (coherent) checkpoint active; a crash after leaves the new (coherent) checkpoint active. The manifest's step is the **absolute** OpenMM step (the simulation's current step at save time, computed as `start_step + steps_done` where `start_step` is the absolute step the loop started at: `total_equil_steps` for fresh runs, the saved step for resumed runs). `energy.csv` is NEVER consulted to determine the saved step. Any `state.*.xml` file not referenced by the manifest is an orphan and is garbage-collected at the next save. A non-empty state file without a valid manifest fails fast and requires `force=True` to discard — the orphaned state cannot be paired with a freshly-built System.
 - **Manifest ↔ state filename binding:** The v7 generation-versioned state filename embeds the absolute step (`state.<absolute_step>_<pid>_<nanos>.xml`). The runner parses this embedded step and requires it to equal the manifest's `step` field. A mismatch indicates a corrupt or forged checkpoint and raises `InvalidCheckpointError` — the runner cannot resume with a state saved at one step and accounting at another. Legacy `state.xml` has no embedded step and is accepted as a compatibility shim (logged at INFO level so the user can decide to migrate).
-- **Terminal status is part of the manifest:** The optional `terminal` field on the manifest's last record carries the early-abort classification (`{"type": "early_abort", "step": <absolute_step>, "reason": <str>, "production_ns": <float>}`). The terminal payload commits in the same `os.replace` as the checkpoint step — there is no separate marker write between the state file and the manifest, so a crash cannot leave a resumable-but-terminal decision unrecorded. The `step` of the terminal payload MUST equal the manifest's `step`; a binding mismatch is classified as an invalid-terminal payload and converted by `run_state.decide()` to `FailurePlan` — the run is in an ambiguous state and the user must invoke `force=True` to discard the manifest. The legacy `early_abort.json` file is written AFTER the atomic save as a derived compat file for downstream consumers (`oral_amp.cloud.openmm_cloud`); it is moved by `force=True` quarantine together with the manifest.
+- **Terminal status is part of the manifest:** The optional `terminal` field on the manifest's last record carries the early-abort classification (`{"type": "early_abort", "step": <absolute_step>, "reason": <str>, "production_ns": <float>}`). The terminal payload commits in the same `os.replace` as the checkpoint step — there is no separate marker write between the state file and the manifest, so a crash cannot leave a resumable-but-terminal decision unrecorded. The `step` of the terminal payload MUST equal the manifest's `step`; a binding mismatch is classified as an invalid-terminal payload and converted by `run_state.decide()` to `FailurePlan` — the run is in an ambiguous state and the user must invoke `force=True` to discard the manifest. The legacy `early_abort.json` file is written AFTER the atomic save as a derived compatibility file for downstream consumers; it is moved by `force=True` quarantine together with the manifest.
 - **Derived marker is best-effort:** The derived `early_abort.json` write is NOT authoritative — the manifest has already committed the terminal decision. A failure to write the derived marker (`OSError` from a full disk, permission denied, etc.) MUST be logged + suppressed — the runner must continue normally and return `early_abort=True`. The crash must NOT propagate out of `_poll_offline_gate()` because the manifest's terminal classification is already durable on disk.
 - **Terminal schema validation:** The manifest's optional `terminal` payload is the authoritative terminal marker. A valid payload MUST have `step` as a strict positive `int` (no string coercion), `type == "early_abort"` (the only supported non-normal terminal type — unknown or missing types cause the validator to fail the run), and `reason` as a non-empty string. The `terminal.step` MUST equal the manifest's `step`; a mismatch indicates corruption and causes the validator to fail the run. The terminal check is tri-state: ABSENT (no `terminal` key) — the run is in-progress (or normal-completed, which the snapshot determines separately). INVALID (present but failing any schema check) — the validator returns an explicit `invalid_terminal_<reason>` classification which `run_state.decide()` converts to FAIL_FAST; the run is in an ambiguous state and the runner fails fast with `result.error` and `force=True` guidance. The runner MUST NEVER fall back to the inferred normal-completion heuristic for a present-but-invalid payload. VALID — the run is terminal via manifest payload. The structured `CompletionStatus` enum (`IN_PROGRESS`, `NORMAL_COMPLETE`, `EARLY_ABORT`, `INVALID_TERMINAL`) is the cross-module protocol — downstream code branches on the enum value, not on string-prefixes of the `reason` field.
 - **Production-time semantics:** Every ns reported to downstream consumers (`abort_ns`, `result.total_ns`, `md_summary.json`, the reconstructed result) is computed from the COMPLETED PRODUCTION steps (`max(0, absolute_step - total_equil_steps) * timestep_fs / 1e6`). Equilibration steps are protocol setup, not scientific progress — they must never appear in `total_ns`. The checkpoint step stays absolute (`start_step + steps_done`) for resume accounting; only the reported time uses the production invariant. `result.ns_per_day` is INVOCATION-LOCAL throughput (`steps_done * timestep_fs / 1e6 / elapsed * 86400`) — mixing cumulative production with invocation-local wall time would inflate throughput on every resumed run.
@@ -116,10 +152,10 @@ The checkpoint invariants (atomic save, manifest binding, terminal schema, force
 
 - **Boltz-2:** `boltz` CLI on PATH, GPU with 24 GB VRAM (RTX 4090)
 - **OpenMM:** Best via conda (`conda install -c conda-forge openmm pdbfixer`); pip only provides OpenCL
-- **RFdiffusion:** upstream clone at `~/tools/RFdiffusion` (the default `RFDIFFUSION_HOME`) + the in-package `rfdiffusion` console script from the installed wheel (or a `${RFDIFFUSION_BIN}` custom binary); Python with PyTorch + CUDA in the runner interpreter, GPU with ~10 GB VRAM for design. The bootstrap (`~/.local/bin/install-proteinmpnn-rfdiffusion.sh`) clones the repo; model weights are downloaded on first run
-- **ProteinMPNN:** upstream clone at `~/tools/ProteinMPNN` + wrapper at `~/.local/bin/proteinmpnn` (same bootstrap script)
-- **Rosetta:** license-gated; the runner skips when the license is absent
-- **GROMACS:** heavy install; parse_nthcol tested via fixture `.xvg` files
+- **RFdiffusion:** upstream clone at `~/tools/RFdiffusion` (the default `RFDIFFUSION_HOME`) + the in-package `rfdiffusion` console script from the installed wheel (or a compatible `${RFDIFFUSION_BIN}` executable); Python with PyTorch + CUDA in the runner interpreter, GPU with ~10 GB VRAM for design. The bootstrap (`~/.local/bin/install-proteinmpnn-rfdiffusion.sh`) clones the repo; model weights are downloaded on first run
+- **ProteinMPNN:** upstream clone at `~/tools/ProteinMPNN` + the in-package `proteinmpnn` console adapter (the same bootstrap script only supplies the upstream checkout)
+- **Rosetta:** license-gated; `RosettaConfig.license_acknowledged=True` is required and callers should use `rosetta_available()` before invoking. `RosettaRunner.run()` does not silently skip an unavailable binary
+- **GROMACS:** heavy install; `parse_nthcol_energy` is tested via fixture `.xvg` files
 
 ### Integration / Scientific-Validation Tests
 
@@ -154,7 +190,7 @@ make lint           # Check linting and formatting
 make test           # Run tests only
 # Heavy OpenMM CUDA smoke (opt-in; ~90 s on RTX 4090):
 BIOLAB_RUN_HEAVY_CUDA_TESTS=1 uv run pytest -m integration -v
-```text
+```
 
 ## Quick Reference
 
@@ -196,4 +232,4 @@ should be catching them — the biolab-runners audit found 20 latent
 errors that were hidden because tests/ was excluded from pyright.
 CI:          .github/workflows/ci.yml (lint → type → complexity → test, Python 3.11+3.12)
 Coverage:    70% floor (ratcheting to 80%)
-```text
+```
