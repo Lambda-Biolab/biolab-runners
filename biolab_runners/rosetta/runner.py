@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -117,7 +116,6 @@ class RosettaRunner:
         if cfg is None:
             raise ValueError("RosettaConfig is required: pass it to run() or the runner")
         image_digest = validate_image_digest(image_digest)
-        execution_mode = _execution_mode(self._binary_prefix)
 
         config_dict = _config_to_cli(cfg)
         output_dir = self._effective_output_dir(cfg, config_dict)
@@ -127,6 +125,7 @@ class RosettaRunner:
             config=config_dict,
             binary_prefix=self._binary_prefix,
         )
+        execution_mode = _execution_mode(intended_command)
 
         if not force and self.is_complete(cfg):
             records = parse_score_files(sorted(output_dir.glob("score.sc")))
@@ -308,11 +307,11 @@ def _provenance(
     )
 
 
-def _execution_mode(binary_prefix: list[str] | None) -> ExecutionMode:
-    """Identify direct or container-backed Rosetta execution."""
-    configured = os.environ.get("ROSETTA_BIN", "")
-    if configured.startswith("container://") or (
-        binary_prefix and binary_prefix[0].startswith("container://")
+def _execution_mode(command: tuple[str, ...]) -> ExecutionMode:
+    """Identify the mode of the command that Rosetta will receive."""
+    runtime = Path(command[0]).name
+    if runtime in {"docker", "podman", "nerdctl", "singularity", "apptainer"} and any(
+        token in {"run", "exec"} for token in command[1:4]
     ):
         return ExecutionMode.CONTAINER_URI
     return ExecutionMode.SUBPROCESS
