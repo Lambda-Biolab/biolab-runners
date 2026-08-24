@@ -35,6 +35,16 @@ ACDEFGHIKLPQRSTVWY
 ACDEFGHIKLPQRSTVWY
 """
 
+NATIVE_AND_SAMPLE_FASTA = (
+    ">design_8, score=0.7520, global_score=0.8010, fixed_chains=[], "
+    "designed_chains=['A','B','C'], model_name=v_48_020, git_hash=deadbeef, seed=37\n"
+    "MKTAYIAKQRQISFVKSHFSRQDILDLI\n"
+    ">T=0.1, sample=1, score=0.6214, global_score=0.6501, seq_recovery=0.4828\n"
+    "VKTAYIAKQRQISFVKSHFSRQDILDLI\n"
+    ">T=0.1, sample=2, score=0.6382, global_score=0.6610, seq_recovery=0.5172\n"
+    "AKTAYIAKQRQISFVKSHFSRQDILDLI\n"
+)
+
 #: Canonical OCI form.
 VALID_OCI_DIGEST = "sha256:" + "ab" * 32  # 64 hex chars
 #: Same digest in bare-hex form — accepted and normalised to OCI form.
@@ -360,6 +370,38 @@ def test_runner_reads_stock_seq_directory_layout(
     assert result.status.value == "cached"
     assert result.skipped == 4
     assert {Path(record.path).parent.name for record in result.records} == {"seqs"}
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_runner_excludes_native_record_from_stock_fasta(
+    output_root: Path,
+    pdb_input: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    cached: bool,
+) -> None:
+    config = ProteinMPNNConfig(name=f"native-{cached}", task_count=2)
+    design_dir = output_root / config.name / pdb_input.stem
+
+    def fake_invoke(*, output_dir: Path, **_: Any) -> InvokeResult:
+        (output_dir / "seqs").mkdir(parents=True)
+        (output_dir / "seqs" / "design_8.fa").write_text(NATIVE_AND_SAMPLE_FASTA)
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.proteinmpnn.runner._invoke_with_metadata", fake_invoke)
+    if cached:
+        fake_invoke(output_dir=design_dir)
+
+    result = ProteinMPNNRunner(output_root=output_root).run(pdb_input, config)
+
+    assert result.succeeded == config.task_count
+    assert result.failed == 0
+    assert result.skipped == (config.task_count if cached else 0)
+    assert [record.sequence for record in result.records] == [
+        "VKTAYIAKQRQISFVKSHFSRQDILDLI",
+        "AKTAYIAKQRQISFVKSHFSRQDILDLI",
+    ]
+    assert result.provenance.task_count == config.task_count
 
 
 def test_runner_cache_counters_reflect_malformed_records(

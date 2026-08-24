@@ -376,7 +376,7 @@ def _parse_records(output_dir: Path) -> tuple[DesignRecord, ...]:
     records: list[DesignRecord] = []
     for path in _fasta_paths(output_dir):
         try:
-            fasta = parse_fasta_sequences(path)
+            fasta = parse_fasta_sequences(path, full_header=True)
         except (OSError, UnicodeDecodeError) as exc:
             logger.warning("failed to parse %s: %s", path, exc)
             records.append(
@@ -390,7 +390,9 @@ def _parse_records(output_dir: Path) -> tuple[DesignRecord, ...]:
                 )
             )
             continue
-        for record_index, (_name, sequence) in enumerate(fasta):
+        for record_index, (header, sequence) in enumerate(fasta):
+            if _is_native_template(header):
+                continue
             records.append(
                 DesignRecord(
                     index=len(records),
@@ -402,6 +404,11 @@ def _parse_records(output_dir: Path) -> tuple[DesignRecord, ...]:
             )
             _ = record_index
     return tuple(records)
+
+
+def _is_native_template(header: str) -> bool:
+    """Identify the native/template record emitted before ProteinMPNN samples."""
+    return "fixed_chains=" in header and "designed_chains=" in header
 
 
 def _artifacts_for_records(
