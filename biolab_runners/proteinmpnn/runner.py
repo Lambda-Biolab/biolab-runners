@@ -376,7 +376,7 @@ def _parse_records(output_dir: Path) -> tuple[DesignRecord, ...]:
     records: list[DesignRecord] = []
     for path in _fasta_paths(output_dir):
         try:
-            fasta = parse_fasta_sequences(path)
+            fasta = parse_fasta_sequences(path, full_header=True)
         except (OSError, UnicodeDecodeError) as exc:
             logger.warning("failed to parse %s: %s", path, exc)
             records.append(
@@ -390,7 +390,7 @@ def _parse_records(output_dir: Path) -> tuple[DesignRecord, ...]:
                 )
             )
             continue
-        for record_index, (_name, sequence) in enumerate(fasta):
+        for _, sequence in _classify_fasta_records(fasta, path):
             records.append(
                 DesignRecord(
                     index=len(records),
@@ -400,8 +400,29 @@ def _parse_records(output_dir: Path) -> tuple[DesignRecord, ...]:
                     status=DesignRecordStatus.SUCCEEDED,
                 )
             )
-            _ = record_index
     return tuple(records)
+
+
+def _classify_fasta_records(fasta: list[tuple[str, str]], path: Path) -> list[tuple[str, str]]:
+    """Validate one FASTA and return only its designed sequence records."""
+    stock_samples = [_is_stock_sample(header) for header, _ in fasta]
+    if not any(stock_samples):
+        return [(header, sequence) for header, sequence in fasta if not _is_native_template(header)]
+    if all(stock_samples):
+        return fasta
+    if _is_native_template(fasta[0][0]) and all(stock_samples[1:]):
+        return fasta[1:]
+    raise ValueError(f"malformed ProteinMPNN FASTA {path}: ambiguous non-sample record")
+
+
+def _is_native_template(header: str) -> bool:
+    """Identify the native/template record emitted before ProteinMPNN samples."""
+    return "fixed_chains=" in header and "designed_chains=" in header
+
+
+def _is_stock_sample(header: str) -> bool:
+    """Identify a designed sample by stock ProteinMPNN header metadata."""
+    return any(field.strip().startswith("sample=") for field in header.split(","))
 
 
 def _artifacts_for_records(

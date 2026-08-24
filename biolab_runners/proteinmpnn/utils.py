@@ -101,7 +101,7 @@ def _resolved_binary() -> list[str]:
     return [binary]
 
 
-def parse_fasta_sequences(path: Path) -> list[tuple[str, str]]:
+def parse_fasta_sequences(path: Path, *, full_header: bool = False) -> list[tuple[str, str]]:
     """Parse a FASTA file into a list of ``(name, sequence)`` tuples.
 
     ProteinMPNN emits ``<input>.fa`` with one header per sequence.
@@ -109,7 +109,7 @@ def parse_fasta_sequences(path: Path) -> list[tuple[str, str]]:
     are preserved for downstream tooling.
     """
     lines = path.read_text().splitlines()
-    return _parse_fasta_lines(lines)
+    return _parse_fasta_lines(lines, full_header=full_header)
 
 
 def build_invocation_command(
@@ -141,7 +141,7 @@ def build_invocation_command(
     )
 
 
-def _parse_fasta_lines(lines: list[str]) -> list[tuple[str, str]]:
+def _parse_fasta_lines(lines: list[str], *, full_header: bool = False) -> list[tuple[str, str]]:
     """Inner helper that splits a FASTA into ``(name, sequence)`` pairs."""
     records: list[tuple[str, str]] = []
     current_name: str | None = None
@@ -149,7 +149,7 @@ def _parse_fasta_lines(lines: list[str]) -> list[tuple[str, str]]:
     for line in lines:
         if line.startswith(">"):
             _flush_record(records, current_name, current_seq)
-            current_name = _parse_header(line)
+            current_name = _parse_header(line, full_header=full_header)
             current_seq = []
         else:
             current_seq.append(line.strip())
@@ -163,8 +163,10 @@ def _flush_record(records: list[tuple[str, str]], name: str | None, seq: list[st
         records.append((name, "".join(seq)))
 
 
-def _parse_header(line: str) -> str:
+def _parse_header(line: str, *, full_header: bool = False) -> str:
     """Return the FASTA header name (everything after ``>`` until whitespace)."""
+    if full_header:
+        return line[1:].strip()
     match = _FASTA_HEADER_RE.match(line)
     return match.group(1) if match else ""
 
