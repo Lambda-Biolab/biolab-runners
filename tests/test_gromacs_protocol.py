@@ -64,6 +64,7 @@ from biolab_runners.gromacs import (
 from biolab_runners.gromacs.config import GromacsConfig
 from biolab_runners.gromacs.paths import GromacsFiles
 from biolab_runners.gromacs.protocol import (
+    GROMACS_PROTOCOL_VERSION,
     StageKind,
     build_commands,
     build_stage_plan,
@@ -75,6 +76,7 @@ from biolab_runners.gromacs.protocol import (
     stage_minimum_outputs,
     stage_outputs_for,
 )
+from biolab_runners.gromacs.runner import _protocol_executed_config
 from biolab_runners.gromacs.utils import (
     load_stage_manifest,
     record_stage_status,
@@ -229,6 +231,46 @@ class TestMdpPositionRestraints:
         assert "DPOSRES" not in mdp
         assert "[ position_restraints ]" not in mdp
 
+    def test_restrained_npt_scales_reference_coordinate_com(self) -> None:
+        npt = generate_equil_npt_mdp()
+
+        assert "refcoord-scaling = com" in npt
+
+    @pytest.mark.parametrize("generator", [generate_equil_nvt_mdp, generate_production_mdp])
+    def test_other_protocols_omit_refcoord_scaling(self, generator: Any) -> None:
+        assert "refcoord-scaling" not in generator()
+
+
+class TestModernMdpOptions:
+    @pytest.mark.parametrize(
+        "generator",
+        [
+            generate_minimization_mdp,
+            generate_equil_nvt_mdp,
+            generate_equil_npt_mdp,
+            generate_production_mdp,
+            ions_mdp_content,
+        ],
+    )
+    def test_generated_mdp_omits_obsolete_options(self, generator: Any) -> None:
+        mdp = generator()
+
+        assert "ns-type" not in mdp
+        assert "nstxtcout" not in mdp
+
+    @pytest.mark.parametrize(
+        ("generator", "expected_interval"),
+        [
+            (generate_equil_nvt_mdp, 5000),
+            (generate_equil_npt_mdp, 5000),
+            (generate_production_mdp, 50000),
+        ],
+    )
+    def test_dynamics_use_modern_compressed_coordinate_output(
+        self, generator: Any, expected_interval: int
+    ) -> None:
+        assert f"nstxout-compressed = {expected_interval}\n" in generator()
+
 
 # ---------------------------------------------------------------------------
 # .mdp contract — v-rescale equilibration, nose-hoover production
@@ -253,11 +295,12 @@ class TestMdpThermostat:
 
     def test_npt_uses_parrinello_rahman_for_production_pressure(self) -> None:
         # Production carries Parrinello-Rahman; NPT equilibration
-        # uses Berendsen for fast pressure equilibration.
+        # uses ensemble-correct C-rescale pressure coupling.
         prod = generate_production_mdp()
         equil = generate_equil_npt_mdp()
         assert "pcoupl           = parrinello-rahman" in prod
-        assert "pcoupl           = berendsen" in equil
+        assert "pcoupl           = C-rescale" in equil
+        assert "pcoupl           = berendsen" not in equil
 
     @pytest.mark.parametrize(
         "generator",
@@ -380,10 +423,21 @@ class TestMdpValidation:
         second = generator()
         assert first == second
 
-    def test_ions_mdp_is_zero_step(self) -> None:
-        mdp = ions_mdp_content()
-        assert "integrator       = steep" in mdp
-        assert "nsteps           = 0" in mdp
+    def test_ions_mdp_is_exact_warning_clean_zero_step_genion_prep(self) -> None:
+        assert ions_mdp_content() == (
+            "; Zero-step TPR preparation for genion (no dynamics)\n"
+            "integrator       = md\n"
+            "nsteps           = 0\n"
+            "continuation     = yes\n"
+            "constraints      = none\n"
+            "cutoff-scheme    = Verlet\n"
+            "coulombtype      = Cut-off\n"
+            "rcoulomb         = 1.0\n"
+            "vdwtype          = Cut-off\n"
+            "rvdw             = 1.0\n"
+            "tcoupl           = no\n"
+            "pcoupl           = no\n"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +447,11 @@ class TestMdpValidation:
 
 class TestBuildCommands:
     """Command construction: grompp → mdrun, genion group selection, -nt gating."""
+
+    def test_executed_config_binds_protocol_version(self) -> None:
+        payload = _protocol_executed_config(_valid_protocol_config())
+
+        assert payload["protocol_version"] == GROMACS_PROTOCOL_VERSION
 
     def test_topology_emits_pdb2gmx(self) -> None:
         cfg = _valid_protocol_config()
@@ -420,6 +479,31 @@ class TestBuildCommands:
         assert "genion" in cmds[1]
         assert "0.15" in cmds[1]
         assert "-neutral" in cmds[1]
+
+    def test_all_grompp_commands_are_exactly_warning_clean(self) -> None:
+        cfg = _valid_protocol_config()
+        stages = build_stage_plan()
+        grompp_commands = [
+            command
+            for stage in stages
+            for command in build_commands(stage, checkpoint_path=None, config=cfg)
+            if command[:2] == ["gmx", "grompp"]
+        ]
+
+        assert grompp_commands
+        assert all("-maxwarn" not in command for command in grompp_commands)
+        assert grompp_commands[0] == [
+            "gmx",
+            "grompp",
+            "-f",
+            "ions.mdp",
+            "-c",
+            "solvated.gro",
+            "-p",
+            "topol.top",
+            "-o",
+            "ions.tpr",
+        ]
 
     def test_md_stage_emits_grompp_then_mdrun(self) -> None:
         """The runner must call gmx grompp BEFORE gmx mdrun for every MD stage."""
@@ -456,6 +540,52 @@ class TestBuildCommands:
         assert _arg_after(grompp_nvt, "-c") == "min.gro"
         assert _arg_after(grompp_npt, "-c") == "nvt.gro"
         assert _arg_after(grompp_prod, "-c") == "npt.gro"
+
+    def test_posres_stages_use_exact_deterministic_restraint_references(self) -> None:
+        cfg = _valid_protocol_config()
+        stages = build_stage_plan()
+
+        nvt = build_commands(stages[5], checkpoint_path=None, config=cfg)[0]
+        npt = build_commands(stages[6], checkpoint_path=None, config=cfg)[0]
+
+        assert nvt == [
+            "gmx",
+            "grompp",
+            "-f",
+            "nvt.mdp",
+            "-c",
+            "min.gro",
+            "-p",
+            "topol.top",
+            "-o",
+            "nvt.tpr",
+            "-r",
+            "min.gro",
+        ]
+        assert npt == [
+            "gmx",
+            "grompp",
+            "-f",
+            "npt.mdp",
+            "-c",
+            "nvt.gro",
+            "-p",
+            "topol.top",
+            "-o",
+            "npt.tpr",
+            "-r",
+            "nvt.gro",
+        ]
+
+    def test_non_posres_stages_do_not_receive_restraint_reference(self) -> None:
+        cfg = _valid_protocol_config()
+        stages = build_stage_plan()
+
+        minimize = build_commands(stages[4], checkpoint_path=None, config=cfg)[0]
+        production = build_commands(stages[7], checkpoint_path=None, config=cfg)[0]
+
+        assert "-r" not in minimize
+        assert "-r" not in production
 
     def test_grompp_uses_relative_paths_for_container_compatibility(self) -> None:
         """All grompp flags that reference work-dir artifacts use relative paths.
@@ -532,6 +662,22 @@ class TestBuildCommands:
         assert "-t" in grompp
         idx = grompp.index("-t")
         assert grompp[idx + 1] == cpi_path
+
+    @pytest.mark.parametrize(
+        ("stage_index", "restraint_reference"),
+        [(5, "min.gro"), (6, "nvt.gro")],
+    )
+    def test_posres_resume_keeps_deterministic_restraint_reference(
+        self, stage_index: int, restraint_reference: str
+    ) -> None:
+        cfg = _valid_protocol_config()
+        stage = build_stage_plan()[stage_index]
+        checkpoint = f"/tmp/{stage.prefix}.cpt"
+
+        grompp = build_commands(stage, checkpoint_path=checkpoint, config=cfg)[0]
+
+        assert grompp[grompp.index("-r") + 1] == restraint_reference
+        assert grompp[grompp.index("-t") + 1] == checkpoint
 
     def test_genvel_is_set_only_in_nvt_mdp(self) -> None:
         """``gen-vel = yes`` bootstraps velocities in NVT only.
@@ -764,8 +910,8 @@ class TestStageMinimumOutputs:
     """Stage-specific minimum outputs — what the disk fallback actually checks.
 
     These tests exist to catch a class of bug where the fallback
-    requires IMPOSSIBLE artifacts (e.g. ``.xtc`` on a 1 ps
-    minimisation that never reaches ``nstxtcout``) and forces the
+    requires IMPOSSIBLE artifacts (e.g. ``.xtc`` from a minimisation
+    with no compressed-coordinate output interval) and forces the
     runner to re-run every short simulation.
 
     The minimum set MUST be a strict subset of the full set
@@ -782,12 +928,13 @@ class TestStageMinimumOutputs:
             )
 
     def test_minimum_does_not_require_xtc_for_short_md_stages(self) -> None:
-        """``.xtc`` is only written at ``nstxtcout`` — short runs won't have it.
+        """``.xtc`` is interval-driven — short runs might not write it.
 
-        NVT is 100 ps × 0.002 fs = 50 000 steps; with nstxtcout=5000
-        that DOES fire (10 frames). NPT same. Production 200 ns
-        with nstxtcout=50000 also fires. BUT a 1 ps minimisation
-        (500 steps) does NOT reach nstxtcout=5000 — so ``.xtc`` is
+        NVT is 100 ps × 0.002 fs = 50 000 steps; with
+        nstxout-compressed=5000 that DOES fire (10 frames). NPT same.
+        Production 200 ns with nstxout-compressed=50000 also fires.
+        BUT a 1 ps minimisation (500 steps) has no compressed-output
+        interval — so ``.xtc`` is
         not in the minimum for MINIMIZE.
         """
         min_outputs = stage_minimum_outputs(StageKind.MINIMIZE, "min")
@@ -871,6 +1018,95 @@ class TestStageManifest:
 class TestRunnerSkipAndResume:
     """Skip semantics (manifest authority) + resume (``-cpi`` iff .cpt)."""
 
+    @pytest.mark.parametrize(
+        ("binary_prefix", "expected_prefix"),
+        [
+            (None, ["gmx"]),
+            (["launcher", "--profile", "gmx-custom"], ["launcher", "--profile", "gmx-custom"]),
+        ],
+    )
+    def test_logical_gmx_is_replaced_by_exact_resolved_prefix(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        binary_prefix: list[str] | None,
+        expected_prefix: list[str],
+    ) -> None:
+        monkeypatch.delenv("GROMACS_BIN", raising=False)
+        cfg = _valid_protocol_config(output_root=str(tmp_path), force=True)
+        stage = next(item for item in build_stage_plan() if item.kind == StageKind.BOX)
+        work_dir = tmp_path / "exact-prefix"
+        work_dir.mkdir()
+        logical = build_commands(stage, checkpoint_path=None, config=cfg)[0]
+        expected = [*expected_prefix, *logical[1:]]
+        process = MagicMock(returncode=0)
+        process.communicate.return_value = ("", "")
+        runner = GromacsProtocolRunner(binary_prefix=binary_prefix)
+
+        with patch("biolab_runners.gromacs.runner.subprocess.Popen", return_value=process) as popen:
+            status, rc, skipped = runner._run_single_stage(work_dir, stage, cfg)
+
+        assert (status, rc, skipped) == (StageStatus.COMPLETED, 0, False)
+        assert popen.call_args.args[0] == expected
+        assert runner._last_command == tuple(expected)
+        record = load_stage_manifest(work_dir)["stages"][StageKind.BOX.value]
+        assert record["command"] == " ".join(expected)
+
+    def test_protocol_rejects_unexpected_logical_executable(self, tmp_path: Path) -> None:
+        cfg = _valid_protocol_config(output_root=str(tmp_path), force=True)
+        stage = next(item for item in build_stage_plan() if item.kind == StageKind.BOX)
+        work_dir = tmp_path / "invalid-logical-command"
+        work_dir.mkdir()
+        runner = GromacsProtocolRunner()
+
+        with (
+            patch("biolab_runners.gromacs.runner.build_commands", return_value=[["python", "x"]]),
+            pytest.raises(ValueError, match="logical executable token 'gmx'"),
+        ):
+            runner._run_single_stage(work_dir, stage, cfg)
+
+    @pytest.mark.parametrize("stage_kind", [StageKind.EQUIL_NVT, StageKind.EQUIL_NPT])
+    @pytest.mark.parametrize(
+        ("binary_prefix", "expected_prefix"),
+        [
+            (None, ["gmx"]),
+            (["launcher", "--profile", "gmx-custom"], ["launcher", "--profile", "gmx-custom"]),
+        ],
+    )
+    def test_posres_stage_records_and_executes_exact_resolved_argv(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        stage_kind: StageKind,
+        binary_prefix: list[str] | None,
+        expected_prefix: list[str],
+    ) -> None:
+        monkeypatch.delenv("GROMACS_BIN", raising=False)
+        cfg = _valid_protocol_config(output_root=str(tmp_path), force=True)
+        stage = next(item for item in build_stage_plan() if item.kind == stage_kind)
+        work_dir = tmp_path / f"exact-{stage_kind.value}-{len(expected_prefix)}"
+        work_dir.mkdir()
+        logical_commands = build_commands(stage, checkpoint_path=None, config=cfg)
+        expected_commands = [
+            [*expected_prefix, *logical_command[1:]] for logical_command in logical_commands
+        ]
+        process = MagicMock(returncode=0)
+        process.communicate.return_value = ("", "")
+        runner = GromacsProtocolRunner(binary_prefix=binary_prefix)
+
+        with patch("biolab_runners.gromacs.runner.subprocess.Popen", return_value=process) as popen:
+            status, rc, skipped = runner._run_single_stage(work_dir, stage, cfg)
+
+        assert (status, rc, skipped) == (StageStatus.COMPLETED, 0, False)
+        assert [call.args[0] for call in popen.call_args_list] == expected_commands
+        assert runner._last_command == tuple(expected_commands[-1])
+        record = load_stage_manifest(work_dir)["stages"][stage_kind.value]
+        assert record["command"] == " ".join(expected_commands[0])
+        assert expected_commands[0][expected_commands[0].index("-r") + 1] in {
+            "min.gro",
+            "nvt.gro",
+        }
+
     def test_skip_when_manifest_already_completed(self, tmp_path: Path) -> None:
         cfg = _valid_protocol_config(output_root=str(tmp_path))
         work_dir = tmp_path / cfg.name
@@ -901,7 +1137,7 @@ class TestRunnerSkipAndResume:
         ``.edr``, ``.log`` on disk — but lost the intermittent
         ``.cpt`` / ``.xtc`` / ``.trr`` — is correctly recognised as
         complete. Without this fallback, the runner would re-run
-        every short simulation that didn't reach ``nstxtcout``.
+        every short simulation that didn't reach its trajectory-output interval.
         """
         cfg = _valid_protocol_config(output_root=str(tmp_path))
         work_dir = tmp_path / cfg.name
@@ -1246,6 +1482,25 @@ class TestRunnerSigtermPreservation:
         code = _runner_code_only()
         assert "shell=True" not in code, "shell=True found in runner.py code"
         assert "sh -c" not in code, "shell invocation found in runner.py code"
+
+    def test_custom_prefix_genion_detection_uses_resolved_argv_boundary(
+        self, tmp_path: Path
+    ) -> None:
+        prefix = ["launcher", "--profile", "gmx-custom"]
+        runner = GromacsProtocolRunner(binary_prefix=prefix)
+        mock_proc = MagicMock(returncode=0)
+        mock_proc.communicate.return_value = ("", "")
+        command = [*prefix, "genion", "-s", "ions.tpr"]
+
+        with patch(
+            "biolab_runners.gromacs.runner.subprocess.Popen", return_value=mock_proc
+        ) as mock_popen:
+            runner._run_subprocess(command, tmp_path, timeout_seconds=60)
+
+        assert mock_popen.call_args.args[0] == command
+        assert mock_popen.call_args.kwargs["stdin"] is not None
+        assert mock_proc.communicate.call_args.kwargs["input"] == GENION_INPUT
+        assert runner._last_command == tuple(command)
 
     def test_sigterm_grace_does_not_block_24h(self, tmp_path: Path) -> None:
         """The SIGTERM grace timer runs in a background thread, NOT on the communicate timeout.

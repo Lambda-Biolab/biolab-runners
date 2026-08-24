@@ -26,6 +26,10 @@ exactly one peptide-NH, not the N-terminal NH3+ triple):
 4. Re-run ``findMissingAtoms`` + ``addMissingAtoms`` after the
    mutation so the new template's side-chain atoms (CG, CD1, CD2,
    HG, HD11-13, HD21-23 for LEU) are populated.
+5. Normalize every non-Gly C-alpha to L by reflecting any
+   misoriented side chain through the N-CA-C plane. PDBFixer can
+   otherwise place a new C-beta on either side of an achiral
+   poly-Gly backbone.
 
 The source residue's 1-letter → 3-letter table is the same canonical
 amino-acid alphabet as :mod:`biolab_runners.peptide_prep.config` —
@@ -54,11 +58,16 @@ build a config without an OpenMM install).
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from biolab_runners.peptide_prep.utils import THREE_LETTER
 
+if TYPE_CHECKING:
+    from collections.abc import MutableSequence
+
 logger = logging.getLogger(__name__)
+
+_BACKBONE_ATOM_NAMES = frozenset({"N", "CA", "C", "O", "OXT", "H", "H1", "H2", "H3", "HN"})
 
 __all__ = [
     "apply_sequence_mutation",
@@ -146,6 +155,67 @@ def select_chain_atoms(
     return drop
 
 
+def _normalize_residue_l_chirality(
+    residue: object,
+    positions_nm: MutableSequence[Any],
+    residue_index: int,
+) -> None:
+    import numpy as np
+
+    from openmm import Vec3
+
+    atoms = {atom.name: atom for atom in residue.atoms()}  # type: ignore[attr-defined]
+    missing = {"N", "CA", "C", "CB"} - atoms.keys()
+    if missing:
+        raise ValueError(
+            f"cannot normalize L chirality at residue {residue_index}: "
+            f"missing atoms {sorted(missing)}"
+        )
+    coordinates = {
+        name: np.asarray(positions_nm[atom.index], dtype=float) for name, atom in atoms.items()
+    }
+    ca = coordinates["CA"]
+    normal = np.cross(coordinates["N"] - ca, coordinates["C"] - ca)
+    normal_squared = float(np.dot(normal, normal))
+    signed_volume = float(np.dot(normal, coordinates["CB"] - ca))
+    if normal_squared == 0.0 or signed_volume == 0.0:
+        raise ValueError(
+            f"cannot normalize L chirality at residue {residue_index}: "
+            "N, CA, C, and CB define degenerate geometry"
+        )
+    if signed_volume < 0.0:
+        for name, atom in atoms.items():
+            if name in _BACKBONE_ATOM_NAMES:
+                continue
+            point = coordinates[name]
+            reflected = point - 2.0 * np.dot(point - ca, normal) / normal_squared * normal
+            positions_nm[atom.index] = Vec3(*reflected)
+
+
+def _normalize_l_sidechain_chirality(
+    topology: object,
+    positions: object,
+    target_sequence: str,
+) -> object:
+    """Reflect misoriented side chains into canonical L geometry."""
+    from openmm import unit
+
+    residues = list(topology.residues())  # type: ignore[attr-defined]
+    if len(residues) != len(target_sequence):
+        raise ValueError(
+            f"sequence/source length mismatch after mutation: topology has "
+            f"{len(residues)} residues, target has {len(target_sequence)}"
+        )
+    positions_nm = positions.value_in_unit(unit.nanometer)  # type: ignore[attr-defined]
+    for residue_index, (residue, residue_code) in enumerate(
+        zip(residues, target_sequence, strict=True)
+    ):
+        if residue_code.upper() == "G":
+            continue
+        _normalize_residue_l_chirality(residue, positions_nm, residue_index)
+    return positions_nm * unit.nanometer
+
+
 def apply_sequence_mutation(
     *,
     backbone_pdb_path: str,
@@ -163,7 +233,9 @@ def apply_sequence_mutation(
        residue whose target 3-letter code differs from the source.
     4. ``findMissingAtoms`` + ``addMissingAtoms`` — re-discover and
        add the target template's atoms (CG/CD1/CD2 for LEU etc.).
-    5. ``addMissingHydrogens`` — final hydrogen addition. This
+    5. Normalize newly populated side chains to L geometry without
+       moving N, CA, C, O, or terminal backbone atoms.
+    6. ``addMissingHydrogens`` — final hydrogen addition. This
        populates the chain with terminal NH3+ / COO- caps that
        the orchestrator removes for cyclic peptides.
 
@@ -245,6 +317,11 @@ def apply_sequence_mutation(
 
     fixer.findMissingAtoms()
     fixer.addMissingAtoms()
+    fixer.positions = _normalize_l_sidechain_chirality(
+        fixer.topology,
+        fixer.positions,
+        target_sequence,
+    )
     fixer.addMissingHydrogens(7.4)
 
     return fixer.topology, fixer.positions

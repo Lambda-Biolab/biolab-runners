@@ -90,6 +90,7 @@ def test_reused_peptide_result_is_cached_in_public_contract() -> None:
 
 
 COMMITTED_BACKBONE_PDB = "tests/integration/fixtures/biology/ala5_peptide.pdb"
+POLY_GLY_BACKBONE_PDB = "tests/integration/fixtures/biology/rfdiffusion_poly_gly_15.pdb"
 
 
 class _FakeDSub:
@@ -212,6 +213,16 @@ def _gromacs_binary_available() -> bool:
 class TestPeptidePrepConfig:
     """Required paths, sequence alphabet, and topology invariants."""
 
+    def test_rejects_nonpositive_gromacs_position_restraint_force(self, tmp_path: Path) -> None:
+        with pytest.raises(
+            ValueError,
+            match="gromacs_position_restraint_force_k_kjmol_nm2 must be positive",
+        ):
+            _make_linear_config(
+                str(tmp_path / "out"),
+                gromacs_position_restraint_force_k_kjmol_nm2=0.0,
+            )
+
     def test_default_construction_succeeds_with_minimum_required(self, tmp_path: Path) -> None:
         cfg = _make_linear_config(str(tmp_path / "out"))
         assert cfg.sequence == "AAAAA"
@@ -324,6 +335,59 @@ class TestPeptidePrepConfig:
                 str(tmp_path / "out"),
                 minimization_max_iterations=0,
             )
+
+    def test_rejects_invalid_chirality_restraint_parameters(self, tmp_path: Path) -> None:
+        for force_constant in (-1.0, 0.0):
+            with pytest.raises(ValueError, match="chirality_restraint_force_k_kjmol"):
+                _make_linear_config(
+                    str(tmp_path / "out"),
+                    chirality_restraint_force_k_kjmol=force_constant,
+                )
+        with pytest.raises(ValueError, match="chirality_restraint_min_signed_volume_nm3"):
+            _make_linear_config(
+                str(tmp_path / "out"),
+                chirality_restraint_min_signed_volume_nm3=0.0,
+            )
+
+    def test_rejects_unsupported_gromacs_force_field_combinations(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match=r"unsupported.*GROMACS export force-field"):
+            _make_linear_config(str(tmp_path / "out"), protein_ff="charmm36.xml")
+        with pytest.raises(ValueError, match=r"unsupported.*GROMACS export force-field"):
+            _make_linear_config(str(tmp_path / "out"), water_ff_xml="spce.xml")
+
+    def test_chirality_restraint_physics_is_bound_into_science_digest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import dataclasses
+
+        from biolab_runners.peptide_prep import config as config_module
+        from biolab_runners.peptide_prep.runner import _compute_config_digest
+
+        cfg = _make_linear_config(str(tmp_path / "out"))
+        baseline = _compute_config_digest(cfg)
+        assert baseline != _compute_config_digest(
+            dataclasses.replace(cfg, chirality_restraint_force_k_kjmol=500.0)
+        )
+        assert baseline != _compute_config_digest(
+            dataclasses.replace(cfg, chirality_restraint_min_signed_volume_nm3=0.002)
+        )
+        monkeypatch.setattr(
+            config_module,
+            "CHIRALITY_RESTRAINT_ALGORITHM_VERSION",
+            "n-ca-c-cb-signed-volume-wall-v2",
+        )
+        assert baseline != _compute_config_digest(cfg)
+        monkeypatch.setattr(
+            config_module,
+            "CHIRALITY_RESTRAINT_ALGORITHM_VERSION",
+            "n-ca-c-cb-signed-volume-wall-v1",
+        )
+        monkeypatch.setattr(
+            config_module,
+            "GROMACS_TOPOLOGY_MATERIALIZER_VERSION",
+            "parmed-standalone-gromacs-includes-v2",
+        )
+        assert baseline != _compute_config_digest(cfg)
 
     def test_rejects_non_positive_closure_limit(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="max_disulfide_distance_angstrom"):
@@ -573,9 +637,26 @@ class TestPeptidePrepLinear:
         assert result.closure_distances_before == {}
         assert result.closure_distances_after == {}
 
+        top_text = Path(result.gromacs_top).read_text()
+        defaults_index = top_text.index("[ defaults ]")
+        atomtypes_index = top_text.index("[ atomtypes ]")
+        nonbonded_index = top_text.index("amber99sb-ildn.ff/ffnonbonded.itp")
+        solute_index = top_text.index("[ moleculetype ]")
+        water_index = top_text.index("Materialized from GROMACS 2026.3 amber99sb-ildn.ff/tip3p.itp")
+        ions_index = top_text.index("Materialized from GROMACS 2026.3 amber99sb-ildn.ff/ions.itp")
+        system_index = top_text.index("[ system ]")
+        assert defaults_index < atomtypes_index < nonbonded_index < solute_index
+        assert solute_index < water_index < ions_index < system_index
+        assert top_text.count("[ defaults ]") == 1
+        assert "PEP_N1" in top_text
+
         manifest_data = json.loads(Path(result.manifest_path).read_text())
         assert manifest_data["source_backbone_sha256"] == result.source_backbone_digest
         assert manifest_data["config_digest"] == result.source_config_digest
+        assert manifest_data["gromacs_include_family"] == "amber99sb-ildn-tip3p"
+        assert manifest_data["gromacs_topology_materializer_version"]
+        assert manifest_data["gromacs_position_restraint_algorithm_version"]
+        assert manifest_data["gromacs_position_restraint_force_k_kjmol_nm2"] == 1000.0
         assert manifest_data["outputs"]["prepared_pdb_sha256"] == result.prepared_pdb_sha256
 
     def test_idempotent_reuse_returns_reused_flag(self, tmp_output_dir: Path) -> None:
@@ -949,6 +1030,44 @@ class TestPeptidePrepMutation:
         result = PeptidePrepRunner().run(cfg)
         assert result.success, f"heterogeneous mutation failed: {result.error}"
 
+    def test_poly_gly_mutation_materializes_all_l_sidechains(self) -> None:
+        """RFdiffusion poly-Gly threading must start from canonical L side chains."""
+        from biolab_runners.peptide_prep.mutation import apply_sequence_mutation
+        from biolab_runners.peptide_prep.utils import collect_atom_mapping
+
+        sequence = "SAHPGVQRAVGGMPP"
+        topology, positions = apply_sequence_mutation(
+            backbone_pdb_path=POLY_GLY_BACKBONE_PDB,
+            chain_id="C",
+            target_sequence=sequence,
+        )
+        source = PDBFixer(filename=POLY_GLY_BACKBONE_PDB)
+
+        for residue_index, residue_code in enumerate(sequence):
+            source_mapping = collect_atom_mapping(source.topology, source.positions, residue_index)
+            mapping = collect_atom_mapping(topology, positions, residue_index)
+            for atom_name in ("N", "CA", "C", "O"):
+                assert mapping[atom_name] == pytest.approx(source_mapping[atom_name], abs=2e-6)
+            if residue_code == "G":
+                continue
+            n = mapping["N"]
+            ca = mapping["CA"]
+            c = mapping["C"]
+            cb = mapping["CB"]
+            n_ca = tuple(n[i] - ca[i] for i in range(3))
+            c_ca = tuple(c[i] - ca[i] for i in range(3))
+            cb_ca = tuple(cb[i] - ca[i] for i in range(3))
+            normal = (
+                n_ca[1] * c_ca[2] - n_ca[2] * c_ca[1],
+                n_ca[2] * c_ca[0] - n_ca[0] * c_ca[2],
+                n_ca[0] * c_ca[1] - n_ca[1] * c_ca[0],
+            )
+            signed_volume = sum(normal[i] * cb_ca[i] for i in range(3))
+            assert signed_volume > 0.0, (
+                f"residue {residue_index} {residue_code} was materialized with "
+                f"D chirality ({signed_volume=})"
+            )
+
 
 # ---------------------------------------------------------------------------
 # Restraint during minimization (B2)
@@ -1124,6 +1243,156 @@ class TestPeptidePrepRestraint:
         system.addForce(wrong_expression)
         with pytest.raises(RuntimeError, match="unexpected energy expression"):
             build_closed_system(system, restraint_force_index=system.getNumForces() - 1)
+
+    def test_chirality_restraint_penalizes_mirrored_handedness(self) -> None:
+        """The scalar-volume wall scales strongly against wrong-handed terminal Pro."""
+        from biolab_runners.peptide_prep.config import (
+            DEFAULT_CHIRALITY_RESTRAINT_FORCE_K_KJMOL,
+        )
+        from biolab_runners.peptide_prep.minimization import (
+            read_potential_energy,
+            restrain_chirality,
+        )
+        from biolab_runners.peptide_prep.mutation import apply_sequence_mutation
+
+        topology, positions = apply_sequence_mutation(
+            backbone_pdb_path=POLY_GLY_BACKBONE_PDB,
+            chain_id="C",
+            target_sequence="SAHPGVQRAVGGMPP",
+        )
+        system = openmm.System()
+        for _ in topology.atoms():
+            system.addParticle(12.0)
+        restraint_index = restrain_chirality(
+            system,
+            topology,
+            positions,
+            force_constant_k_kjmol=DEFAULT_CHIRALITY_RESTRAINT_FORCE_K_KJMOL,
+            minimum_signed_volume_nm3=0.001,
+        )
+        assert isinstance(system.getForce(restraint_index), openmm.CustomCompoundBondForce)
+
+        from openmm import unit
+
+        residue = next(r for r in topology.residues() if r.index == 14)
+        atoms = {atom.name: atom for atom in residue.atoms()}
+        nanometer_positions = list(positions.value_in_unit(unit.nanometer))
+        n, ca, c, cb = (nanometer_positions[atoms[name].index] for name in ("N", "CA", "C", "CB"))
+        normal = openmm.Vec3(
+            (n - ca)[1] * (c - ca)[2] - (n - ca)[2] * (c - ca)[1],
+            (n - ca)[2] * (c - ca)[0] - (n - ca)[0] * (c - ca)[2],
+            (n - ca)[0] * (c - ca)[1] - (n - ca)[1] * (c - ca)[0],
+        )
+        signed_volume = sum(normal[i] * (cb - ca)[i] for i in range(3))
+        assert signed_volume != 0.0
+        wrong_handed = list(nanometer_positions)
+        wrong_handed[atoms["CB"].index] = ca + (-0.0022171265 / signed_volume) * (cb - ca)
+        wrong_handed_positions = wrong_handed * unit.nanometer
+
+        force = system.getForce(restraint_index)
+        energy_differences: list[float] = []
+        for force_constant in (300.0, 1000.0, DEFAULT_CHIRALITY_RESTRAINT_FORCE_K_KJMOL):
+            force.setGlobalParameterDefaultValue(0, force_constant)
+            initial_energy = read_potential_energy(
+                topology, system, positions, platform_name="Reference"
+            )
+            wrong_handed_energy = read_potential_energy(
+                topology, system, wrong_handed_positions, platform_name="Reference"
+            )
+            energy_differences.append(wrong_handed_energy - initial_energy)
+
+        assert energy_differences[1] == pytest.approx(energy_differences[0] * (1000.0 / 300.0))
+        assert energy_differences[2] == pytest.approx(
+            energy_differences[0] * (DEFAULT_CHIRALITY_RESTRAINT_FORCE_K_KJMOL / 300.0)
+        )
+        assert energy_differences[2] > 10_000.0
+
+    def test_closed_system_removes_backbone_and_chirality_restraints(self) -> None:
+        """Both temporary forces leave only the deep-copied export system."""
+        from biolab_runners.peptide_prep.minimization import (
+            build_closed_system,
+            restrain_backbone,
+            restrain_chirality,
+        )
+
+        fixer = PDBFixer(filename=COMMITTED_BACKBONE_PDB)
+        fixer.findMissingResidues()
+        fixer.findMissingAtoms()
+        fixer.addMissingAtoms()
+        fixer.addMissingHydrogens(7.4)
+        system = app.ForceField("amber99sbildn.xml", "tip3p.xml").createSystem(fixer.topology)
+        backbone_index = restrain_backbone(
+            system, fixer.topology, fixer.positions, force_constant_k_kjmol_nm2=1000.0
+        )
+        chirality_index = restrain_chirality(
+            system,
+            fixer.topology,
+            fixer.positions,
+            force_constant_k_kjmol=1000.0,
+            minimum_signed_volume_nm3=0.001,
+        )
+        original_force_count = system.getNumForces()
+
+        closed = build_closed_system(
+            system,
+            restraint_force_index=backbone_index,
+            chirality_restraint_force_index=chirality_index,
+        )
+
+        assert closed.getNumForces() == original_force_count - 2
+        assert not any(
+            isinstance(
+                closed.getForce(i),
+                (openmm.CustomExternalForce, openmm.CustomCompoundBondForce),
+            )
+            for i in range(closed.getNumForces())
+        )
+        assert system.getNumForces() == original_force_count
+        assert isinstance(system.getForce(backbone_index), openmm.CustomExternalForce)
+        assert isinstance(system.getForce(chirality_index), openmm.CustomCompoundBondForce)
+
+    def test_closed_system_rejects_bad_chirality_restraint_index(self) -> None:
+        """Malformed chirality index, force type, or expression fails closed."""
+        from biolab_runners.peptide_prep.minimization import (
+            build_closed_system,
+            restrain_backbone,
+        )
+
+        fixer = PDBFixer(filename=COMMITTED_BACKBONE_PDB)
+        fixer.findMissingResidues()
+        fixer.findMissingAtoms()
+        fixer.addMissingAtoms()
+        fixer.addMissingHydrogens(7.4)
+        system = app.ForceField("amber99sbildn.xml", "tip3p.xml").createSystem(fixer.topology)
+        backbone_index = restrain_backbone(
+            system, fixer.topology, fixer.positions, force_constant_k_kjmol_nm2=1000.0
+        )
+        with pytest.raises(ValueError, match="chirality_restraint_force_index"):
+            build_closed_system(
+                system,
+                restraint_force_index=backbone_index,
+                chirality_restraint_force_index=True,
+            )
+
+        wrong_type = openmm.CustomExternalForce("x*x")
+        wrong_type.addParticle(0, [])
+        wrong_type_index = system.addForce(wrong_type)
+        with pytest.raises(RuntimeError, match="expected CustomCompoundBondForce"):
+            build_closed_system(
+                system,
+                restraint_force_index=backbone_index,
+                chirality_restraint_force_index=wrong_type_index,
+            )
+
+        wrong_expression = openmm.CustomCompoundBondForce(4, "x1")
+        wrong_expression.addBond([0, 1, 2, 3], [])
+        wrong_expression_index = system.addForce(wrong_expression)
+        with pytest.raises(RuntimeError, match="unexpected energy expression"):
+            build_closed_system(
+                system,
+                restraint_force_index=backbone_index,
+                chirality_restraint_force_index=wrong_expression_index,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1334,6 +1603,37 @@ class TestPeptidePrepGromacsParity:
     possible, text-parsing otherwise).
     """
 
+    def test_export_places_posres_in_solute_and_selects_only_heavy_atoms(
+        self, tmp_output_dir: Path
+    ) -> None:
+        cfg = _make_linear_config(
+            str(tmp_output_dir),
+            name="posres",
+            minimization_max_iterations=20,
+            gromacs_position_restraint_force_k_kjmol_nm2=750.0,
+        )
+        result = PeptidePrepRunner().run(cfg)
+        assert result.success, result.error
+
+        pdb = app.PDBFile(result.prepared_pdb)
+        atoms = list(pdb.topology.atoms())
+        expected = {atom.index + 1 for atom in atoms if atom.element.atomic_number != 1}
+        topology_text = Path(result.gromacs_top).read_text()
+        block = topology_text.split("#ifdef POSRES", 1)[1].split("#endif", 1)[0]
+        restrained = {
+            int(line.split()[0])
+            for line in block.splitlines()
+            if line.strip() and line.split()[0].isdigit()
+        }
+
+        assert restrained == expected
+        assert max(restrained) <= len(atoms)
+        assert "750.000000 750.000000 750.000000" in block
+        first_moleculetype = topology_text.index("[ moleculetype ]")
+        posres = topology_text.index("#ifdef POSRES")
+        solvent_moleculetype = topology_text.index("[ moleculetype ]", first_moleculetype + 1)
+        assert first_moleculetype < posres < solvent_moleculetype
+
     def test_atom_count_matches_openmm(self, tmp_output_dir: Path, two_cys_pdb: Path) -> None:
         cfg = _make_linear_config(
             str(tmp_output_dir),
@@ -1508,6 +1808,145 @@ class TestPeptidePrepGromacsParity:
         )
         assert ok, f"real gmx grompp audit failed: {message}"
 
+    @pytest.mark.skipif(
+        not _gromacs_binary_available(),
+        reason="gmx binary not available; real-GROMACS solvation test is availability-gated",
+    )
+    def test_real_gromacs_charged_system_ions_grompp_has_zero_warnings(
+        self, tmp_output_dir: Path
+    ) -> None:
+        from biolab_runners.gromacs.config import GromacsProtocolConfig
+        from biolab_runners.gromacs.protocol import build_commands, build_stage_plan
+        from biolab_runners.gromacs.runner import _emit_mdp
+
+        prep = PeptidePrepRunner().run(
+            _make_linear_config(
+                str(tmp_output_dir),
+                name="charged_arg",
+                sequence="AAAAR",
+                minimization_max_iterations=20,
+            )
+        )
+        assert prep.success, prep.error
+        assert prep.net_charge == pytest.approx(1.0, abs=1e-6)
+
+        work_dir = tmp_output_dir / "charged_ions_grompp"
+        work_dir.mkdir()
+        shutil.copy2(prep.gromacs_top, work_dir / "topol.top")
+        shutil.copy2(prep.gromacs_gro, work_dir / "processed.gro")
+        config = GromacsProtocolConfig(
+            name="charged-ions-grompp",
+            output_root=str(tmp_output_dir),
+            prebuilt_topology=prep.gromacs_top,
+            prebuilt_coordinates=prep.gromacs_gro,
+        )
+        stages = build_stage_plan()
+        _emit_mdp(work_dir, stages[3], config)
+        commands = [
+            command
+            for stage in stages[1:4]
+            for command in build_commands(stage, checkpoint_path=None, config=config)
+        ]
+
+        for command in commands:
+            completed = subprocess.run(
+                command,
+                cwd=work_dir,
+                input="SOL\n" if "genion" in command else None,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            output = f"{completed.stdout}\n{completed.stderr}"
+            assert completed.returncode == 0, f"{' '.join(command)} failed:\n{output}"
+            if "grompp" in command:
+                assert "WARNING" not in output
+
+        assert (work_dir / "ions.gro").is_file()
+
+    @pytest.mark.skipif(
+        not _gromacs_binary_available(),
+        reason="gmx binary not available; real-GROMACS solvation test is availability-gated",
+    )
+    def test_real_gromacs_cyclic_d_ala_pipeline_through_npt(self, tmp_output_dir: Path) -> None:
+        from biolab_runners.gromacs.config import GromacsProtocolConfig
+        from biolab_runners.gromacs.protocol import build_commands, build_stage_plan
+        from biolab_runners.gromacs.runner import _emit_mdp
+
+        cfg = _make_linear_config(
+            str(tmp_output_dir),
+            name="gromacs_solvation",
+            topology=PeptideTopologyDescriptor(
+                d_substitutions=(_FakeDSub(2, "ALA"),),
+                head_to_tail=_FakeCyclic(1, 5),
+            ),
+            minimization_max_iterations=100,
+            coordinate_transformer_identity="test-ct-v1",
+            chirality_validator_identity="test-cv-v1",
+        )
+        result = PeptidePrepRunner().run(
+            cfg,
+            coordinate_transformer=_HermeticDReflectionTransformer(),
+            chirality_validator=_AlwaysValidValidator(),
+        )
+        assert result.success, result.error
+
+        work_dir = tmp_output_dir / "real_gromacs_solvation"
+        work_dir.mkdir()
+        shutil.copy2(result.gromacs_top, work_dir / "topol.top")
+        shutil.copy2(result.gromacs_gro, work_dir / "processed.gro")
+        protocol_config = GromacsProtocolConfig(
+            name="cyclic-d-ala-runtime",
+            output_root=str(tmp_output_dir),
+            prebuilt_topology=result.gromacs_top,
+            prebuilt_coordinates=result.gromacs_gro,
+            minimization_max_iterations=100,
+            nvt_ps=1,
+            npt_ps=1,
+            production_ns=0.001,
+        )
+        stages = build_stage_plan()
+        for stage in stages[3:7]:
+            _emit_mdp(work_dir, stage, protocol_config)
+        npt_mdp = (work_dir / "npt.mdp").read_text()
+        assert "refcoord-scaling = com" in npt_mdp
+        for mdp_name in ("ions.mdp", "min.mdp", "nvt.mdp", "npt.mdp"):
+            mdp = (work_dir / mdp_name).read_text()
+            assert "ns-type" not in mdp
+            assert "nstxtcout" not in mdp
+        commands = [
+            command
+            for stage in stages[1:7]
+            for command in build_commands(stage, checkpoint_path=None, config=protocol_config)
+        ]
+        assert all("-maxwarn" not in command for command in commands)
+        grompp_commands = {
+            command[command.index("-f") + 1]: command for command in commands if "grompp" in command
+        }
+        assert grompp_commands["nvt.mdp"][grompp_commands["nvt.mdp"].index("-r") + 1] == "min.gro"
+        assert grompp_commands["npt.mdp"][grompp_commands["npt.mdp"].index("-r") + 1] == "nvt.gro"
+        for command in commands:
+            completed = subprocess.run(
+                command,
+                cwd=work_dir,
+                input="SOL\n" if "genion" in command else None,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            assert completed.returncode == 0, (
+                f"{' '.join(command)} failed:\n{completed.stdout}\n{completed.stderr}"
+            )
+            if "grompp" in command:
+                assert "WARNING" not in f"{completed.stdout}\n{completed.stderr}"
+        assert (work_dir / "ions.gro").is_file()
+        assert (work_dir / "npt.gro").is_file()
+        molecule_lines = (work_dir / "topol.top").read_text()
+        assert "#ifdef POSRES" in molecule_lines
+        assert "SOL" in molecule_lines
+        assert "NA" in molecule_lines
+        assert "CL" in molecule_lines
+
     def test_parmed_round_trip_rejects_mutated_atom_metadata_and_coordinates(
         self, tmp_output_dir: Path
     ) -> None:
@@ -1536,6 +1975,8 @@ class TestPeptidePrepGromacsParity:
             positions,
             top_path=tmp_output_dir / "parity.top",
             gro_path=tmp_output_dir / "parity.gro",
+            gromacs_include_family="amber99sb-ildn-tip3p",
+            position_restraint_force_k_kjmol_nm2=1000.0,
         )
         top_path = tmp_output_dir / "parity.top"
         gro_path = tmp_output_dir / "parity.gro"
@@ -1948,6 +2389,20 @@ class TestPeptidePrepScienceDigestControls:
     physics, platform, and callback identities. Source CONTENT is
     bound separately (``source_backbone_sha256``).
     """
+
+    def test_gromacs_position_restraint_force_changes_science_digest(
+        self, tmp_output_dir: Path
+    ) -> None:
+        from biolab_runners.peptide_prep.runner import _compute_config_digest
+
+        default = _make_linear_config(str(tmp_output_dir), name="posres-default")
+        changed = _make_linear_config(
+            str(tmp_output_dir),
+            name="posres-changed",
+            gromacs_position_restraint_force_k_kjmol_nm2=750.0,
+        )
+
+        assert _compute_config_digest(default) != _compute_config_digest(changed)
 
     def test_force_rebuild_reusable_on_next_normal_invocation(self, tmp_output_dir: Path) -> None:
         """A force rebuild must be reusable by the next normal invocation."""
@@ -3762,3 +4217,112 @@ class TestPeptidePrepGromppAuditContract:
         ok, message = export.gmx_grompp_pp_check(top, gro, audit_workdir=tmp_path / "audit")
         assert not ok, "audit accepted rc=0 with no topol.top output"
         assert "topol.top" in message or "did not produce" in message
+
+
+def test_poly_gly_d_substitution_chirality_is_stable_across_five_minimizations(
+    tmp_path: Path,
+) -> None:
+    """Real OpenMM repeats preserve every intended L/D signed volume."""
+    import math
+
+    from biolab_runners.peptide_prep.minimization import run_minimization
+    from biolab_runners.peptide_prep.runner import _compute_config_digest
+    from biolab_runners.peptide_prep.topology import build_modeller
+    from biolab_runners.peptide_prep.utils import collect_atom_mapping
+
+    sequence = "SAHPGVQRAVGGMPP"
+    expected = {
+        index: ("D" if index == 6 else "L") for index, aa in enumerate(sequence) if aa != "G"
+    }
+    observed_repeats: list[tuple[list[float], list[float]]] = []
+
+    def signed_volume(mapping: dict[str, tuple[float, float, float]]) -> float:
+        n, ca, c, cb = (mapping[name] for name in ("N", "CA", "C", "CB"))
+        n_ca = tuple(n[i] - ca[i] for i in range(3))
+        c_ca = tuple(c[i] - ca[i] for i in range(3))
+        cb_ca = tuple(cb[i] - ca[i] for i in range(3))
+        return (
+            n_ca[0] * (c_ca[1] * cb_ca[2] - c_ca[2] * cb_ca[1])
+            - n_ca[1] * (c_ca[0] * cb_ca[2] - c_ca[2] * cb_ca[0])
+            + n_ca[2] * (c_ca[0] * cb_ca[1] - c_ca[1] * cb_ca[0])
+        )
+
+    for repeat in range(5):
+        cfg = PeptidePrepConfig(
+            name=f"poly_gly_repeat_{repeat}",
+            backbone_pdb=POLY_GLY_BACKBONE_PDB,
+            sequence=sequence,
+            chain_id="C",
+            output_root=str(tmp_path),
+            topology=PeptideTopologyDescriptor(
+                d_substitutions=(_FakeDSub(7, "ALA"),),
+                head_to_tail=_FakeCyclic(1, 15),
+            ),
+            coordinate_transformer_identity="test-reflection-v1",
+            chirality_validator_identity="test-signed-volume-v1",
+            openmm_platform="Reference",
+        )
+        artifacts = build_modeller(cfg)
+        runner = PeptidePrepRunner()
+        runner._apply_d_transform(cfg, artifacts, _HermeticDReflectionTransformer())
+        failure = runner._stage_bind_chirality_restraint(
+            cfg,
+            tmp_path,
+            tmp_path / "manifest.json",
+            "source",
+            _compute_config_digest(cfg, platform_name="Reference"),
+            artifacts,
+        )
+        assert failure is None
+        assert artifacts.chirality_restraint_force_index is not None
+        assert isinstance(
+            artifacts.system.getForce(artifacts.chirality_restraint_force_index),
+            openmm.CustomCompoundBondForce,
+        )
+        assert not any(
+            isinstance(
+                artifacts.closed_system.getForce(index),
+                (openmm.CustomExternalForce, openmm.CustomCompoundBondForce),
+            )
+            for index in range(artifacts.closed_system.getNumForces())
+        )
+
+        initial = [
+            signed_volume(collect_atom_mapping(artifacts.topology, artifacts.positions, index))
+            for index in expected
+        ]
+        positions_after, energy_after, no_nan = run_minimization(
+            artifacts.topology,
+            artifacts.system,
+            artifacts.positions,
+            platform_name="Reference",
+            max_iterations=cfg.minimization_max_iterations,
+            tolerance_kjmol_nm=cfg.minimization_tolerance_kjmol_nm,
+        )
+        assert isinstance(
+            artifacts.system.getForce(artifacts.chirality_restraint_force_index),
+            openmm.CustomCompoundBondForce,
+        )
+        assert isinstance(
+            artifacts.system.getForce(artifacts.restraint_force_index),
+            openmm.CustomExternalForce,
+        )
+        final = [
+            signed_volume(collect_atom_mapping(artifacts.topology, positions_after, index))
+            for index in expected
+        ]
+        observed_repeats.append((initial, final))
+        assert no_nan and math.isfinite(energy_after)
+        closure_distances = runner._closure_distances(positions_after, artifacts.bond_graph)
+        assert closure_distances
+        assert all(
+            distance <= cfg.max_head_to_tail_distance_angstrom
+            for distance in closure_distances.values()
+        )
+        for residue_index, volume in zip(expected, final, strict=True):
+            observed = "L" if volume > 0.0 else "D"
+            assert observed == expected[residue_index], (
+                f"repeat {repeat + 1}, residue {residue_index + 1}: "
+                f"expected {expected[residue_index]}, signed volume {volume:+.6g}; "
+                f"all repeats={observed_repeats!r}"
+            )

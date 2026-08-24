@@ -123,6 +123,8 @@ class PreparationArtifacts:
     system: object
     closed_system: object
     net_charge: float
+    restraint_force_index: int
+    chirality_restraint_force_index: int | None = None
     bond_graph: list[Any] = field(default_factory=list)
     closure_distances_before: dict[str, float] = field(default_factory=dict)
     energy_before_kjmol: float = 0.0
@@ -254,6 +256,7 @@ def build_modeller(
         system=system,
         closed_system=closed_system,
         net_charge=net_charge,
+        restraint_force_index=restraint_force_index,
         bond_graph=closure_bond_records,
         closure_distances_before=closure_distances_before,
         energy_before_kjmol=energy_before_kjmol,

@@ -730,6 +730,17 @@ class PeptidePrepRunner:
         if failed is not None:
             return failed
 
+        failed = self._stage_bind_chirality_restraint(
+            config,
+            work_dir,
+            manifest_path,
+            source_digest,
+            config_digest,
+            artifacts,
+        )
+        if failed is not None:
+            return failed
+
         # Stage 4 — pre-minimization chirality validation (after
         # heavy-atom D construction — if any D substitutions were
         # requested).
@@ -1025,6 +1036,7 @@ class PeptidePrepRunner:
                 chirality_validator,
                 stage="pre",
             )
+
         except Exception as exc:
             # External-callback seam (fail-closed contract) — see
             # ``_stage_post_h_chirality`` for the rationale.
@@ -1039,6 +1051,53 @@ class PeptidePrepRunner:
                 net_charge=artifacts.net_charge,
                 potential_energy_before_kjmol=artifacts.energy_before_kjmol,
             )
+
+    def _stage_bind_chirality_restraint(
+        self,
+        config: PeptidePrepConfig,
+        work_dir: Path,
+        manifest_path: Path,
+        source_digest: str,
+        config_digest: str,
+        artifacts: object,
+    ) -> PeptidePrepResult | None:
+        """Anchor temporary chirality wells after all intended D transforms."""
+        from biolab_runners.peptide_prep import export, minimization
+
+        try:
+            chirality_index = minimization.restrain_chirality(
+                artifacts.system,
+                artifacts.topology,
+                artifacts.positions,
+                force_constant_k_kjmol=config.chirality_restraint_force_k_kjmol,
+                minimum_signed_volume_nm3=config.chirality_restraint_min_signed_volume_nm3,
+            )
+            artifacts.chirality_restraint_force_index = chirality_index
+            artifacts.energy_before_kjmol = minimization.read_potential_energy(
+                artifacts.topology,
+                artifacts.system,
+                artifacts.positions,
+                platform_name=self._effective_platform(config),
+            )
+            artifacts.closed_system = minimization.build_closed_system(
+                artifacts.system,
+                restraint_force_index=artifacts.restraint_force_index,
+                chirality_restraint_force_index=chirality_index,
+            )
+            artifacts.net_charge = export.compute_net_charge_from_openmm(artifacts.closed_system)
+        except Exception as exc:
+            return self._fail(
+                config,
+                work_dir,
+                manifest_path,
+                error=f"chirality restraint construction failed: {exc}",
+                source_digest=source_digest,
+                config_digest=config_digest,
+                bond_graph=artifacts.bond_graph,
+                net_charge=artifacts.net_charge,
+                potential_energy_before_kjmol=artifacts.energy_before_kjmol,
+            )
+        return None
 
     def _stage_minimize(
         self,
@@ -1182,12 +1241,20 @@ class PeptidePrepRunner:
         from biolab_runners.peptide_prep import export
 
         try:
+            from biolab_runners.peptide_prep.config import resolve_gromacs_include_family
+
             gromacs_artifacts = export.export_gromacs(
                 artifacts.topology,
                 artifacts.closed_system,
                 positions_after,
                 top_path=work_dir / "prepared.top",
                 gro_path=work_dir / "prepared.gro",
+                gromacs_include_family=resolve_gromacs_include_family(
+                    config.protein_ff, config.water_ff_xml
+                ),
+                position_restraint_force_k_kjmol_nm2=(
+                    config.gromacs_position_restraint_force_k_kjmol_nm2
+                ),
             )
         except (OSError, RuntimeError, ValueError) as exc:
             return self._fail(
@@ -1698,6 +1765,12 @@ class PeptidePrepRunner:
         no_nan: bool,
     ) -> dict[str, Any]:
         """Build the manifest payload."""
+        from biolab_runners.peptide_prep.config import (
+            GROMACS_POSITION_RESTRAINT_ALGORITHM_VERSION,
+            GROMACS_TOPOLOGY_MATERIALIZER_VERSION,
+            resolve_gromacs_include_family,
+        )
+
         return {
             "schema_version": 1,
             "name": config.name,
@@ -1707,6 +1780,16 @@ class PeptidePrepRunner:
             "source_backbone_path": config.backbone_pdb,
             "source_backbone_sha256": source_digest,
             "config_digest": config_digest,
+            "gromacs_include_family": resolve_gromacs_include_family(
+                config.protein_ff, config.water_ff_xml
+            ),
+            "gromacs_topology_materializer_version": GROMACS_TOPOLOGY_MATERIALIZER_VERSION,
+            "gromacs_position_restraint_algorithm_version": (
+                GROMACS_POSITION_RESTRAINT_ALGORITHM_VERSION
+            ),
+            "gromacs_position_restraint_force_k_kjmol_nm2": (
+                config.gromacs_position_restraint_force_k_kjmol_nm2
+            ),
             "outputs": {
                 "prepared_pdb": str(prepared_pdb_path),
                 "prepared_pdb_sha256": prepared_pdb_sha,
@@ -1936,6 +2019,12 @@ def _compute_config_digest(
     """
     import hashlib
 
+    from biolab_runners.peptide_prep.config import (
+        CHIRALITY_RESTRAINT_ALGORITHM_VERSION,
+        GROMACS_POSITION_RESTRAINT_ALGORITHM_VERSION,
+        GROMACS_TOPOLOGY_MATERIALIZER_VERSION,
+        resolve_gromacs_include_family,
+    )
     from biolab_runners.provenance import _canonical_json
 
     topo = config.topology
@@ -1951,8 +2040,23 @@ def _compute_config_digest(
         },
         "protein_ff": config.protein_ff,
         "water_ff_xml": config.water_ff_xml,
+        "gromacs_include_family": resolve_gromacs_include_family(
+            config.protein_ff, config.water_ff_xml
+        ),
+        "gromacs_topology_materializer_version": GROMACS_TOPOLOGY_MATERIALIZER_VERSION,
+        "gromacs_position_restraint_algorithm_version": (
+            GROMACS_POSITION_RESTRAINT_ALGORITHM_VERSION
+        ),
+        "gromacs_position_restraint_force_k_kjmol_nm2": (
+            config.gromacs_position_restraint_force_k_kjmol_nm2
+        ),
         "minimization_max_iterations": config.minimization_max_iterations,
         "restraint_force_k_kjmol_nm2": config.restraint_force_k_kjmol_nm2,
+        "chirality_restraint_force_k_kjmol": config.chirality_restraint_force_k_kjmol,
+        "chirality_restraint_min_signed_volume_nm3": (
+            config.chirality_restraint_min_signed_volume_nm3
+        ),
+        "chirality_restraint_algorithm_version": CHIRALITY_RESTRAINT_ALGORITHM_VERSION,
         "minimization_tolerance_kjmol_nm": config.minimization_tolerance_kjmol_nm,
         "max_disulfide_distance_angstrom": config.max_disulfide_distance_angstrom,
         "max_head_to_tail_distance_angstrom": config.max_head_to_tail_distance_angstrom,

@@ -727,9 +727,23 @@ def _protocol_input_digests(config: GromacsProtocolConfig) -> dict[str, str | No
 
 def _protocol_executed_config(config: GromacsProtocolConfig) -> dict[str, object]:
     """Bind protocol settings and consumed input contents to execution."""
+    from biolab_runners.gromacs.protocol import GROMACS_PROTOCOL_VERSION
+
     payload = dataclasses.asdict(config)
+    payload["protocol_version"] = GROMACS_PROTOCOL_VERSION
     payload["input_digests"] = _protocol_input_digests(config)
     return payload
+
+
+def _resolve_protocol_command(command: list[str], prefix: tuple[str, ...]) -> list[str]:
+    if not prefix:
+        raise ValueError("resolved GROMACS executable prefix must not be empty")
+    if not command or command[0] != "gmx":
+        actual = command[0] if command else "<empty>"
+        raise ValueError(
+            f"protocol command must begin with the logical executable token 'gmx'; got {actual!r}"
+        )
+    return [*prefix, *command[1:]]
 
 
 def _protocol_source_digest(config: GromacsProtocolConfig) -> str | None:
@@ -993,8 +1007,9 @@ class GromacsProtocolRunner:
             config=config,
         )
         prefix = self._resolved_binary_prefix or resolve_binary_prefix(self._binary_prefix)
-        if commands:
-            self._last_command = (*prefix, *commands[-1])
+        resolved_commands = [_resolve_protocol_command(command, prefix) for command in commands]
+        if resolved_commands:
+            self._last_command = tuple(resolved_commands[-1])
 
         if self._dry_run:
             return _DRY_RUN_STATUS, 0, False
@@ -1003,14 +1018,14 @@ class GromacsProtocolRunner:
             work_dir,
             stage.kind.value,
             StageStatus.RUNNING,
-            command=" ".join(commands[0]) if commands else "",
+            command=" ".join(resolved_commands[0]) if resolved_commands else "",
             started_at=started_at,
         )
 
         # --- Execute commands ---
         rc = 0
-        for cmd in commands:
-            self._last_command = (*prefix, *cmd)
+        for cmd in resolved_commands:
+            self._last_command = tuple(cmd)
             rc = self._run_subprocess(cmd, work_dir, config.timeout_seconds)
             if rc != 0:
                 break
@@ -1026,7 +1041,7 @@ class GromacsProtocolRunner:
                 stage.kind.value,
                 StageStatus.RUNNING,
                 outputs=stage_minimum_outputs(stage.kind, stage.prefix),
-                command=" ".join(commands[0]) if commands else "",
+                command=" ".join(resolved_commands[0]) if resolved_commands else "",
                 started_at=started_at,
                 completed_at=completed_at,
                 error="interrupted by SIGTERM; resumable on next invocation",
@@ -1039,7 +1054,7 @@ class GromacsProtocolRunner:
             stage.kind.value,
             status,
             outputs=stage_minimum_outputs(stage.kind, stage.prefix),
-            command=" ".join(commands[0]) if commands else "",
+            command=" ".join(resolved_commands[0]) if resolved_commands else "",
             started_at=started_at,
             completed_at=completed_at,
             error="" if rc == 0 else f"rc={rc}",
@@ -1127,7 +1142,7 @@ class GromacsProtocolRunner:
         work_dir: Path,
         timeout_seconds: int,
     ) -> int:
-        r"""Run one ``gmx`` command with SIGTERM grace + kill escalation.
+        r"""Run one resolved GROMACS argv with SIGTERM grace + kill escalation.
 
         **Honest SIGTERM semantics** (no 24 h blocking):
 
@@ -1160,18 +1175,21 @@ class GromacsProtocolRunner:
         a separate timer (the SIGTERM signal handler) — it does
         NOT block on the communicate timeout.
 
-        **Genion stdin**: when ``cmd`` is the IONS stage's genion
-        invocation (``gmx genion ...``), the parent's stdin pipe
+        **Genion stdin**: when ``cmd`` is the IONS stage's resolved genion
+        invocation, the parent's stdin pipe
         is closed and ``GENION_INPUT`` ("SOL\n") is fed via
         ``Popen.communicate(input=GENION_INPUT)``. No shell, no
         quoting, no injection.
         """
         prefix = self._resolved_binary_prefix or resolve_binary_prefix(self._binary_prefix)
-        full_cmd = [*prefix, *cmd]
-        self._last_command = tuple(full_cmd)
+        if tuple(cmd[: len(prefix)]) != prefix or len(cmd) <= len(prefix):
+            raise ValueError(
+                "subprocess command does not match the resolved GROMACS executable prefix"
+            )
+        self._last_command = tuple(cmd)
 
         # Detect genion — needs stdin (group selection).
-        is_genion = "genion" in cmd
+        is_genion = cmd[len(prefix)] == "genion"
 
         # Track whether the parent received SIGTERM (Spot preemption).
         interrupted = threading.Event()
@@ -1181,7 +1199,7 @@ class GromacsProtocolRunner:
         stdin_arg = subprocess.PIPE if is_genion else None
 
         proc = subprocess.Popen(
-            full_cmd,
+            cmd,
             cwd=str(work_dir),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
