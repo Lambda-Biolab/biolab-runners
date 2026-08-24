@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import unittest.mock as mock_mod
 from pathlib import Path
@@ -69,6 +70,20 @@ def pdb_input(tmp_path: Path) -> Path:
     pdb.write_text(
         "HEADER    test\n"
         "ATOM      1  CA  GLY A   1       0.000   0.000   0.000  1.00  0.00           C\n"
+        "END\n"
+    )
+    return pdb
+
+
+@pytest.fixture
+def two_chain_pdb_input(tmp_path: Path) -> Path:
+    pdb = tmp_path / "two_chain_backbone.pdb"
+    pdb.write_text(
+        "HEADER    test\n"
+        "ATOM      1  CA  GLY A   1       0.000   0.000   0.000  1.00  0.00           C\n"
+        "ATOM      2  CA  ALA A   2       1.000   0.000   0.000  1.00  0.00           C\n"
+        "ATOM      3  CA  GLY B   1       0.000   1.000   0.000  1.00  0.00           C\n"
+        "ATOM      4  CA  ALA B   2       1.000   1.000   0.000  1.00  0.00           C\n"
         "END\n"
     )
     return pdb
@@ -214,7 +229,6 @@ def test_invoke_preserves_wrapper_flag_names_and_paths(tmp_path: Path) -> None:
                 "sampling_temp": "0.2",
                 "seed": "42",
                 "ca_only": "True",
-                "fixed_positions": "2,6",
                 "omit_AA": "CDF",
                 "pdb_path": input_pdb.name,
             },
@@ -243,8 +257,6 @@ def test_invoke_preserves_wrapper_flag_names_and_paths(tmp_path: Path) -> None:
         "42",
         "--ca_only",
         "True",
-        "--fixed_positions",
-        "2,6",
         "--omit_AA",
         "CDF",
         "--pdb_path",
@@ -318,11 +330,154 @@ def test_config_to_cli_default_omits_fixed_positions(pdb_input: Path) -> None:
 
 
 def test_config_to_cli_handles_fixed_positions(pdb_input: Path) -> None:
+    fixed_path = pdb_input.parent / "fixed_positions.jsonl"
     cli = _config_to_cli(
         ProteinMPNNConfig(fixed_positions=(3, 7)),
         pdb_input,
+        fixed_positions_jsonl=fixed_path,
     )
-    assert cli["fixed_positions"] == "2,6"
+    assert cli["fixed_positions_jsonl"] == str(fixed_path)
+    assert "fixed_positions" not in cli
+
+
+def test_runner_materializes_chain_aware_fixed_positions_and_exact_argv(
+    output_root: Path,
+    two_chain_pdb_input: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_invoke(**kwargs: Any) -> InvokeResult:
+        captured.update(kwargs)
+        (kwargs["output_dir"] / "out.fa").write_text(SAMPLE_FASTA)
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.proteinmpnn.runner._invoke_with_metadata", fake_invoke)
+    config = ProteinMPNNConfig(
+        name="fixed",
+        fixed_positions=(2, 1),
+        extra={"pdb_path_chains": "B A"},
+    )
+
+    result = ProteinMPNNRunner(output_root=output_root, binary_prefix=["proteinmpnn"]).run(
+        two_chain_pdb_input, config
+    )
+
+    fixed_path = output_root / "fixed" / two_chain_pdb_input.stem / "fixed_positions.jsonl"
+    assert json.loads(fixed_path.read_text()) == {
+        two_chain_pdb_input.stem: {"A": [1, 2], "B": [1, 2]}
+    }
+    assert captured["config_dict"]["fixed_positions_jsonl"] == str(fixed_path)
+    assert "fixed_positions" not in captured["config_dict"]
+    assert result.provenance.command == (
+        "proteinmpnn",
+        "--input_path",
+        str(two_chain_pdb_input.parent),
+        "--output_path",
+        str(fixed_path.parent),
+        "--batch_size",
+        "1",
+        "--model_name",
+        "v_48_020",
+        "--num_seq_per_target",
+        "4",
+        "--sampling_temp",
+        "0.1",
+        "--seed",
+        "0",
+        "--fixed_positions_jsonl",
+        str(fixed_path),
+        "--pdb_path",
+        two_chain_pdb_input.name,
+        "--pdb_path_chains",
+        "B A",
+    )
+    fixed_artifacts = [a for a in result.provenance.artifacts if a.kind == "fixed_positions"]
+    assert len(fixed_artifacts) == 1
+    assert fixed_artifacts[0].path == str(fixed_path)
+    assert fixed_artifacts[0].digest is not None
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        ({}, "pdb_path_chains"),
+        ({"pdb_path_chains": "AB"}, "one-character"),
+        ({"pdb_path_chains": "A A"}, "unique"),
+    ],
+)
+def test_runner_fixed_positions_fails_closed_for_invalid_chains(
+    output_root: Path,
+    pdb_input: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    extra: dict[str, str],
+    message: str,
+) -> None:
+    invoked = False
+
+    def fake_invoke(**_: Any) -> InvokeResult:
+        nonlocal invoked
+        invoked = True
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.proteinmpnn.runner._invoke_with_metadata", fake_invoke)
+
+    with pytest.raises(ValueError, match=message):
+        ProteinMPNNRunner(output_root=output_root).run(
+            pdb_input,
+            ProteinMPNNConfig(name="invalid-chain", fixed_positions=(1,), extra=extra),
+        )
+
+    assert invoked is False
+    assert not (output_root / "invalid-chain" / pdb_input.stem / "fixed_positions.jsonl").exists()
+
+
+def test_runner_fixed_positions_rejects_duplicates_and_out_of_range_positions(
+    output_root: Path,
+    pdb_input: Path,
+) -> None:
+    config = ProteinMPNNConfig(
+        name="invalid-position",
+        fixed_positions=(1, 1),
+        extra={"pdb_path_chains": "A"},
+    )
+    with pytest.raises(ValueError, match="duplicate"):
+        ProteinMPNNRunner(output_root=output_root).run(pdb_input, config)
+
+    config = ProteinMPNNConfig(
+        name="out-of-range",
+        fixed_positions=(2,),
+        extra={"pdb_path_chains": "A"},
+    )
+    with pytest.raises(ValueError, match="out of range"):
+        ProteinMPNNRunner(output_root=output_root).run(pdb_input, config)
+
+
+def test_runner_reuses_deterministic_fixed_positions_artifact(
+    output_root: Path,
+    two_chain_pdb_input: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_invoke(*, output_dir: Path, **_: Any) -> InvokeResult:
+        (output_dir / "out.fa").write_text(SAMPLE_FASTA)
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.proteinmpnn.runner._invoke_with_metadata", fake_invoke)
+    config = ProteinMPNNConfig(
+        name="reuse-fixed",
+        fixed_positions=(1,),
+        extra={"pdb_path_chains": "A B"},
+    )
+    runner = ProteinMPNNRunner(output_root=output_root)
+
+    first = runner.run(two_chain_pdb_input, config, force=True)
+    fixed_path = Path(first.output_dir) / "fixed_positions.jsonl"
+    first_bytes = fixed_path.read_bytes()
+    second = runner.run(two_chain_pdb_input, config, force=True)
+
+    assert Path(second.output_dir) / "fixed_positions.jsonl" == fixed_path
+    assert fixed_path.read_bytes() == first_bytes
+    assert first.provenance.artifacts == second.provenance.artifacts
 
 
 def test_config_to_cli_default_omits_omit_AA(pdb_input: Path) -> None:
@@ -530,6 +685,50 @@ def test_proteinmpnn_cli_does_not_abbreviate_flags() -> None:
     )
 
     assert translated[-2:] == ["--sampling_te", "0.2"]
+
+
+def test_proteinmpnn_cli_forwards_fixed_positions_jsonl() -> None:
+    from biolab_runners.proteinmpnn.cli import translate_runner_args
+
+    translated = translate_runner_args(
+        [
+            "--input_path",
+            "/tmp/input",
+            "--output_path",
+            "/tmp/output",
+            "--pdb_path",
+            "backbone.pdb",
+            "--fixed_positions_jsonl",
+            "/tmp/output/fixed_positions.jsonl",
+            "--pdb_path_chains",
+            "A B",
+        ]
+    )
+
+    assert translated[-4:] == [
+        "--fixed_positions_jsonl",
+        "/tmp/output/fixed_positions.jsonl",
+        "--pdb_path_chains",
+        "A B",
+    ]
+
+
+def test_proteinmpnn_cli_rejects_legacy_fixed_positions() -> None:
+    from biolab_runners.proteinmpnn.cli import translate_runner_args
+
+    with pytest.raises(ValueError, match="fixed_positions is unsupported"):
+        translate_runner_args(
+            [
+                "--input_path",
+                "/tmp/input",
+                "--output_path",
+                "/tmp/output",
+                "--pdb_path",
+                "backbone.pdb",
+                "--fixed_positions",
+                "1,2",
+            ]
+        )
 
 
 def test_runner_force_re_runs(

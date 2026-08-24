@@ -56,13 +56,13 @@ def translate_runner_args(args: list[str]) -> list[str]:
     parser.add_argument("--seed", default="0")
     parser.add_argument("--ca_only", default="False")
     parser.add_argument("--omit_AA", default="")
-    parser.add_argument("--fixed_positions", default="")
+    parser.add_argument("--fixed_positions_jsonl", default="")
     parser.add_argument("--pdb_path", required=True)
     try:
         parsed, extra = parser.parse_known_args(args)
     except SystemExit as exc:  # pragma: no cover - defensive for argparse versions
         raise ValueError("invalid ProteinMPNN runner arguments") from exc
-    if parsed.fixed_positions:
+    if any(arg == "--fixed_positions" or arg.startswith("--fixed_positions=") for arg in args):
         raise ValueError("fixed_positions is unsupported without a chain-aware JSONL contract")
 
     upstream = [
@@ -85,6 +85,8 @@ def translate_runner_args(args: list[str]) -> list[str]:
         upstream.append("--ca_only")
     if parsed.omit_AA:
         upstream.extend(["--omit_AAs", parsed.omit_AA])
+    if parsed.fixed_positions_jsonl:
+        upstream.extend(["--fixed_positions_jsonl", parsed.fixed_positions_jsonl])
     return [*upstream, *extra]
 
 

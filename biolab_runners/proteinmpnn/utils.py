@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import re
 import shutil
@@ -28,6 +29,7 @@ __all__ = [
     "DesignRecordStatus",
     "build_invocation_command",
     "invoke",
+    "materialize_fixed_positions_jsonl",
     "parse_fasta_sequences",
     "proteinmpnn_available",
 ]
@@ -139,6 +141,87 @@ def build_invocation_command(
         "1",
         *extra_args,
     )
+
+
+def materialize_fixed_positions_jsonl(
+    *,
+    fixed_positions: tuple[int, ...],
+    pdb_path_chains: object,
+    input_pdb: Path,
+    output_dir: Path,
+) -> Path:
+    """Write the deterministic chain-aware fixed-position input for upstream."""
+    chains = _parse_pdb_path_chains(pdb_path_chains)
+    positions = _normalise_fixed_positions(fixed_positions)
+    chain_lengths = _parse_pdb_chain_lengths(input_pdb)
+    if chain_lengths is not None:
+        _validate_position_ranges(positions, chains, chain_lengths)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / "fixed_positions.jsonl"
+    payload = {input_pdb.stem: dict.fromkeys(sorted(chains), positions)}
+    path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+    return path
+
+
+def _parse_pdb_path_chains(value: object) -> tuple[str, ...]:
+    """Validate the space-separated one-character chain contract."""
+    if not isinstance(value, str):
+        raise ValueError("fixed_positions requires space-separated pdb_path_chains")
+    chains = value.split()
+    if not chains:
+        raise ValueError("fixed_positions requires pdb_path_chains")
+    if any(len(chain) != 1 for chain in chains):
+        raise ValueError("pdb_path_chains must contain one-character chain IDs")
+    if len(set(chains)) != len(chains):
+        raise ValueError("pdb_path_chains must contain unique chain IDs")
+    return tuple(chains)
+
+
+def _normalise_fixed_positions(fixed_positions: tuple[int, ...]) -> tuple[int, ...]:
+    """Validate and sort the caller's 1-indexed positions."""
+    if len(set(fixed_positions)) != len(fixed_positions):
+        raise ValueError("fixed_positions must not contain duplicate positions")
+    return tuple(sorted(fixed_positions))
+
+
+def _parse_pdb_chain_lengths(input_pdb: Path) -> dict[str, int] | None:
+    """Return residue counts when all ATOM records have safe fixed-width fields."""
+    try:
+        lines = input_pdb.read_text().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+    residues: dict[str, set[tuple[str, str]]] = {}
+    atom_found = False
+    for line in lines:
+        if not line.startswith("ATOM  "):
+            continue
+        atom_found = True
+        if len(line) < 27:
+            return None
+        chain = line[21]
+        residue_number = line[22:26].strip()
+        if not residue_number:
+            return None
+        try:
+            int(residue_number)
+        except ValueError:
+            return None
+        residues.setdefault(chain, set()).add((residue_number, line[26]))
+    if not atom_found:
+        return None
+    return {chain: len(chain_residues) for chain, chain_residues in residues.items()}
+
+
+def _validate_position_ranges(
+    positions: tuple[int, ...], chains: tuple[str, ...], chain_lengths: dict[str, int]
+) -> None:
+    """Reject positions absent from any safely parsed designed chain."""
+    for chain in chains:
+        chain_length = chain_lengths.get(chain, 0)
+        if any(position > chain_length for position in positions):
+            raise ValueError(f"fixed_positions are out of range for chain {chain!r}")
 
 
 def _parse_fasta_lines(lines: list[str], *, full_header: bool = False) -> list[tuple[str, str]]:

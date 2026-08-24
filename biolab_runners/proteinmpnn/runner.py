@@ -14,6 +14,7 @@ from biolab_runners.proteinmpnn.utils import (
     DesignRecordStatus,
     _invoke_with_metadata,
     build_invocation_command,
+    materialize_fixed_positions_jsonl,
     parse_fasta_sequences,
 )
 from biolab_runners.provenance import (
@@ -39,7 +40,7 @@ __all__ = ["ProteinMPNNResult", "ProteinMPNNRunner"]
 #: Field names excluded from the *executed* config digest for ProteinMPNN.
 #: Empty by default — ProteinMPNN forwards every config field the
 #: dataclass exposes (``--seed``, ``--sampling_temp``, ``--model_name``,
-#: ``--num_seq_per_target``, ``--ca_only``, ``--fixed_positions``,
+#: ``--num_seq_per_target``, ``--ca_only``, ``--fixed_positions_jsonl``,
 #: ``--omit_AA``), so the requested and executed digests agree.
 EXCLUDED_FROM_EXECUTED_DIGEST: tuple[str, ...] = ()
 
@@ -160,11 +161,16 @@ class ProteinMPNNRunner:
 
         output_dir = self._design_dir(cfg, input_pdb)
         output_dir.mkdir(parents=True, exist_ok=True)
+        fixed_positions_jsonl, fixed_positions_artifact = _prepare_fixed_positions(
+            cfg, input_pdb, output_dir
+        )
 
         if not force and self.is_complete(cfg, input_pdb):
             records = _parse_records(output_dir)
             status = _status_from_records(0, records, cached=True)
-            artifacts = _artifacts_for_records(records, output_dir)
+            artifacts = _with_fixed_artifact(
+                _artifacts_for_records(records, output_dir), fixed_positions_artifact
+            )
             succeeded, failed = _record_counts(records)
             return ProteinMPNNResult(
                 name=cfg.name,
@@ -194,7 +200,11 @@ class ProteinMPNNRunner:
                 execution_mode=execution_mode,
             )
 
-        config_dict = _config_to_cli(cfg, input_pdb)
+        config_dict = _config_to_cli(
+            cfg,
+            input_pdb,
+            fixed_positions_jsonl=fixed_positions_jsonl,
+        )
         intended_command = build_invocation_command(
             config_dict=config_dict,
             input_pdb=input_pdb,
@@ -203,6 +213,7 @@ class ProteinMPNNRunner:
         )
         if dry_run:
             status = ExecutionStatus.DRY_RUN
+            dry_run_artifacts = _with_fixed_artifact((), fixed_positions_artifact)
             return ProteinMPNNResult(
                 name=cfg.name,
                 output_dir=str(output_dir),
@@ -223,10 +234,12 @@ class ProteinMPNNRunner:
                     executed=False,
                     cache_hit=False,
                     status=status,
+                    artifacts=dry_run_artifacts,
                     execution_mode=execution_mode,
                     command=intended_command,
                 ),
                 status=status,
+                artifacts=dry_run_artifacts,
                 execution_mode=execution_mode,
             )
 
@@ -244,7 +257,9 @@ class ProteinMPNNRunner:
         succeeded = sum(1 for r in records if r.status == DesignRecordStatus.SUCCEEDED)
         failed = len(records) - succeeded
         status = _status_from_records(result.exit_code, records)
-        artifacts = _artifacts_for_records(records, output_dir)
+        artifacts = _with_fixed_artifact(
+            _artifacts_for_records(records, output_dir), fixed_positions_artifact
+        )
         return ProteinMPNNResult(
             name=cfg.name,
             output_dir=str(output_dir),
@@ -351,7 +366,12 @@ class ProteinMPNNRunner:
         )
 
 
-def _config_to_cli(config: ProteinMPNNConfig, input_pdb: Path) -> dict[str, str]:
+def _config_to_cli(
+    config: ProteinMPNNConfig,
+    input_pdb: Path,
+    *,
+    fixed_positions_jsonl: Path | None = None,
+) -> dict[str, str]:
     """Translate :class:`ProteinMPNNConfig` into the upstream CLI kwargs."""
     payload: dict[str, str] = {
         "model_name": config.model_name,
@@ -362,13 +382,38 @@ def _config_to_cli(config: ProteinMPNNConfig, input_pdb: Path) -> dict[str, str]
     if config.ca_only:
         payload["ca_only"] = "True"
     if config.fixed_positions:
-        payload["fixed_positions"] = ",".join(str(p - 1) for p in config.fixed_positions)
+        if fixed_positions_jsonl is None:
+            raise ValueError("fixed_positions_jsonl path is required for fixed_positions")
+        payload["fixed_positions_jsonl"] = str(fixed_positions_jsonl)
     if config.omit_aa:
         payload["omit_AA"] = config.omit_aa
     payload["pdb_path"] = input_pdb.name  # upstream expects basename
     for key, value in config.extra.items():
         payload[key] = str(value)
     return payload
+
+
+def _prepare_fixed_positions(
+    config: ProteinMPNNConfig, input_pdb: Path, output_dir: Path
+) -> tuple[Path | None, ArtifactReference | None]:
+    """Materialize and describe the optional fixed-position input."""
+    if not config.fixed_positions:
+        return None, None
+    path = materialize_fixed_positions_jsonl(
+        fixed_positions=config.fixed_positions,
+        pdb_path_chains=config.extra.get("pdb_path_chains"),
+        input_pdb=input_pdb,
+        output_dir=output_dir,
+    )
+    artifact = ArtifactReference.from_path(path, kind="fixed_positions", root=output_dir)
+    return path, artifact
+
+
+def _with_fixed_artifact(
+    artifacts: tuple[ArtifactReference, ...], fixed_artifact: ArtifactReference | None
+) -> tuple[ArtifactReference, ...]:
+    """Append the optional fixed-position artifact to output artifacts."""
+    return artifacts if fixed_artifact is None else (*artifacts, fixed_artifact)
 
 
 def _parse_records(output_dir: Path) -> tuple[DesignRecord, ...]:
