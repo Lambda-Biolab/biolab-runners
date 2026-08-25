@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
-from dataclasses import dataclass
+import shutil
+import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -14,6 +18,7 @@ from biolab_runners.proteinmpnn.utils import (
     DesignRecordStatus,
     _invoke_with_metadata,
     build_invocation_command,
+    materialize_fixed_positions_jsonl,
     parse_fasta_sequences,
 )
 from biolab_runners.provenance import (
@@ -39,9 +44,33 @@ __all__ = ["ProteinMPNNResult", "ProteinMPNNRunner"]
 #: Field names excluded from the *executed* config digest for ProteinMPNN.
 #: Empty by default — ProteinMPNN forwards every config field the
 #: dataclass exposes (``--seed``, ``--sampling_temp``, ``--model_name``,
-#: ``--num_seq_per_target``, ``--ca_only``, ``--fixed_positions``,
+#: ``--num_seq_per_target``, ``--ca_only``, ``--fixed_positions_jsonl``,
 #: ``--omit_AA``), so the requested and executed digests agree.
 EXCLUDED_FROM_EXECUTED_DIGEST: tuple[str, ...] = ()
+CACHE_IDENTITY_FILENAME = ".proteinmpnn-cache.json"
+_RESERVED_EXTRA_KEYS = frozenset(
+    {
+        "name",
+        "task_count",
+        "temperature",
+        "seed",
+        "model_name",
+        "ca_only",
+        "fixed_positions",
+        "omit_aa",
+        "extra",
+        "input_path",
+        "output_path",
+        "out_folder",
+        "batch_size",
+        "pdb_path",
+        "fixed_positions_jsonl",
+        "num_seq_per_target",
+        "sampling_temp",
+        "omit_AA",
+        "omit_AAs",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -108,12 +137,32 @@ class ProteinMPNNRunner:
         """Return the root directory into which FASTA outputs are written."""
         return self._output_root
 
-    def is_complete(self, config: ProteinMPNNConfig, input_pdb: Path) -> bool:
-        """Return True if the design FASTA already exists for ``input_pdb``."""
+    def is_complete(
+        self,
+        config: ProteinMPNNConfig,
+        input_pdb: Path,
+        *,
+        image_digest: str | None = None,
+    ) -> bool:
+        """Return True only for a well-formed output with matching identity."""
+        _validate_config(config)
         target = self._design_dir(config, input_pdb)
-        if not target.exists():
+        if not target.is_dir():
             return False
-        return bool(_fasta_paths(target))
+        normalized_image = validate_image_digest(image_digest)
+        fixed_path = None
+        try:
+            if config.fixed_positions:
+                fixed_path = materialize_fixed_positions_jsonl(
+                    fixed_positions=config.fixed_positions,
+                    pdb_path_chains=config.extra.get("pdb_path_chains"),
+                    input_pdb=input_pdb,
+                    output_dir=target,
+                )
+            expected = _cache_identity(config, input_pdb, normalized_image, fixed_path)
+            return _cache_matches(target, expected)
+        except (OSError, ValueError, UnicodeDecodeError):
+            return False
 
     def run(
         self,
@@ -155,16 +204,24 @@ class ProteinMPNNRunner:
         cfg = config or self._config_override
         if cfg is None:
             raise ValueError("ProteinMPNNConfig is required: pass it to run() or the runner")
+        _validate_config(cfg)
         binary_prefix = _effective_binary_prefix(self._binary_prefix)
         execution_mode = _execution_mode(binary_prefix)
 
         output_dir = self._design_dir(cfg, input_pdb)
         output_dir.mkdir(parents=True, exist_ok=True)
+        fixed_positions_jsonl, fixed_positions_artifact = _prepare_fixed_positions(
+            cfg, input_pdb, output_dir
+        )
 
-        if not force and self.is_complete(cfg, input_pdb):
+        if not force and _cache_matches_current(
+            output_dir, cfg, input_pdb, image_digest, fixed_positions_jsonl
+        ):
             records = _parse_records(output_dir)
             status = _status_from_records(0, records, cached=True)
-            artifacts = _artifacts_for_records(records, output_dir)
+            artifacts = _with_fixed_artifact(
+                _artifacts_for_records(records, output_dir), fixed_positions_artifact
+            )
             succeeded, failed = _record_counts(records)
             return ProteinMPNNResult(
                 name=cfg.name,
@@ -194,7 +251,14 @@ class ProteinMPNNRunner:
                 execution_mode=execution_mode,
             )
 
-        config_dict = _config_to_cli(cfg, input_pdb)
+        if not dry_run:
+            _quarantine_stale_outputs(output_dir)
+
+        config_dict = _config_to_cli(
+            cfg,
+            input_pdb,
+            fixed_positions_jsonl=fixed_positions_jsonl,
+        )
         intended_command = build_invocation_command(
             config_dict=config_dict,
             input_pdb=input_pdb,
@@ -203,6 +267,7 @@ class ProteinMPNNRunner:
         )
         if dry_run:
             status = ExecutionStatus.DRY_RUN
+            dry_run_artifacts = _with_fixed_artifact((), fixed_positions_artifact)
             return ProteinMPNNResult(
                 name=cfg.name,
                 output_dir=str(output_dir),
@@ -223,10 +288,12 @@ class ProteinMPNNRunner:
                     executed=False,
                     cache_hit=False,
                     status=status,
+                    artifacts=dry_run_artifacts,
                     execution_mode=execution_mode,
                     command=intended_command,
                 ),
                 status=status,
+                artifacts=dry_run_artifacts,
                 execution_mode=execution_mode,
             )
 
@@ -244,7 +311,14 @@ class ProteinMPNNRunner:
         succeeded = sum(1 for r in records if r.status == DesignRecordStatus.SUCCEEDED)
         failed = len(records) - succeeded
         status = _status_from_records(result.exit_code, records)
-        artifacts = _artifacts_for_records(records, output_dir)
+        artifacts = _with_fixed_artifact(
+            _artifacts_for_records(records, output_dir), fixed_positions_artifact
+        )
+        if status == ExecutionStatus.SUCCEEDED:
+            _write_cache_identity(
+                output_dir,
+                _cache_identity(cfg, input_pdb, image_digest, fixed_positions_jsonl),
+            )
         return ProteinMPNNResult(
             name=cfg.name,
             output_dir=str(output_dir),
@@ -351,8 +425,14 @@ class ProteinMPNNRunner:
         )
 
 
-def _config_to_cli(config: ProteinMPNNConfig, input_pdb: Path) -> dict[str, str]:
+def _config_to_cli(
+    config: ProteinMPNNConfig,
+    input_pdb: Path,
+    *,
+    fixed_positions_jsonl: Path | None = None,
+) -> dict[str, str]:
     """Translate :class:`ProteinMPNNConfig` into the upstream CLI kwargs."""
+    _validate_config(config)
     payload: dict[str, str] = {
         "model_name": config.model_name,
         "num_seq_per_target": str(config.task_count),
@@ -362,13 +442,133 @@ def _config_to_cli(config: ProteinMPNNConfig, input_pdb: Path) -> dict[str, str]
     if config.ca_only:
         payload["ca_only"] = "True"
     if config.fixed_positions:
-        payload["fixed_positions"] = ",".join(str(p - 1) for p in config.fixed_positions)
+        if fixed_positions_jsonl is None:
+            raise ValueError("fixed_positions_jsonl path is required for fixed_positions")
+        payload["fixed_positions_jsonl"] = str(fixed_positions_jsonl)
     if config.omit_aa:
         payload["omit_AA"] = config.omit_aa
     payload["pdb_path"] = input_pdb.name  # upstream expects basename
     for key, value in config.extra.items():
         payload[key] = str(value)
     return payload
+
+
+def _validate_config(config: ProteinMPNNConfig) -> None:
+    """Reject names and extra flags that can override runner-owned paths."""
+    if type(config.name) is not str or not config.name:
+        raise ValueError("config.name must be a non-empty output name")
+    name_path = Path(config.name)
+    if (
+        name_path.is_absolute()
+        or name_path.name != config.name
+        or any(part in {"", ".", ".."} for part in name_path.parts)
+    ):
+        raise ValueError("config.name must be a safe single output-name component")
+    for key in config.extra:
+        if type(key) is not str:
+            raise ValueError("config.extra keys must be strings")
+        if key in _RESERVED_EXTRA_KEYS:
+            raise ValueError(f"config.extra key {key!r} is reserved by the runner")
+
+
+def _cache_identity(
+    config: ProteinMPNNConfig,
+    input_pdb: Path,
+    image_digest: str | None,
+    fixed_positions_jsonl: Path | None,
+) -> dict[str, Any]:
+    """Build the deterministic identity that binds a FASTA cache entry."""
+    fixed_payload = None
+    fixed_digest = None
+    if fixed_positions_jsonl is not None:
+        fixed_payload = fixed_positions_jsonl.read_text()
+        fixed_digest = compute_file_digest(fixed_positions_jsonl)
+    identity = {
+        "schema_version": 1,
+        "config": json.loads(json.dumps(asdict(config))),
+        "config_digest": compute_config_digest(config),
+        "input_pdb_digest": compute_file_digest(input_pdb),
+        "image_digest": image_digest,
+        "fixed_positions_jsonl": fixed_payload,
+        "fixed_positions_digest": fixed_digest,
+    }
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    identity["identity_digest"] = hashlib.sha256(encoded).hexdigest()
+    return identity
+
+
+def _cache_matches_current(
+    output_dir: Path,
+    config: ProteinMPNNConfig,
+    input_pdb: Path,
+    image_digest: str | None,
+    fixed_positions_jsonl: Path | None,
+) -> bool:
+    """Return whether current inputs match a complete, well-formed cache."""
+    try:
+        expected = _cache_identity(config, input_pdb, image_digest, fixed_positions_jsonl)
+        return _cache_matches(output_dir, expected)
+    except (OSError, UnicodeDecodeError, ValueError):
+        return False
+
+
+def _cache_matches(output_dir: Path, expected: dict[str, Any]) -> bool:
+    """Compare a sidecar and its FASTA records without accepting partial output."""
+    identity_path = output_dir / CACHE_IDENTITY_FILENAME
+    try:
+        stored = json.loads(identity_path.read_text())
+        records = _parse_records(output_dir)
+    except (OSError, UnicodeDecodeError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return (
+        stored == expected
+        and bool(records)
+        and all(record.status == DesignRecordStatus.SUCCEEDED for record in records)
+    )
+
+
+def _write_cache_identity(output_dir: Path, identity: dict[str, Any]) -> None:
+    """Atomically persist the identity after a successful execution."""
+    path = output_dir / CACHE_IDENTITY_FILENAME
+    temporary = output_dir / f".{CACHE_IDENTITY_FILENAME}.{os.getpid()}.tmp"
+    temporary.write_text(json.dumps(identity, sort_keys=True, separators=(",", ":")) + "\n")
+    os.replace(temporary, path)
+
+
+def _quarantine_stale_outputs(output_dir: Path) -> None:
+    """Move old FASTAs aside before an invocation can write new outputs."""
+    stale = output_dir / ".stale" / str(time.time_ns())
+    for fasta in _fasta_paths(output_dir):
+        destination = stale / fasta.relative_to(output_dir)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(fasta), str(destination))
+    seqs_dir = output_dir / "seqs"
+    if seqs_dir.is_dir() and not any(seqs_dir.iterdir()):
+        seqs_dir.rmdir()
+    (output_dir / CACHE_IDENTITY_FILENAME).unlink(missing_ok=True)
+
+
+def _prepare_fixed_positions(
+    config: ProteinMPNNConfig, input_pdb: Path, output_dir: Path
+) -> tuple[Path | None, ArtifactReference | None]:
+    """Materialize and describe the optional fixed-position input."""
+    if not config.fixed_positions:
+        return None, None
+    path = materialize_fixed_positions_jsonl(
+        fixed_positions=config.fixed_positions,
+        pdb_path_chains=config.extra.get("pdb_path_chains"),
+        input_pdb=input_pdb,
+        output_dir=output_dir,
+    )
+    artifact = ArtifactReference.from_path(path, kind="fixed_positions", root=output_dir)
+    return path, artifact
+
+
+def _with_fixed_artifact(
+    artifacts: tuple[ArtifactReference, ...], fixed_artifact: ArtifactReference | None
+) -> tuple[ArtifactReference, ...]:
+    """Append the optional fixed-position artifact to output artifacts."""
+    return artifacts if fixed_artifact is None else (*artifacts, fixed_artifact)
 
 
 def _parse_records(output_dir: Path) -> tuple[DesignRecord, ...]:

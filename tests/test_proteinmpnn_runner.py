@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import unittest.mock as mock_mod
 from pathlib import Path
@@ -69,6 +70,20 @@ def pdb_input(tmp_path: Path) -> Path:
     pdb.write_text(
         "HEADER    test\n"
         "ATOM      1  CA  GLY A   1       0.000   0.000   0.000  1.00  0.00           C\n"
+        "END\n"
+    )
+    return pdb
+
+
+@pytest.fixture
+def two_chain_pdb_input(tmp_path: Path) -> Path:
+    pdb = tmp_path / "two_chain_backbone.pdb"
+    pdb.write_text(
+        "HEADER    test\n"
+        "ATOM      1  CA  GLY A   1       0.000   0.000   0.000  1.00  0.00           C\n"
+        "ATOM      2  CA  ALA A   2       1.000   0.000   0.000  1.00  0.00           C\n"
+        "ATOM      3  CA  GLY B   1       0.000   1.000   0.000  1.00  0.00           C\n"
+        "ATOM      4  CA  ALA B   2       1.000   1.000   0.000  1.00  0.00           C\n"
         "END\n"
     )
     return pdb
@@ -214,7 +229,6 @@ def test_invoke_preserves_wrapper_flag_names_and_paths(tmp_path: Path) -> None:
                 "sampling_temp": "0.2",
                 "seed": "42",
                 "ca_only": "True",
-                "fixed_positions": "2,6",
                 "omit_AA": "CDF",
                 "pdb_path": input_pdb.name,
             },
@@ -243,8 +257,6 @@ def test_invoke_preserves_wrapper_flag_names_and_paths(tmp_path: Path) -> None:
         "42",
         "--ca_only",
         "True",
-        "--fixed_positions",
-        "2,6",
         "--omit_AA",
         "CDF",
         "--pdb_path",
@@ -318,11 +330,373 @@ def test_config_to_cli_default_omits_fixed_positions(pdb_input: Path) -> None:
 
 
 def test_config_to_cli_handles_fixed_positions(pdb_input: Path) -> None:
+    fixed_path = pdb_input.parent / "fixed_positions.jsonl"
     cli = _config_to_cli(
         ProteinMPNNConfig(fixed_positions=(3, 7)),
         pdb_input,
+        fixed_positions_jsonl=fixed_path,
     )
-    assert cli["fixed_positions"] == "2,6"
+    assert cli["fixed_positions_jsonl"] == str(fixed_path)
+    assert "fixed_positions" not in cli
+
+
+def test_runner_materializes_chain_aware_fixed_positions_and_exact_argv(
+    output_root: Path,
+    two_chain_pdb_input: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_invoke(**kwargs: Any) -> InvokeResult:
+        captured.update(kwargs)
+        (kwargs["output_dir"] / "out.fa").write_text(SAMPLE_FASTA)
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.proteinmpnn.runner._invoke_with_metadata", fake_invoke)
+    config = ProteinMPNNConfig(
+        name="fixed",
+        fixed_positions=(2, 1),
+        extra={"pdb_path_chains": "B A"},
+    )
+
+    result = ProteinMPNNRunner(output_root=output_root, binary_prefix=["proteinmpnn"]).run(
+        two_chain_pdb_input, config
+    )
+
+    fixed_path = output_root / "fixed" / two_chain_pdb_input.stem / "fixed_positions.jsonl"
+    assert json.loads(fixed_path.read_text()) == {
+        two_chain_pdb_input.stem: {"A": [1, 2], "B": [1, 2]}
+    }
+    assert captured["config_dict"]["fixed_positions_jsonl"] == str(fixed_path)
+    assert "fixed_positions" not in captured["config_dict"]
+    assert result.provenance.command == (
+        "proteinmpnn",
+        "--input_path",
+        str(two_chain_pdb_input.parent),
+        "--output_path",
+        str(fixed_path.parent),
+        "--batch_size",
+        "1",
+        "--model_name",
+        "v_48_020",
+        "--num_seq_per_target",
+        "4",
+        "--sampling_temp",
+        "0.1",
+        "--seed",
+        "0",
+        "--fixed_positions_jsonl",
+        str(fixed_path),
+        "--pdb_path",
+        two_chain_pdb_input.name,
+        "--pdb_path_chains",
+        "B A",
+    )
+    fixed_artifacts = [a for a in result.provenance.artifacts if a.kind == "fixed_positions"]
+    assert len(fixed_artifacts) == 1
+    assert fixed_artifacts[0].path == str(fixed_path)
+    assert fixed_artifacts[0].digest is not None
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        ({}, "pdb_path_chains"),
+        ({"pdb_path_chains": "AB"}, "one-character"),
+        ({"pdb_path_chains": "A A"}, "unique"),
+    ],
+)
+def test_runner_fixed_positions_fails_closed_for_invalid_chains(
+    output_root: Path,
+    pdb_input: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    extra: dict[str, str],
+    message: str,
+) -> None:
+    invoked = False
+
+    def fake_invoke(**_: Any) -> InvokeResult:
+        nonlocal invoked
+        invoked = True
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.proteinmpnn.runner._invoke_with_metadata", fake_invoke)
+
+    with pytest.raises(ValueError, match=message):
+        ProteinMPNNRunner(output_root=output_root).run(
+            pdb_input,
+            ProteinMPNNConfig(name="invalid-chain", fixed_positions=(1,), extra=extra),
+        )
+
+    assert invoked is False
+    assert not (output_root / "invalid-chain" / pdb_input.stem / "fixed_positions.jsonl").exists()
+
+
+def test_runner_fixed_positions_rejects_duplicates_and_out_of_range_positions(
+    output_root: Path,
+    pdb_input: Path,
+) -> None:
+    config = ProteinMPNNConfig(
+        name="invalid-position",
+        fixed_positions=(1, 1),
+        extra={"pdb_path_chains": "A"},
+    )
+    with pytest.raises(ValueError, match="duplicate"):
+        ProteinMPNNRunner(output_root=output_root).run(pdb_input, config)
+
+    config = ProteinMPNNConfig(
+        name="out-of-range",
+        fixed_positions=(2,),
+        extra={"pdb_path_chains": "A"},
+    )
+    with pytest.raises(ValueError, match="out of range"):
+        ProteinMPNNRunner(output_root=output_root).run(pdb_input, config)
+
+
+@pytest.mark.parametrize(
+    "pdb_text",
+    [
+        "HEADER only\nEND\n",
+        "ATOM\nEND\n",
+        "ATOM      1  CA  GLY A   X       0.000   0.000   0.000\n",
+    ],
+)
+def test_fixed_positions_reject_malformed_pdb_before_subprocess(
+    output_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pdb_text: str,
+) -> None:
+    pdb = tmp_path / "invalid.pdb"
+    pdb.write_text(pdb_text)
+    invoked = False
+
+    def fake_invoke(**_: Any) -> InvokeResult:
+        nonlocal invoked
+        invoked = True
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.proteinmpnn.runner._invoke_with_metadata", fake_invoke)
+    config = ProteinMPNNConfig(fixed_positions=(1,), extra={"pdb_path_chains": "A"})
+
+    with pytest.raises(ValueError):
+        ProteinMPNNRunner(output_root=output_root).run(pdb, config)
+
+    assert invoked is False
+
+
+def test_fixed_positions_reject_unreadable_pdb_before_subprocess(
+    output_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    invoked = False
+
+    def fake_invoke(**_: Any) -> InvokeResult:
+        nonlocal invoked
+        invoked = True
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.proteinmpnn.runner._invoke_with_metadata", fake_invoke)
+    config = ProteinMPNNConfig(fixed_positions=(1,), extra={"pdb_path_chains": "A"})
+
+    with pytest.raises(ValueError):
+        ProteinMPNNRunner(output_root=output_root).run(tmp_path / "missing.pdb", config)
+
+    assert invoked is False
+
+
+def test_fixed_positions_use_sequence_offsets_and_deduplicate_atoms(
+    output_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pdb = tmp_path / "offset.pdb"
+    pdb.write_text(
+        "ATOM      1  CA AGLY A  42       0.000   0.000   0.000  1.00  0.00           C\n"
+        "ATOM      2  CA BGLY A  42       0.000   0.000   0.000  1.00  0.00           C\n"
+        "ATOM      3  CA  ALA A  43       1.000   0.000   0.000  1.00  0.00           C\n"
+    )
+    captured: dict[str, Any] = {}
+
+    def fake_invoke(**kwargs: Any) -> InvokeResult:
+        captured.update(kwargs)
+        (kwargs["output_dir"] / "out.fa").write_text(SAMPLE_FASTA)
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.proteinmpnn.runner._invoke_with_metadata", fake_invoke)
+    config = ProteinMPNNConfig(fixed_positions=(2,), extra={"pdb_path_chains": "A"})
+    result = ProteinMPNNRunner(output_root=output_root).run(pdb, config)
+
+    fixed_path = Path(result.output_dir) / "fixed_positions.jsonl"
+    assert json.loads(fixed_path.read_text()) == {"offset": {"A": [2]}}
+    assert captured["config_dict"]["fixed_positions_jsonl"] == str(fixed_path)
+
+
+@pytest.mark.parametrize(
+    "pdb_text",
+    [
+        "ATOM      1  CA  GLY A   1       0.000   0.000   0.000  1.00  0.00           C\n"
+        "ATOM      2  CA  ALA A   3       1.000   0.000   0.000  1.00  0.00           C\n",
+        "ATOM      1  CA  GLY A  42A       0.000   0.000   0.000  1.00  0.00           C\n",
+    ],
+)
+def test_fixed_positions_reject_gaps_and_insertion_codes(
+    output_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pdb_text: str,
+) -> None:
+    pdb = tmp_path / "ambiguous.pdb"
+    pdb.write_text(pdb_text)
+    invoked = False
+
+    def fake_invoke(**_: Any) -> InvokeResult:
+        nonlocal invoked
+        invoked = True
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.proteinmpnn.runner._invoke_with_metadata", fake_invoke)
+    with pytest.raises(ValueError):
+        ProteinMPNNRunner(output_root=output_root).run(
+            pdb,
+            ProteinMPNNConfig(fixed_positions=(1,), extra={"pdb_path_chains": "A"}),
+        )
+    assert invoked is False
+
+
+def test_fixed_positions_reject_missing_selected_chain(
+    output_root: Path,
+    pdb_input: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    invoked = False
+
+    def fake_invoke(**_: Any) -> InvokeResult:
+        nonlocal invoked
+        invoked = True
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.proteinmpnn.runner._invoke_with_metadata", fake_invoke)
+    with pytest.raises(ValueError, match="missing chain"):
+        ProteinMPNNRunner(output_root=output_root).run(
+            pdb_input,
+            ProteinMPNNConfig(fixed_positions=(1,), extra={"pdb_path_chains": "B"}),
+        )
+    assert invoked is False
+
+
+def test_runner_reuses_deterministic_fixed_positions_artifact(
+    output_root: Path,
+    two_chain_pdb_input: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_invoke(*, output_dir: Path, **_: Any) -> InvokeResult:
+        (output_dir / "out.fa").write_text(SAMPLE_FASTA)
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.proteinmpnn.runner._invoke_with_metadata", fake_invoke)
+    config = ProteinMPNNConfig(
+        name="reuse-fixed",
+        fixed_positions=(1,),
+        extra={"pdb_path_chains": "A B"},
+    )
+    runner = ProteinMPNNRunner(output_root=output_root)
+
+    first = runner.run(two_chain_pdb_input, config, force=True)
+    fixed_path = Path(first.output_dir) / "fixed_positions.jsonl"
+    first_bytes = fixed_path.read_bytes()
+    second = runner.run(two_chain_pdb_input, config, force=True)
+
+    assert Path(second.output_dir) / "fixed_positions.jsonl" == fixed_path
+    assert fixed_path.read_bytes() == first_bytes
+    assert first.provenance.artifacts == second.provenance.artifacts
+
+
+@pytest.mark.parametrize("change", ["fixed", "chains", "pdb", "config", "image"])
+def test_cache_identity_changes_quarantine_stale_fasta(
+    output_root: Path,
+    two_chain_pdb_input: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    calls: list[int] = []
+
+    def fake_invoke(*, output_dir: Path, **_: Any) -> InvokeResult:
+        calls.append(len(calls) + 1)
+        (output_dir / f"run-{calls[-1]}.fa").write_text(SAMPLE_FASTA)
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.proteinmpnn.runner._invoke_with_metadata", fake_invoke)
+    runner = ProteinMPNNRunner(output_root=output_root)
+    base = ProteinMPNNConfig(
+        name="identity",
+        fixed_positions=(1,),
+        extra={"pdb_path_chains": "A B"},
+    )
+    image = VALID_OCI_DIGEST
+    runner.run(two_chain_pdb_input, base, image_digest=image)
+
+    changed = base
+    if change == "fixed":
+        changed = ProteinMPNNConfig(
+            name="identity",
+            fixed_positions=(2,),
+            extra={"pdb_path_chains": "A B"},
+        )
+    elif change == "chains":
+        changed = ProteinMPNNConfig(
+            name="identity",
+            fixed_positions=(1,),
+            extra={"pdb_path_chains": "A"},
+        )
+    elif change == "pdb":
+        two_chain_pdb_input.write_text(two_chain_pdb_input.read_text() + "\n")
+    elif change == "config":
+        changed = ProteinMPNNConfig(
+            name="identity",
+            seed=99,
+            fixed_positions=(1,),
+            extra={"pdb_path_chains": "A B"},
+        )
+    elif change == "image":
+        image = "sha256:" + "cd" * 32
+
+    result = runner.run(two_chain_pdb_input, changed, image_digest=image)
+    assert calls == [1, 2]
+    assert {Path(record.path).name for record in result.records} == {"run-2.fa"}
+    assert list((Path(result.output_dir) / ".stale").rglob("run-1.fa"))
+
+
+@pytest.mark.parametrize("sidecar", ["missing", "malformed"])
+def test_missing_or_malformed_cache_identity_reruns_and_excludes_old_fasta(
+    output_root: Path,
+    pdb_input: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sidecar: str,
+) -> None:
+    calls = 0
+
+    def fake_invoke(*, output_dir: Path, **_: Any) -> InvokeResult:
+        nonlocal calls
+        calls += 1
+        (output_dir / f"run-{calls}.fa").write_text(SAMPLE_FASTA)
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.proteinmpnn.runner._invoke_with_metadata", fake_invoke)
+    runner = ProteinMPNNRunner(output_root=output_root)
+    config = ProteinMPNNConfig(name="sidecar")
+    first = runner.run(pdb_input, config)
+    identity = Path(first.output_dir) / ".proteinmpnn-cache.json"
+    if sidecar == "missing":
+        identity.unlink()
+    else:
+        identity.write_text("not json")
+
+    result = runner.run(pdb_input, config)
+    assert calls == 2
+    assert {Path(record.path).name for record in result.records} == {"run-2.fa"}
+    assert list((Path(result.output_dir) / ".stale").rglob("run-1.fa"))
 
 
 def test_config_to_cli_default_omits_omit_AA(pdb_input: Path) -> None:
@@ -334,6 +708,42 @@ def test_config_to_cli_default_omits_omit_AA(pdb_input: Path) -> None:
 def test_config_to_cli_handles_omit_aa(pdb_input: Path) -> None:
     cli = _config_to_cli(ProteinMPNNConfig(omit_aa="CDF"), pdb_input)
     assert cli["omit_AA"] == "CDF"
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        ProteinMPNNConfig(extra={"input_path": "/tmp/other"}),
+        ProteinMPNNConfig(extra={"output_path": "/tmp/other"}),
+        ProteinMPNNConfig(extra={"batch_size": 99}),
+        ProteinMPNNConfig(extra={"pdb_path": "other.pdb"}),
+        ProteinMPNNConfig(extra={"fixed_positions_jsonl": "/tmp/other.jsonl"}),
+        ProteinMPNNConfig(extra={"model_name": "other"}),
+    ],
+)
+def test_runner_rejects_reserved_extra_flags(
+    output_root: Path,
+    pdb_input: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config: ProteinMPNNConfig,
+) -> None:
+    invoked = False
+
+    def fake_invoke(**_: Any) -> InvokeResult:
+        nonlocal invoked
+        invoked = True
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.proteinmpnn.runner._invoke_with_metadata", fake_invoke)
+    with pytest.raises(ValueError, match="reserved"):
+        ProteinMPNNRunner(output_root=output_root).run(pdb_input, config)
+    assert invoked is False
+
+
+@pytest.mark.parametrize("name", ["../escape", "/tmp/absolute", "nested/name"])
+def test_runner_rejects_unsafe_output_names(output_root: Path, pdb_input: Path, name: str) -> None:
+    with pytest.raises(ValueError, match="safe single output-name"):
+        ProteinMPNNRunner(output_root=output_root).run(pdb_input, ProteinMPNNConfig(name=name))
 
 
 # ---------------------------------------------------------------------------
@@ -360,12 +770,14 @@ def test_runner_dry_run_does_not_invoke(
 def test_runner_idempotent_when_fasta_exists(
     output_root: Path, pdb_input: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("biolab_runners.proteinmpnn.runner._invoke_with_metadata", _fake_invoke_ok)
+    def fake_invoke(*, output_dir: Path, **_: Any) -> InvokeResult:
+        (output_dir / "out.fa").write_text(SAMPLE_FASTA)
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.proteinmpnn.runner._invoke_with_metadata", fake_invoke)
     runner = ProteinMPNNRunner(output_root=output_root, config=ProteinMPNNConfig())
     name = "idem"
-    design_dir = output_root / name / pdb_input.stem
-    design_dir.mkdir(parents=True, exist_ok=True)
-    (design_dir / "out.fa").write_text(SAMPLE_FASTA)
+    runner.run(pdb_input, ProteinMPNNConfig(name=name), force=True)
 
     result = runner.run(pdb_input, ProteinMPNNConfig(name=name))
     assert result.skipped == 4
@@ -375,13 +787,18 @@ def test_runner_idempotent_when_fasta_exists(
 def test_runner_reads_stock_seq_directory_layout(
     output_root: Path, pdb_input: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("biolab_runners.proteinmpnn.runner._invoke_with_metadata", _fake_invoke_ok)
     config = ProteinMPNNConfig(name="stock")
-    design_dir = output_root / config.name / pdb_input.stem
-    (design_dir / "seqs").mkdir(parents=True)
-    (design_dir / "seqs" / f"{pdb_input.stem}.fa").write_text(SAMPLE_FASTA)
 
-    result = ProteinMPNNRunner(output_root=output_root).run(pdb_input, config)
+    def fake_invoke(*, output_dir: Path, **_: Any) -> InvokeResult:
+        (output_dir / "seqs").mkdir(parents=True, exist_ok=True)
+        (output_dir / "seqs" / f"{pdb_input.stem}.fa").write_text(SAMPLE_FASTA)
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.proteinmpnn.runner._invoke_with_metadata", fake_invoke)
+    runner = ProteinMPNNRunner(output_root=output_root)
+    runner.run(pdb_input, config, force=True)
+
+    result = runner.run(pdb_input, config)
 
     assert result.status.value == "cached"
     assert result.skipped == 4
@@ -397,7 +814,6 @@ def test_runner_excludes_native_record_from_stock_fasta(
     cached: bool,
 ) -> None:
     config = ProteinMPNNConfig(name=f"native-{cached}", task_count=2)
-    design_dir = output_root / config.name / pdb_input.stem
 
     def fake_invoke(*, output_dir: Path, **_: Any) -> InvokeResult:
         (output_dir / "seqs").mkdir(parents=True)
@@ -406,7 +822,7 @@ def test_runner_excludes_native_record_from_stock_fasta(
 
     monkeypatch.setattr("biolab_runners.proteinmpnn.runner._invoke_with_metadata", fake_invoke)
     if cached:
-        fake_invoke(output_dir=design_dir)
+        ProteinMPNNRunner(output_root=output_root).run(pdb_input, config, force=True)
 
     result = ProteinMPNNRunner(output_root=output_root).run(pdb_input, config)
 
@@ -478,17 +894,22 @@ def test_runner_cache_counters_reflect_malformed_records(
     design_dir.mkdir(parents=True)
     fasta = design_dir / "cached.fa"
     fasta.write_text(SAMPLE_FASTA)
-    monkeypatch.setattr(
-        "biolab_runners.proteinmpnn.runner.parse_fasta_sequences",
-        mock_mod.Mock(side_effect=OSError("corrupt FASTA")),
-    )
+    invoked = False
+
+    def fake_invoke(**_: Any) -> InvokeResult:
+        nonlocal invoked
+        invoked = True
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.proteinmpnn.runner._invoke_with_metadata", fake_invoke)
 
     result = ProteinMPNNRunner(output_root=output_root).run(pdb_input, config)
 
-    assert result.status.value == "malformed"
+    assert invoked is True
+    assert result.status.value == "incomplete"
     assert result.succeeded == 0
-    assert result.failed == 1
-    assert result.skipped == 1
+    assert result.failed == 0
+    assert result.skipped == 0
 
 
 def test_runner_fake_upstream_e2e_reads_stock_layout(output_root: Path, pdb_input: Path) -> None:
@@ -530,6 +951,88 @@ def test_proteinmpnn_cli_does_not_abbreviate_flags() -> None:
     )
 
     assert translated[-2:] == ["--sampling_te", "0.2"]
+
+
+def test_proteinmpnn_cli_forwards_fixed_positions_jsonl() -> None:
+    from biolab_runners.proteinmpnn.cli import translate_runner_args
+
+    translated = translate_runner_args(
+        [
+            "--input_path",
+            "/tmp/input",
+            "--output_path",
+            "/tmp/output",
+            "--pdb_path",
+            "backbone.pdb",
+            "--fixed_positions_jsonl",
+            "/tmp/output/fixed_positions.jsonl",
+            "--pdb_path_chains",
+            "A B",
+        ]
+    )
+
+    assert translated[-4:] == [
+        "--fixed_positions_jsonl",
+        "/tmp/output/fixed_positions.jsonl",
+        "--pdb_path_chains",
+        "A B",
+    ]
+
+
+def test_proteinmpnn_cli_rejects_legacy_fixed_positions() -> None:
+    from biolab_runners.proteinmpnn.cli import translate_runner_args
+
+    with pytest.raises(ValueError, match="fixed_positions is unsupported"):
+        translate_runner_args(
+            [
+                "--input_path",
+                "/tmp/input",
+                "--output_path",
+                "/tmp/output",
+                "--pdb_path",
+                "backbone.pdb",
+                "--fixed_positions",
+                "1,2",
+            ]
+        )
+
+
+@pytest.mark.parametrize("flag", ["input_path", "output_path", "batch_size", "pdb_path"])
+def test_proteinmpnn_cli_rejects_duplicate_managed_flags(flag: str) -> None:
+    from biolab_runners.proteinmpnn.cli import translate_runner_args
+
+    args = [
+        "--input_path",
+        "/tmp/input",
+        "--output_path",
+        "/tmp/output",
+        "--batch_size",
+        "1",
+        "--pdb_path",
+        "backbone.pdb",
+        f"--{flag}",
+        "/tmp/override",
+    ]
+    with pytest.raises(ValueError, match="duplicate managed flag"):
+        translate_runner_args(args)
+
+
+def test_proteinmpnn_cli_rejects_upstream_output_override() -> None:
+    from biolab_runners.proteinmpnn.cli import translate_runner_args
+
+    with pytest.raises(ValueError, match="managed by the runner"):
+        translate_runner_args(
+            [
+                "--input_path",
+                "/tmp/input",
+                "--output_path",
+                "/tmp/output",
+                "--pdb_path",
+                "backbone.pdb",
+                "--out_folder",
+                "/tmp/override",
+            ]
+        )
 
 
 def test_runner_force_re_runs(
@@ -719,14 +1222,18 @@ def test_runner_cache_hit_records_honest_cache_provenance(
     """On a cache hit, ``executed=False``, ``cache_hit=True``,
     ``executed_config_digest=None`` — the runner does not know which
     prior call produced the existing files."""
-    monkeypatch.setattr("biolab_runners.proteinmpnn.runner._invoke_with_metadata", _fake_invoke_ok)
+
+    def fake_invoke(*, output_dir: Path, **_: Any) -> InvokeResult:
+        (output_dir / "out.fa").write_text(SAMPLE_FASTA)
+        return InvokeResult(exit_code=0)
+
+    monkeypatch.setattr("biolab_runners.proteinmpnn.runner._invoke_with_metadata", fake_invoke)
     name = "idem-prov"
-    design_dir = output_root / name / pdb_input.stem
-    design_dir.mkdir(parents=True, exist_ok=True)
-    (design_dir / "out.fa").write_text(SAMPLE_FASTA)
 
     runner = ProteinMPNNRunner(output_root=output_root)
-    result = runner.run(pdb_input, ProteinMPNNConfig(name=name, seed=9))
+    config = ProteinMPNNConfig(name=name, seed=9)
+    runner.run(pdb_input, config, force=True)
+    result = runner.run(pdb_input, config)
     prov = result.provenance
 
     assert prov.cache_hit is True
