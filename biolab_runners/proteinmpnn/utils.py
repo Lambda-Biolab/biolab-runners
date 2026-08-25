@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -158,8 +161,20 @@ def materialize_fixed_positions_jsonl(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / "fixed_positions.jsonl"
+    if path.is_symlink():
+        raise ValueError("fixed_positions.jsonl must not be a symlink")
     payload = {input_pdb.stem: dict.fromkeys(sorted(chains), positions)}
-    path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+    content = json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+    temporary_fd, temporary_name = tempfile.mkstemp(
+        dir=output_dir, prefix=".fixed_positions.", suffix=".tmp", text=True
+    )
+    try:
+        with os.fdopen(temporary_fd, "w", encoding="utf-8") as temporary_file:
+            temporary_file.write(content)
+        os.replace(temporary_name, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary_name)
     return path
 
 
@@ -179,9 +194,21 @@ def _parse_pdb_path_chains(value: object) -> tuple[str, ...]:
 
 def _normalise_fixed_positions(fixed_positions: tuple[int, ...]) -> tuple[int, ...]:
     """Validate and sort the caller's 1-indexed positions."""
-    if len(set(fixed_positions)) != len(fixed_positions):
+    try:
+        positions = tuple(fixed_positions)
+    except TypeError as exc:
+        raise ValueError(
+            "fixed_positions must contain positive Python integers; "
+            "positions are 1-indexed and must be ≥ 1"
+        ) from exc
+    if any(type(position) is not int or position < 1 for position in positions):
+        raise ValueError(
+            "fixed_positions must contain positive Python integers; "
+            "positions are 1-indexed and must be ≥ 1"
+        )
+    if len(set(positions)) != len(positions):
         raise ValueError("fixed_positions must not contain duplicate positions")
-    return tuple(sorted(fixed_positions))
+    return tuple(sorted(positions))
 
 
 def _parse_pdb_chain_lengths(input_pdb: Path) -> dict[str, int]:

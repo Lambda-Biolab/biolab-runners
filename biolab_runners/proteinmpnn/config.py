@@ -52,5 +52,8 @@ class ProteinMPNNConfig:
             raise ValueError(f"task_count must be ≥ 1; got {self.task_count}")
         if self.temperature <= 0:
             raise ValueError(f"temperature must be positive; got {self.temperature}")
-        if self.fixed_positions and any(p < 1 for p in self.fixed_positions):
-            raise ValueError("fixed_positions are 1-indexed; must be ≥ 1")
+        if any(type(position) is not int or position < 1 for position in self.fixed_positions):
+            raise ValueError(
+                "fixed_positions must contain positive Python integers; "
+                "positions are 1-indexed and must be ≥ 1"
+            )
