@@ -22,6 +22,7 @@ from biolab_runners.proteinmpnn.runner import (
 from biolab_runners.proteinmpnn.utils import (
     InvokeResult,
     invoke,
+    materialize_fixed_positions_jsonl,
     parse_fasta_sequences,
 )
 
@@ -116,6 +117,12 @@ def test_config_rejects_zero_indexed_fixed_positions() -> None:
         ProteinMPNNConfig(fixed_positions=(0, 1, 2))
 
 
+@pytest.mark.parametrize("position", [1.0, 1.5, "1", True, None, object()])
+def test_config_rejects_non_integer_fixed_positions(position: Any) -> None:
+    with pytest.raises(ValueError, match="positive Python integers"):
+        ProteinMPNNConfig(fixed_positions=(position,))
+
+
 def test_excluded_from_executed_digest_constant_is_empty() -> None:
     """ProteinMPNN forwards every config field, so nothing is excluded."""
     assert EXCLUDED_FROM_EXECUTED_DIGEST == ()
@@ -154,6 +161,90 @@ def test_parse_fasta_sequences_handles_empty_file(tmp_path: Path) -> None:
     p = tmp_path / "empty.fa"
     p.write_text("")
     assert parse_fasta_sequences(p) == []
+
+
+@pytest.mark.parametrize("position", [0, 1.0, 1.5, "1", True, None, object()])
+def test_materialize_rejects_non_integer_fixed_positions(
+    pdb_input: Path, tmp_path: Path, position: Any
+) -> None:
+    with pytest.raises(ValueError, match="positive Python integers"):
+        materialize_fixed_positions_jsonl(
+            fixed_positions=(position,),
+            pdb_path_chains="A",
+            input_pdb=pdb_input,
+            output_dir=tmp_path / "fixed",
+        )
+
+
+@pytest.mark.parametrize(
+    ("positions", "expected"),
+    [((1,), [1]), ((2, 1), [1, 2])],
+)
+def test_materialize_accepts_positive_python_integer_positions(
+    two_chain_pdb_input: Path,
+    tmp_path: Path,
+    positions: tuple[int, ...],
+    expected: list[int],
+) -> None:
+    path = materialize_fixed_positions_jsonl(
+        fixed_positions=positions,
+        pdb_path_chains="B A",
+        input_pdb=two_chain_pdb_input,
+        output_dir=tmp_path / "fixed",
+    )
+
+    assert json.loads(path.read_text()) == {
+        two_chain_pdb_input.stem: {"A": expected, "B": expected}
+    }
+
+
+def test_materialize_refuses_fixed_positions_symlink_before_subprocess(
+    output_root: Path,
+    pdb_input: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = output_root / "symlink" / pdb_input.stem
+    output_dir.mkdir(parents=True)
+    target = output_root / "external.jsonl"
+    original = b"external bytes must remain unchanged\n"
+    target.write_bytes(original)
+    link = output_dir / "fixed_positions.jsonl"
+    link.symlink_to(target)
+    subprocess_run = mock_mod.Mock()
+    monkeypatch.setattr("biolab_runners.proteinmpnn.utils.subprocess.run", subprocess_run)
+
+    with pytest.raises(ValueError, match="must not be a symlink"):
+        ProteinMPNNRunner(output_root=output_root, binary_prefix=["proteinmpnn"]).run(
+            pdb_input,
+            ProteinMPNNConfig(
+                name="symlink",
+                fixed_positions=(1,),
+                extra={"pdb_path_chains": "A"},
+            ),
+        )
+
+    assert target.read_bytes() == original
+    assert link.is_symlink()
+    subprocess_run.assert_not_called()
+
+
+def test_materialize_refuses_dangling_fixed_positions_symlink(
+    pdb_input: Path, tmp_path: Path
+) -> None:
+    output_dir = tmp_path / "fixed"
+    output_dir.mkdir()
+    link = output_dir / "fixed_positions.jsonl"
+    link.symlink_to(tmp_path / "missing.jsonl")
+
+    with pytest.raises(ValueError, match="must not be a symlink"):
+        materialize_fixed_positions_jsonl(
+            fixed_positions=(1,),
+            pdb_path_chains="A",
+            input_pdb=pdb_input,
+            output_dir=output_dir,
+        )
+
+    assert link.is_symlink()
 
 
 def test_proteinmpnn_available_returns_false_when_binary_missing(
