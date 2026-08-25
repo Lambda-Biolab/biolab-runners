@@ -21,6 +21,23 @@ __all__ = ["build_command", "main", "resolve_script", "translate_runner_args"]
 
 DEFAULT_HOME = "~/tools/ProteinMPNN"
 UPSTREAM_SCRIPT = "protein_mpnn_run.py"
+_MANAGED_FLAGS = frozenset(
+    {
+        "input_path",
+        "output_path",
+        "batch_size",
+        "model_name",
+        "num_seq_per_target",
+        "sampling_temp",
+        "seed",
+        "ca_only",
+        "omit_AA",
+        "fixed_positions_jsonl",
+        "pdb_path",
+        "pdb_path_chains",
+    }
+)
+_OVERRIDE_FLAGS = frozenset({"out_folder", "omit_AAs"})
 
 
 def resolve_script() -> Path:
@@ -58,6 +75,7 @@ def translate_runner_args(args: list[str]) -> list[str]:
     parser.add_argument("--omit_AA", default="")
     parser.add_argument("--fixed_positions_jsonl", default="")
     parser.add_argument("--pdb_path", required=True)
+    _reject_ambiguous_flags(args)
     try:
         parsed, extra = parser.parse_known_args(args)
     except SystemExit as exc:  # pragma: no cover - defensive for argparse versions
@@ -88,6 +106,23 @@ def translate_runner_args(args: list[str]) -> list[str]:
     if parsed.fixed_positions_jsonl:
         upstream.extend(["--fixed_positions_jsonl", parsed.fixed_positions_jsonl])
     return [*upstream, *extra]
+
+
+def _reject_ambiguous_flags(args: list[str]) -> None:
+    """Reject legacy overrides and duplicate wrapper-owned arguments."""
+    seen: set[str] = set()
+    for arg in args:
+        if not arg.startswith("--"):
+            continue
+        flag = arg[2:].split("=", 1)[0]
+        if flag == "fixed_positions":
+            raise ValueError("fixed_positions is unsupported without a chain-aware JSONL contract")
+        if flag in _OVERRIDE_FLAGS:
+            raise ValueError(f"{flag} is managed by the runner and cannot be overridden")
+        if flag in _MANAGED_FLAGS:
+            if flag in seen:
+                raise ValueError(f"duplicate managed flag --{flag}")
+            seen.add(flag)
 
 
 def build_command(argv: Sequence[str]) -> list[str]:
