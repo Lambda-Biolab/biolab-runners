@@ -54,10 +54,18 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "CHIRALITY_RESTRAINT_ALGORITHM_VERSION",
+    "DEFAULT_CHIRALITY_RESTRAINT_FORCE_K_KJMOL",
+    "DEFAULT_CHIRALITY_RESTRAINT_MIN_SIGNED_VOLUME_NM3",
+    "DEFAULT_GROMACS_POSITION_RESTRAINT_FORCE_K_KJMOL_NM2",
     "DEFAULT_MAX_DISULFIDE_DISTANCE_A",
     "DEFAULT_MAX_HEAD_TO_TAIL_DISTANCE_A",
+    "GROMACS_INCLUDE_FAMILY_AMBER99SB_ILDN_TIP3P",
+    "GROMACS_POSITION_RESTRAINT_ALGORITHM_VERSION",
+    "GROMACS_TOPOLOGY_MATERIALIZER_VERSION",
     "PeptidePrepConfig",
     "PeptideTopologyDescriptor",
+    "resolve_gromacs_include_family",
 ]
 
 
@@ -66,6 +74,28 @@ __all__ = [
 # so tests can import them without reaching into the dataclass.
 DEFAULT_MAX_DISULFIDE_DISTANCE_A = 2.5
 DEFAULT_MAX_HEAD_TO_TAIL_DISTANCE_A = 2.0
+DEFAULT_CHIRALITY_RESTRAINT_FORCE_K_KJMOL = 3000.0
+DEFAULT_CHIRALITY_RESTRAINT_MIN_SIGNED_VOLUME_NM3 = 0.001
+CHIRALITY_RESTRAINT_ALGORITHM_VERSION = "n-ca-c-cb-signed-volume-wall-v1"
+DEFAULT_GROMACS_POSITION_RESTRAINT_FORCE_K_KJMOL_NM2 = 1000.0
+GROMACS_POSITION_RESTRAINT_ALGORITHM_VERSION = "solute-heavy-atoms-posres-v1"
+GROMACS_INCLUDE_FAMILY_AMBER99SB_ILDN_TIP3P = "amber99sb-ildn-tip3p"
+GROMACS_TOPOLOGY_MATERIALIZER_VERSION = "parmed-standalone-gromacs-includes-posres-v2"
+
+_GROMACS_INCLUDE_FAMILIES = {
+    ("amber99sbildn.xml", "tip3p.xml"): GROMACS_INCLUDE_FAMILY_AMBER99SB_ILDN_TIP3P,
+}
+
+
+def resolve_gromacs_include_family(protein_ff: str, water_ff_xml: str) -> str:
+    """Resolve an OpenMM force-field pair to its compatible GROMACS include family."""
+    try:
+        return _GROMACS_INCLUDE_FAMILIES[(protein_ff, water_ff_xml)]
+    except KeyError as exc:
+        raise ValueError(
+            "unsupported peptide-prep GROMACS export force-field combination: "
+            f"protein_ff={protein_ff!r}, water_ff_xml={water_ff_xml!r}"
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +282,13 @@ class PeptidePrepConfig:
     # Minimization
     minimization_max_iterations: int = 1_000
     restraint_force_k_kjmol_nm2: float = 1000.0
+    chirality_restraint_force_k_kjmol: float = DEFAULT_CHIRALITY_RESTRAINT_FORCE_K_KJMOL
+    chirality_restraint_min_signed_volume_nm3: float = (
+        DEFAULT_CHIRALITY_RESTRAINT_MIN_SIGNED_VOLUME_NM3
+    )
+    gromacs_position_restraint_force_k_kjmol_nm2: float = (
+        DEFAULT_GROMACS_POSITION_RESTRAINT_FORCE_K_KJMOL_NM2
+    )
     minimization_tolerance_kjmol_nm: float = 10.0
 
     # Closure bond-length limits (H5)
@@ -272,6 +309,7 @@ class PeptidePrepConfig:
     def __post_init__(self) -> None:
         """Validate required paths, sequence alphabet/length, and topology positions."""
         self._validate_paths()
+        resolve_gromacs_include_family(self.protein_ff, self.water_ff_xml)
         self._validate_sequence()
         self._validate_minimization()
         self._validate_closure_limits()
@@ -314,6 +352,21 @@ class PeptidePrepConfig:
             raise ValueError(
                 f"restraint_force_k_kjmol_nm2 must be non-negative; "
                 f"got {self.restraint_force_k_kjmol_nm2}"
+            )
+        if self.chirality_restraint_force_k_kjmol <= 0:
+            raise ValueError(
+                f"chirality_restraint_force_k_kjmol must be positive; "
+                f"got {self.chirality_restraint_force_k_kjmol}"
+            )
+        if self.chirality_restraint_min_signed_volume_nm3 <= 0:
+            raise ValueError(
+                f"chirality_restraint_min_signed_volume_nm3 must be positive; "
+                f"got {self.chirality_restraint_min_signed_volume_nm3}"
+            )
+        if self.gromacs_position_restraint_force_k_kjmol_nm2 <= 0:
+            raise ValueError(
+                "gromacs_position_restraint_force_k_kjmol_nm2 must be positive; "
+                f"got {self.gromacs_position_restraint_force_k_kjmol_nm2}"
             )
         if self.minimization_tolerance_kjmol_nm <= 0:
             raise ValueError(

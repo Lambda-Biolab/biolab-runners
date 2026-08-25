@@ -57,11 +57,18 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _BACKBONE_RESTRAINT_EXPRESSION = "k*((x-x0)^2 + (y-y0)^2 + (z-z0)^2)"
+_CHIRALITY_RESTRAINT_EXPRESSION = (
+    "0.5*chirality_k*step(chirality_vmin-s*v)*(chirality_vmin-s*v)^2/chirality_vmin^2;"
+    "v=(x1-x2)*((y3-y2)*(z4-z2)-(z3-z2)*(y4-y2))"
+    "-(y1-y2)*((x3-x2)*(z4-z2)-(z3-z2)*(x4-x2))"
+    "+(z1-z2)*((x3-x2)*(y4-y2)-(y3-y2)*(x4-x2))"
+)
 
 __all__ = [
     "build_closed_system",
     "read_potential_energy",
     "restrain_backbone",
+    "restrain_chirality",
     "run_minimization",
 ]
 
@@ -123,10 +130,65 @@ def restrain_backbone(
     return restraint_index
 
 
+def restrain_chirality(
+    system: object,
+    topology: object,
+    positions: object,
+    *,
+    force_constant_k_kjmol: float,
+    minimum_signed_volume_nm3: float,
+) -> int:
+    """Attach signed N-CA-C-CB chiral-volume wells for every non-Gly residue."""
+    import openmm
+
+    restraint = openmm.CustomCompoundBondForce(4, _CHIRALITY_RESTRAINT_EXPRESSION)
+    restraint.addGlobalParameter("chirality_k", force_constant_k_kjmol)
+    restraint.addGlobalParameter("chirality_vmin", minimum_signed_volume_nm3)
+    restraint.addPerBondParameter("s")
+    for residue in topology.residues():
+        if residue.name == "GLY":
+            continue
+        atoms = {atom.name: atom for atom in residue.atoms()}
+        missing = {"N", "CA", "C", "CB"} - atoms.keys()
+        if missing:
+            raise ValueError(
+                f"cannot restrain chirality at residue {residue.index}: "
+                f"missing atoms {sorted(missing)}"
+            )
+        atom_indices = tuple(atoms[name].index for name in ("N", "CA", "C", "CB"))
+        signed_volume = _signed_chiral_volume(
+            *(positions[index] for index in atom_indices)  # type: ignore[index]
+        )
+        if signed_volume == 0.0:
+            raise ValueError(
+                f"cannot restrain chirality at residue {residue.index}: "
+                "N, CA, C, and CB define degenerate geometry"
+            )
+        restraint.addBond(atom_indices, [1.0 if signed_volume > 0.0 else -1.0])
+
+    restraint_index = system.getNumForces()
+    system.addForce(restraint)
+    return restraint_index
+
+
+def _signed_chiral_volume(p1: object, p2: object, p3: object, p4: object) -> float:
+    import numpy as np
+    import openmm.unit as unit
+
+    points = [
+        np.asarray(point.value_in_unit(unit.nanometer), dtype=float)  # type: ignore[attr-defined]
+        for point in (p1, p2, p3, p4)
+    ]
+    return float(
+        np.dot(np.cross(points[0] - points[1], points[2] - points[1]), points[3] - points[1])
+    )
+
+
 def build_closed_system(
     restrained_system: object,
     *,
     restraint_force_index: int,
+    chirality_restraint_force_index: int | None = None,
 ) -> object:
     """Build an unrestrained copy of the system for ParmEd export.
 
@@ -144,6 +206,8 @@ def build_closed_system(
             attached.
         restraint_force_index: Zero-based index returned by
             :func:`restrain_backbone`.
+        chirality_restraint_force_index: Optional zero-based index
+            returned by :func:`restrain_chirality`.
 
     Returns:
         A new OpenMM ``System`` with the validated backbone restraint
@@ -172,21 +236,62 @@ def build_closed_system(
             "force count changed during the OpenMM XML round-trip; refusing to remove restraint"
         )
 
-    force = closed_system.getForce(restraint_force_index)
-    if not isinstance(force, openmm.CustomExternalForce):
-        raise RuntimeError(
-            f"force at restraint index {restraint_force_index} is "
-            f"{type(force).__name__}, expected CustomExternalForce"
+    _validate_restraint_force(
+        closed_system,
+        restraint_force_index,
+        force_type=openmm.CustomExternalForce,
+        expression=_BACKBONE_RESTRAINT_EXPRESSION,
+        index_name="restraint_force_index",
+    )
+    restraint_indices = [restraint_force_index]
+    if chirality_restraint_force_index is not None:
+        _validate_force_index(
+            restrained_system,
+            chirality_restraint_force_index,
+            index_name="chirality_restraint_force_index",
         )
-    if force.getEnergyFunction() != _BACKBONE_RESTRAINT_EXPRESSION:
-        raise RuntimeError(
-            f"CustomExternalForce at restraint index {restraint_force_index} has unexpected "
-            f"energy expression {force.getEnergyFunction()!r}; expected "
-            f"{_BACKBONE_RESTRAINT_EXPRESSION!r}"
+        _validate_restraint_force(
+            closed_system,
+            chirality_restraint_force_index,
+            force_type=openmm.CustomCompoundBondForce,
+            expression=_CHIRALITY_RESTRAINT_EXPRESSION,
+            index_name="chirality_restraint_force_index",
+        )
+        restraint_indices.append(chirality_restraint_force_index)
+
+    for force_index in sorted(restraint_indices, reverse=True):
+        closed_system.removeForce(force_index)
+    return closed_system
+
+
+def _validate_force_index(system: object, force_index: object, *, index_name: str) -> None:
+    if type(force_index) is not int:
+        raise ValueError(f"{index_name} must be an integer; got {force_index!r}")
+    if force_index < 0 or force_index >= system.getNumForces():  # type: ignore[operator]
+        raise ValueError(
+            f"{index_name} {force_index} is outside system with {system.getNumForces()} forces"
         )
 
-    closed_system.removeForce(restraint_force_index)
-    return closed_system
+
+def _validate_restraint_force(
+    system: object,
+    force_index: int,
+    *,
+    force_type: type,
+    expression: str,
+    index_name: str,
+) -> None:
+    force = system.getForce(force_index)  # type: ignore[attr-defined]
+    if not isinstance(force, force_type):
+        raise RuntimeError(
+            f"force at {index_name} {force_index} is {type(force).__name__}, "
+            f"expected {force_type.__name__}"
+        )
+    if force.getEnergyFunction() != expression:
+        raise RuntimeError(
+            f"{force_type.__name__} at {index_name} {force_index} has unexpected "
+            f"energy expression {force.getEnergyFunction()!r}; expected {expression!r}"
+        )
 
 
 def read_potential_energy(

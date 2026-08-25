@@ -93,6 +93,64 @@ _GROMPP_AUDIT_MDP_CONTENT = (
 )
 
 _GRO_COORDINATE_TOLERANCE_NM = 5.1e-4
+_CUSTOM_ATOM_TYPE_PREFIX = "PEP_"
+_AMBER99SB_ILDN_SOLVENT_ATOM_TYPES = """; Materialized from GROMACS 2026.3
+; amber99sb-ildn.ff/ffnonbonded.itp
+; source sha256: 4c712502e6bd0d96b4aa5400b63f9d24c3768c805850df7f1065807aa0d9c5ce
+[ atomtypes ]
+; name      at.num  mass     charge ptype  sigma      epsilon
+HW           1       1.008   0.0000  A   0.00000e+00  0.00000e+00
+Cl          17      35.45    0.0000  A   4.40104e-01  4.18400e-01
+Na          11      22.99    0.0000  A   3.32840e-01  1.15897e-02
+OW           8      16.00    0.0000  A   3.15061e-01  6.36386e-01"""
+_AMBER99SB_ILDN_TIP3P = """; Materialized from GROMACS 2026.3 amber99sb-ildn.ff/tip3p.itp
+; source sha256: c3eeb41bd1840248b0da6070e40bc8229a94d253830a1f392542f329d1ff386b
+[ moleculetype ]
+; molname nrexcl
+SOL 2
+
+[ atoms ]
+; id at type res nr res name at name cg nr charge mass
+1 OW 1 SOL OW 1 -0.834 16.00000
+2 HW 1 SOL HW1 1 0.417 1.00800
+3 HW 1 SOL HW2 1 0.417 1.00800
+
+#ifndef FLEXIBLE
+[ settles ]
+; OW funct doh dhh
+1 1 0.09572 0.15139
+
+[ exclusions ]
+1 2 3
+2 1 3
+3 1 2
+#else
+[ bonds ]
+; i j funct length force_constant
+1 2 1 0.09572 502416.0 0.09572 502416.0
+1 3 1 0.09572 502416.0 0.09572 502416.0
+
+[ angles ]
+; i j k funct angle force_constant
+2 1 3 1 104.52 628.02 104.52 628.02
+#endif"""
+_AMBER99SB_ILDN_IONS = """; Materialized from GROMACS 2026.3 amber99sb-ildn.ff/ions.itp
+; source sha256: d6cbb4aeb3389fd15c981bdbff335c32ccbfe887ef004e0b7119d6da813cb098
+[ moleculetype ]
+; molname nrexcl
+CL 1
+
+[ atoms ]
+; id at type res nr residue name at name cg nr charge
+1 Cl 1 CL CL 1 -1.00000
+
+[ moleculetype ]
+; molname nrexcl
+NA 1
+
+[ atoms ]
+; id at type res nr residue name at name cg nr charge
+1 Na 1 NA NA 1 1.00000"""
 
 
 class _ParmEdResidue(Protocol):
@@ -160,6 +218,8 @@ def export_gromacs(
     *,
     top_path: object,
     gro_path: object,
+    gromacs_include_family: str,
+    position_restraint_force_k_kjmol_nm2: float,
 ) -> dict[str, Any]:
     """Write the prepared ``.top`` and ``.gro`` via ParmEd.
 
@@ -198,11 +258,136 @@ def export_gromacs(
     # overwrite ParmEd refuses to write the new files).
     struct.save(str(top_path), overwrite=True)
     struct.save(str(gro_path), overwrite=True)
+    heavy_atom_indices = tuple(
+        index for index, atom in enumerate(struct.atoms, start=1) if atom.element != 1
+    )
+    _materialize_gromacs_includes(
+        top_path,
+        gromacs_include_family,
+        heavy_atom_indices=heavy_atom_indices,
+        position_restraint_force_k_kjmol_nm2=position_restraint_force_k_kjmol_nm2,
+    )
     return {
         "top_path": str(top_path),
         "gro_path": str(gro_path),
         "parmed_atom_count": len(struct.atoms),
     }
+
+
+def _materialize_gromacs_includes(
+    top_path: object,
+    include_family: str,
+    *,
+    heavy_atom_indices: tuple[int, ...],
+    position_restraint_force_k_kjmol_nm2: float,
+) -> None:
+    from pathlib import Path
+
+    from biolab_runners.peptide_prep.config import (
+        GROMACS_INCLUDE_FAMILY_AMBER99SB_ILDN_TIP3P,
+        GROMACS_POSITION_RESTRAINT_ALGORITHM_VERSION,
+    )
+
+    if include_family != GROMACS_INCLUDE_FAMILY_AMBER99SB_ILDN_TIP3P:
+        raise ValueError(f"unsupported GROMACS include family: {include_family!r}")
+
+    path = Path(str(top_path))
+    lines = path.read_text().splitlines()
+    atom_type_names = _collect_atom_type_names(lines)
+    renamed = {name: f"{_CUSTOM_ATOM_TYPE_PREFIX}{name}" for name in atom_type_names}
+    output: list[str] = []
+    section = ""
+    inserted_nonbonded = False
+    inserted_molecules = False
+    for line in lines:
+        next_section = _section_name(line)
+        if next_section is not None:
+            if section == "atomtypes" and next_section != "atomtypes":
+                output.extend(["", *_AMBER99SB_ILDN_SOLVENT_ATOM_TYPES.splitlines(), ""])
+                inserted_nonbonded = True
+            if next_section == "system":
+                output.extend(
+                    [
+                        *_position_restraints(
+                            heavy_atom_indices,
+                            position_restraint_force_k_kjmol_nm2,
+                            GROMACS_POSITION_RESTRAINT_ALGORITHM_VERSION,
+                        ),
+                        "",
+                        *_AMBER99SB_ILDN_TIP3P.splitlines(),
+                        "",
+                        *_AMBER99SB_ILDN_IONS.splitlines(),
+                        "",
+                    ]
+                )
+                inserted_molecules = True
+            section = next_section
+        output.append(_rename_custom_atom_type(line, section, renamed, next_section is not None))
+
+    if not inserted_nonbonded or not inserted_molecules:
+        raise ValueError("ParmEd topology lacks required atomtypes or system section")
+    path.write_text("\n".join(output) + "\n")
+
+
+def _position_restraints(
+    atom_indices: tuple[int, ...],
+    force_k_kjmol_nm2: float,
+    algorithm_version: str,
+) -> list[str]:
+    if not atom_indices:
+        raise ValueError("cannot materialize position restraints without solute heavy atoms")
+    force = f"{force_k_kjmol_nm2:.6f}"
+    return [
+        f"; biolab-runners position restraints: {algorithm_version}",
+        "#ifdef POSRES",
+        "[ position_restraints ]",
+        "; atom  type      fx      fy      fz",
+        *(f"{atom_index:6d}     1 {force} {force} {force}" for atom_index in atom_indices),
+        "#endif",
+    ]
+
+
+def _section_name(line: str) -> str | None:
+    stripped = line.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        return stripped[1:-1].strip().lower()
+    return None
+
+
+def _collect_atom_type_names(lines: list[str]) -> set[str]:
+    section = ""
+    names: set[str] = set()
+    for line in lines:
+        next_section = _section_name(line)
+        if next_section is not None:
+            section = next_section
+        elif section == "atomtypes" and line.strip() and not line.lstrip().startswith(";"):
+            names.add(line.split()[0])
+    return names
+
+
+def _rename_custom_atom_type(
+    line: str,
+    section: str,
+    renamed: dict[str, str],
+    is_section_header: bool,
+) -> str:
+    stripped = line.strip()
+    if is_section_header or not stripped or stripped.startswith(";"):
+        return line
+    if section == "atomtypes":
+        tokens = line.split()
+        tokens[0] = renamed[tokens[0]]
+        return " ".join(tokens)
+    if section != "atoms":
+        return line
+    content, separator, comment = line.partition(";")
+    tokens = content.split()
+    if len(tokens) < 2 or tokens[1] not in renamed:
+        return line
+    tokens[1] = renamed[tokens[1]]
+    renamed_line = " ".join(tokens)
+    return f"{renamed_line} ;{comment}" if separator else renamed_line
 
 
 def write_prepared_pdb(

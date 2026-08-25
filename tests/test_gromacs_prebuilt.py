@@ -29,12 +29,14 @@ import hashlib
 import re
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 from biolab_runners.gromacs.config import GromacsProtocolConfig
 from biolab_runners.gromacs.protocol import (
     build_commands,
     build_stage_plan,
+    stage_outputs_for,
     stage_prebuilt_topology,
 )
 from biolab_runners.gromacs.utils import (
@@ -617,6 +619,59 @@ class TestPrebuiltSourceCascadeInvalidation:
                     "prod.gro",
                 ):
                     assert name in stale_files, f"{name} not in stale dir {stale.name}"
+
+    def test_source_change_quarantines_full_outputs_and_starts_fresh(self, tmp_path: Path) -> None:
+        from biolab_runners.gromacs.runner import GromacsProtocolRunner, _work_dir
+        from biolab_runners.gromacs.utils import load_stage_manifest
+
+        src_top_v1 = tmp_path / "v1.top"
+        src_gro_v1 = tmp_path / "v1.gro"
+        src_top_v1.write_text("; top v1\n")
+        src_gro_v1.write_text("GRO v1\n")
+        work = tmp_path / "work"
+        cfg_v1 = _valid_protocol_config(
+            name="full-quarantine",
+            output_root=str(work),
+            prebuilt_topology=str(src_top_v1),
+            prebuilt_coordinates=str(src_gro_v1),
+        )
+        with patch.object(GromacsProtocolRunner, "_run_subprocess", return_value=0):
+            GromacsProtocolRunner().run_protocol(cfg_v1)
+
+        work_dir = _work_dir(cfg_v1)
+        for stage in build_stage_plan()[1:]:
+            for name in stage_outputs_for(stage.kind, stage.prefix):
+                (work_dir / name).write_text(f"stale {name}")
+
+        src_top_v2 = tmp_path / "v2.top"
+        src_gro_v2 = tmp_path / "v2.gro"
+        src_top_v2.write_text("; top v2\n")
+        src_gro_v2.write_text("GRO v2\n")
+        cfg_v2 = _valid_protocol_config(
+            name="full-quarantine",
+            output_root=str(work),
+            prebuilt_topology=str(src_top_v2),
+            prebuilt_coordinates=str(src_gro_v2),
+        )
+        captured: list[list[str]] = []
+
+        def _capture(command: list[str], _work_dir: Path, _timeout: int) -> int:
+            captured.append(command)
+            return 0
+
+        with patch.object(GromacsProtocolRunner, "_run_subprocess", side_effect=_capture):
+            result = GromacsProtocolRunner().run_protocol(cfg_v2)
+
+        assert result.succeeded == 7
+        assert all("-t" not in command and "-cpi" not in command for command in captured)
+        stale_files = {
+            path.name
+            for stale_dir in (work_dir / ".stale").iterdir()
+            if stale_dir.is_dir()
+            for path in stale_dir.iterdir()
+        }
+        assert {"prod.cpt", "prod.xtc", "prod.trr"}.issubset(stale_files)
+        assert load_stage_manifest(work_dir)["stages"]["production"]["status"] == "completed"
 
 
 def _prebuilt_meta_inline(cfg: GromacsProtocolConfig) -> dict[str, str]:
