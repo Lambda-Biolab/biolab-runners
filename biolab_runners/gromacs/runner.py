@@ -82,6 +82,9 @@ from biolab_runners.provenance import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from types import FrameType
+
     from biolab_runners.gromacs.config import GromacsConfig, GromacsProtocolConfig
 
 logger = logging.getLogger(__name__)
@@ -1207,35 +1210,9 @@ class GromacsProtocolRunner:
             stdin=stdin_arg,
         )
 
-        # Background grace watchdog: when SIGTERM arrives, set
-        # interrupted and schedule a kill after sigterm_grace_seconds.
-        # The watchdog is a daemon thread so it does not block
-        # communicate() — the parent only waits on communicate
-        # (which has its own timeout_seconds cap).
-        def _forward_sigterm(*_unused: object) -> None:
-            if interrupted.is_set():
-                return  # already handling
-            interrupted.set()
-            sigterm_received_at[0] = time.monotonic()
-            with contextlib.suppress(ProcessLookupError):
-                proc.terminate()
-
-            def _escalate_to_kill() -> None:
-                if kill_dispatched.is_set():
-                    return
-                kill_dispatched.set()
-                with contextlib.suppress(ProcessLookupError):
-                    proc.kill()
-                logger.warning(
-                    "gmx child did not exit within %.1fs of SIGTERM; escalated to SIGKILL",
-                    self._sigterm_grace_seconds,
-                )
-
-            watchdog = threading.Timer(self._sigterm_grace_seconds, _escalate_to_kill)
-            watchdog.daemon = True
-            watchdog.start()
-
-        original = signal.signal(signal.SIGTERM, _forward_sigterm)
+        original = self._install_sigterm_handler(
+            proc, interrupted, sigterm_received_at, kill_dispatched
+        )
         try:
             # Communicate is in text mode (text=True on Popen); the
             # stdin payload must be a str, not bytes. The
@@ -1271,6 +1248,40 @@ class GromacsProtocolRunner:
                 (stderr or "")[-500:],
             )
         return rc
+
+    def _install_sigterm_handler(
+        self,
+        proc: subprocess.Popen[str],
+        interrupted: threading.Event,
+        sigterm_received_at: list[float | None],
+        kill_dispatched: threading.Event,
+    ) -> Callable[[int, FrameType | None], object] | int | signal.Handlers | None:
+        """Install the SIGTERM forwarder and its grace-period watchdog."""
+
+        def _forward_sigterm(*_unused: object) -> None:
+            if interrupted.is_set():
+                return  # already handling
+            interrupted.set()
+            sigterm_received_at[0] = time.monotonic()
+            with contextlib.suppress(ProcessLookupError):
+                proc.terminate()
+
+            def _escalate_to_kill() -> None:
+                if kill_dispatched.is_set():
+                    return
+                kill_dispatched.set()
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                logger.warning(
+                    "gmx child did not exit within %.1fs of SIGTERM; escalated to SIGKILL",
+                    self._sigterm_grace_seconds,
+                )
+
+            watchdog = threading.Timer(self._sigterm_grace_seconds, _escalate_to_kill)
+            watchdog.daemon = True
+            watchdog.start()
+
+        return signal.signal(signal.SIGTERM, _forward_sigterm)
 
 
 def _cached_stage_invalidated_for_topology(work_dir: Path, config: GromacsProtocolConfig) -> bool:
