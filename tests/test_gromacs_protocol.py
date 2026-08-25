@@ -76,7 +76,7 @@ from biolab_runners.gromacs.protocol import (
     stage_minimum_outputs,
     stage_outputs_for,
 )
-from biolab_runners.gromacs.runner import _protocol_executed_config
+from biolab_runners.gromacs.runner import _protocol_executed_config, _protocol_stage_identity
 from biolab_runners.gromacs.utils import (
     load_stage_manifest,
     record_stage_status,
@@ -1118,6 +1118,12 @@ class TestRunnerSkipAndResume:
                 StageStatus.COMPLETED,
                 outputs=stage_minimum_outputs(stage.kind, stage.prefix),
             )
+        manifest = load_stage_manifest(work_dir)
+        for stage in build_stage_plan():
+            manifest["stages"][stage.kind.value]["protocol_identity"] = _protocol_stage_identity(
+                stage, cfg
+            )
+        save_stage_manifest(work_dir, manifest)
         runner = GromacsProtocolRunner()
         with patch.object(GromacsProtocolRunner, "_run_subprocess") as mock_run:
             result = runner.run_protocol(cfg)
@@ -1128,6 +1134,86 @@ class TestRunnerSkipAndResume:
         # All 8 stages were "skipped" (manifest authority).
         assert result.skipped == 8
         assert result.succeeded == 0
+
+    def test_legacy_completed_manifest_without_identity_reruns(self, tmp_path: Path) -> None:
+        cfg = _valid_protocol_config(output_root=str(tmp_path))
+        work_dir = tmp_path / cfg.name
+        for stage in build_stage_plan():
+            record_stage_status(
+                work_dir,
+                stage.kind.value,
+                StageStatus.COMPLETED,
+                outputs=stage_minimum_outputs(stage.kind, stage.prefix),
+            )
+
+        with patch.object(GromacsProtocolRunner, "_run_subprocess", return_value=0) as mock_run:
+            result = GromacsProtocolRunner().run_protocol(cfg)
+
+        assert mock_run.call_count >= 8
+        assert result.succeeded == 8
+        assert result.skipped == 0
+
+    def test_matching_identity_skips_with_digest_provenance(self, tmp_path: Path) -> None:
+        cfg = _valid_protocol_config(output_root=str(tmp_path))
+        runner = GromacsProtocolRunner()
+        with patch.object(GromacsProtocolRunner, "_run_subprocess", return_value=0):
+            first = runner.run_protocol(cfg)
+        assert first.succeeded == 8
+
+        with patch.object(GromacsProtocolRunner, "_run_subprocess") as mock_run:
+            second = GromacsProtocolRunner().run_protocol(cfg)
+
+        mock_run.assert_not_called()
+        assert second.skipped == 8
+        assert second.executed is False
+        assert second.executed_config_digest
+        assert second.provenance.executed_config_digest == second.executed_config_digest
+
+    def test_temperature_change_invalidates_first_affected_stage_and_dependents(
+        self, tmp_path: Path
+    ) -> None:
+        cfg = _valid_protocol_config(output_root=str(tmp_path))
+        with patch.object(GromacsProtocolRunner, "_run_subprocess", return_value=0):
+            GromacsProtocolRunner().run_protocol(cfg)
+
+        changed = _valid_protocol_config(output_root=str(tmp_path), temperature_k=315.0)
+        with patch.object(GromacsProtocolRunner, "_run_subprocess", return_value=0) as mock_run:
+            result = GromacsProtocolRunner().run_protocol(changed)
+
+        assert result.skipped == 5
+        assert result.succeeded == 3
+        assert list(result.stage_statuses) == [
+            StageKind.TOPOLOGY.value,
+            StageKind.BOX.value,
+            StageKind.SOLVATE.value,
+            StageKind.IONS.value,
+            StageKind.MINIMIZE.value,
+            StageKind.EQUIL_NVT.value,
+            StageKind.EQUIL_NPT.value,
+            StageKind.PRODUCTION.value,
+        ]
+        assert mock_run.call_count == 6
+
+    def test_protocol_version_change_invalidates_all_cached_stages(self, tmp_path: Path) -> None:
+        cfg = _valid_protocol_config(output_root=str(tmp_path))
+        with patch.object(GromacsProtocolRunner, "_run_subprocess", return_value=0):
+            GromacsProtocolRunner().run_protocol(cfg)
+
+        import biolab_runners.gromacs.protocol as protocol_module
+
+        with (
+            patch.object(
+                protocol_module,
+                "GROMACS_PROTOCOL_VERSION",
+                f"{GROMACS_PROTOCOL_VERSION}-changed",
+            ),
+            patch.object(GromacsProtocolRunner, "_run_subprocess", return_value=0) as mock_run,
+        ):
+            result = GromacsProtocolRunner().run_protocol(cfg)
+
+        assert result.skipped == 0
+        assert result.succeeded == 8
+        assert mock_run.call_count >= 8
 
     def test_disk_output_fallback_succeeds_with_minimum_outputs(self, tmp_path: Path) -> None:
         """Spot reclaim recovery: manifest lost, only minimum outputs on disk.

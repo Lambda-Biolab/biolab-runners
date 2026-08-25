@@ -57,6 +57,7 @@ from biolab_runners.gromacs.protocol import (
     generate_production_mdp,
     ions_mdp_content,
     stage_minimum_outputs,
+    stage_outputs_for,
     stage_prebuilt_topology,
 )
 from biolab_runners.gromacs.utils import (
@@ -231,7 +232,7 @@ class GromacsProtocolResult:
     @property
     def provenance(self) -> ProvenanceMetadata:
         """Return shared execution provenance for this protocol result."""
-        return build_execution_provenance(
+        provenance = build_execution_provenance(
             runner_name="gromacs_protocol",
             execution_mode=self.execution_mode,
             status=self.status,
@@ -244,6 +245,12 @@ class GromacsProtocolResult:
             cache_hit=self.cache_hit,
             command=self.command,
         )
+        if not self.executed and self.cache_hit and self.executed_config_digest:
+            provenance = dataclasses.replace(
+                provenance,
+                executed_config_digest=self.executed_config_digest,
+            )
+        return provenance
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the result into a JSON-safe dictionary."""
@@ -279,6 +286,40 @@ class GromacsProtocolResult:
 _DRY_RUN_STATUS = "validated"
 
 
+def _mdp_content_for(stage: ProtocolStage, config: GromacsProtocolConfig) -> str | None:
+    """Return the canonical generated ``.mdp`` content for a stage."""
+    if not stage.mdp_filename:
+        return None
+    if stage.kind == StageKind.IONS:
+        return ions_mdp_content()
+    if stage.kind == StageKind.MINIMIZE:
+        return generate_minimization_mdp(
+            config.minimization_max_iterations,
+            replica_index=config.replica_index,
+        )
+    if stage.kind == StageKind.EQUIL_NVT:
+        return generate_equil_nvt_mdp(
+            config.nvt_ps,
+            config.temperature_k,
+            replica_index=config.replica_index,
+        )
+    if stage.kind == StageKind.EQUIL_NPT:
+        return generate_equil_npt_mdp(
+            config.npt_ps,
+            config.temperature_k,
+            config.pressure_bar,
+            replica_index=config.replica_index,
+        )
+    if stage.kind == StageKind.PRODUCTION:
+        return generate_production_mdp(
+            config.effective_production_ns(),
+            config.temperature_k,
+            config.pressure_bar,
+            replica_index=config.replica_index,
+        )
+    return None
+
+
 def _emit_mdp(work_dir: Path, stage: ProtocolStage, config: GromacsProtocolConfig) -> str | None:
     """Emit the .mdp content for a stage and write it to disk.
 
@@ -288,36 +329,8 @@ def _emit_mdp(work_dir: Path, stage: ProtocolStage, config: GromacsProtocolConfi
     The content is the canonical deterministic string from the
     protocol module — same config → byte-identical content.
     """
-    if not stage.mdp_filename:
-        return None
-    if stage.kind == StageKind.IONS:
-        content = ions_mdp_content()
-    elif stage.kind == StageKind.MINIMIZE:
-        content = generate_minimization_mdp(
-            config.minimization_max_iterations,
-            replica_index=config.replica_index,
-        )
-    elif stage.kind == StageKind.EQUIL_NVT:
-        content = generate_equil_nvt_mdp(
-            config.nvt_ps,
-            config.temperature_k,
-            replica_index=config.replica_index,
-        )
-    elif stage.kind == StageKind.EQUIL_NPT:
-        content = generate_equil_npt_mdp(
-            config.npt_ps,
-            config.temperature_k,
-            config.pressure_bar,
-            replica_index=config.replica_index,
-        )
-    elif stage.kind == StageKind.PRODUCTION:
-        content = generate_production_mdp(
-            config.effective_production_ns(),
-            config.temperature_k,
-            config.pressure_bar,
-            replica_index=config.replica_index,
-        )
-    else:
+    content = _mdp_content_for(stage, config)
+    if content is None:
         return None
     mdp_path = work_dir / stage.mdp_filename
     mdp_path.write_text(content)
@@ -408,7 +421,9 @@ def _prebuilt_source_changed(work_dir: Path, config: GromacsProtocolConfig) -> b
     cached = record.get("prebuilt_source") or {}
     new = _prebuilt_meta(config)
     return (
-        cached.get("sha256_topology") != new["sha256_topology"]
+        cached.get("prebuilt_topology") != new["prebuilt_topology"]
+        or cached.get("prebuilt_coordinates") != new["prebuilt_coordinates"]
+        or cached.get("sha256_topology") != new["sha256_topology"]
         or cached.get("sha256_coordinates") != new["sha256_coordinates"]
     )
 
@@ -728,6 +743,65 @@ def _protocol_input_digests(config: GromacsProtocolConfig) -> dict[str, str | No
     return {"input_pdb": compute_file_digest(Path(config.input_pdb))}
 
 
+def _protocol_source_identity(config: GromacsProtocolConfig) -> dict[str, str | None]:
+    """Return the canonical source path/content identity for a protocol."""
+    if config.prebuilt_topology and config.prebuilt_coordinates:
+        return {
+            "mode": "prebuilt",
+            "topology_path": config.prebuilt_topology,
+            "coordinates_path": config.prebuilt_coordinates,
+            "topology_digest": compute_file_digest(Path(config.prebuilt_topology)),
+            "coordinates_digest": compute_file_digest(Path(config.prebuilt_coordinates)),
+        }
+    return {
+        "mode": "input_pdb",
+        "input_pdb_path": config.input_pdb,
+        "input_pdb_digest": compute_file_digest(Path(config.input_pdb)),
+    }
+
+
+def _protocol_stage_identity_payload(
+    stage: ProtocolStage,
+    config: GromacsProtocolConfig,
+) -> dict[str, object]:
+    """Build the stage-scoped science identity used by manifest reuse."""
+    from biolab_runners.gromacs.protocol import GROMACS_PROTOCOL_VERSION
+
+    payload: dict[str, object] = {
+        "protocol_version": GROMACS_PROTOCOL_VERSION,
+        "stage": {
+            "kind": stage.kind.value,
+            "prefix": stage.prefix,
+            "mdp_filename": stage.mdp_filename,
+        },
+        "source": _protocol_source_identity(config),
+    }
+    if stage.kind == StageKind.TOPOLOGY:
+        payload["topology_parameters"] = {
+            "force_field": config.force_field,
+            "water_model": config.water_model,
+        }
+    elif stage.kind == StageKind.BOX:
+        payload["box_parameters"] = {"box_buffer_nm": config.box_buffer_nm}
+    elif stage.kind == StageKind.IONS:
+        payload["ion_parameters"] = {
+            "ion_concentration_m": config.ion_concentration_m,
+            "mdp": _mdp_content_for(stage, config),
+        }
+    elif _is_md_stage(stage.kind):
+        payload["md_parameters"] = {
+            "mdp": _mdp_content_for(stage, config),
+            "nt_threads": config.nt_threads,
+            "extra_mdrun_flags": list(config.extra_mdrun_flags),
+        }
+    return payload
+
+
+def _protocol_stage_identity(stage: ProtocolStage, config: GromacsProtocolConfig) -> str:
+    """Return the canonical digest binding a stage to its science inputs."""
+    return compute_executed_config_digest(_protocol_stage_identity_payload(stage, config))
+
+
 def _protocol_executed_config(config: GromacsProtocolConfig) -> dict[str, object]:
     """Bind protocol settings and consumed input contents to execution."""
     from biolab_runners.gromacs.protocol import GROMACS_PROTOCOL_VERSION
@@ -735,6 +809,11 @@ def _protocol_executed_config(config: GromacsProtocolConfig) -> dict[str, object
     payload = dataclasses.asdict(config)
     payload["protocol_version"] = GROMACS_PROTOCOL_VERSION
     payload["input_digests"] = _protocol_input_digests(config)
+    payload["mdp_contents"] = {
+        stage.kind.value: _mdp_content_for(stage, config)
+        for stage in build_stage_plan()
+        if stage.mdp_filename
+    }
     return payload
 
 
@@ -933,6 +1012,7 @@ class GromacsProtocolRunner:
                 error = f"stage {stage.kind.value} failed (rc={rc})"
                 break
 
+        did_work = bool(succeeded or failed or interrupted)
         return GromacsProtocolResult(
             name=config.name,
             output_dir=str(work_dir),
@@ -952,14 +1032,12 @@ class GromacsProtocolRunner:
             requested_config_digest=compute_config_digest(config),
             executed_config_digest=(
                 compute_executed_config_digest(_protocol_executed_config(config))
-                if not self._dry_run and (succeeded or failed or interrupted)
+                if not self._dry_run and (did_work or skipped)
                 else None
             ),
             source_backbone_digest=_protocol_source_digest(config),
-            executed=not self._dry_run and bool(succeeded or failed or interrupted),
-            cache_hit=not self._dry_run
-            and not bool(succeeded or failed or interrupted)
-            and skipped > 0,
+            executed=not self._dry_run and did_work,
+            cache_hit=not self._dry_run and not did_work and skipped > 0,
             command=self._last_command,
         )
 
@@ -1017,9 +1095,10 @@ class GromacsProtocolRunner:
         if self._dry_run:
             return _DRY_RUN_STATUS, 0, False
 
-        record_stage_status(
+        _record_protocol_stage_status(
             work_dir,
-            stage.kind.value,
+            stage,
+            config,
             StageStatus.RUNNING,
             command=" ".join(resolved_commands[0]) if resolved_commands else "",
             started_at=started_at,
@@ -1039,9 +1118,10 @@ class GromacsProtocolRunner:
             # SIGTERM: the child was forwarded the signal and exited.
             # Preserve the manifest in RUNNING (NOT failed) so the
             # next invocation sees the on-disk .cpt and resumes.
-            record_stage_status(
+            _record_protocol_stage_status(
                 work_dir,
-                stage.kind.value,
+                stage,
+                config,
                 StageStatus.RUNNING,
                 outputs=stage_minimum_outputs(stage.kind, stage.prefix),
                 command=" ".join(resolved_commands[0]) if resolved_commands else "",
@@ -1052,9 +1132,10 @@ class GromacsProtocolRunner:
             return "interrupted", _INTERRUPTED_RC, False
 
         status = StageStatus.COMPLETED if rc == 0 else StageStatus.FAILED
-        record_stage_status(
+        _record_protocol_stage_status(
             work_dir,
-            stage.kind.value,
+            stage,
+            config,
             status,
             outputs=stage_minimum_outputs(stage.kind, stage.prefix),
             command=" ".join(resolved_commands[0]) if resolved_commands else "",
@@ -1112,11 +1193,15 @@ class GromacsProtocolRunner:
                 "sha256_topology": staged["sha256_topology"],
                 "sha256_coordinates": staged["sha256_coordinates"],
             }
-            record_stage_status(
+            topology_stage = next(
+                item for item in build_stage_plan() if item.kind == StageKind.TOPOLOGY
+            )
+            _record_protocol_stage_status(
                 work_dir,
-                StageKind.TOPOLOGY.value,
+                topology_stage,
+                config,
                 StageStatus.COMPLETED,
-                outputs=stage_minimum_outputs(StageKind.TOPOLOGY, "topol"),
+                outputs=stage_minimum_outputs(topology_stage.kind, topology_stage.prefix),
                 prebuilt_source=prebuilt_meta,
             )
         except (FileNotFoundError, ValueError) as exc:
@@ -1296,6 +1381,42 @@ def _cached_stage_invalidated_for_topology(work_dir: Path, config: GromacsProtoc
     return _prebuilt_source_changed(work_dir, config)
 
 
+def _stage_record_outputs(
+    record: dict[str, Any] | None,
+    stage: ProtocolStage,
+) -> list[str]:
+    """Return recorded and canonical outputs for forensic quarantine."""
+    recorded = record.get("outputs") if record else None
+    names = recorded if isinstance(recorded, list) else []
+    return sorted(set(names).union(stage_outputs_for(stage.kind, stage.prefix)))
+
+
+def _invalidate_stages_from(
+    work_dir: Path,
+    start_kind: StageKind,
+    *,
+    reason: str,
+) -> None:
+    """Quarantine and reset a stage plus every dependent downstream stage."""
+    manifest = load_stage_manifest(work_dir)
+    stages_section = manifest.setdefault("stages", {})
+    plan = build_stage_plan()
+    start_index = next(index for index, item in enumerate(plan) if item.kind == start_kind)
+    stale_dir = _prebuilt_stale_dir(work_dir)
+
+    for stage in plan[start_index:]:
+        kind = stage.kind.value
+        record = stages_section.get(kind)
+        _move_outputs_to_stale(work_dir, _stage_record_outputs(record, stage), stale_dir)
+        updated = dict(record) if isinstance(record, dict) else {}
+        updated["status"] = StageStatus.PENDING
+        updated[f"invalidated_by_{reason}"] = True
+        stages_section[kind] = updated
+
+    save_stage_manifest(work_dir, manifest)
+    logger.info("invalidated protocol stages from %s; stale dir=%s", start_kind.value, stale_dir)
+
+
 def _invalidate_downstream_for_prebuilt_change(work_dir: Path) -> None:
     """Invalidate every dependent stage when the prebuilt source has changed.
 
@@ -1323,6 +1444,7 @@ def _invalidate_downstream_for_prebuilt_change(work_dir: Path) -> None:
     manifest = load_stage_manifest(work_dir)
     stages_section = manifest.setdefault("stages", {})
     dependent_kinds = (
+        StageKind.TOPOLOGY,
         StageKind.BOX,
         StageKind.SOLVATE,
         StageKind.IONS,
@@ -1335,15 +1457,8 @@ def _invalidate_downstream_for_prebuilt_change(work_dir: Path) -> None:
 
     for kind in dependent_kinds:
         record = stages_section.get(kind.value)
-        if record is None:
-            continue
-        existing_outputs = record.get("outputs")
-        outputs: list[str] = (
-            list(existing_outputs)
-            if isinstance(existing_outputs, list)
-            else list(stage_minimum_outputs(kind, _prefix_for(kind)))
-        )
-        _move_outputs_to_stale(work_dir, outputs, stale_dir)
+        stage = next(item for item in build_stage_plan() if item.kind == kind)
+        _move_outputs_to_stale(work_dir, _stage_record_outputs(record, stage), stale_dir)
         # Reset to PENDING; the per-stage loop will re-run it.
         stages_section[kind.value] = {
             "status": StageStatus.PENDING,
@@ -1357,20 +1472,35 @@ def _invalidate_downstream_for_prebuilt_change(work_dir: Path) -> None:
     )
 
 
-def _prefix_for(kind: StageKind) -> str:
-    """Return the canonical ``-deffnm`` prefix for a stage kind."""
-    from biolab_runners.gromacs.paths import GromacsFiles
-
-    prefixes = {
-        StageKind.BOX: "box",
-        StageKind.SOLVATE: "solvate",
-        StageKind.IONS: "ions",
-        StageKind.MINIMIZE: GromacsFiles.MIN_PREFIX,
-        StageKind.EQUIL_NVT: GromacsFiles.NVT_PREFIX,
-        StageKind.EQUIL_NPT: GromacsFiles.NPT_PREFIX,
-        StageKind.PRODUCTION: GromacsFiles.PROD_PREFIX,
-    }
-    return prefixes[kind]
+def _record_protocol_stage_status(
+    work_dir: Path,
+    stage: ProtocolStage,
+    config: GromacsProtocolConfig,
+    status: str,
+    *,
+    outputs: tuple[str, ...] = (),
+    command: str = "",
+    started_at: str | None = None,
+    completed_at: str | None = None,
+    error: str = "",
+    prebuilt_source: dict[str, Any] | None = None,
+) -> None:
+    """Record a stage result and bind it to the current protocol identity."""
+    record_stage_status(
+        work_dir,
+        stage.kind.value,
+        status,
+        outputs=outputs,
+        command=command,
+        started_at=started_at,
+        completed_at=completed_at,
+        error=error,
+        prebuilt_source=prebuilt_source,
+    )
+    manifest = load_stage_manifest(work_dir)
+    record = manifest["stages"].setdefault(stage.kind.value, {})
+    record["protocol_identity"] = _protocol_stage_identity(stage, config)
+    save_stage_manifest(work_dir, manifest)
 
 
 def _prebuilt_stale_dir(work_dir: Path) -> Path:
@@ -1419,6 +1549,16 @@ def _stage_should_skip(
 
     # Manifest authority — cache hit.
     if _stage_already_complete(work_dir, stage):
+        manifest = load_stage_manifest(work_dir)
+        record = manifest["stages"][stage.kind.value]
+        identity = _protocol_stage_identity(stage, config)
+        if record.get("protocol_identity") != identity:
+            logger.info(
+                "%s stage identity is missing or changed; invalidating downstream stages",
+                stage.kind.value,
+            )
+            _invalidate_stages_from(work_dir, stage.kind, reason="protocol_identity")
+            return False
         # Prebuilt mode invalidates a cached TOPOLOGY stage
         # when the supplied source digests differ from the
         # recorded ones.
@@ -1430,9 +1570,10 @@ def _stage_should_skip(
                 "digests differ; invalidating cached stage"
             )
             return False
-        record_stage_status(
+        _record_protocol_stage_status(
             work_dir,
-            stage.kind.value,
+            stage,
+            config,
             StageStatus.COMPLETED,
             outputs=stage_minimum_outputs(stage.kind, stage.prefix),
         )
@@ -1450,9 +1591,10 @@ def _stage_should_skip(
         and _checkpoint_for(work_dir, stage) is None
         and _outputs_complete_on_disk(work_dir, stage)
     ):
-        record_stage_status(
+        _record_protocol_stage_status(
             work_dir,
-            stage.kind.value,
+            stage,
+            config,
             StageStatus.COMPLETED,
             outputs=stage_minimum_outputs(stage.kind, stage.prefix),
         )
