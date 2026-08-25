@@ -21,13 +21,19 @@ from biolab_runners.gromacs import (
 from biolab_runners.gromacs.config import GromacsConfig
 from biolab_runners.gromacs.paths import GromacsFiles
 from biolab_runners.gromacs.protocol import StageKind, build_stage_plan, stage_minimum_outputs
-from biolab_runners.gromacs.runner import GromacsProtocolResult, GromacsRunner, _config_to_cli
+from biolab_runners.gromacs.runner import (
+    GromacsProtocolResult,
+    GromacsRunner,
+    _config_to_cli,
+    _protocol_stage_identity,
+)
 from biolab_runners.gromacs.utils import (
     invoke,
     load_stage_manifest,
     now_utc_iso,
     parse_nthcol_energy,
     record_stage_status,
+    save_stage_manifest,
 )
 
 
@@ -317,7 +323,14 @@ def test_gromacs_record_to_dict_round_trip() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _setup_interrupted(work_dir: Path, kind: StageKind, prefix: str, *, with_cpt: bool) -> None:
+def _setup_interrupted(
+    work_dir: Path,
+    kind: StageKind,
+    prefix: str,
+    *,
+    with_cpt: bool,
+    config: GromacsProtocolConfig | None = None,
+) -> None:
     """Mirror the post-SIGTERM disk state (RUNNING manifest + minimum outputs [+ .cpt])."""
     work_dir.mkdir(parents=True, exist_ok=True)
     for name in stage_minimum_outputs(kind, prefix):
@@ -332,10 +345,23 @@ def _setup_interrupted(work_dir: Path, kind: StageKind, prefix: str, *, with_cpt
         started_at=now_utc_iso(),
         error="interrupted by SIGTERM; resumable on next invocation",
     )
+    if config is not None:
+        manifest = load_stage_manifest(work_dir)
+        stage = next(item for item in build_stage_plan() if item.kind == kind)
+        manifest["stages"][kind.value]["protocol_identity"] = _protocol_stage_identity(
+            stage, config
+        )
+        save_stage_manifest(work_dir, manifest)
 
 
-def _make_config(name: str, output_root: str) -> GromacsProtocolConfig:
-    return GromacsProtocolConfig(name=name, input_pdb="/tmp/in.pdb", output_root=output_root)
+def _make_config(name: str, output_root: str, **overrides: Any) -> GromacsProtocolConfig:
+    values: dict[str, Any] = {
+        "name": name,
+        "input_pdb": "/tmp/in.pdb",
+        "output_root": output_root,
+    }
+    values.update(overrides)
+    return GromacsProtocolConfig(**values)
 
 
 class TestRunnerInterruptedResume:
@@ -350,7 +376,7 @@ class TestRunnerInterruptedResume:
         cfg = _make_config("cpi-resume", str(tmp_path))
         work_dir = tmp_path / cfg.name
         stage = next(s for s in build_stage_plan() if s.kind == StageKind.PRODUCTION)
-        _setup_interrupted(work_dir, StageKind.PRODUCTION, stage.prefix, with_cpt=True)
+        _setup_interrupted(work_dir, StageKind.PRODUCTION, stage.prefix, with_cpt=True, config=cfg)
         cpt_path = work_dir / GromacsFiles.checkpoint(stage.prefix)
 
         captured: list[list[str]] = []
@@ -378,6 +404,95 @@ class TestRunnerInterruptedResume:
         # Manifest now COMPLETED via real execution (not disk-fallback).
         record = load_stage_manifest(work_dir)["stages"][StageKind.PRODUCTION.value]
         assert record["status"] == StageStatus.COMPLETED
+
+    def test_running_npt_with_matching_identity_resumes_via_t_and_cpi(self, tmp_path: Path) -> None:
+        cfg = _make_config("npt-cpi-resume", str(tmp_path))
+        work_dir = tmp_path / cfg.name
+        stage = next(s for s in build_stage_plan() if s.kind == StageKind.EQUIL_NPT)
+        _setup_interrupted(work_dir, stage.kind, stage.prefix, with_cpt=True, config=cfg)
+        cpt_path = work_dir / GromacsFiles.checkpoint(stage.prefix)
+
+        captured: list[list[str]] = []
+
+        def _capture(cmd: list[str], _wd: Path, _timeout: int) -> int:
+            captured.append(cmd)
+            return 0
+
+        with patch.object(GromacsProtocolRunner, "_run_subprocess", side_effect=_capture):
+            status, rc, was_skipped = GromacsProtocolRunner()._run_single_stage(
+                work_dir, stage, cfg
+            )
+
+        assert (status, rc, was_skipped) == (StageStatus.COMPLETED, 0, False)
+        assert "-t" in captured[0] and str(cpt_path) in captured[0]
+        assert "-cpi" in captured[1] and str(cpt_path) in captured[1]
+        assert "-append" in captured[1]
+
+    @pytest.mark.parametrize("change", [{"npt_ps": 150}, {"pressure_bar": 2.0}])
+    def test_running_npt_identity_change_quarantines_checkpoint_and_downstream(
+        self, tmp_path: Path, change: dict[str, Any]
+    ) -> None:
+        original = _make_config("npt-identity-change", str(tmp_path))
+        with patch.object(GromacsProtocolRunner, "_run_subprocess", return_value=0):
+            first = GromacsProtocolRunner().run_protocol(original)
+        assert first.succeeded == 8
+
+        work_dir = tmp_path / original.name
+        npt = next(s for s in build_stage_plan() if s.kind == StageKind.EQUIL_NPT)
+        production = next(s for s in build_stage_plan() if s.kind == StageKind.PRODUCTION)
+        npt_cpt = work_dir / GromacsFiles.checkpoint(npt.prefix)
+        production_cpt = work_dir / GromacsFiles.checkpoint(production.prefix)
+        npt_cpt.write_text("stale npt checkpoint")
+        production_cpt.write_text("stale production checkpoint")
+        manifest = load_stage_manifest(work_dir)
+        manifest["stages"][npt.kind.value]["status"] = StageStatus.RUNNING
+        manifest["stages"][npt.kind.value]["protocol_identity"] = _protocol_stage_identity(
+            npt, original
+        )
+        save_stage_manifest(work_dir, manifest)
+
+        changed = _make_config(original.name, str(tmp_path), **change)
+        captured: list[list[str]] = []
+
+        def _capture(cmd: list[str], _wd: Path, _timeout: int) -> int:
+            captured.append(cmd)
+            return 0
+
+        with patch.object(GromacsProtocolRunner, "_run_subprocess", side_effect=_capture):
+            result = GromacsProtocolRunner().run_protocol(changed)
+
+        assert result.skipped == 6
+        assert result.succeeded == 2
+        assert len(captured) == 4
+        assert all("-t" not in command and "-cpi" not in command for command in captured)
+        assert not npt_cpt.exists()
+        assert not production_cpt.exists()
+        stale_files = [path for path in (work_dir / ".stale").rglob("*") if path.is_file()]
+        assert npt_cpt.name in {path.name for path in stale_files}
+        assert production_cpt.name in {path.name for path in stale_files}
+
+    def test_legacy_running_without_identity_starts_fresh(self, tmp_path: Path) -> None:
+        cfg = _make_config("legacy-running", str(tmp_path))
+        work_dir = tmp_path / cfg.name
+        stage = next(s for s in build_stage_plan() if s.kind == StageKind.EQUIL_NPT)
+        _setup_interrupted(work_dir, stage.kind, stage.prefix, with_cpt=True)
+        cpt_path = work_dir / GromacsFiles.checkpoint(stage.prefix)
+        captured: list[list[str]] = []
+
+        def _capture(cmd: list[str], _wd: Path, _timeout: int) -> int:
+            captured.append(cmd)
+            return 0
+
+        with patch.object(GromacsProtocolRunner, "_run_subprocess", side_effect=_capture):
+            status, rc, was_skipped = GromacsProtocolRunner()._run_single_stage(
+                work_dir, stage, cfg
+            )
+
+        assert (status, rc, was_skipped) == (StageStatus.COMPLETED, 0, False)
+        assert "-t" not in captured[0] and "-cpi" not in captured[1]
+        assert not cpt_path.exists()
+        stale_files = [path for path in (work_dir / ".stale").rglob("*") if path.is_file()]
+        assert cpt_path.name in {path.name for path in stale_files}
 
     def test_manifest_silent_with_checkpoint_resumes_via_cpi(self, tmp_path: Path) -> None:
         """Manifest silent + minimum outputs + .cpt -> runner resumes via -cpi.

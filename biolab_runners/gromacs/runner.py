@@ -396,7 +396,7 @@ def _stage_already_complete(work_dir: Path, stage: ProtocolStage) -> bool:
     """
     manifest = load_stage_manifest(work_dir)
     record = manifest.get("stages", {}).get(stage.kind.value)
-    return record is not None and record.get("status") == StageStatus.COMPLETED
+    return isinstance(record, dict) and record.get("status") == StageStatus.COMPLETED
 
 
 def _prebuilt_source_changed(work_dir: Path, config: GromacsProtocolConfig) -> bool:
@@ -1386,7 +1386,7 @@ def _stage_record_outputs(
     stage: ProtocolStage,
 ) -> list[str]:
     """Return recorded and canonical outputs for forensic quarantine."""
-    recorded = record.get("outputs") if record else None
+    recorded = record.get("outputs") if isinstance(record, dict) else None
     names = recorded if isinstance(recorded, list) else []
     return sorted(set(names).union(stage_outputs_for(stage.kind, stage.prefix)))
 
@@ -1526,6 +1526,26 @@ def _move_outputs_to_stale(work_dir: Path, outputs: list[str], stale_dir: Path) 
             logger.warning("quarantine failed for %s: %s", src, exc)
 
 
+def _stage_identity_changed(
+    work_dir: Path,
+    stage: ProtocolStage,
+    config: GromacsProtocolConfig,
+) -> bool:
+    """Invalidate resumable manifest records that are not protocol-compatible."""
+    record = load_stage_manifest(work_dir).get("stages", {}).get(stage.kind.value)
+    if record is None or (isinstance(record, dict) and record.get("status") == StageStatus.PENDING):
+        return False
+    identity = _protocol_stage_identity(stage, config)
+    if isinstance(record, dict) and record.get("protocol_identity") == identity:
+        return False
+    logger.info(
+        "%s stage identity is missing or changed; invalidating downstream stages",
+        stage.kind.value,
+    )
+    _invalidate_stages_from(work_dir, stage.kind, reason="protocol_identity")
+    return True
+
+
 def _stage_should_skip(
     work_dir: Path,
     stage: ProtocolStage,
@@ -1547,18 +1567,11 @@ def _stage_should_skip(
     if config.force:
         return False
 
+    if _stage_identity_changed(work_dir, stage, config):
+        return False
+
     # Manifest authority — cache hit.
     if _stage_already_complete(work_dir, stage):
-        manifest = load_stage_manifest(work_dir)
-        record = manifest["stages"][stage.kind.value]
-        identity = _protocol_stage_identity(stage, config)
-        if record.get("protocol_identity") != identity:
-            logger.info(
-                "%s stage identity is missing or changed; invalidating downstream stages",
-                stage.kind.value,
-            )
-            _invalidate_stages_from(work_dir, stage.kind, reason="protocol_identity")
-            return False
         # Prebuilt mode invalidates a cached TOPOLOGY stage
         # when the supplied source digests differ from the
         # recorded ones.
