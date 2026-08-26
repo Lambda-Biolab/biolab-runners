@@ -58,6 +58,7 @@ build a config without an OpenMM install).
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING, Any
 
 from biolab_runners.peptide_prep.utils import THREE_LETTER
@@ -68,6 +69,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _BACKBONE_ATOM_NAMES = frozenset({"N", "CA", "C", "O", "OXT", "H", "H1", "H2", "H3", "HN"})
+_UNCHANGED_CHAIN_COORDINATE_TOLERANCE_NM = 1e-9
 
 __all__ = [
     "apply_design_chain_mutation",
@@ -217,8 +219,20 @@ def _normalize_l_sidechain_chirality(
     return positions_nm * unit.nanometer
 
 
-def _discover_missing_heavy_atoms(fixer: object) -> None:
+def _discover_missing_heavy_atoms(fixer: object, design_chain_id: str) -> None:
     fixer.findMissingResidues()  # type: ignore[attr-defined]
+    chains = list(fixer.topology.chains())  # type: ignore[attr-defined]
+    non_design_gaps = []
+    for (chain_index, residue_index), residue_names in fixer.missingResidues.items():  # type: ignore[attr-defined]
+        chain = chains[chain_index]
+        if chain.id != design_chain_id:
+            residue_names_text = ", ".join(residue_names)
+            non_design_gaps.append(f"{chain.id}[{residue_index}] ({residue_names_text})")
+    if non_design_gaps:
+        raise ValueError(
+            "non-design chain has missing residues; refusing to repair it: "
+            + "; ".join(non_design_gaps)
+        )
     fixer.missingResidues = {}  # type: ignore[attr-defined]
     fixer.findMissingAtoms()  # type: ignore[attr-defined]
     fixer.missingTerminals = {}  # type: ignore[attr-defined]
@@ -232,9 +246,104 @@ def _reject_missing_non_design_atoms(fixer: object, design_chain_id: str) -> Non
     ]
     if missing:
         raise ValueError(
-            "non-design chain has missing heavy atoms; refusing to repair receptor: "
-            + "; ".join(missing)
+            "non-design chain has missing heavy atoms; refusing to repair it: " + "; ".join(missing)
         )
+
+
+def _capture_unchanged_chain_snapshot(
+    topology: object, positions: object, design_chain_id: str
+) -> tuple[Any, ...]:
+    from openmm import unit
+
+    positions_nm = positions.value_in_unit(unit.nanometer)  # type: ignore[attr-defined]
+    return tuple(
+        _capture_chain_snapshot(chain, positions_nm)
+        for chain in topology.chains()  # type: ignore[attr-defined]
+        if chain.id != design_chain_id
+    )
+
+
+def _capture_chain_snapshot(chain: object, positions_nm: object) -> tuple[Any, ...]:
+    residues: list[Any] = []
+    for residue in chain.residues():  # type: ignore[attr-defined]
+        atoms = tuple(
+            (
+                atom.name,
+                atom.element.symbol if atom.element is not None else None,
+                tuple(float(value) for value in positions_nm[atom.index]),  # type: ignore[index]
+            )
+            for atom in residue.atoms()
+        )
+        residues.append((residue.id, residue.name, atoms))
+    return chain.id, tuple(residues)  # type: ignore[attr-defined]
+
+
+def _validate_unchanged_chain_metadata(
+    source_chain: tuple[Any, ...], current_chain: tuple[Any, ...]
+) -> None:
+    if source_chain[0] != current_chain[0]:
+        raise ValueError("non-design chain order or identity changed during mutation")
+    source_residues = source_chain[1]
+    current_residues = current_chain[1]
+    if len(source_residues) != len(current_residues):
+        raise ValueError(
+            f"non-design residue count changed for chain {source_chain[0]} during mutation"
+        )
+    for source_residue, current_residue in zip(source_residues, current_residues, strict=True):
+        if source_residue[:2] != current_residue[:2]:
+            raise ValueError(
+                f"non-design residue identity or order changed in chain {source_chain[0]}"
+            )
+        source_metadata = [(name, element) for name, element, _ in source_residue[2]]
+        current_metadata = [(name, element) for name, element, _ in current_residue[2]]
+        if source_metadata != current_metadata:
+            raise ValueError(
+                f"non-design atom names or elements changed in chain {source_chain[0]} "
+                f"residue {source_residue[0]}"
+            )
+
+
+def _unchanged_chain_coordinate_changed(
+    source: tuple[float, ...], current: tuple[float, ...]
+) -> bool:
+    return any(
+        not math.isclose(
+            source_coordinate,
+            current_coordinate,
+            rel_tol=0.0,
+            abs_tol=_UNCHANGED_CHAIN_COORDINATE_TOLERANCE_NM,
+        )
+        for source_coordinate, current_coordinate in zip(source, current, strict=True)
+    )
+
+
+def _validate_unchanged_chain_coordinates(
+    source_snapshot: tuple[Any, ...], current_snapshot: tuple[Any, ...]
+) -> None:
+    for source_chain, current_chain in zip(source_snapshot, current_snapshot, strict=True):
+        for source_residue, current_residue in zip(source_chain[1], current_chain[1], strict=True):
+            for source_atom, current_atom in zip(
+                source_residue[2], current_residue[2], strict=True
+            ):
+                if _unchanged_chain_coordinate_changed(source_atom[2], current_atom[2]):
+                    raise ValueError(
+                        f"non-design atom coordinates changed in chain {source_chain[0]} "
+                        f"residue {source_residue[0]} atom {source_atom[0]}"
+                    )
+
+
+def _validate_non_design_chains_unchanged(
+    source_snapshot: tuple[Any, ...],
+    topology: object,
+    positions: object,
+    design_chain_id: str,
+) -> None:
+    current_snapshot = _capture_unchanged_chain_snapshot(topology, positions, design_chain_id)
+    if len(source_snapshot) != len(current_snapshot):
+        raise ValueError("non-design chain count changed during design-chain mutation")
+    for source_chain, current_chain in zip(source_snapshot, current_snapshot, strict=True):
+        _validate_unchanged_chain_metadata(source_chain, current_chain)
+    _validate_unchanged_chain_coordinates(source_snapshot, current_snapshot)
 
 
 def apply_design_chain_mutation(
@@ -259,6 +368,9 @@ def apply_design_chain_mutation(
         raise FileNotFoundError(f"backbone PDB not found: {backbone_pdb_path}")
 
     fixer = PDBFixer(filename=backbone_pdb_path)
+    source_unchanged_snapshot = _capture_unchanged_chain_snapshot(
+        fixer.topology, fixer.positions, design_chain_id
+    )
     chain = next(
         (candidate for candidate in fixer.topology.chains() if candidate.id == design_chain_id),
         None,
@@ -275,7 +387,7 @@ def apply_design_chain_mutation(
         target_sequence,
         [residue.id for residue in source_residues],
     )
-    _discover_missing_heavy_atoms(fixer)
+    _discover_missing_heavy_atoms(fixer, design_chain_id)
     _reject_missing_non_design_atoms(fixer, design_chain_id)
 
     if mutations:
@@ -287,8 +399,11 @@ def apply_design_chain_mutation(
                 f"on chain {design_chain_id!r}: {exc}"
             ) from exc
 
-    _discover_missing_heavy_atoms(fixer)
+    _discover_missing_heavy_atoms(fixer, design_chain_id)
     fixer.addMissingAtoms()  # type: ignore[attr-defined]
+    _validate_non_design_chains_unchanged(
+        source_unchanged_snapshot, fixer.topology, fixer.positions, design_chain_id
+    )
     return fixer.topology, fixer.positions
 
 

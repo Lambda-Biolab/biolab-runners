@@ -204,6 +204,16 @@ def _full_complex_pdb_text() -> str:
     return "\n".join(lines) + "\n"
 
 
+def _full_complex_receptor_gap_pdb_text() -> str:
+    """Build the complex with an A-chain SEQRES/ATOM residue gap."""
+    lines = _full_complex_pdb_text().splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith("ATOM") and line[21] == "A" and line[22:26].strip() == "11":
+            lines[index] = line[:22] + "  12" + line[26:]
+    lines.insert(1, "SEQRES   1 A    3  ALA ALA ALA")
+    return "\n".join(lines) + "\n"
+
+
 @pytest.fixture
 def tmp_output_dir(tmp_path: Path) -> Path:
     """Return a fresh per-test output directory under tmp_path."""
@@ -225,6 +235,14 @@ def full_complex_pdb(tmp_path: Path) -> Path:
     """Write the synthetic receptor-plus-design-chain PDB to ``tmp_path``."""
     path = tmp_path / "full_complex.pdb"
     path.write_text(_full_complex_pdb_text())
+    return path
+
+
+@pytest.fixture
+def full_complex_receptor_gap_pdb(tmp_path: Path) -> Path:
+    """Write a complex whose A-chain SEQRES declares an absent residue."""
+    path = tmp_path / "full_complex_receptor_gap.pdb"
+    path.write_text(_full_complex_receptor_gap_pdb_text())
     return path
 
 
@@ -1107,6 +1125,29 @@ class TestPeptidePrepMutation:
             if chain.id != "C":
                 assert [residue.name for residue in residues] == residue_names
 
+        source_positions_nm = source.positions.value_in_unit(openmm.unit.nanometer)
+        output_positions_nm = positions.value_in_unit(openmm.unit.nanometer)
+        for source_chain in source_chains:
+            if source_chain.id not in {"A", "B"}:
+                continue
+            output_chain = next(chain for chain in chains if chain.id == source_chain.id)
+            for source_residue, output_residue in zip(
+                source_chain.residues(), output_chain.residues(), strict=True
+            ):
+                source_atoms = list(source_residue.atoms())
+                output_atoms = list(output_residue.atoms())
+                assert [
+                    (atom.name, atom.element.symbol if atom.element is not None else None)
+                    for atom in output_atoms
+                ] == [
+                    (atom.name, atom.element.symbol if atom.element is not None else None)
+                    for atom in source_atoms
+                ]
+                for source_atom, output_atom in zip(source_atoms, output_atoms, strict=True):
+                    assert tuple(output_positions_nm[output_atom.index]) == pytest.approx(
+                        tuple(source_positions_nm[source_atom.index]), abs=1e-9
+                    )
+
         design_residues = list(chains[2].residues())
         assert [residue.name for residue in design_residues] == ["LEU", "ALA"]
         assert {atom.name for atom in design_residues[0].atoms()} >= {
@@ -1171,6 +1212,25 @@ class TestPeptidePrepMutation:
         with pytest.raises(ValueError, match="non-design chain has missing heavy atoms"):
             apply_design_chain_mutation(
                 backbone_pdb_path=str(broken_pdb),
+                design_chain_id="C",
+                target_sequence="LA",
+            )
+
+    def test_full_complex_mutation_rejects_missing_receptor_residue(
+        self, full_complex_receptor_gap_pdb: Path
+    ) -> None:
+        from biolab_runners.peptide_prep.mutation import apply_design_chain_mutation
+
+        probe = PDBFixer(filename=str(full_complex_receptor_gap_pdb))
+        probe.findMissingResidues()
+        assert any(
+            list(probe.topology.chains())[chain_index].id == "A"
+            for chain_index, _residue_index in probe.missingResidues
+        ), "fixture must expose an A-chain SEQRES/ATOM gap"
+
+        with pytest.raises(ValueError, match="non-design chain has missing residues"):
+            apply_design_chain_mutation(
+                backbone_pdb_path=str(full_complex_receptor_gap_pdb),
                 design_chain_id="C",
                 target_sequence="LA",
             )
