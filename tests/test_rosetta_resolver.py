@@ -269,35 +269,78 @@ def test_required_metrics_must_be_present_finite_and_known(tmp_path: Path) -> No
 
 
 @pytest.mark.parametrize(
-    "output_mutation",
+    ("output_mutation", "expected_error"),
     [
-        lambda output: output.replace(_crlf(_atom(6, "C", 1, record="HETATM")), b""),
-        lambda output: output + _atom(7, "D", 1).encode(),
-        lambda output: output.replace(b"   1.000", b"     bad", 1),
-        lambda output: b"HEADER\n",
-        lambda output: b"MODEL        1\n" + output + b"MODEL        2\n",
-        lambda output: b"MODEL        1\n" + output,
-        lambda output: output + b"ENDMDL\n",
-        lambda output: b"MODEL        1\n" + output + b"ENDMDL\n" + _atom(7, "A", 1).encode(),
-        lambda output: output + b"MODEL        1\nENDMDL\n",
-        lambda output: output.replace(_crlf(_atom(1, "A", 1)), _crlf(_atom(1, " ", 1))),
-        lambda output: output.replace(b"ATOM      1", b"ATOM  bad 1", 1),
-        lambda output: output.replace(
-            _crlf(_atom(1, "A", 1)), _crlf(_atom(1, "A", 1, atom_name=""))
+        (
+            lambda output: output.replace(_crlf(_atom(6, "C", 1, record="HETATM")), b""),
+            "output PDB chain set does not match expected chain roles",
         ),
-        lambda output: output.replace(
-            _crlf(_atom(1, "A", 1)), _crlf(_atom(1, "A", 1, residue_name=""))
+        (
+            lambda output: output + _atom(7, "D", 1).encode(),
+            "output PDB chain set does not match expected chain roles",
+        ),
+        (
+            lambda output: output.replace(b"   1.000", b"     bad", 1),
+            "ATOM/HETATM record has malformed serial, residue number, or coordinates",
+        ),
+        (lambda output: b"HEADER\n", "output PDB contains no atoms"),
+        (
+            lambda output: b"MODEL        1\n" + output + b"MODEL        2\n",
+            "output PDB contains multiple or nested MODEL records",
+        ),
+        (
+            lambda output: b"MODEL        1\n" + output,
+            "output PDB contains an unclosed MODEL record",
+        ),
+        (
+            lambda output: output + b"ENDMDL\n",
+            "output PDB contains an unmatched ENDMDL record",
+        ),
+        (
+            lambda output: b"MODEL        1\n" + output + b"ENDMDL\n" + _atom(7, "A", 1).encode(),
+            "output PDB contains atoms outside its explicit model",
+        ),
+        (
+            lambda output: output + b"MODEL        1\nENDMDL\n",
+            "output PDB contains atoms outside its explicit model",
+        ),
+        (
+            lambda output: output.replace(_crlf(_atom(1, "A", 1)), _crlf(_atom(1, " ", 1))),
+            "ATOM/HETATM record has a blank chain",
+        ),
+        (
+            lambda output: output.replace(b"ATOM      1", b"ATOM  bad 1", 1),
+            "ATOM/HETATM record has malformed serial, residue number, or coordinates",
+        ),
+        (
+            lambda output: output.replace(
+                _crlf(_atom(1, "A", 1)), _crlf(_atom(1, "A", 1, atom_name=""))
+            ),
+            "ATOM/HETATM record has a blank atom or residue name",
+        ),
+        (
+            lambda output: output.replace(
+                _crlf(_atom(1, "A", 1)), _crlf(_atom(1, "A", 1, residue_name=""))
+            ),
+            "ATOM/HETATM record has a blank atom or residue name",
         ),
     ],
 )
 def test_output_pdb_must_have_valid_expected_single_model_chains(
-    tmp_path: Path, output_mutation: object
+    tmp_path: Path, output_mutation: object, expected_error: str
 ) -> None:
     request = _request(tmp_path)
     output = request.output_pdb.read_bytes()
-    request.output_pdb.write_bytes(output_mutation(output))  # type: ignore[operator]
+    mutated_output = output_mutation(output)  # type: ignore[operator]
+    request.output_pdb.write_bytes(mutated_output)
+    request = replace(
+        request,
+        output_pdb_identity=PDBIdentity(
+            request.output_pdb_identity.uri, hashlib.sha256(mutated_output).hexdigest()
+        ),
+    )
 
-    with pytest.raises(MalformedOutputError):
+    with pytest.raises(MalformedOutputError, match=expected_error):
         resolve_decoy(request)
 
 
