@@ -70,6 +70,7 @@ logger = logging.getLogger(__name__)
 _BACKBONE_ATOM_NAMES = frozenset({"N", "CA", "C", "O", "OXT", "H", "H1", "H2", "H3", "HN"})
 
 __all__ = [
+    "apply_design_chain_mutation",
     "apply_sequence_mutation",
     "build_mutation_list",
     "select_chain_atoms",
@@ -214,6 +215,81 @@ def _normalize_l_sidechain_chirality(
             continue
         _normalize_residue_l_chirality(residue, positions_nm, residue_index)
     return positions_nm * unit.nanometer
+
+
+def _discover_missing_heavy_atoms(fixer: object) -> None:
+    fixer.findMissingResidues()  # type: ignore[attr-defined]
+    fixer.missingResidues = {}  # type: ignore[attr-defined]
+    fixer.findMissingAtoms()  # type: ignore[attr-defined]
+    fixer.missingTerminals = {}  # type: ignore[attr-defined]
+
+
+def _reject_missing_non_design_atoms(fixer: object, design_chain_id: str) -> None:
+    missing = [
+        f"{residue.chain.id}:{residue.id} {residue.name} ({', '.join(atom.name for atom in atoms)})"
+        for residue, atoms in fixer.missingAtoms.items()  # type: ignore[attr-defined]
+        if residue.chain.id != design_chain_id
+    ]
+    if missing:
+        raise ValueError(
+            "non-design chain has missing heavy atoms; refusing to repair receptor: "
+            + "; ".join(missing)
+        )
+
+
+def apply_design_chain_mutation(
+    *,
+    backbone_pdb_path: str,
+    design_chain_id: str,
+    target_sequence: str,
+) -> tuple[Any, Any]:
+    """Mutate one design chain while retaining the complete source complex.
+
+    The returned topology and positions contain only the source heavy atoms
+    plus heavy atoms required by the target residue templates.  Missing
+    residues and terminal atoms are intentionally not added: residue identity,
+    numbering, chain order, and the no-hydrogen boundary belong to the caller's
+    subsequent preparation stages.
+    """
+    import os
+
+    from pdbfixer import PDBFixer
+
+    if not os.path.isfile(backbone_pdb_path):
+        raise FileNotFoundError(f"backbone PDB not found: {backbone_pdb_path}")
+
+    fixer = PDBFixer(filename=backbone_pdb_path)
+    chain = next(
+        (candidate for candidate in fixer.topology.chains() if candidate.id == design_chain_id),
+        None,
+    )
+    if chain is None:
+        raise ValueError(
+            f"design_chain_id {design_chain_id!r} not found in PDB; "
+            f"available: {[candidate.id for candidate in fixer.topology.chains()]}"
+        )
+
+    source_residues = list(chain.residues())
+    mutations = build_mutation_list(
+        [residue.name for residue in source_residues],
+        target_sequence,
+        [residue.id for residue in source_residues],
+    )
+    _discover_missing_heavy_atoms(fixer)
+    _reject_missing_non_design_atoms(fixer, design_chain_id)
+
+    if mutations:
+        try:
+            fixer.applyMutations(mutations, design_chain_id)
+        except (KeyError, ValueError) as exc:
+            raise ValueError(
+                f"PDBFixer mutation failed for mutations={mutations!r} "
+                f"on chain {design_chain_id!r}: {exc}"
+            ) from exc
+
+    _discover_missing_heavy_atoms(fixer)
+    fixer.addMissingAtoms()  # type: ignore[attr-defined]
+    return fixer.topology, fixer.positions
 
 
 def apply_sequence_mutation(
