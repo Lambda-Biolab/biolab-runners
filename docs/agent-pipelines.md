@@ -8,13 +8,15 @@ implicit consumer pipeline.
 
 ## Composition rules
 
-- Use the config and result type for the runner being called. Shared
-  `ExecutionStatus`, `ExecutionMode`, `ArtifactReference`, typed errors, and
-  `ProvenanceMetadata` standardize handoffs; result fields remain
+- Use the config and result type for the runner being called. Where exposed,
+  shared `ExecutionStatus`, `ExecutionMode`, `ArtifactReference`, typed
+  errors, and `ProvenanceMetadata` standardize handoffs; result fields remain
   runner-specific.
-- Treat `status`, record statuses, required artifacts, and provenance as part
-  of the handoff. Do not infer success from a directory existing or from an
-  exit code alone.
+- For runners exposing shared fields, treat `status`, record statuses,
+  required artifacts, and provenance as part of the handoff. OpenMM retains
+  its legacy `SimulationResult` boundary: inspect `error` and its concrete
+  artifact-path fields instead. Do not infer success from a directory
+  existing or from an exit code alone.
 - Keep consumer policy outside this package. Candidate registries, ranking,
   acceptance thresholds, finalist selection, campaign iteration, uploads, and
   cloud job orchestration belong to the consuming pipeline.
@@ -40,10 +42,14 @@ RFdiffusion target-conditioned design requires `target_pdb` plus stock
 chain-referencing `contigs`. `RFdiffusionResult.records` contains the full
 target-plus-binder PDB in `RecordData.path`, while `RecordData.sequence` is
 parsed from the generated design chain only. A consumer should pass a
-successful record's PDB path to ProteinMPNN and branch on its
-`DesignRecordStatus`/result status before using a sequence. RFdiffusion's
-head-to-tail mode is distinct from its disulfide intent: residue-pair
-disulfides are downstream topology intent, not an RFdiffusion feature.
+successful record's PDB path to ProteinMPNN. Set
+`ProteinMPNNConfig.extra["pdb_path_chains"]` to the space-separated
+`RFdiffusionConfig.design_chains` so only generated binder chains are
+designed and receptor chains remain fixed. Branch on ProteinMPNN's
+`DesignRecordStatus` and result status before using a sequence.
+RFdiffusion's head-to-tail mode is distinct from its disulfide intent:
+residue-pair disulfides are downstream topology intent, not an RFdiffusion
+feature.
 
 `ProteinMPNNRunner.run_batch(inputs, config)` is available when the consumer
 has already selected several backbone paths. Its result records contain the
@@ -110,10 +116,10 @@ For a complete GROMACS protocol, import `GromacsProtocolConfig` and
 normalized `status` property and artifact/provenance accessors.
 
 The protocol runs topology, box, solvation, ions, minimization, NVT, NPT,
-and production stages. Completed stages are skipped from the manifest. An
-MD stage with a `.cpt` resumes with GROMACS checkpoint flags; a stage without
-one starts fresh. SIGTERM leaves an interrupted stage resumable when GROMACS
-has written its checkpoint. With both `prebuilt_topology` and
+and production stages. Stages recorded as completed in the manifest are
+skipped. An MD stage with a `.cpt` resumes with GROMACS checkpoint flags; a
+stage without one starts fresh. SIGTERM leaves an interrupted stage resumable
+when GROMACS has written its checkpoint. With both `prebuilt_topology` and
 `prebuilt_coordinates` set on `GromacsProtocolConfig`, the caller's `.top`
 and `.gro` are staged and the `pdb2gmx` topology stage is bypassed. The
 remaining solvation and MD stages are unchanged.
@@ -129,7 +135,9 @@ implementation.
 enable_early_abort=True)` returns `SimulationResult`. Its normal artifact
 fields point to `trajectory.dcd`, `energy.csv`, the state XML, and
 `topology.pdb`; the result also reports `total_ns`, `ns_per_day`, early-abort
-fields, and `error`.
+fields, and `error`. This result does not expose the shared `status`,
+`artifacts`, `provenance`, or `execution_mode` fields; use `error` plus the
+concrete path fields at this legacy boundary.
 
 The runner itself delegates run-state decisions to
 `biolab_runners.openmm.run_state.decide(output_dir, config, force)`, which
@@ -153,12 +161,13 @@ consumer-specific qualification.
 
 ## Optional decomposition
 
-After a compatible MD result exists, `GmxMMPBSARunner` from
-`biolab_runners.mmpbsa` can run optional per-residue gmx_MMPBSA decomposition.
-`run()` returns the legacy JSON-stable dictionary with `status`, `records`,
-and `error` plus shared metadata. Missing optional tooling is
-`status="unsupported"`; a successful invocation with absent required
-decomposition output is `status="incomplete"`.
+After a compatible MD result exists, construct `GmxMMPBSARunner` from
+`biolab_runners.mmpbsa` with an `OpenMMConfig` and output `prefix` to run
+optional per-residue gmx_MMPBSA decomposition. `run()` returns the legacy
+JSON-stable dictionary with `status`, `per_residue_records`, and `error` plus
+shared metadata. Missing optional tooling is `status="unsupported"`; a
+successful invocation with absent required decomposition output is
+`status="incomplete"`.
 
 For tool-level smoke coverage and scientific-validation scope, use
 [`docs/testing/scientific-validation.md`](testing/scientific-validation.md).
