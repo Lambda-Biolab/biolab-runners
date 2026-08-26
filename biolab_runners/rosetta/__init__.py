@@ -35,6 +35,7 @@ the parser API :func:`parse_relax_score` + :func:`parse_score_files`
 is the entry point for those tests.
 """
 
+from biolab_runners.rosetta.artifact import ChainAudit, PDBIdentity, RosettaDecoyArtifact
 from biolab_runners.rosetta.config import (
     ConstrainedRelaxOptions,
     PreparationMode,
@@ -54,12 +55,15 @@ from biolab_runners.rosetta.utils import (
 
 __all__ = [
     "METRIC_ALIASES",
+    "ChainAudit",
     "ConstrainedRelaxOptions",
+    "PDBIdentity",
     "PreparationMode",
     "RelaxRecord",
     "RelaxRecordStatus",
     "RelaxScore",
     "RosettaConfig",
+    "RosettaDecoyArtifact",
     "RosettaResult",
     "RosettaRunner",
     "parse_relax_score",
