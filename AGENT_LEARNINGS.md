@@ -103,3 +103,18 @@ validation. The library itself defaults to OpenCL for this reason — the
 hardcoded CUDA in the smoke scripts is for the conda-target CI
 environment. The `make smoke_test` recipe doesn't override the
 platform, so a pip-OpenMM local run will fail.
+
+## Session-boundary recovery — reconcile work before compaction
+
+**Context:** Agent sessions with dirty work and commits that may already have
+been published or superseded.
+
+**Problem:** Context compaction or session termination can strand unique work,
+or cause a stale snapshot to be recommitted after its source commit is already
+published.
+
+**Solution:** Before context compaction or session end, inspect `git status`,
+map dirty paths to commits and PRs, commit unique work on a task branch, record
+the branch, commit, and PR in the handoff or ledger, and leave the primary
+checkout reconciled. Do not recommit stale snapshots that are already
+published.
