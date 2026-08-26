@@ -160,6 +160,60 @@ def _two_cys_pdb_text() -> str:
     )
 
 
+def _full_complex_pdb_text() -> str:
+    """Build a small A+B receptor and C design-chain complex."""
+    atoms = [
+        ("N", "ALA", "A", 10, 0.000, 0.000, 0.000, "N"),
+        ("CA", "ALA", "A", 10, 1.450, 0.000, 0.000, "C"),
+        ("C", "ALA", "A", 10, 2.450, 1.200, 0.000, "C"),
+        ("O", "ALA", "A", 10, 2.200, 2.350, 0.000, "O"),
+        ("CB", "ALA", "A", 10, 1.400, -1.000, -1.000, "C"),
+        ("N", "ALA", "A", 11, 3.550, 1.100, 0.000, "N"),
+        ("CA", "ALA", "A", 11, 4.550, 2.200, 0.000, "C"),
+        ("C", "ALA", "A", 11, 5.850, 1.400, 0.000, "C"),
+        ("O", "ALA", "A", 11, 6.900, 1.800, 0.000, "O"),
+        ("CB", "ALA", "A", 11, 4.700, 3.300, -1.000, "C"),
+        ("N", "GLY", "B", 20, 0.000, 10.000, 0.000, "N"),
+        ("CA", "GLY", "B", 20, 1.450, 10.000, 0.000, "C"),
+        ("C", "GLY", "B", 20, 2.450, 11.200, 0.000, "C"),
+        ("O", "GLY", "B", 20, 2.200, 12.350, 0.000, "O"),
+        ("N", "GLY", "B", 21, 3.550, 11.100, 0.000, "N"),
+        ("CA", "GLY", "B", 21, 4.550, 12.200, 0.000, "C"),
+        ("C", "GLY", "B", 21, 5.850, 11.400, 0.000, "C"),
+        ("O", "GLY", "B", 21, 6.900, 11.800, 0.000, "O"),
+        ("N", "ALA", "C", 30, 0.000, 20.000, 0.000, "N"),
+        ("CA", "ALA", "C", 30, 1.450, 20.000, 0.000, "C"),
+        ("C", "ALA", "C", 30, 2.450, 21.200, 0.000, "C"),
+        ("O", "ALA", "C", 30, 2.200, 22.350, 0.000, "O"),
+        ("CB", "ALA", "C", 30, 1.400, 19.000, -1.000, "C"),
+        ("N", "ALA", "C", 31, 3.550, 21.100, 0.000, "N"),
+        ("CA", "ALA", "C", 31, 4.550, 22.200, 0.000, "C"),
+        ("C", "ALA", "C", 31, 5.850, 21.400, 0.000, "C"),
+        ("O", "ALA", "C", 31, 6.900, 21.800, 0.000, "O"),
+        ("CB", "ALA", "C", 31, 4.700, 23.300, -1.000, "C"),
+    ]
+    lines = ["HEADER    synthetic full complex"]
+    for serial, (atom, residue, chain, resid, x, y, z, element) in enumerate(atoms, 1):
+        lines.append(
+            f"ATOM  {serial:5d} {atom:>4s} {residue} {chain}{resid:4d}"
+            f"    {x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00           {element:>2s}"
+        )
+        if serial in (10, 18):
+            lines.append("TER")
+    lines.append("END")
+    return "\n".join(lines) + "\n"
+
+
+def _full_complex_receptor_gap_pdb_text() -> str:
+    """Build the complex with an A-chain SEQRES/ATOM residue gap."""
+    lines = _full_complex_pdb_text().splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith("ATOM") and line[21] == "A" and line[22:26].strip() == "11":
+            lines[index] = line[:22] + "  12" + line[26:]
+    lines.insert(1, "SEQRES   1 A    3  ALA ALA ALA")
+    return "\n".join(lines) + "\n"
+
+
 @pytest.fixture
 def tmp_output_dir(tmp_path: Path) -> Path:
     """Return a fresh per-test output directory under tmp_path."""
@@ -173,6 +227,22 @@ def two_cys_pdb(tmp_path: Path) -> Path:
     """Write the synthetic two-CYS peptide PDB to ``tmp_path``."""
     path = tmp_path / "two_cys.pdb"
     path.write_text(_two_cys_pdb_text())
+    return path
+
+
+@pytest.fixture
+def full_complex_pdb(tmp_path: Path) -> Path:
+    """Write the synthetic receptor-plus-design-chain PDB to ``tmp_path``."""
+    path = tmp_path / "full_complex.pdb"
+    path.write_text(_full_complex_pdb_text())
+    return path
+
+
+@pytest.fixture
+def full_complex_receptor_gap_pdb(tmp_path: Path) -> Path:
+    """Write a complex whose A-chain SEQRES declares an absent residue."""
+    path = tmp_path / "full_complex_receptor_gap.pdb"
+    path.write_text(_full_complex_receptor_gap_pdb_text())
     return path
 
 
@@ -1018,6 +1088,152 @@ class TestPeptidePrepMutation:
             f"TRP heavy atoms missing after mutation: {sorted(missing)}; "
             f"threaded atoms: {sorted(trp_atoms)}"
         )
+
+    def test_full_complex_mutation_preserves_chain_and_residue_identity(
+        self, full_complex_pdb: Path
+    ) -> None:
+        """Mutating C retains the complete A+B+C heavy-atom complex."""
+        from biolab_runners.peptide_prep.mutation import apply_design_chain_mutation
+
+        source = PDBFixer(filename=str(full_complex_pdb))
+        source_chains = list(source.topology.chains())
+        source_chain_data = [
+            (
+                chain.id,
+                [residue.id for residue in chain.residues()],
+                [residue.name for residue in chain.residues()],
+                len(list(chain.atoms())),
+            )
+            for chain in source_chains
+        ]
+
+        topology, positions = apply_design_chain_mutation(
+            backbone_pdb_path=str(full_complex_pdb),
+            design_chain_id="C",
+            target_sequence="LA",
+        )
+
+        chains = list(topology.chains())
+        assert [chain.id for chain in chains] == ["A", "B", "C"]
+        for chain, (chain_id, residue_ids, residue_names, atom_count) in zip(
+            chains, source_chain_data, strict=True
+        ):
+            residues = list(chain.residues())
+            assert chain.id == chain_id
+            assert [residue.id for residue in residues] == residue_ids
+            assert len(list(chain.atoms())) == atom_count + (3 if chain.id == "C" else 0)
+            if chain.id != "C":
+                assert [residue.name for residue in residues] == residue_names
+
+        source_positions_nm = source.positions.value_in_unit(openmm.unit.nanometer)
+        output_positions_nm = positions.value_in_unit(openmm.unit.nanometer)
+        for source_chain in source_chains:
+            if source_chain.id not in {"A", "B"}:
+                continue
+            output_chain = next(chain for chain in chains if chain.id == source_chain.id)
+            for source_residue, output_residue in zip(
+                source_chain.residues(), output_chain.residues(), strict=True
+            ):
+                source_atoms = list(source_residue.atoms())
+                output_atoms = list(output_residue.atoms())
+                assert [
+                    (atom.name, atom.element.symbol if atom.element is not None else None)
+                    for atom in output_atoms
+                ] == [
+                    (atom.name, atom.element.symbol if atom.element is not None else None)
+                    for atom in source_atoms
+                ]
+                for source_atom, output_atom in zip(source_atoms, output_atoms, strict=True):
+                    assert tuple(output_positions_nm[output_atom.index]) == pytest.approx(
+                        tuple(source_positions_nm[source_atom.index]), abs=1e-9
+                    )
+
+        design_residues = list(chains[2].residues())
+        assert [residue.name for residue in design_residues] == ["LEU", "ALA"]
+        assert {atom.name for atom in design_residues[0].atoms()} >= {
+            "N",
+            "CA",
+            "C",
+            "O",
+            "CB",
+            "CG",
+            "CD1",
+            "CD2",
+        }
+        assert not any(atom.element == app.element.hydrogen for atom in topology.atoms())
+        assert not any(atom.name == "OXT" for atom in topology.atoms())
+        assert len(list(positions)) == topology.getNumAtoms()
+        assert list(full_complex_pdb.parent.iterdir()) == [full_complex_pdb]
+
+    def test_full_complex_mutation_rejects_unknown_design_chain(
+        self, full_complex_pdb: Path
+    ) -> None:
+        from biolab_runners.peptide_prep.mutation import apply_design_chain_mutation
+
+        with pytest.raises(ValueError, match="design_chain_id 'D' not found"):
+            apply_design_chain_mutation(
+                backbone_pdb_path=str(full_complex_pdb),
+                design_chain_id="D",
+                target_sequence="LA",
+            )
+
+    def test_full_complex_mutation_rejects_target_length_mismatch(
+        self, full_complex_pdb: Path
+    ) -> None:
+        from biolab_runners.peptide_prep.mutation import apply_design_chain_mutation
+
+        with pytest.raises(ValueError, match="sequence/source length mismatch"):
+            apply_design_chain_mutation(
+                backbone_pdb_path=str(full_complex_pdb),
+                design_chain_id="C",
+                target_sequence="L",
+            )
+
+    def test_full_complex_mutation_rejects_missing_receptor_atom(
+        self, full_complex_pdb: Path
+    ) -> None:
+        from biolab_runners.peptide_prep.mutation import apply_design_chain_mutation
+
+        broken_pdb = full_complex_pdb.with_name("broken_complex.pdb")
+        broken_pdb.write_text(
+            "\n".join(
+                line
+                for line in full_complex_pdb.read_text().splitlines()
+                if not (
+                    line.startswith("ATOM")
+                    and line[12:16].strip() == "CB"
+                    and line[21] == "A"
+                    and line[22:26].strip() == "10"
+                )
+            )
+            + "\n"
+        )
+
+        with pytest.raises(ValueError, match="non-design chain has missing heavy atoms"):
+            apply_design_chain_mutation(
+                backbone_pdb_path=str(broken_pdb),
+                design_chain_id="C",
+                target_sequence="LA",
+            )
+
+    def test_full_complex_mutation_rejects_missing_receptor_residue(
+        self, full_complex_receptor_gap_pdb: Path
+    ) -> None:
+        from biolab_runners.peptide_prep.mutation import apply_design_chain_mutation
+
+        probe = PDBFixer(filename=str(full_complex_receptor_gap_pdb))
+        probe.findMissingResidues()
+        assert any(
+            list(probe.topology.chains())[chain_index].id == "A"
+            for chain_index, _residue_index in probe.missingResidues
+        ), "fixture must expose an A-chain SEQRES/ATOM gap"
+
+        with pytest.raises(ValueError, match="non-design chain has missing residues"):
+            apply_design_chain_mutation(
+                backbone_pdb_path=str(full_complex_receptor_gap_pdb),
+                design_chain_id="C",
+                target_sequence="LA",
+            )
 
     def test_create_system_succeeds_after_real_mutation(self, tmp_output_dir: Path) -> None:
         """After mutation the OpenMM system creation must succeed (no template mismatch)."""
