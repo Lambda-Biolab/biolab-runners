@@ -27,8 +27,11 @@ __all__ = [
     "RelaxRecord",
     "RelaxRecordStatus",
     "RelaxScore",
+    "RelaxScoreRow",
     "build_invocation_command",
     "parse_relax_score",
+    "parse_relax_score_rows",
+    "parse_relax_score_rows_text",
     "parse_score_file",
     "parse_score_files",
     "rosetta_available",
@@ -252,6 +255,14 @@ class RelaxScore:
 
 
 @dataclass(frozen=True)
+class RelaxScoreRow:
+    """One scorefile data row with its unparsed Rosetta description."""
+
+    description: str
+    score: RelaxScore
+
+
+@dataclass(frozen=True)
 class RelaxRecord:
     """One relax output produced by ``rosetta_scripts``.
 
@@ -388,6 +399,62 @@ def parse_relax_score(path: Path) -> RelaxScore:
     text = path.read_text()
     header_to_idx, first_data_row = _extract_first_score_row(text)
     return _build_relax_score(header_to_idx, first_data_row)
+
+
+def parse_relax_score_rows(path: Path) -> tuple[RelaxScoreRow, ...]:
+    """Parse every data row in a Rosetta scorefile against its first header."""
+    return parse_relax_score_rows_text(path.read_text())
+
+
+def parse_relax_score_rows_text(text: str) -> tuple[RelaxScoreRow, ...]:
+    """Parse every data row from one already-read scorefile snapshot."""
+    header_to_idx: dict[str, int] = {}
+    header_tokens: tuple[str, ...] | None = None
+    rows: list[RelaxScoreRow] = []
+    for line in text.splitlines():
+        tokens = _score_tokens(line)
+        if tokens is None:
+            continue
+        if header_tokens is None:
+            header_tokens = _validate_score_header(tokens)
+            header_to_idx = {name.lower(): idx for idx, name in enumerate(tokens)}
+            continue
+        if tuple(tokens) == header_tokens:
+            continue
+        if len(tokens) != len(header_tokens):
+            raise ValueError("score data row does not match score header arity")
+        rows.append(_build_relax_score_row(header_to_idx, tokens))
+    return tuple(rows)
+
+
+def _validate_score_header(tokens: list[str]) -> tuple[str, ...]:
+    normalized = tuple(token.casefold() for token in tokens)
+    if len(normalized) != len(set(normalized)):
+        raise ValueError("score header contains duplicate column names")
+    if normalized.count("description") != 1:
+        raise ValueError("score header must contain exactly one description column")
+    return tuple(tokens)
+
+
+def _score_tokens(line: str) -> list[str] | None:
+    """Return tokens from a meaningful SCORE line."""
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or not stripped.startswith("SCORE:"):
+        return None
+    tokens = stripped[len("SCORE:") :].split()
+    return tokens or None
+
+
+def _build_relax_score_row(header_to_idx: Mapping[str, int], tokens: list[str]) -> RelaxScoreRow:
+    """Build one row while retaining its raw description token."""
+    description_idx = header_to_idx.get("description")
+    description = (
+        tokens[description_idx]
+        if description_idx is not None and description_idx < len(tokens)
+        else ""
+    )
+    values = [_parse_token(token) for token in tokens]
+    return RelaxScoreRow(description, _build_relax_score(header_to_idx, values))
 
 
 def _extract_first_score_row(

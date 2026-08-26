@@ -41,13 +41,17 @@ from biolab_runners.rosetta.config import (
     PreparationMode,
     RosettaConfig,
 )
+from biolab_runners.rosetta.resolver import RosettaDecoyResolutionRequest, resolve_decoy
 from biolab_runners.rosetta.runner import RosettaResult, RosettaRunner
 from biolab_runners.rosetta.utils import (
     METRIC_ALIASES,
     RelaxRecord,
     RelaxRecordStatus,
     RelaxScore,
+    RelaxScoreRow,
     parse_relax_score,
+    parse_relax_score_rows,
+    parse_relax_score_rows_text,
     parse_score_file,
     parse_score_files,
     rosetta_available,
@@ -62,12 +66,17 @@ __all__ = [
     "RelaxRecord",
     "RelaxRecordStatus",
     "RelaxScore",
+    "RelaxScoreRow",
     "RosettaConfig",
     "RosettaDecoyArtifact",
+    "RosettaDecoyResolutionRequest",
     "RosettaResult",
     "RosettaRunner",
     "parse_relax_score",
+    "parse_relax_score_rows",
+    "parse_relax_score_rows_text",
     "parse_score_file",
     "parse_score_files",
+    "resolve_decoy",
     "rosetta_available",
 ]
