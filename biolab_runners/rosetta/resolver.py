@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import math
+import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
@@ -17,7 +20,7 @@ from biolab_runners.rosetta.artifact import ChainAudit, PDBIdentity, RosettaDeco
 from biolab_runners.rosetta.utils import (
     METRIC_ALIASES,
     RelaxScoreRow,
-    parse_relax_score_rows,
+    parse_relax_score_rows_text,
 )
 
 __all__ = ["RosettaDecoyResolutionRequest", "resolve_decoy"]
@@ -40,9 +43,9 @@ class RosettaDecoyResolutionRequest:
     config_identity: str
     runtime_identity: str
     expected_chain_roles: tuple[ChainRole, ...]
+    status: ExecutionStatus
     decoy_description: str | None = None
     required_metrics: tuple[str, ...] = ("total_score",)
-    status: ExecutionStatus = ExecutionStatus.SUCCEEDED
 
     def __post_init__(self) -> None:
         """Reject mutable or ambiguous request configuration."""
@@ -98,10 +101,21 @@ def _malformed(message: str) -> NoReturn:
 
 
 def _read_required_file(path: Path, label: str) -> bytes:
-    if path.is_symlink() or not path.is_file():
-        _incomplete(f"{label} is missing or not a regular file: {path}")
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        _incomplete(f"{label} cannot be opened with no-follow semantics")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | no_follow
     try:
-        contents = path.read_bytes()
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOENT, errno.ENOTDIR}:
+            _incomplete(f"{label} is missing or not a regular file: {path}")
+        raise MalformedOutputError(f"{label} is unreadable: {path}", runner="rosetta") from exc
+    try:
+        with os.fdopen(descriptor, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                _incomplete(f"{label} is missing or not a regular file: {path}")
+            contents = handle.read()
     except OSError as exc:
         raise MalformedOutputError(f"{label} is unreadable: {path}", runner="rosetta") from exc
     if not contents:
@@ -210,10 +224,10 @@ def resolve_decoy(request: RosettaDecoyResolutionRequest) -> RosettaDecoyArtifac
         _malformed("only SUCCEEDED is a scientific terminal success")
     input_bytes = _read_required_file(request.input_pdb, "input PDB")
     output_bytes = _read_required_file(request.output_pdb, "output PDB")
-    _read_required_file(request.score_file, "score file")
+    score_bytes = _read_required_file(request.score_file, "score file")
     try:
-        rows = parse_relax_score_rows(request.score_file)
-    except (OSError, UnicodeError) as exc:
+        rows = parse_relax_score_rows_text(score_bytes.decode("utf-8"))
+    except UnicodeError as exc:
         raise MalformedOutputError("score file is unreadable", runner="rosetta") from exc
     row = _select_score_row(rows, request)
     _validate_score(row, request.required_metrics)

@@ -31,6 +31,7 @@ __all__ = [
     "build_invocation_command",
     "parse_relax_score",
     "parse_relax_score_rows",
+    "parse_relax_score_rows_text",
     "parse_score_file",
     "parse_score_files",
     "rosetta_available",
@@ -402,7 +403,11 @@ def parse_relax_score(path: Path) -> RelaxScore:
 
 def parse_relax_score_rows(path: Path) -> tuple[RelaxScoreRow, ...]:
     """Parse every data row in a Rosetta scorefile against its first header."""
-    text = path.read_text()
+    return parse_relax_score_rows_text(path.read_text())
+
+
+def parse_relax_score_rows_text(text: str) -> tuple[RelaxScoreRow, ...]:
+    """Parse every data row from one already-read scorefile snapshot."""
     header_to_idx: dict[str, int] = {}
     header_tokens: tuple[str, ...] | None = None
     rows: list[RelaxScoreRow] = []

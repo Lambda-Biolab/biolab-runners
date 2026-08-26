@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, fields, replace
 from pathlib import Path
 
 import pytest
@@ -29,15 +29,21 @@ def _atom(
     insertion: str = " ",
     atom_name: str = "CA",
     residue_name: str = "ALA",
+    record: str = "ATOM",
 ) -> str:
     return (
-        f"ATOM  {serial:5d} {atom_name:^4s} {residue_name:>3s} {chain}{residue:4d}{insertion}   "
+        f"{record:<6}{serial:5d} {atom_name:^4s} {residue_name:>3s} "
+        f"{chain}{residue:4d}{insertion}   "
         f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00 20.00           C  \n"
     )
 
 
 def _pdb(*records: str) -> bytes:
     return "".join(records).encode("ascii")
+
+
+def _crlf(record: str) -> bytes:
+    return record.encode("ascii").replace(b"\n", b"\r\n")
 
 
 def _score(description: str, total_score: str = "-12.5", extra: str = "") -> str:
@@ -60,8 +66,8 @@ def _request(tmp_path: Path, **overrides: object) -> RosettaDecoyResolutionReque
             _atom(3, "B", 1),
             _atom(4, "B", 2),
             _atom(5, "B", 2, 2.0, insertion="A"),
-            _atom(6, "C", 1),
-        )
+            _atom(6, "C", 1, record="HETATM"),
+        ).replace(b"\n", b"\r\n")
     )
     score_file.write_text(_score("2wpt.ppk_0001"))
     values: dict[str, object] = {
@@ -80,6 +86,7 @@ def _request(tmp_path: Path, **overrides: object) -> RosettaDecoyResolutionReque
             ("B", "receptor-beta"),
             ("C", "binder"),
         ),
+        "status": ExecutionStatus.SUCCEEDED,
     }
     values.update(overrides)
     return RosettaDecoyResolutionRequest(**values)  # type: ignore[arg-type]
@@ -219,18 +226,18 @@ def test_required_metrics_must_be_present_finite_and_known(tmp_path: Path) -> No
 @pytest.mark.parametrize(
     "output_mutation",
     [
-        lambda output: output.replace(_atom(6, "C", 1).encode(), b""),
+        lambda output: output.replace(_crlf(_atom(6, "C", 1, record="HETATM")), b""),
         lambda output: output + _atom(7, "D", 1).encode(),
         lambda output: output.replace(b"   1.000", b"     bad", 1),
         lambda output: b"HEADER\n",
         lambda output: b"MODEL        1\n" + output + b"MODEL        2\n",
-        lambda output: output.replace(_atom(1, "A", 1).encode(), _atom(1, " ", 1).encode()),
+        lambda output: output.replace(_crlf(_atom(1, "A", 1)), _crlf(_atom(1, " ", 1))),
         lambda output: output.replace(b"ATOM      1", b"ATOM  bad 1", 1),
         lambda output: output.replace(
-            _atom(1, "A", 1).encode(), _atom(1, "A", 1, atom_name="").encode()
+            _crlf(_atom(1, "A", 1)), _crlf(_atom(1, "A", 1, atom_name=""))
         ),
         lambda output: output.replace(
-            _atom(1, "A", 1).encode(), _atom(1, "A", 1, residue_name="").encode()
+            _crlf(_atom(1, "A", 1)), _crlf(_atom(1, "A", 1, residue_name=""))
         ),
     ],
 )
@@ -265,6 +272,18 @@ def test_request_requires_nonempty_required_metrics(tmp_path: Path) -> None:
 def test_request_requires_nonempty_string_selector(tmp_path: Path, selector: object) -> None:
     with pytest.raises(ValueError, match="decoy_description"):
         _request(tmp_path, decoy_description=selector)
+
+
+def test_request_requires_explicit_terminal_status(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    values = {
+        field.name: getattr(request, field.name)
+        for field in fields(request)
+        if field.name != "status"
+    }
+
+    with pytest.raises(TypeError, match="status"):
+        RosettaDecoyResolutionRequest(**values)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
