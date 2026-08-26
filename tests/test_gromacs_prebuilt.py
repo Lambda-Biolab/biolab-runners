@@ -479,6 +479,34 @@ class TestPrebuiltRunnerIntegration:
 
         assert working_topology.read_text() == "; solvated topology with ions\n"
 
+    def test_same_source_with_stale_identity_restages_topology(self, tmp_path: Path) -> None:
+        """An incompatible topology cache is invalidated before the resume shortcut."""
+        from biolab_runners.gromacs.runner import GromacsProtocolRunner
+        from biolab_runners.gromacs.utils import load_stage_manifest, save_stage_manifest
+
+        src_top = tmp_path / "src.top"
+        src_gro = tmp_path / "src.gro"
+        src_top.write_text("; prebuilt topology\n")
+        src_gro.write_text("GRO\n   1\n   1A    C    1   0.0   0.0   0.0\n")
+        cfg = _valid_protocol_config(
+            name="prebuilt-stale-identity",
+            output_root=str(tmp_path / "work"),
+            prebuilt_topology=str(src_top),
+            prebuilt_coordinates=str(src_gro),
+        )
+
+        first = GromacsProtocolRunner(dry_run=True).run_protocol(cfg)
+        work_dir = Path(first.output_dir)
+        working_topology = work_dir / "topol.top"
+        working_topology.write_text("; stale solvated topology\n")
+        manifest = load_stage_manifest(work_dir)
+        del manifest["stages"]["topology"]["protocol_identity"]
+        save_stage_manifest(work_dir, manifest)
+
+        GromacsProtocolRunner(dry_run=True).run_protocol(cfg)
+
+        assert working_topology.read_text() == "; prebuilt topology\n"
+
 
 class TestPrebuiltSourceCascadeInvalidation:
     """B4 — prebuilt source change must invalidate ALL dependent stages.

@@ -1171,6 +1171,7 @@ class GromacsProtocolRunner:
         if not (config.prebuilt_topology and config.prebuilt_coordinates):
             return None
 
+        topology_stage = build_stage_plan()[0]
         source_changed = _prebuilt_source_changed(work_dir, config)
         if source_changed:
             logger.info(
@@ -1178,7 +1179,9 @@ class GromacsProtocolRunner:
                 "invalidating downstream dependent stages"
             )
             _invalidate_downstream_for_prebuilt_change(work_dir)
-        elif not config.force and _stage_already_complete(work_dir, build_stage_plan()[0]):
+        elif not config.force and _stage_identity_changed(work_dir, topology_stage, config):
+            pass
+        elif not config.force and _stage_already_complete(work_dir, topology_stage):
             return None
 
         try:
@@ -1196,9 +1199,6 @@ class GromacsProtocolRunner:
                 "sha256_topology": staged["sha256_topology"],
                 "sha256_coordinates": staged["sha256_coordinates"],
             }
-            topology_stage = next(
-                item for item in build_stage_plan() if item.kind == StageKind.TOPOLOGY
-            )
             _record_protocol_stage_status(
                 work_dir,
                 topology_stage,
