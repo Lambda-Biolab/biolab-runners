@@ -11,6 +11,7 @@
 - [AGENTS.md](https://github.com/Lambda-Biolab/biolab-runners/blob/main/AGENTS.md): Project purpose, architecture, domain rules, QA
 - [CONTRIBUTING.md](https://github.com/Lambda-Biolab/biolab-runners/blob/main/CONTRIBUTING.md): Contributor workflow, PR guidelines, code style
 - [CHANGELOG.md](https://github.com/Lambda-Biolab/biolab-runners/blob/main/CHANGELOG.md): Version history
+- [docs/agent-pipelines.md](https://github.com/Lambda-Biolab/biolab-runners/blob/main/docs/agent-pipelines.md): Agent composition recipes and runner handoff boundaries
 
 ## Source — biolab_runners
 

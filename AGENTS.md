@@ -32,6 +32,7 @@ content from an authority doc into a dependent one.
 |---|---|---|
 | Project overview, features, install, quick start | [`README.md`](README.md) | Humans |
 | Project purpose, architecture, domain rules, QA | [`AGENTS.md`](AGENTS.md) | AI agents (this file) |
+| Agent pipeline composition and runner handoff recipes | [`docs/agent-pipelines.md`](docs/agent-pipelines.md) | AI agents |
 | Contributor workflow, PR guidelines, code style | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contributors |
 | Version history | [`CHANGELOG.md`](CHANGELOG.md) | All |
 | Scientific validation and test commands | [`docs/testing/scientific-validation.md`](docs/testing/scientific-validation.md) | Contributors and operators |

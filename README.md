@@ -289,6 +289,9 @@ result = runner.run(config, dry_run=True)  # validate inputs without a GPU
   weights downloaded — the wheel's `rfdiffusion` console script
   resolves `scripts/run_inference.py` there.
 
+For end-to-end runner composition and file handoffs, see
+[`docs/agent-pipelines.md`](docs/agent-pipelines.md).
+
 ### OpenMM MD Simulation
 
 ```python
