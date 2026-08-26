@@ -38,16 +38,43 @@ def _artifact(**overrides: object) -> RosettaDecoyArtifact:
 def test_rosetta_artifact_serializes_nested_values_and_preserves_order() -> None:
     artifact = _artifact()
 
-    payload = artifact.to_dict()
+    expected = {
+        "candidate_identity": "candidate-7",
+        "parent_input_identity": "parent-3",
+        "protocol_identity": "protocol-1",
+        "config_identity": "config-2",
+        "runtime_identity": "runtime-4",
+        "input_pdb_identity": {"uri": "gs://bucket/input.pdb", "sha256": _DIGEST},
+        "output_pdb_identity": {
+            "uri": "https://example.test/output.pdb",
+            "sha256": _DIGEST,
+        },
+        "chain_audits": [
+            {"chain_id": "X", "role": "binder-like", "residue_count": 12, "atom_count": 91},
+            {"chain_id": "q7", "role": "opaque partner", "residue_count": 8, "atom_count": 64},
+        ],
+        "relax_score": {
+            "total_score": -12.5,
+            "total_sasa": None,
+            "delta_sasa": None,
+            "hydrophobic_sasa": None,
+            "polar_sasa": None,
+            "interface_polar_sasa": None,
+            "interface_hydrophobic_sasa": None,
+            "interface_dG": None,
+            "interface_dSASA": None,
+            "buried_unsatisfied_hbonds": None,
+            "cross_interface_hbonds": None,
+            "hbond_energy": None,
+            "hbond_energy_fraction": None,
+            "shape_complementarity": None,
+            "packstat": 0.7,
+        },
+        "status": "succeeded",
+        "schema_version": 1,
+    }
 
-    assert payload["input_pdb_identity"] == {"uri": "gs://bucket/input.pdb", "sha256": _DIGEST}
-    assert payload["chain_audits"] == [
-        {"chain_id": "X", "role": "binder-like", "residue_count": 12, "atom_count": 91},
-        {"chain_id": "q7", "role": "opaque partner", "residue_count": 8, "atom_count": 64},
-    ]
-    assert payload["relax_score"] == RelaxScore(total_score=-12.5, packstat=0.7).to_dict()
-    assert payload["status"] == "succeeded"
-    assert payload["schema_version"] == 1
+    assert artifact.to_dict() == expected
 
 
 def test_rosetta_artifact_payload_is_json_safe_and_round_trips_as_a_dictionary() -> None:
@@ -144,9 +171,3 @@ def test_artifact_dataclasses_are_frozen() -> None:
 
     with pytest.raises(FrozenInstanceError):
         artifact.status = ExecutionStatus.FAILED  # type: ignore[misc]
-
-
-def test_artifact_types_are_publicly_importable() -> None:
-    assert PDBIdentity.__name__ == "PDBIdentity"
-    assert ChainAudit.__name__ == "ChainAudit"
-    assert RosettaDecoyArtifact.__name__ == "RosettaDecoyArtifact"
