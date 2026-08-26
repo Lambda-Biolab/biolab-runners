@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import FrozenInstanceError, fields, replace
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import pytest
 from biolab_runners.contracts import ExecutionStatus, IncompleteOutputError, MalformedOutputError
 from biolab_runners.rosetta import (
     ChainAudit,
+    PDBIdentity,
     RelaxScore,
     RelaxScoreRow,
     RosettaDecoyResolutionRequest,
@@ -74,8 +76,12 @@ def _request(tmp_path: Path, **overrides: object) -> RosettaDecoyResolutionReque
         "score_file": score_file,
         "input_pdb": input_pdb,
         "output_pdb": output_pdb,
-        "input_pdb_uri": "gs://bucket/input.pdb",
-        "output_pdb_uri": "gs://bucket/2wpt.ppk_0001.pdb",
+        "input_pdb_identity": PDBIdentity(
+            "gs://bucket/input.pdb", hashlib.sha256(input_pdb.read_bytes()).hexdigest()
+        ),
+        "output_pdb_identity": PDBIdentity(
+            "gs://bucket/2wpt.ppk_0001.pdb", hashlib.sha256(output_pdb.read_bytes()).hexdigest()
+        ),
         "candidate_identity": "candidate-7",
         "parent_input_identity": "parent-3",
         "protocol_identity": "protocol-1",
@@ -101,8 +107,8 @@ def test_resolver_returns_exact_identities_score_audits_and_status(tmp_path: Pat
 
     assert artifact.input_pdb_identity.sha256 == hashlib.sha256(input_bytes).hexdigest()
     assert artifact.output_pdb_identity.sha256 == hashlib.sha256(output_bytes).hexdigest()
-    assert artifact.input_pdb_identity.uri == "gs://bucket/input.pdb"
-    assert artifact.output_pdb_identity.uri == "gs://bucket/2wpt.ppk_0001.pdb"
+    assert artifact.input_pdb_identity == request.input_pdb_identity
+    assert artifact.output_pdb_identity == request.output_pdb_identity
     assert artifact.candidate_identity == "candidate-7"
     assert artifact.parent_input_identity == "parent-3"
     assert artifact.protocol_identity == "protocol-1"
@@ -175,6 +181,45 @@ def test_multiple_rows_require_unique_exact_selector(tmp_path: Path) -> None:
     assert selected.relax_score.total_score == -2.0
 
 
+@pytest.mark.parametrize("field", ["input_pdb", "output_pdb"])
+def test_resolver_rejects_replaced_pdb_snapshot(tmp_path: Path, field: str) -> None:
+    request = _request(tmp_path)
+    path = getattr(request, field)
+    replacement = (
+        _pdb(_atom(99, "A", 1, x=9.0))
+        if field == "input_pdb"
+        else _pdb(
+            _atom(1, "A", 1, x=9.0),
+            _atom(2, "A", 1, 2.0),
+            _atom(3, "B", 1),
+            _atom(4, "B", 2),
+            _atom(5, "B", 2, 2.0, insertion="A"),
+            _atom(6, "C", 1, record="HETATM"),
+        )
+    )
+    path.write_bytes(replacement)
+
+    with pytest.raises(MalformedOutputError, match="expected PDB identity"):
+        resolve_decoy(request)
+
+
+@pytest.mark.parametrize("field", ["input_pdb_identity", "output_pdb_identity"])
+def test_request_requires_typed_pdb_identities(tmp_path: Path, field: str) -> None:
+    with pytest.raises(ValueError, match="PDBIdentity"):
+        _request(tmp_path, **{field: "gs://bucket/replaced.pdb"})
+
+
+def test_fifo_required_file_is_rejected_without_blocking(tmp_path: Path) -> None:
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("os.mkfifo is unavailable")
+    request = _request(tmp_path)
+    request.input_pdb.unlink()
+    os.mkfifo(request.input_pdb)
+
+    with pytest.raises(IncompleteOutputError, match="input PDB"):
+        resolve_decoy(request)
+
+
 @pytest.mark.parametrize("field", ["input_pdb", "output_pdb", "score_file"])
 @pytest.mark.parametrize("kind", ["missing", "empty", "symlink"])
 def test_required_files_must_be_nonempty_regular_non_symlinks(
@@ -231,6 +276,10 @@ def test_required_metrics_must_be_present_finite_and_known(tmp_path: Path) -> No
         lambda output: output.replace(b"   1.000", b"     bad", 1),
         lambda output: b"HEADER\n",
         lambda output: b"MODEL        1\n" + output + b"MODEL        2\n",
+        lambda output: b"MODEL        1\n" + output,
+        lambda output: output + b"ENDMDL\n",
+        lambda output: b"MODEL        1\n" + output + b"ENDMDL\n" + _atom(7, "A", 1).encode(),
+        lambda output: output + b"MODEL        1\nENDMDL\n",
         lambda output: output.replace(_crlf(_atom(1, "A", 1)), _crlf(_atom(1, " ", 1))),
         lambda output: output.replace(b"ATOM      1", b"ATOM  bad 1", 1),
         lambda output: output.replace(
@@ -249,6 +298,48 @@ def test_output_pdb_must_have_valid_expected_single_model_chains(
     request.output_pdb.write_bytes(output_mutation(output))  # type: ignore[operator]
 
     with pytest.raises(MalformedOutputError):
+        resolve_decoy(request)
+
+
+def test_output_pdb_accepts_one_balanced_explicit_model(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    output = request.output_pdb.read_bytes()
+    explicit_output = b"MODEL        1\n" + output + b"ENDMDL\n"
+    request.output_pdb.write_bytes(explicit_output)
+    request = replace(
+        request,
+        output_pdb_identity=PDBIdentity(
+            request.output_pdb_identity.uri, hashlib.sha256(explicit_output).hexdigest()
+        ),
+    )
+
+    artifact = resolve_decoy(request)
+
+    assert artifact.chain_audits[0].atom_count == 2
+
+
+@pytest.mark.parametrize(
+    "score_text",
+    [
+        "SCORE: total_score description packstat\nSCORE: -12.5 2wpt.ppk_0001\n",
+        "SCORE: total_score packstat description\nSCORE: -12.5 0.7 2wpt.ppk_0001 extra\n",
+    ],
+)
+def test_resolver_rejects_score_rows_with_wrong_arity(tmp_path: Path, score_text: str) -> None:
+    request = _request(tmp_path)
+    request.score_file.write_text(score_text)
+
+    with pytest.raises(MalformedOutputError, match="schema"):
+        resolve_decoy(request)
+
+
+def test_resolver_rejects_duplicate_score_description_columns(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    request.score_file.write_text(
+        "SCORE: total_score DESCRIPTION description\nSCORE: -12.5 2wpt.ppk_0001 2wpt.ppk_0001\n"
+    )
+
+    with pytest.raises(MalformedOutputError, match="schema"):
         resolve_decoy(request)
 
 

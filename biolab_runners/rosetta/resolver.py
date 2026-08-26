@@ -35,8 +35,8 @@ class RosettaDecoyResolutionRequest:
     score_file: Path
     input_pdb: Path
     output_pdb: Path
-    input_pdb_uri: str
-    output_pdb_uri: str
+    input_pdb_identity: PDBIdentity
+    output_pdb_identity: PDBIdentity
     candidate_identity: str
     parent_input_identity: str
     protocol_identity: str
@@ -50,6 +50,7 @@ class RosettaDecoyResolutionRequest:
     def __post_init__(self) -> None:
         """Reject mutable or ambiguous request configuration."""
         _validate_request_paths((self.score_file, self.input_pdb, self.output_pdb))
+        _validate_request_identities((self.input_pdb_identity, self.output_pdb_identity))
         _validate_expected_chain_roles(self.expected_chain_roles)
         _validate_required_metrics(self.required_metrics)
         if self.decoy_description is not None and (
@@ -63,6 +64,11 @@ class RosettaDecoyResolutionRequest:
 def _validate_request_paths(paths: tuple[object, ...]) -> None:
     if any(not isinstance(path, Path) for path in paths):
         raise ValueError("score_file, input_pdb, and output_pdb must be Paths")
+
+
+def _validate_request_identities(identities: tuple[object, ...]) -> None:
+    if any(not isinstance(identity, PDBIdentity) for identity in identities):
+        raise ValueError("input_pdb_identity and output_pdb_identity must be PDBIdentity values")
 
 
 def _validate_expected_chain_roles(expected: object) -> None:
@@ -104,7 +110,7 @@ def _read_required_file(path: Path, label: str) -> bytes:
     no_follow = getattr(os, "O_NOFOLLOW", None)
     if no_follow is None:
         _incomplete(f"{label} cannot be opened with no-follow semantics")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | no_follow
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NONBLOCK | no_follow
     try:
         descriptor = os.open(path, flags)
     except OSError as exc:
@@ -121,6 +127,13 @@ def _read_required_file(path: Path, label: str) -> bytes:
     if not contents:
         _incomplete(f"{label} is empty: {path}")
     return contents
+
+
+def _verify_pdb_identity(contents: bytes, expected: PDBIdentity, label: str) -> PDBIdentity:
+    actual = PDBIdentity(expected.uri, hashlib.sha256(contents).hexdigest())
+    if actual != expected:
+        _malformed(f"{label} does not match expected PDB identity")
+    return actual
 
 
 def _select_score_row(
@@ -182,6 +195,39 @@ def _parse_atom_line(line: str) -> tuple[str, tuple[int, str]]:
     return chain_id, (residue_number, line[26].strip())
 
 
+def _validate_model_boundaries(text: str) -> None:
+    model_seen = False
+    model_open = False
+    for line in text.splitlines():
+        record = line[:6].strip()
+        if record == "MODEL":
+            if model_seen:
+                _malformed("output PDB contains multiple or nested MODEL records")
+            model_seen = True
+            model_open = True
+            continue
+        if record == "ENDMDL":
+            if not model_open:
+                _malformed("output PDB contains an unmatched ENDMDL record")
+            model_open = False
+            continue
+        if record in {"ATOM", "HETATM"} and model_seen and not model_open:
+            _malformed("output PDB contains atoms outside its explicit model")
+    if model_open:
+        _malformed("output PDB contains an unclosed MODEL record")
+
+
+def _has_atoms_before_model(text: str) -> bool:
+    atoms_seen = False
+    for line in text.splitlines():
+        record = line[:6].strip()
+        if record == "MODEL":
+            return atoms_seen
+        if record in {"ATOM", "HETATM"}:
+            atoms_seen = True
+    return False
+
+
 def _audit_output(output: bytes, expected: tuple[ChainRole, ...]) -> tuple[ChainAudit, ...]:
     try:
         text = output.decode("ascii")
@@ -189,18 +235,16 @@ def _audit_output(output: bytes, expected: tuple[ChainRole, ...]) -> tuple[Chain
         raise MalformedOutputError("output PDB is not ASCII text", runner="rosetta") from exc
     atom_counts: dict[str, int] = {}
     residues: dict[str, set[tuple[int, str]]] = {}
-    model_count = 0
+    if _has_atoms_before_model(text):
+        _malformed("output PDB contains atoms outside its explicit model")
+    _validate_model_boundaries(text)
     for line in text.splitlines():
         record = line[:6].strip()
-        if record == "MODEL":
-            model_count += 1
         if record not in {"ATOM", "HETATM"}:
             continue
         chain_id, residue = _parse_atom_line(line)
         atom_counts[chain_id] = atom_counts.get(chain_id, 0) + 1
         residues.setdefault(chain_id, set()).add(residue)
-    if model_count > 1:
-        _malformed("output PDB contains multiple MODEL records")
     if not atom_counts:
         _malformed("output PDB contains no atoms")
     expected_ids = {chain_id for chain_id, _ in expected}
@@ -224,11 +268,17 @@ def resolve_decoy(request: RosettaDecoyResolutionRequest) -> RosettaDecoyArtifac
         _malformed("only SUCCEEDED is a scientific terminal success")
     input_bytes = _read_required_file(request.input_pdb, "input PDB")
     output_bytes = _read_required_file(request.output_pdb, "output PDB")
+    input_identity = _verify_pdb_identity(input_bytes, request.input_pdb_identity, "input PDB")
+    output_identity = _verify_pdb_identity(output_bytes, request.output_pdb_identity, "output PDB")
     score_bytes = _read_required_file(request.score_file, "score file")
     try:
         rows = parse_relax_score_rows_text(score_bytes.decode("utf-8"))
     except UnicodeError as exc:
         raise MalformedOutputError("score file is unreadable", runner="rosetta") from exc
+    except ValueError as exc:
+        raise MalformedOutputError(
+            f"score file schema is invalid: {exc}", runner="rosetta"
+        ) from exc
     row = _select_score_row(rows, request)
     _validate_score(row, request.required_metrics)
     audits = _audit_output(output_bytes, request.expected_chain_roles)
@@ -238,12 +288,8 @@ def resolve_decoy(request: RosettaDecoyResolutionRequest) -> RosettaDecoyArtifac
         protocol_identity=request.protocol_identity,
         config_identity=request.config_identity,
         runtime_identity=request.runtime_identity,
-        input_pdb_identity=PDBIdentity(
-            request.input_pdb_uri, hashlib.sha256(input_bytes).hexdigest()
-        ),
-        output_pdb_identity=PDBIdentity(
-            request.output_pdb_uri, hashlib.sha256(output_bytes).hexdigest()
-        ),
+        input_pdb_identity=input_identity,
+        output_pdb_identity=output_identity,
         chain_audits=audits,
         relax_score=row.score,
         status=request.status,

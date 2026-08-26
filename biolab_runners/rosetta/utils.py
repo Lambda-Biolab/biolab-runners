@@ -416,13 +416,24 @@ def parse_relax_score_rows_text(text: str) -> tuple[RelaxScoreRow, ...]:
         if tokens is None:
             continue
         if header_tokens is None:
-            header_tokens = tuple(tokens)
+            header_tokens = _validate_score_header(tokens)
             header_to_idx = {name.lower(): idx for idx, name in enumerate(tokens)}
             continue
         if tuple(tokens) == header_tokens:
             continue
+        if len(tokens) != len(header_tokens):
+            raise ValueError("score data row does not match score header arity")
         rows.append(_build_relax_score_row(header_to_idx, tokens))
     return tuple(rows)
+
+
+def _validate_score_header(tokens: list[str]) -> tuple[str, ...]:
+    normalized = tuple(token.casefold() for token in tokens)
+    if len(normalized) != len(set(normalized)):
+        raise ValueError("score header contains duplicate column names")
+    if normalized.count("description") != 1:
+        raise ValueError("score header must contain exactly one description column")
+    return tuple(tokens)
 
 
 def _score_tokens(line: str) -> list[str] | None:
