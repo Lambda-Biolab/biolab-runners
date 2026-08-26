@@ -456,6 +456,29 @@ class TestPrebuiltRunnerIntegration:
             f"got {len(calls)} — the staging block re-read the source files"
         )
 
+    def test_same_source_resume_preserves_solvated_topology(self, tmp_path: Path) -> None:
+        """A resume must not replace the working topology with its prebuilt source."""
+        from biolab_runners.gromacs.runner import GromacsProtocolRunner
+
+        src_top = tmp_path / "src.top"
+        src_gro = tmp_path / "src.gro"
+        src_top.write_text("; prebuilt topology\n")
+        src_gro.write_text("GRO\n   1\n   1A    C    1   0.0   0.0   0.0\n")
+        cfg = _valid_protocol_config(
+            name="prebuilt-resume",
+            output_root=str(tmp_path / "work"),
+            prebuilt_topology=str(src_top),
+            prebuilt_coordinates=str(src_gro),
+        )
+
+        first = GromacsProtocolRunner(dry_run=True).run_protocol(cfg)
+        working_topology = Path(first.output_dir) / "topol.top"
+        working_topology.write_text("; solvated topology with ions\n")
+
+        GromacsProtocolRunner(dry_run=True).run_protocol(cfg)
+
+        assert working_topology.read_text() == "; solvated topology with ions\n"
+
 
 class TestPrebuiltSourceCascadeInvalidation:
     """B4 — prebuilt source change must invalidate ALL dependent stages.

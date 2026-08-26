@@ -1171,12 +1171,15 @@ class GromacsProtocolRunner:
         if not (config.prebuilt_topology and config.prebuilt_coordinates):
             return None
 
-        if _prebuilt_source_changed(work_dir, config):
+        source_changed = _prebuilt_source_changed(work_dir, config)
+        if source_changed:
             logger.info(
                 "prebuilt source digests differ from cached values; "
                 "invalidating downstream dependent stages"
             )
             _invalidate_downstream_for_prebuilt_change(work_dir)
+        elif not config.force and _stage_already_complete(work_dir, build_stage_plan()[0]):
+            return None
 
         try:
             staged = stage_prebuilt_topology(config, work_dir)
