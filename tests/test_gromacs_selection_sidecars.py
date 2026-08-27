@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import signal
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -172,6 +174,56 @@ def _strict_config(tmp_path: Path, bundle: dict[str, Path]) -> GromacsProtocolCo
         prebuilt_index=str(bundle["index"]),
         prebuilt_bundle_manifest=str(bundle["manifest"]),
     )
+
+
+def _protocol_invoker(
+    commands: list[list[str]],
+    observed_states: list[str],
+) -> Callable[[list[str], Path, int], int]:
+    solvent_atoms = [
+        (1, "ALA", "N", 1),
+        (2, "GLY", "CA", 2),
+        (3, "SOL", "OW", 3),
+        (3, "SOL", "HW1", 4),
+        (3, "SOL", "HW2", 5),
+    ]
+    ionized_atoms = [
+        (1, "ALA", "N", 1),
+        (2, "GLY", "CA", 2),
+        (3, "SOL", "OW", 3),
+        (4, "NA", "NA", 4),
+        (5, "CL", "CL", 5),
+    ]
+
+    def _invoke(command: list[str], work_dir: Path, _timeout: int) -> int:
+        commands.append(command)
+        subcommand = command[1]
+        if subcommand == "editconf":
+            _write_gro(work_dir / "boxed.gro", [(1, "ALA", "N", 1), (2, "GLY", "CA", 2)])
+        elif subcommand == "solvate":
+            _write_gro(work_dir / "solvated.gro", solvent_atoms)
+            (work_dir / "topol.top").write_text("; topology with solvent\n")
+        elif subcommand == "grompp":
+            output = command[command.index("-o") + 1]
+            if output in {"ions.tpr", "min.tpr"}:
+                observed_states.append(
+                    json.loads((work_dir / "selection-map.json").read_text())["gromacs_state"][
+                        "stage"
+                    ]
+                )
+            (work_dir / output).write_text(f"compiled {output}\n")
+        elif subcommand == "genion":
+            _write_gro(work_dir / "ions.gro", ionized_atoms)
+            (work_dir / "topol.top").write_text("; topology with solvent and ions\n")
+        elif subcommand == "mdrun":
+            prefix = command[command.index("-deffnm") + 1]
+            _write_gro(work_dir / f"{prefix}.gro", ionized_atoms)
+            (work_dir / f"{prefix}.cpt").write_bytes(f"{prefix}-checkpoint".encode())
+            (work_dir / f"{prefix}.edr").write_text("energy\n")
+            (work_dir / f"{prefix}.log").write_text("log\n")
+        return 0
+
+    return _invoke
 
 
 def test_config_preserves_legacy_prebuilt_pair_without_sidecars(tmp_path: Path) -> None:
@@ -437,3 +489,223 @@ def test_stage_selection_sidecars_rejects_incompatible_extra_index_group(
 
     with pytest.raises(ValueError, match="exactly receptor_ab, design_c, dimer_ab"):
         stage_selection_sidecars(_strict_config(tmp_path, bundle), tmp_path / "work")
+
+
+def test_protocol_runner_refreshes_strict_sidecars_through_every_state_transition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from biolab_runners.gromacs.runner import GromacsProtocolRunner
+    from biolab_runners.gromacs.utils import load_stage_manifest
+
+    bundle = _write_bundle(tmp_path / "bundle")
+    config = _strict_config(tmp_path, bundle)
+    commands: list[list[str]] = []
+    observed_states: list[str] = []
+    runner = GromacsProtocolRunner(binary_prefix=["gmx"])
+    monkeypatch.setattr(runner, "_run_subprocess", _protocol_invoker(commands, observed_states))
+
+    result = runner.run_protocol(config)
+
+    work_dir = Path(result.output_dir)
+    final_map = json.loads((work_dir / "selection-map.json").read_text())
+    manifest = load_stage_manifest(work_dir)
+    assert result.failed == 0
+    assert result.succeeded == 7
+    assert result.skipped == 1
+    assert observed_states == ["solvate", "ions"]
+    assert final_map["schema_version"] == 2
+    assert final_map["gromacs_state"]["stage"] == "production"
+    assert final_map["gromacs_state"]["checkpoint_file"] == "prod.cpt"
+    assert final_map["gromacs_state"]["checkpoint_sha256"] == _sha256(work_dir / "prod.cpt")
+    assert final_map["solvent_ion_boundaries"]["solvent_atom_indices"] == [3]
+    assert final_map["solvent_ion_boundaries"]["ion_atom_indices"] == [4, 5]
+    assert len(manifest["stages"]["topology"]["protocol_identity"]) == 64
+    assert any(command[1] == "mdrun" for command in commands)
+
+
+def test_protocol_runner_binds_interruption_and_resumes_only_exact_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from biolab_runners.gromacs.runner import GromacsProtocolRunner
+
+    bundle = _write_bundle(tmp_path / "bundle")
+    config = _strict_config(tmp_path, bundle)
+    first_commands: list[list[str]] = []
+    observed_states: list[str] = []
+    successful = _protocol_invoker(first_commands, observed_states)
+    interrupted = False
+
+    def _interrupt_minimize(command: list[str], work_dir: Path, timeout: int) -> int:
+        nonlocal interrupted
+        if command[1] == "mdrun" and command[command.index("-deffnm") + 1] == "min":
+            first_commands.append(command)
+            (work_dir / "min.cpt").write_bytes(b"interrupted-minimize")
+            interrupted = True
+            return -signal.SIGTERM
+        return successful(command, work_dir, timeout)
+
+    first_runner = GromacsProtocolRunner(binary_prefix=["gmx"])
+    monkeypatch.setattr(first_runner, "_run_subprocess", _interrupt_minimize)
+
+    first_result = first_runner.run_protocol(config)
+
+    work_dir = Path(first_result.output_dir)
+    interrupted_map = json.loads((work_dir / "selection-map.json").read_text())
+    assert interrupted is True
+    assert first_result.interrupted == 1
+    assert interrupted_map["gromacs_state"]["stage"] == "minimize"
+    assert interrupted_map["gromacs_state"]["checkpoint_sha256"] == _sha256(work_dir / "min.cpt")
+
+    resumed_commands: list[list[str]] = []
+    resumed_runner = GromacsProtocolRunner(binary_prefix=["gmx"])
+    monkeypatch.setattr(
+        resumed_runner,
+        "_run_subprocess",
+        _protocol_invoker(resumed_commands, []),
+    )
+
+    resumed_result = resumed_runner.run_protocol(config)
+
+    min_grompp = next(command for command in resumed_commands if "min.tpr" in command)
+    min_mdrun = next(
+        command
+        for command in resumed_commands
+        if command[1] == "mdrun" and command[command.index("-deffnm") + 1] == "min"
+    )
+    assert resumed_result.failed == 0
+    assert "-t" in min_grompp
+    assert min_grompp[min_grompp.index("-t") + 1] == str(work_dir / "min.cpt")
+    assert min_mdrun[-3:] == ["-cpi", str(work_dir / "min.cpt"), "-append"]
+
+
+def test_protocol_runner_refuses_replaced_checkpoint_before_subprocess(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from biolab_runners.gromacs.runner import GromacsProtocolRunner
+
+    bundle = _write_bundle(tmp_path / "bundle")
+    config = _strict_config(tmp_path, bundle)
+    successful = _protocol_invoker([], [])
+
+    def _interrupt_minimize(command: list[str], work_dir: Path, timeout: int) -> int:
+        if command[1] == "mdrun" and command[command.index("-deffnm") + 1] == "min":
+            (work_dir / "min.cpt").write_bytes(b"bound-checkpoint")
+            return -signal.SIGTERM
+        return successful(command, work_dir, timeout)
+
+    first_runner = GromacsProtocolRunner(binary_prefix=["gmx"])
+    monkeypatch.setattr(first_runner, "_run_subprocess", _interrupt_minimize)
+    first_result = first_runner.run_protocol(config)
+    work_dir = Path(first_result.output_dir)
+    (work_dir / "min.cpt").write_bytes(b"replacement-checkpoint")
+    refused_commands: list[list[str]] = []
+    second_runner = GromacsProtocolRunner(binary_prefix=["gmx"])
+    monkeypatch.setattr(
+        second_runner,
+        "_run_subprocess",
+        _protocol_invoker(refused_commands, []),
+    )
+
+    result = second_runner.run_protocol(config)
+
+    assert result.failed == 1
+    assert "checkpoint digest mismatch" in result.error
+    assert refused_commands == []
+
+
+def test_protocol_runner_refuses_checkpoint_bound_to_different_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from biolab_runners.gromacs.runner import GromacsProtocolRunner
+
+    bundle = _write_bundle(tmp_path / "bundle")
+    config = _strict_config(tmp_path, bundle)
+    successful = _protocol_invoker([], [])
+
+    def _interrupt_minimize(command: list[str], work_dir: Path, timeout: int) -> int:
+        if command[1] == "mdrun" and command[command.index("-deffnm") + 1] == "min":
+            (work_dir / "min.cpt").write_bytes(b"bound-checkpoint")
+            return -signal.SIGTERM
+        return successful(command, work_dir, timeout)
+
+    first_runner = GromacsProtocolRunner(binary_prefix=["gmx"])
+    monkeypatch.setattr(first_runner, "_run_subprocess", _interrupt_minimize)
+    first_result = first_runner.run_protocol(config)
+    work_dir = Path(first_result.output_dir)
+    selection_map = json.loads((work_dir / "selection-map.json").read_text())
+    selection_map["gromacs_state"]["stage"] = "production"
+    (work_dir / "selection-map.json").write_text(
+        json.dumps(selection_map, indent=2, sort_keys=True) + "\n"
+    )
+    refused_commands: list[list[str]] = []
+    second_runner = GromacsProtocolRunner(binary_prefix=["gmx"])
+    monkeypatch.setattr(
+        second_runner,
+        "_run_subprocess",
+        _protocol_invoker(refused_commands, []),
+    )
+
+    result = second_runner.run_protocol(config)
+
+    assert result.failed == 1
+    assert "checkpoint stage mismatch for minimize" in result.error
+    assert refused_commands == []
+
+
+def test_protocol_runner_refuses_missing_staged_sidecar_without_restaging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from biolab_runners.gromacs.runner import GromacsProtocolRunner
+
+    bundle = _write_bundle(tmp_path / "bundle")
+    config = _strict_config(tmp_path, bundle)
+    first = GromacsProtocolRunner(binary_prefix=["gmx"], dry_run=True).run_protocol(config)
+    work_dir = Path(first.output_dir)
+    (work_dir / "index.ndx").unlink()
+    refused_commands: list[list[str]] = []
+    second_runner = GromacsProtocolRunner(binary_prefix=["gmx"])
+    monkeypatch.setattr(
+        second_runner,
+        "_run_subprocess",
+        _protocol_invoker(refused_commands, []),
+    )
+
+    result = second_runner.run_protocol(config)
+
+    assert result.failed == 1
+    assert "index.ndx is missing" in result.error
+    assert refused_commands == []
+    assert (work_dir / "topol.top").read_bytes() == bundle["top"].read_bytes()
+
+
+def test_protocol_runner_binds_sidecar_source_changes_into_stage_identity(tmp_path: Path) -> None:
+    from biolab_runners.gromacs.runner import GromacsProtocolRunner
+    from biolab_runners.gromacs.utils import load_stage_manifest
+
+    bundle = _write_bundle(tmp_path / "bundle")
+    config = _strict_config(tmp_path, bundle)
+    first = GromacsProtocolRunner(binary_prefix=["gmx"], dry_run=True).run_protocol(config)
+    work_dir = Path(first.output_dir)
+    first_identity = load_stage_manifest(work_dir)["stages"]["topology"]["protocol_identity"]
+    selection_map = json.loads(bundle["map"].read_text())
+    selection_map["source_pdb_sha256"] = "c" * 64
+    bundle["map"].write_text(json.dumps(selection_map, indent=2, sort_keys=True))
+    manifest = json.loads(bundle["manifest"].read_text())
+    manifest["artifacts"]["selection-map.json"]["sha256"] = _sha256(bundle["map"])
+    manifest["scientific_metadata_sha256"] = _canonical_digest(
+        manifest,
+        excluded="scientific_metadata_sha256",
+    )
+    bundle["manifest"].write_text(json.dumps(manifest, indent=2, sort_keys=True))
+
+    second = GromacsProtocolRunner(binary_prefix=["gmx"], dry_run=True).run_protocol(config)
+
+    second_identity = load_stage_manifest(work_dir)["stages"]["topology"]["protocol_identity"]
+    assert second.error == ""
+    assert second_identity != first_identity
+    assert (work_dir / "selection-map.json").read_bytes() == bundle["map"].read_bytes()

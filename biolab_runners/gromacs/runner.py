@@ -60,6 +60,14 @@ from biolab_runners.gromacs.protocol import (
     stage_outputs_for,
     stage_prebuilt_topology,
 )
+from biolab_runners.gromacs.selection_sidecars import (
+    bind_checkpoint_identity,
+    refresh_selection_sidecars,
+    stage_selection_sidecars,
+    strict_sidecars_requested,
+    validate_checkpoint_identity,
+    validate_staged_selection_sidecars,
+)
 from biolab_runners.gromacs.utils import (
     GromacsRecord,
     GromacsRecordStatus,
@@ -102,6 +110,10 @@ __all__ = [
 # from any plausible gmx exit code; the runner checks for it before
 # marking a stage FAILED (an interrupted stage is still RESUMABLE).
 _INTERRUPTED_RC = -signal.SIGTERM
+
+
+class _SelectionSidecarRefusalError(ValueError):
+    pass
 
 
 def _empty_metrics_dict() -> dict[str, float]:
@@ -362,6 +374,83 @@ def _checkpoint_for(work_dir: Path, stage: ProtocolStage) -> str | None:
 
     cpt = work_dir / GromacsFiles.checkpoint(stage.prefix)
     return str(cpt) if cpt.exists() else None
+
+
+def _require_staged_selection_sidecars(
+    work_dir: Path,
+    config: GromacsProtocolConfig,
+) -> None:
+    if not strict_sidecars_requested(config):
+        return
+    try:
+        validate_staged_selection_sidecars(work_dir)
+    except (OSError, ValueError) as exc:
+        raise _SelectionSidecarRefusalError(str(exc)) from exc
+
+
+def _require_checkpoint_identity(
+    work_dir: Path,
+    stage: ProtocolStage,
+    config: GromacsProtocolConfig,
+    checkpoint_path: str | None,
+) -> None:
+    if not strict_sidecars_requested(config) or checkpoint_path is None:
+        return
+    try:
+        validate_checkpoint_identity(
+            work_dir,
+            stage=stage.kind.value,
+            checkpoint=Path(checkpoint_path),
+        )
+    except (OSError, ValueError) as exc:
+        raise _SelectionSidecarRefusalError(str(exc)) from exc
+
+
+def _refresh_selection_sidecars_after_stage(
+    work_dir: Path,
+    stage: ProtocolStage,
+    config: GromacsProtocolConfig,
+) -> None:
+    if not strict_sidecars_requested(config):
+        return
+    coordinates: Path | None = None
+    if stage.kind == StageKind.SOLVATE:
+        coordinates = work_dir / "solvated.gro"
+    elif stage.kind == StageKind.IONS:
+        coordinates = work_dir / "ions.gro"
+    elif _is_md_stage(stage.kind):
+        coordinates = work_dir / f"{stage.prefix}.gro"
+    if coordinates is None:
+        return
+    checkpoint_path = _checkpoint_for(work_dir, stage)
+    try:
+        refresh_selection_sidecars(
+            work_dir,
+            stage=stage.kind.value,
+            topology_path=work_dir / "topol.top",
+            coordinates_path=coordinates,
+            checkpoint=Path(checkpoint_path) if checkpoint_path is not None else None,
+        )
+    except (OSError, ValueError) as exc:
+        raise _SelectionSidecarRefusalError(str(exc)) from exc
+
+
+def _bind_stage_checkpoint(
+    work_dir: Path,
+    stage: ProtocolStage,
+    config: GromacsProtocolConfig,
+) -> None:
+    checkpoint_path = _checkpoint_for(work_dir, stage)
+    if not strict_sidecars_requested(config) or checkpoint_path is None:
+        return
+    try:
+        bind_checkpoint_identity(
+            work_dir,
+            stage=stage.kind.value,
+            checkpoint=Path(checkpoint_path),
+        )
+    except (OSError, ValueError) as exc:
+        raise _SelectionSidecarRefusalError(str(exc)) from exc
 
 
 def _outputs_exist(work_dir: Path, outputs: tuple[str, ...]) -> bool:
@@ -736,23 +825,57 @@ def _gromacs_execution_mode(
 def _protocol_input_digests(config: GromacsProtocolConfig) -> dict[str, str | None]:
     """Return content digests for the scientific files a protocol consumes."""
     if config.prebuilt_topology and config.prebuilt_coordinates:
-        return {
+        digests = {
             "prebuilt_topology": compute_file_digest(Path(config.prebuilt_topology)),
             "prebuilt_coordinates": compute_file_digest(Path(config.prebuilt_coordinates)),
         }
+        if strict_sidecars_requested(config):
+            digests.update(
+                {
+                    "prebuilt_prepared_pdb": compute_file_digest(
+                        Path(config.prebuilt_prepared_pdb)
+                    ),
+                    "prebuilt_selection_map": compute_file_digest(
+                        Path(config.prebuilt_selection_map)
+                    ),
+                    "prebuilt_index": compute_file_digest(Path(config.prebuilt_index)),
+                    "prebuilt_bundle_manifest": compute_file_digest(
+                        Path(config.prebuilt_bundle_manifest)
+                    ),
+                }
+            )
+        return digests
     return {"input_pdb": compute_file_digest(Path(config.input_pdb))}
 
 
 def _protocol_source_identity(config: GromacsProtocolConfig) -> dict[str, str | None]:
     """Return the canonical source path/content identity for a protocol."""
     if config.prebuilt_topology and config.prebuilt_coordinates:
-        return {
-            "mode": "prebuilt",
+        identity = {
+            "mode": "strict_prebuilt" if strict_sidecars_requested(config) else "prebuilt",
             "topology_path": config.prebuilt_topology,
             "coordinates_path": config.prebuilt_coordinates,
             "topology_digest": compute_file_digest(Path(config.prebuilt_topology)),
             "coordinates_digest": compute_file_digest(Path(config.prebuilt_coordinates)),
         }
+        if strict_sidecars_requested(config):
+            identity.update(
+                {
+                    "prepared_pdb_path": config.prebuilt_prepared_pdb,
+                    "prepared_pdb_digest": compute_file_digest(Path(config.prebuilt_prepared_pdb)),
+                    "selection_map_path": config.prebuilt_selection_map,
+                    "selection_map_digest": compute_file_digest(
+                        Path(config.prebuilt_selection_map)
+                    ),
+                    "index_path": config.prebuilt_index,
+                    "index_digest": compute_file_digest(Path(config.prebuilt_index)),
+                    "bundle_manifest_path": config.prebuilt_bundle_manifest,
+                    "bundle_manifest_digest": compute_file_digest(
+                        Path(config.prebuilt_bundle_manifest)
+                    ),
+                }
+            )
+        return identity
     return {
         "mode": "input_pdb",
         "input_pdb_path": config.input_pdb,
@@ -833,6 +956,49 @@ def _protocol_source_digest(config: GromacsProtocolConfig) -> str | None:
     if config.prebuilt_topology and config.prebuilt_coordinates:
         return None
     return compute_file_digest(Path(config.input_pdb))
+
+
+def _stage_prebuilt_files(
+    config: GromacsProtocolConfig,
+    work_dir: Path,
+) -> dict[str, str]:
+    if not strict_sidecars_requested(config):
+        return stage_prebuilt_topology(config, work_dir)
+    stage_selection_sidecars(config, work_dir)
+    return {
+        "topology": config.prebuilt_topology,
+        "coordinates": config.prebuilt_coordinates,
+        "sha256_topology": compute_file_digest(Path(config.prebuilt_topology)) or "",
+        "sha256_coordinates": compute_file_digest(Path(config.prebuilt_coordinates)) or "",
+    }
+
+
+def _prebuilt_failure_result(
+    config: GromacsProtocolConfig,
+    work_dir: Path,
+    started: float,
+    execution_mode: ExecutionMode,
+    *,
+    dry_run: bool,
+    error: str,
+) -> GromacsProtocolResult:
+    return GromacsProtocolResult(
+        name=config.name,
+        output_dir=str(work_dir),
+        replica_index=config.replica_index,
+        replicas_total=config.replicas_total,
+        stage_statuses={},
+        succeeded=0,
+        failed=1,
+        skipped=0,
+        interrupted=0,
+        validated=0,
+        dry_run=dry_run,
+        exit_code=2,
+        duration_seconds=time.monotonic() - started,
+        error=error,
+        execution_mode=execution_mode,
+    )
 
 
 def _config_to_cli(config: GromacsConfig) -> dict[str, str]:
@@ -960,6 +1126,11 @@ class GromacsProtocolRunner:
         ``prebuilt_topology`` / ``prebuilt_coordinates`` pair
         correctly invalidates the cached stage (see the
         ``_stage_already_complete`` short-circuit).
+
+        Strict prebuilt mode additionally stages and validates the
+        prepared PDB, selection map, index, and bundle manifest. The
+        sidecar identity follows each atom-index-changing stage and
+        binds any resumable checkpoint before ``-cpi`` is allowed.
         """
         work_dir = _work_dir(config)
         self._resolved_binary_prefix = resolve_binary_prefix(self._binary_prefix)
@@ -984,7 +1155,22 @@ class GromacsProtocolRunner:
             return prebuilt_failure
 
         for stage in build_stage_plan():
-            status, rc, was_skipped = self._run_single_stage(work_dir, stage, config)
+            try:
+                status, rc, was_skipped = self._run_single_stage(work_dir, stage, config)
+            except _SelectionSidecarRefusalError as exc:
+                _record_protocol_stage_status(
+                    work_dir,
+                    stage,
+                    config,
+                    StageStatus.FAILED,
+                    outputs=stage_minimum_outputs(stage.kind, stage.prefix),
+                    error=str(exc),
+                )
+                stage_statuses[stage.kind.value] = StageStatus.FAILED
+                failed += 1
+                exit_code = 2
+                error = f"stage {stage.kind.value} selection sidecar refusal: {exc}"
+                break
             stage_statuses[stage.kind.value] = status
             if status == StageStatus.COMPLETED:
                 if was_skipped:
@@ -1082,6 +1268,7 @@ class GromacsProtocolRunner:
         _emit_mdp(work_dir, stage, config)
         started_at = now_utc_iso()
         checkpoint_path = _checkpoint_for(work_dir, stage)
+        _require_checkpoint_identity(work_dir, stage, config, checkpoint_path)
         commands = build_commands(
             stage,
             checkpoint_path=checkpoint_path,
@@ -1115,6 +1302,7 @@ class GromacsProtocolRunner:
 
         # --- Classify the outcome ---
         if rc == _INTERRUPTED_RC:
+            _bind_stage_checkpoint(work_dir, stage, config)
             # SIGTERM: the child was forwarded the signal and exited.
             # Preserve the manifest in RUNNING (NOT failed) so the
             # next invocation sees the on-disk .cpt and resumes.
@@ -1131,6 +1319,10 @@ class GromacsProtocolRunner:
             )
             return "interrupted", _INTERRUPTED_RC, False
 
+        if rc == 0:
+            _refresh_selection_sidecars_after_stage(work_dir, stage, config)
+        else:
+            _bind_stage_checkpoint(work_dir, stage, config)
         status = StageStatus.COMPLETED if rc == 0 else StageStatus.FAILED
         _record_protocol_stage_status(
             work_dir,
@@ -1182,17 +1374,21 @@ class GromacsProtocolRunner:
         elif not config.force and _stage_identity_changed(work_dir, topology_stage, config):
             pass
         elif not config.force and _stage_already_complete(work_dir, topology_stage):
+            try:
+                _require_staged_selection_sidecars(work_dir, config)
+            except _SelectionSidecarRefusalError as exc:
+                return _prebuilt_failure_result(
+                    config,
+                    work_dir,
+                    started,
+                    execution_mode,
+                    dry_run=self._dry_run,
+                    error=f"prebuilt bundle reuse refused: {exc}",
+                )
             return None
 
         try:
-            staged = stage_prebuilt_topology(config, work_dir)
-            # Reuse the digest metadata computed by the staging call
-            # (single source-file read) instead of re-reading the
-            # files via ``_prebuilt_meta``. ``stage_prebuilt_topology``
-            # returns ``{"topology", "coordinates", "sha256_topology",
-            # "sha256_coordinates"}``; the manifest block uses the
-            # ``prebuilt_topology`` / ``prebuilt_coordinates`` key
-            # names, so the values are remapped, not recomputed.
+            staged = _stage_prebuilt_files(config, work_dir)
             prebuilt_meta = {
                 "prebuilt_topology": staged["topology"],
                 "prebuilt_coordinates": staged["coordinates"],
@@ -1207,23 +1403,19 @@ class GromacsProtocolRunner:
                 outputs=stage_minimum_outputs(topology_stage.kind, topology_stage.prefix),
                 prebuilt_source=prebuilt_meta,
             )
-        except (FileNotFoundError, ValueError) as exc:
-            return GromacsProtocolResult(
-                name=config.name,
-                output_dir=str(work_dir),
-                replica_index=config.replica_index,
-                replicas_total=config.replicas_total,
-                stage_statuses={},
-                succeeded=0,
-                failed=1,
-                skipped=0,
-                interrupted=0,
-                validated=0,
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            error_prefix = (
+                "selection sidecar staging failed"
+                if strict_sidecars_requested(config)
+                else "prebuilt topology staging failed"
+            )
+            return _prebuilt_failure_result(
+                config,
+                work_dir,
+                started,
+                execution_mode,
                 dry_run=self._dry_run,
-                exit_code=2,
-                duration_seconds=time.monotonic() - started,
-                error=f"prebuilt topology staging failed: {exc}",
-                execution_mode=execution_mode,
+                error=f"{error_prefix}: {exc}",
             )
         return None
 
@@ -1570,6 +1762,8 @@ def _stage_should_skip(
     if config.force:
         return False
 
+    _require_staged_selection_sidecars(work_dir, config)
+
     if _stage_identity_changed(work_dir, stage, config):
         return False
 
@@ -1607,6 +1801,7 @@ def _stage_should_skip(
         and _checkpoint_for(work_dir, stage) is None
         and _outputs_complete_on_disk(work_dir, stage)
     ):
+        _refresh_selection_sidecars_after_stage(work_dir, stage, config)
         _record_protocol_stage_status(
             work_dir,
             stage,
