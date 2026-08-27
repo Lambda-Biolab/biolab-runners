@@ -990,6 +990,7 @@ class PeptidePrepRunner:
                 config.sequence,
                 config.topology,
                 chirality_validator,
+                design_chain_id=config.chain_id,
                 stage="post_h",
             )
         except Exception as exc:
@@ -1034,6 +1035,7 @@ class PeptidePrepRunner:
                 config.sequence,
                 config.topology,
                 chirality_validator,
+                design_chain_id=config.chain_id,
                 stage="pre",
             )
 
@@ -1168,6 +1170,7 @@ class PeptidePrepRunner:
                 config.sequence,
                 config.topology,
                 chirality_validator,
+                design_chain_id=config.chain_id,
                 stage="post",
             )
         except Exception as exc:
@@ -1474,6 +1477,11 @@ class PeptidePrepRunner:
 
         positions = artifacts.positions
         atoms = list(artifacts.topology.atoms())
+        _, design_residues = _resolve_design_chain(
+            artifacts.topology,
+            config.chain_id,
+            expected_length=len(config.sequence),
+        )
 
         nm_positions: list[tuple[float, float, float]] = []
         for pos in positions:
@@ -1489,7 +1497,8 @@ class PeptidePrepRunner:
             pos_idx_raw = getattr(d, "position", None)
             pos_idx = (pos_idx_raw - 1) if pos_idx_raw is not None else 0
             residue_aa = getattr(d, "residue", "ALA")
-            mapping = collect_atom_mapping(artifacts.topology, positions, pos_idx)
+            design_residue = design_residues[pos_idx]
+            mapping = collect_atom_mapping(artifacts.topology, positions, design_residue.index)
             _verify_d_backbone_invariance(mapping, pos_idx)
 
             raw = transformer(mapping, residue_aa, pos_idx)
@@ -1498,7 +1507,7 @@ class PeptidePrepRunner:
             _verify_d_mapping_complete(mapping, transformed, pos_idx)
 
             for atom in atoms:
-                if atom.residue.index != pos_idx:
+                if atom.residue is not design_residue:
                     continue
                 atom_name = atom.name
                 if atom_name not in transformed:
@@ -1520,6 +1529,7 @@ class PeptidePrepRunner:
         sequence: str,
         topology_descriptor: object,
         validator: ChiralityValidator,
+        design_chain_id: str,
         *,
         stage: str,
     ) -> tuple[ChiralityReport, ...]:
@@ -1534,6 +1544,8 @@ class PeptidePrepRunner:
             sequence: 1-letter sequence matching the topology
                 residues, used to skip Glycine (which is achiral
                 and excluded from sequence validation).
+            design_chain_id: Exact chain identifier whose residues
+                correspond to ``sequence``.
             topology_descriptor: :class:`PeptideTopologyDescriptor`
                 whose ``d_substitutions`` declare which residues
                 are D. The annotation is only applied at
@@ -1562,6 +1574,11 @@ class PeptidePrepRunner:
         ``**kwargs`` audit hint so recording validators can
         attribute calls without inferring from call order.
         """
+        _, design_residues = _resolve_design_chain(
+            topology,
+            design_chain_id,
+            expected_length=len(sequence),
+        )
         # The post-hydrogenation stage runs BEFORE the D
         # transform. Apply the descriptor's D annotations ONLY
         # at the post-transform stages so the validator's
@@ -1569,10 +1586,10 @@ class PeptidePrepRunner:
         # sees.
         apply_d_annotations = stage != "post_h"
         reports: list[ChiralityReport] = []
-        for index, aa in enumerate(sequence):
+        for index, (aa, residue) in enumerate(zip(sequence, design_residues, strict=True)):
             if aa == "G":
                 continue
-            mapping = collect_atom_mapping(topology, positions, index)
+            mapping = collect_atom_mapping(topology, positions, residue.index)
             is_d_position = apply_d_annotations and any(
                 getattr(d, "position", -1) == index + 1 for d in topology_descriptor.d_substitutions
             )
@@ -1905,6 +1922,34 @@ _D_BACKBONE_INVARIANT_ATOMS = ("N", "CA", "C")
 # re-projection. A transform that moves CA by 1e-3 Å or more is a
 # broken mirror, not a rounding artifact.
 _D_TRANSFORM_BACKBONE_TOLERANCE_A = 1e-3
+
+
+def _resolve_design_chain(
+    topology: object,
+    design_chain_id: str,
+    *,
+    expected_length: int,
+) -> tuple[Any, list[Any]]:
+    """Resolve one design chain and verify its residue count."""
+    chains = [
+        chain
+        for chain in topology.chains()  # type: ignore[attr-defined]
+        if chain.id == design_chain_id
+    ]
+    if not chains:
+        raise ValueError(f"design chain {design_chain_id!r} not found in topology")
+    if len(chains) != 1:
+        raise ValueError(
+            f"design chain {design_chain_id!r} is ambiguous in topology; "
+            f"found {len(chains)} matching chains"
+        )
+    residues = list(chains[0].residues())
+    if len(residues) != expected_length:
+        raise ValueError(
+            f"design chain {design_chain_id!r} has {len(residues)} residues but "
+            f"sequence has {expected_length}; residue count must equal sequence length"
+        )
+    return chains[0], residues
 
 
 def three_letter_for(index: int, one_letter: str) -> str:  # noqa: ARG001
