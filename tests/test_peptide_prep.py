@@ -246,6 +246,55 @@ def full_complex_receptor_gap_pdb(tmp_path: Path) -> Path:
     return path
 
 
+def _closure_test_modeller(
+    chain_ids: tuple[str, ...] = ("A", "B", "C"),
+    design_residue_count: int = 2,
+) -> app.Modeller:
+    """Build a small multi-chain topology with explicit terminal caps."""
+    topology = app.Topology()
+    positions: list[openmm.Vec3] = []
+    for chain_id in chain_ids:
+        chain = topology.addChain(chain_id)
+        previous_c: Any = None
+        residue_count = design_residue_count if chain_id == "C" else 2
+        for residue_index in range(residue_count):
+            residue = topology.addResidue("ALA", chain, str(residue_index + 10))
+            atom_names = ["N", "CA", "C", "O"]
+            if residue_index == 0:
+                atom_names.extend(("H", "H2", "H3"))
+            if residue_index == residue_count - 1:
+                atom_names.append("OXT")
+            elements = {
+                "N": app.element.nitrogen,
+                "O": app.element.oxygen,
+                "OXT": app.element.oxygen,
+            }
+            atoms = {
+                name: topology.addAtom(
+                    name,
+                    elements.get(
+                        name,
+                        app.element.hydrogen if name.startswith("H") else app.element.carbon,
+                    ),
+                    residue,
+                )
+                for name in atom_names
+            }
+            positions.extend(openmm.Vec3(float(len(positions)), 0.0, 0.0) for _ in atom_names)
+            topology.addBond(atoms["N"], atoms["CA"])
+            topology.addBond(atoms["CA"], atoms["C"])
+            topology.addBond(atoms["C"], atoms["O"])
+            for name in ("H", "H2", "H3"):
+                if name in atoms:
+                    topology.addBond(atoms["N"], atoms[name])
+            if "OXT" in atoms:
+                topology.addBond(atoms["C"], atoms["OXT"])
+            if previous_c is not None:
+                topology.addBond(previous_c, atoms["N"])
+            previous_c = atoms["C"]
+    return app.Modeller(topology, openmm.unit.Quantity(positions, openmm.unit.nanometer))
+
+
 def _make_linear_config(
     output_root: str,
     *,
@@ -996,6 +1045,129 @@ class TestPeptidePrepHeadToTail:
         head_h_count = sum(1 for atom in first_res_atoms if atom == "H")
         assert head_h_count == 1, f"head N should have exactly one H, found {head_h_count} in PDB"
         assert "OXT" not in last_res_atoms
+
+
+class TestPeptidePrepChainLocalClosure:
+    """Head-to-tail edits are limited to the configured design chain."""
+
+    def test_chain_local_terminal_caps_preserve_full_complex(self) -> None:
+        from biolab_runners.peptide_prep import chemistry
+
+        modeller = _closure_test_modeller()
+        before = {
+            chain.id: tuple(
+                (residue.id, tuple(atom.name for atom in residue.atoms()))
+                for residue in chain.residues()
+            )
+            for chain in modeller.topology.chains()
+        }
+        before_atom_count = modeller.topology.getNumAtoms()
+
+        modeller, head_index, tail_index = chemistry.remove_chain_terminal_caps_for_cyclization(
+            modeller,
+            design_chain_id="C",
+        )
+        tail_c, head_n = chemistry.apply_chain_head_to_tail_closure(
+            modeller.topology,
+            design_chain_id="C",
+            app_module=app,
+        )
+
+        chains = list(modeller.topology.chains())
+        assert [chain.id for chain in chains] == ["A", "B", "C"]
+        after = {
+            chain.id: tuple(
+                (residue.id, tuple(atom.name for atom in residue.atoms()))
+                for residue in chain.residues()
+            )
+            for chain in chains
+        }
+        assert after["A"] == before["A"]
+        assert after["B"] == before["B"]
+        assert [residue_id for residue_id, _atoms in after["C"]] == ["10", "11"]
+        assert not set(after["C"][0][1]) & {"H2", "H3"}
+        assert "H" in after["C"][0][1]
+        assert "OXT" not in after["C"][-1][1]
+        assert modeller.topology.getNumAtoms() == before_atom_count - 3
+        assert len(list(modeller.positions)) == modeller.topology.getNumAtoms()
+        atoms = {atom.index: atom for atom in modeller.topology.atoms()}
+        assert atoms[tail_c].residue.index == tail_index
+        assert atoms[head_n].residue.index == head_index
+        assert atoms[tail_c].residue.chain.id == "C"
+        assert atoms[head_n].residue.chain.id == "C"
+        assert (
+            sum(
+                {bond.atom1.index, bond.atom2.index} == {tail_c, head_n}
+                for bond in modeller.topology.bonds()
+            )
+            == 1
+        )
+
+    @pytest.mark.parametrize(
+        ("chain_id", "chain_ids", "match"),
+        [
+            ("D", ("A", "B", "C"), "not found"),
+            ("A", ("A", "A", "C"), "ambiguous"),
+        ],
+    )
+    def test_chain_local_caps_reject_unknown_or_ambiguous_chain(
+        self, chain_id: str, chain_ids: tuple[str, ...], match: str
+    ) -> None:
+        from biolab_runners.peptide_prep import chemistry
+
+        with pytest.raises(ValueError, match=match):
+            chemistry.remove_chain_terminal_caps_for_cyclization(
+                _closure_test_modeller(chain_ids),
+                design_chain_id=chain_id,
+            )
+
+    def test_chain_local_caps_reject_one_residue_design_chain(self) -> None:
+        from biolab_runners.peptide_prep import chemistry
+
+        with pytest.raises(ValueError, match="at least 2 residues"):
+            chemistry.remove_chain_terminal_caps_for_cyclization(
+                _closure_test_modeller(design_residue_count=1),
+                design_chain_id="C",
+            )
+
+    @pytest.mark.parametrize("missing_atom", ["N", "C"])
+    def test_chain_local_caps_reject_missing_required_terminal_atoms(
+        self, missing_atom: str
+    ) -> None:
+        from biolab_runners.peptide_prep import chemistry
+
+        modeller = _closure_test_modeller()
+        chain = next(chain for chain in modeller.topology.chains() if chain.id == "C")
+        residue = next(chain.residues()) if missing_atom == "N" else list(chain.residues())[-1]
+        missing = next(atom for atom in residue.atoms() if atom.name == missing_atom)
+        modeller.delete([missing])
+
+        with pytest.raises(ValueError, match=f"has no {missing_atom} atom"):
+            chemistry.remove_chain_terminal_caps_for_cyclization(
+                modeller,
+                design_chain_id="C",
+            )
+
+    def test_chain_local_closure_rejects_duplicate_bond(self) -> None:
+        from biolab_runners.peptide_prep import chemistry
+
+        modeller = _closure_test_modeller()
+        modeller, _, _ = chemistry.remove_chain_terminal_caps_for_cyclization(
+            modeller,
+            design_chain_id="C",
+        )
+        chemistry.apply_chain_head_to_tail_closure(
+            modeller.topology,
+            design_chain_id="C",
+            app_module=app,
+        )
+
+        with pytest.raises(ValueError, match="closure already exists"):
+            chemistry.apply_chain_head_to_tail_closure(
+                modeller.topology,
+                design_chain_id="C",
+                app_module=app,
+            )
 
 
 # ---------------------------------------------------------------------------
