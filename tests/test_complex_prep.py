@@ -7,20 +7,27 @@ import json
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
+import openmm.app as app
 import openmm.unit as unit
 import pytest
 from biolab_runners.complex_prep import (
     GROMPP_NOT_RUN,
+    MANIFEST_PAYLOAD_DIGEST_FIELD,
+    SELECTION_MAP_FILENAME,
     ComplexPrepConfig,
     ComplexPrepRunner,
     PeptideTopologyDescriptor,
+    compute_complex_config_digest,
 )
+from biolab_runners.complex_prep import runner as complex_prep_runner
 from biolab_runners.contracts import ExecutionStatus
 from biolab_runners.peptide_prep import ChiralityReport, CoordinateTransformResult
 from biolab_runners.rosetta import ChainAudit, PDBIdentity, RelaxScore, RosettaDecoyArtifact
 from pdbfixer import PDBFixer
+
+import openmm
 
 
 def _complex_pdb_text() -> str:
@@ -35,6 +42,7 @@ def _complex_pdb_text() -> str:
         ("C", "ALA", "A", 11, 5.850, 1.400, 0.000, "C"),
         ("O", "ALA", "A", 11, 6.900, 1.800, 0.000, "O"),
         ("CB", "ALA", "A", 11, 4.700, 3.300, -1.000, "C"),
+        ("OXT", "ALA", "A", 11, 6.800, 1.500, 0.000, "O"),
         ("N", "GLY", "B", 20, 0.000, 10.000, 0.000, "N"),
         ("CA", "GLY", "B", 20, 1.450, 10.000, 0.000, "C"),
         ("C", "GLY", "B", 20, 2.450, 11.200, 0.000, "C"),
@@ -43,6 +51,7 @@ def _complex_pdb_text() -> str:
         ("CA", "GLY", "B", 21, 4.550, 12.200, 0.000, "C"),
         ("C", "GLY", "B", 21, 5.850, 11.400, 0.000, "C"),
         ("O", "GLY", "B", 21, 6.900, 11.800, 0.000, "O"),
+        ("OXT", "GLY", "B", 21, 6.800, 11.500, 0.000, "O"),
         ("N", "ALA", "C", 30, 0.000, 20.000, 0.000, "N"),
         ("CA", "ALA", "C", 30, 1.450, 20.000, 0.000, "C"),
         ("C", "ALA", "C", 30, 2.450, 21.200, 0.000, "C"),
@@ -60,9 +69,41 @@ def _complex_pdb_text() -> str:
             f"ATOM  {serial:5d} {atom:>4s} {residue} {chain}{number:4d}"
             f"    {x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00           {element:>2s}"
         )
-        if serial in (10, 18):
+        if (chain, number, atom) in (("A", 11, "OXT"), ("B", 21, "OXT")):
             lines.append("TER")
     return "\n".join([*lines, "TER", "END"]) + "\n"
+
+
+def _covalent_head_to_tail_complex_pdb_text() -> str:
+    lines = []
+    for line in _complex_pdb_text().splitlines():
+        if (
+            line.startswith("ATOM")
+            and line[21] == "C"
+            and line[22:26].strip() == "31"
+            and line[12:16].strip() == "C"
+        ):
+            line = line[:30] + f"{1.200:8.3f}{20.800:8.3f}{0.000:8.3f}" + line[54:]
+        lines.append(line)
+    return "\n".join(lines) + "\n"
+
+
+def _identity_topology(a_names: tuple[str, ...]) -> tuple[app.Topology, object]:
+    topology = app.Topology()
+    positions = []
+    elements = {"N": app.element.nitrogen, "C": app.element.carbon, "O": app.element.oxygen}
+    for chain_id, residue_id, residue_name, names in (
+        ("A", "10", "ALA", a_names),
+        ("B", "20", "GLY", ("N", "CA", "C", "O", "OXT")),
+        ("C", "30", "ALA", ("N", "CA", "C")),
+    ):
+        chain = topology.addChain(chain_id)
+        residue = topology.addResidue(residue_name, chain, id=residue_id)
+        for index, name in enumerate(names):
+            element = elements["N" if name == "N" else "O" if name.startswith("O") else "C"]
+            topology.addAtom(name, element, residue)
+            positions.append(openmm.Vec3(index * 0.1, int(residue_id) * 0.01, 0.0))
+    return topology, unit.Quantity(positions, unit.nanometer)
 
 
 class _RecordingTransformer:
@@ -109,7 +150,7 @@ def source_pdb(tmp_path: Path) -> Path:
     return path
 
 
-def _cys_complex_pdb_text() -> str:
+def _cys_complex_pdb_text(second_sg: tuple[float, float, float] = (3.2, 21.6, -1.0)) -> str:
     lines: list[str] = []
     for line in _complex_pdb_text().splitlines():
         if line.startswith("ATOM") and line[21] == "C":
@@ -117,7 +158,11 @@ def _cys_complex_pdb_text() -> str:
         lines.append(line)
         if line.startswith("ATOM") and line[21] == "C" and line[12:16].strip() == "CB":
             number = line[22:26].strip()
-            coordinates = "  2.200  19.800  -1.000" if number == "30" else "  3.500  23.000  -1.000"
+            coordinates = (
+                "  2.200  19.800  -1.000"
+                if number == "30"
+                else f"{second_sg[0]:8.3f}{second_sg[1]:8.3f}{second_sg[2]:8.3f}"
+            )
             lines.append(
                 f"ATOM  {len(lines) + 1:5d}  SG  CYS C{int(number):4d}"
                 f"    {coordinates}  1.00  0.00           S"
@@ -136,8 +181,8 @@ def _artifact(source_pdb: Path, *, c_atom_count: int = 10) -> RosettaDecoyArtifa
         input_pdb_identity=PDBIdentity("input", digest),
         output_pdb_identity=PDBIdentity("output", digest),
         chain_audits=(
-            ChainAudit("A", "receptor-alpha", 2, 10),
-            ChainAudit("B", "receptor-beta", 2, 8),
+            ChainAudit("A", "receptor-alpha", 2, 11),
+            ChainAudit("B", "receptor-beta", 2, 9),
             ChainAudit("C", "binder", 2, c_atom_count),
         ),
         relax_score=RelaxScore(total_score=-12.5),
@@ -169,9 +214,165 @@ def test_config_requires_successful_decoy_and_d_identities(
             source_pdb,
             tmp_path / "out",
             topology=PeptideTopologyDescriptor(
-                d_substitutions=(SimpleNamespace(position=1, residue="ALA"),)
+                d_substitutions=(SimpleNamespace(position=1, residue="LEU"),)
             ),
         )
+    with pytest.raises(ValueError, match="must match the design sequence"):
+        _config(
+            source_pdb,
+            tmp_path / "out-mismatch",
+            topology=PeptideTopologyDescriptor(
+                d_substitutions=(SimpleNamespace(position=2, residue="LEU"),)
+            ),
+            coordinate_transformer_identity="transform-v1",
+            chirality_validator_identity="validator-v1",
+        )
+    with pytest.raises(ValueError, match="3-letter amino-acid code"):
+        _config(
+            source_pdb,
+            tmp_path / "out-case",
+            topology=PeptideTopologyDescriptor(
+                d_substitutions=(SimpleNamespace(position=1, residue="leu"),)
+            ),
+            coordinate_transformer_identity="transform-v1",
+            chirality_validator_identity="validator-v1",
+        )
+    with pytest.raises(ValueError, match="head_to_tail"):
+        _config(
+            source_pdb,
+            tmp_path / "out-bool",
+            topology=PeptideTopologyDescriptor(
+                head_to_tail=SimpleNamespace(head=True, tail=2),
+            ),
+        )
+
+
+def test_config_digest_normalizes_disulfide_pair_and_descriptor_order(
+    source_pdb: Path, tmp_path: Path
+) -> None:
+    first = _config(
+        source_pdb,
+        tmp_path / "first",
+        design_sequence="CCCC",
+        topology=PeptideTopologyDescriptor(
+            disulfides=(
+                SimpleNamespace(first=3, second=4),
+                SimpleNamespace(first=2, second=1),
+            ),
+        ),
+    )
+    second = _config(
+        source_pdb,
+        tmp_path / "second",
+        design_sequence="CCCC",
+        topology=PeptideTopologyDescriptor(
+            disulfides=(
+                SimpleNamespace(first=1, second=2),
+                SimpleNamespace(first=4, second=3),
+            ),
+        ),
+    )
+
+    assert compute_complex_config_digest(first) == compute_complex_config_digest(second)
+
+
+@pytest.mark.parametrize(
+    "prepared_names",
+    [
+        ("N", "CA", "C", "O"),
+        ("N", "CB", "C", "O", "OXT"),
+        ("N", "CA", "C", "O", "OXT", "O2"),
+    ],
+    ids=("missing", "replaced", "extra"),
+)
+def test_receptor_heavy_atom_identity_mismatch_fails_closed(
+    prepared_names: tuple[str, ...],
+) -> None:
+    source_topology, source_positions = _identity_topology(("N", "CA", "C", "O", "OXT"))
+    prepared_topology, prepared_positions = _identity_topology(prepared_names)
+    state = SimpleNamespace(
+        source_topology=source_topology,
+        source_positions=source_positions,
+        topology=prepared_topology,
+        positions=prepared_positions,
+    )
+
+    with pytest.raises(ValueError, match="receptor A/B heavy-atom"):
+        complex_prep_runner._validate_preservation(
+            cast("complex_prep_runner._StructureState", state)
+        )
+
+
+def test_source_symlink_is_rejected_as_a_preflight_failure(
+    source_pdb: Path, tmp_path: Path
+) -> None:
+    source_link = tmp_path / "source-link.pdb"
+    source_link.symlink_to(source_pdb)
+    config = _config(source_link, tmp_path / "symlink-out", source_decoy=_artifact(source_link))
+
+    result = ComplexPrepRunner().run(config)
+
+    assert result.status is ExecutionStatus.FAILED
+    assert "source_pdb read failed" in result.error
+    assert not result.executed
+    assert not result.provenance.executed
+
+
+def test_empty_source_is_rejected_as_a_preflight_failure(tmp_path: Path) -> None:
+    source_pdb = tmp_path / "empty-source.pdb"
+    source_pdb.write_bytes(b"")
+    config = _config(source_pdb, tmp_path / "empty-source-out")
+
+    result = ComplexPrepRunner().run(config)
+
+    assert result.status is ExecutionStatus.FAILED
+    assert "source_pdb read failed" in result.error
+    assert not result.executed
+
+
+def test_source_is_replaced_after_snapshot_without_affecting_preparation(
+    source_pdb: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(source_pdb, tmp_path / "snapshot-out")
+    original_digest = hashlib.sha256(source_pdb.read_bytes()).hexdigest()
+    real_load_source = complex_prep_runner._load_source
+
+    def replace_caller_source(snapshot_path: str) -> tuple[object, object]:
+        assert Path(snapshot_path) != source_pdb
+        source_pdb.write_text("caller path replaced after snapshot")
+        return real_load_source(snapshot_path)
+
+    monkeypatch.setattr(complex_prep_runner, "_load_source", replace_caller_source)
+    result = ComplexPrepRunner().run(config)
+
+    assert result.success, result.error
+    assert result.source_digest == original_digest
+
+
+def test_existing_output_inspection_oserror_is_structured(
+    source_pdb: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_inspection(*_: Any, **__: Any) -> None:
+        raise OSError("inspection unavailable")
+
+    monkeypatch.setattr(complex_prep_runner, "_inspect_existing", fail_inspection)
+    result = ComplexPrepRunner().run(_config(source_pdb, tmp_path / "inspection-error"))
+
+    assert result.status is ExecutionStatus.FAILED
+    assert "inspection unavailable" in result.error
+    assert not result.executed
+    assert not result.provenance.executed
+
+
+def test_existing_empty_output_is_not_overwritten(source_pdb: Path, tmp_path: Path) -> None:
+    output_dir = tmp_path / "empty-output"
+    output_dir.mkdir()
+
+    result = ComplexPrepRunner().run(_config(source_pdb, output_dir))
+
+    assert result.status is ExecutionStatus.INCOMPLETE
+    assert "already exists" in result.error
+    assert list(output_dir.iterdir()) == []
 
 
 def test_full_complex_emits_exact_bundle_and_preserves_receptors(
@@ -235,7 +436,7 @@ def test_d_callbacks_are_scoped_to_c_and_use_local_indices(
         source_pdb,
         tmp_path / "out",
         topology=PeptideTopologyDescriptor(
-            d_substitutions=(SimpleNamespace(position=1, residue="ALA"),)
+            d_substitutions=(SimpleNamespace(position=1, residue="LEU"),)
         ),
         coordinate_transformer_identity="transform-v1",
         chirality_validator_identity="validator-v1",
@@ -253,7 +454,9 @@ def test_d_callbacks_are_scoped_to_c_and_use_local_indices(
     assert {stage for _index, _expected, stage in validator.calls} == {"post_h", "pre", "post"}
 
 
-def test_c_local_head_to_tail_closure_has_global_indices(source_pdb: Path, tmp_path: Path) -> None:
+def test_c_local_head_to_tail_closure_has_global_indices(tmp_path: Path) -> None:
+    source_pdb = tmp_path / "covalent-source.pdb"
+    source_pdb.write_text(_covalent_head_to_tail_complex_pdb_text())
     config = _config(
         source_pdb,
         tmp_path / "out",
@@ -274,6 +477,22 @@ def test_c_local_head_to_tail_closure_has_global_indices(source_pdb: Path, tmp_p
         line.startswith("ATOM") and line[21] == "C" and line[12:16].strip() == "OXT"
         for line in Path(result.bundle.prepared_pdb.path).read_text().splitlines()
     )
+
+
+def test_far_head_to_tail_closure_fails_without_publishing(
+    source_pdb: Path, tmp_path: Path
+) -> None:
+    config = _config(
+        source_pdb,
+        tmp_path / "far-cycle",
+        topology=PeptideTopologyDescriptor(head_to_tail=SimpleNamespace(head=1, tail=2)),
+    )
+
+    result = ComplexPrepRunner().run(config)
+
+    assert result.status is ExecutionStatus.FAILED
+    assert "head_to_tail closure distance" in result.error
+    assert not Path(config.output_dir).exists()
 
 
 def test_selection_map_and_index_round_trip_exactly(source_pdb: Path, tmp_path: Path) -> None:
@@ -330,6 +549,26 @@ def test_c_local_disulfide_maps_descriptor_positions_to_global_topology(
     )
 
 
+def test_far_disulfide_fails_without_publishing(tmp_path: Path) -> None:
+    source_pdb = tmp_path / "far-cys-source.pdb"
+    source_pdb.write_text(_cys_complex_pdb_text(second_sg=(3.5, 23.0, -1.0)))
+    config = _config(
+        source_pdb,
+        tmp_path / "far-disulfide",
+        source_decoy=_artifact(source_pdb, c_atom_count=12),
+        design_sequence="CC",
+        topology=PeptideTopologyDescriptor(
+            disulfides=(SimpleNamespace(first=1, second=2),),
+        ),
+    )
+
+    result = ComplexPrepRunner().run(config)
+
+    assert result.status is ExecutionStatus.FAILED
+    assert "disulfide closure distance" in result.error
+    assert not Path(config.output_dir).exists()
+
+
 def test_grompp_status_is_honest_about_gmx_presence(source_pdb: Path, tmp_path: Path) -> None:
     result = ComplexPrepRunner().run(_config(source_pdb, tmp_path / "out"))
 
@@ -373,6 +612,116 @@ def test_cache_hit_and_partial_tampered_malformed_refusals(
     assert malformed.status is ExecutionStatus.MALFORMED
 
 
+def _rewrite_map_and_manifest(output_dir: Path, mutate: Any) -> None:
+    map_path = output_dir / SELECTION_MAP_FILENAME
+    map_data = json.loads(map_path.read_text())
+    mutate(map_data)
+    map_path.write_text(json.dumps(map_data, indent=2, sort_keys=True) + "\n")
+    manifest_path = output_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["artifacts"][SELECTION_MAP_FILENAME]["sha256"] = hashlib.sha256(
+        map_path.read_bytes()
+    ).hexdigest()
+    manifest[MANIFEST_PAYLOAD_DIGEST_FIELD] = complex_prep_runner._manifest_payload_digest(manifest)
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+
+def test_cache_rejects_scientific_manifest_metadata_tampering(
+    source_pdb: Path, tmp_path: Path
+) -> None:
+    output_dir = tmp_path / "metadata-tampered"
+    config = _config(source_pdb, output_dir)
+    first = ComplexPrepRunner().run(config)
+    assert first.success
+    manifest_path = output_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["net_charge"] = 1.0
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+    result = ComplexPrepRunner().run(config)
+
+    assert result.status is ExecutionStatus.FAILED
+    assert "scientific metadata digest" in result.error
+
+
+def test_cache_rejects_malformed_manifest_metadata_types(source_pdb: Path, tmp_path: Path) -> None:
+    output_dir = tmp_path / "metadata-type-tampered"
+    config = _config(source_pdb, output_dir)
+    first = ComplexPrepRunner().run(config)
+    assert first.success
+    manifest_path = output_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["atom_count"] = "not-an-integer"
+    manifest[MANIFEST_PAYLOAD_DIGEST_FIELD] = complex_prep_runner._manifest_payload_digest(manifest)
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+    result = ComplexPrepRunner().run(config)
+
+    assert result.status is ExecutionStatus.MALFORMED
+    assert "atom count" in result.error
+
+
+@pytest.mark.parametrize(
+    ("collection", "field"),
+    (
+        ("source_to_prepared_atoms", "source_pdb_atom_index"),
+        ("source_to_prepared_atoms", "prepared_pdb_atom_index"),
+        ("source_to_prepared_atoms", "prepared_topology_atom_index"),
+        ("source_to_prepared_residues", "source_pdb_residue_index"),
+        ("source_to_prepared_residues", "prepared_pdb_residue_index"),
+        ("source_to_prepared_residues", "prepared_topology_residue_index"),
+    ),
+)
+def test_cache_rejects_stale_map_index_direction(
+    source_pdb: Path, tmp_path: Path, collection: str, field: str
+) -> None:
+    output_dir = tmp_path / f"map-{field}"
+    config = _config(source_pdb, output_dir)
+    first = ComplexPrepRunner().run(config)
+    assert first.success
+
+    def mutate(data: dict[str, Any]) -> None:
+        data[collection][0][field] += 1
+
+    _rewrite_map_and_manifest(output_dir, mutate)
+    result = ComplexPrepRunner().run(config)
+
+    assert result.status is ExecutionStatus.FAILED
+    assert "selection map mapped" in result.error
+
+
+def test_cache_rejects_map_dropped_coverage_tampering(source_pdb: Path, tmp_path: Path) -> None:
+    output_dir = tmp_path / "map-dropped"
+    config = _config(source_pdb, output_dir)
+    first = ComplexPrepRunner().run(config)
+    assert first.success
+
+    def mutate(data: dict[str, Any]) -> None:
+        data["source_to_prepared_atoms"].pop()
+
+    _rewrite_map_and_manifest(output_dir, mutate)
+    result = ComplexPrepRunner().run(config)
+
+    assert result.status is ExecutionStatus.FAILED
+    assert "source atoms" in result.error
+
+
+def test_cache_rejects_map_audit_tampering(source_pdb: Path, tmp_path: Path) -> None:
+    output_dir = tmp_path / "map-audit"
+    config = _config(source_pdb, output_dir)
+    first = ComplexPrepRunner().run(config)
+    assert first.success
+
+    def mutate(data: dict[str, Any]) -> None:
+        data["chain_audits"][0]["source_atom_count"] += 1
+
+    _rewrite_map_and_manifest(output_dir, mutate)
+    result = ComplexPrepRunner().run(config)
+
+    assert result.status is ExecutionStatus.FAILED
+    assert "chain audits" in result.error
+
+
 def test_source_digest_mismatch_and_callback_failure_publish_nothing(
     source_pdb: Path, tmp_path: Path
 ) -> None:
@@ -396,7 +745,7 @@ def test_source_digest_mismatch_and_callback_failure_publish_nothing(
         source_pdb,
         tmp_path / "callback-failure",
         topology=PeptideTopologyDescriptor(
-            d_substitutions=(SimpleNamespace(position=1, residue="ALA"),)
+            d_substitutions=(SimpleNamespace(position=1, residue="LEU"),)
         ),
         coordinate_transformer_identity="transform-v1",
         chirality_validator_identity="validator-v1",
@@ -407,5 +756,7 @@ def test_source_digest_mismatch_and_callback_failure_publish_nothing(
         chirality_validator=_RecordingValidator(),
     )
     assert failed.status is ExecutionStatus.FAILED
+    assert failed.executed
+    assert failed.provenance.executed
     assert not Path(config.output_dir).exists()
     assert not list(Path(config.output_dir).parent.glob(".callback-failure.staging-*"))

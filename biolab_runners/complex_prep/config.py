@@ -7,7 +7,13 @@ from pathlib import Path
 from typing import Any
 
 from biolab_runners.contracts import ArtifactReference, ExecutionMode, ExecutionStatus
-from biolab_runners.peptide_prep.config import PeptideTopologyDescriptor
+from biolab_runners.peptide_prep.config import (
+    CHIRALITY_RESTRAINT_ALGORITHM_VERSION,
+    GROMACS_POSITION_RESTRAINT_ALGORITHM_VERSION,
+    GROMACS_TOPOLOGY_MATERIALIZER_VERSION,
+    PeptideTopologyDescriptor,
+)
+from biolab_runners.peptide_prep.utils import THREE_LETTER
 from biolab_runners.provenance import build_execution_provenance
 from biolab_runners.rosetta.artifact import RosettaDecoyArtifact
 
@@ -24,15 +30,35 @@ SELECTION_MAP_FILENAME = "selection-map.json"
 INDEX_FILENAME = "index.ndx"
 GROMPP_NOT_RUN = "not_run_gmx_unavailable"
 GROMPP_PASSED = "passed"
+COMPLEX_PREPARATION_ALGORITHM_VERSION = "complex-preparation-v2"
+MUTATION_ALGORITHM_VERSION = "design-chain-mutation-v1"
+CLOSURE_ALGORITHM_VERSION = "head-tail-disulfide-closure-v1"
+D_COORDINATE_ALGORITHM_VERSION = "chain-local-d-coordinate-transform-v1"
+MANIFEST_PAYLOAD_DIGEST_FIELD = "scientific_metadata_sha256"
+ALGORITHM_VERSIONS = {
+    "preparation": COMPLEX_PREPARATION_ALGORITHM_VERSION,
+    "mutation": MUTATION_ALGORITHM_VERSION,
+    "closure": CLOSURE_ALGORITHM_VERSION,
+    "d_coordinate": D_COORDINATE_ALGORITHM_VERSION,
+    "chirality": CHIRALITY_RESTRAINT_ALGORITHM_VERSION,
+    "gromacs_position_restraint": GROMACS_POSITION_RESTRAINT_ALGORITHM_VERSION,
+    "gromacs_topology_export": GROMACS_TOPOLOGY_MATERIALIZER_VERSION,
+}
 
 _AMINO_ACIDS = frozenset("ACDEFGHIKLMNPQRSTVWY")
 
 __all__ = [
+    "ALGORITHM_VERSIONS",
+    "CLOSURE_ALGORITHM_VERSION",
+    "COMPLEX_PREPARATION_ALGORITHM_VERSION",
     "DESIGN_CHAIN_ID",
+    "D_COORDINATE_ALGORITHM_VERSION",
     "GROMPP_NOT_RUN",
     "GROMPP_PASSED",
     "INDEX_FILENAME",
     "MANIFEST_FILENAME",
+    "MANIFEST_PAYLOAD_DIGEST_FIELD",
+    "MUTATION_ALGORITHM_VERSION",
     "PREPARATION_SCHEMA_VERSION",
     "PREPARED_GRO_FILENAME",
     "PREPARED_PDB_FILENAME",
@@ -58,7 +84,8 @@ def _require_string(value: object, field_name: str) -> None:
         raise ValueError(f"{field_name} must be a non-empty string")
 
 
-def _validate_d_entry(entry: object, sequence_length: int) -> None:
+def _validate_d_entry(entry: object, sequence: str) -> None:
+    sequence_length = len(sequence)
     position = getattr(entry, "position", None)
     residue = getattr(entry, "residue", None)
     if (
@@ -70,25 +97,33 @@ def _validate_d_entry(entry: object, sequence_length: int) -> None:
             f"topology.d_substitutions entry has invalid position {position!r}; "
             f"design sequence length is {sequence_length}"
         )
-    if not isinstance(residue, str) or len(residue) != 3:
+    if (
+        not isinstance(residue, str)
+        or len(residue) != 3
+        or residue != residue.upper()
+        or residue not in THREE_LETTER.values()
+    ):
         raise ValueError(
             f"topology.d_substitutions entry has invalid residue {residue!r}; "
             "expected a 3-letter amino-acid code"
         )
+    if residue != THREE_LETTER[sequence[position - 1]]:
+        raise ValueError(
+            "topology.d_substitutions residue must match the design sequence "
+            f"at position {position}"
+        )
 
 
 def _validate_topology(topology: PeptideTopologyDescriptor, sequence: str) -> None:
-    d_positions = [
-        _validated_d_position(entry, len(sequence)) for entry in topology.d_substitutions
-    ]
+    d_positions = [_validated_d_position(entry, sequence) for entry in topology.d_substitutions]
     if len(d_positions) != len(set(d_positions)):
         raise ValueError("topology.d_substitutions contains duplicate positions")
     _validate_head_to_tail(topology.head_to_tail, len(sequence))
     _validate_disulfides(topology.disulfides, sequence)
 
 
-def _validated_d_position(entry: object, sequence_length: int) -> int:
-    _validate_d_entry(entry, sequence_length)
+def _validated_d_position(entry: object, sequence: str) -> int:
+    _validate_d_entry(entry, sequence)
     position = getattr(entry, "position", None)
     if not isinstance(position, int):
         raise ValueError("topology.d_substitutions entry has an invalid position")
@@ -100,7 +135,14 @@ def _validate_head_to_tail(entry: object | None, sequence_length: int) -> None:
         return
     head = getattr(entry, "head", None)
     tail = getattr(entry, "tail", None)
-    if head != 1 or tail != sequence_length:
+    if (
+        isinstance(head, bool)
+        or not isinstance(head, int)
+        or isinstance(tail, bool)
+        or not isinstance(tail, int)
+        or head != 1
+        or tail != sequence_length
+    ):
         raise ValueError(
             "topology.head_to_tail must describe the design chain's true "
             f"terminals (1, {sequence_length})"
@@ -161,6 +203,10 @@ class ComplexPrepConfig:
         ):
             raise ValueError("topology must be a PeptideTopologyDescriptor")
 
+        if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+            self.design_sequence, str
+        ):
+            raise ValueError("design_sequence must be a string")
         sequence = self.design_sequence.upper()
         if not sequence:
             raise ValueError("design_sequence is required")

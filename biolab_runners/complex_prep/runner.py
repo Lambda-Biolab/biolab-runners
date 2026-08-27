@@ -7,17 +7,20 @@ import json
 import math
 import os
 import shutil
+import stat
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from biolab_runners.complex_prep.config import (
+    ALGORITHM_VERSIONS,
     DESIGN_CHAIN_ID,
     GROMPP_NOT_RUN,
     GROMPP_PASSED,
     INDEX_FILENAME,
     MANIFEST_FILENAME,
+    MANIFEST_PAYLOAD_DIGEST_FIELD,
     PREPARATION_SCHEMA_VERSION,
     PREPARED_GRO_FILENAME,
     PREPARED_PDB_FILENAME,
@@ -34,6 +37,10 @@ from biolab_runners.complex_prep.config import (
 )
 from biolab_runners.contracts import ArtifactReference, ExecutionStatus
 from biolab_runners.peptide_prep import design_chain
+from biolab_runners.peptide_prep.config import (
+    DEFAULT_MAX_DISULFIDE_DISTANCE_A,
+    DEFAULT_MAX_HEAD_TO_TAIL_DISTANCE_A,
+)
 from biolab_runners.peptide_prep.utils import TopologyBondRecord, file_sha256
 from biolab_runners.provenance import _canonical_json
 
@@ -78,8 +85,8 @@ class ComplexPrepRunner:
     ) -> ComplexPrepResult:
         """Run or strictly reuse a complete preparation bundle."""
         output_dir = Path(config.output_dir)
-        source_digest = file_sha256(Path(config.source_pdb)) or ""
         config_digest = compute_complex_config_digest(config)
+        source_digest = ""
         preparation_digest = compute_preparation_digest(source_digest, config_digest)
         if config.source_decoy.status is not ExecutionStatus.SUCCEEDED:
             return _failure(
@@ -90,23 +97,17 @@ class ComplexPrepRunner:
                 "source_decoy.status must be SUCCEEDED",
             )
 
-        cached = _inspect_existing(
-            output_dir,
-            config,
-            source_digest=source_digest,
-            config_digest=config_digest,
-            preparation_digest=preparation_digest,
-        )
-        if cached is not None:
-            return cached
-        if not source_digest:
+        try:
+            source_bytes, source_digest = _read_source_snapshot(Path(config.source_pdb))
+        except Exception as exc:
             return _failure(
                 output_dir,
                 source_digest,
                 config_digest,
-                preparation_digest,
-                f"source_pdb is missing or unreadable: {config.source_pdb}",
+                compute_preparation_digest(source_digest, config_digest),
+                f"source_pdb read failed: {exc}",
             )
+        preparation_digest = compute_preparation_digest(source_digest, config_digest)
         if source_digest != config.source_decoy.output_pdb_identity.sha256:
             return _failure(
                 output_dir,
@@ -115,65 +116,111 @@ class ComplexPrepRunner:
                 preparation_digest,
                 "source_pdb bytes do not match source_decoy.output_pdb_identity.sha256",
             )
-        if output_dir.exists() and any(output_dir.iterdir()):
-            return _failure(
-                output_dir,
-                source_digest,
-                config_digest,
-                preparation_digest,
-                "output_dir is not empty but no reusable complete bundle was found",
-                status=ExecutionStatus.INCOMPLETE,
-            )
 
-        try:
-            source_topology, source_positions = _load_source(config.source_pdb)
-            _validate_source_against_decoy(source_topology, config)
-            staging = _make_staging_dir(output_dir)
-            try:
-                state = _prepare_structure(
-                    config,
-                    source_topology,
-                    source_positions,
-                    coordinate_transformer=coordinate_transformer,
-                    chirality_validator=chirality_validator,
-                )
-                _validate_preservation(state)
-                manifest = _materialize_bundle(
-                    config,
-                    state,
-                    staging,
-                    source_digest=source_digest,
-                    config_digest=config_digest,
-                    preparation_digest=preparation_digest,
-                )
-                _publish_staging(staging, output_dir)
-                bundle = _bundle_from_disk(
-                    output_dir,
-                    source_digest=source_digest,
-                    config_digest=config_digest,
-                    preparation_digest=preparation_digest,
-                    manifest=manifest,
-                )
-            except Exception:
-                shutil.rmtree(staging, ignore_errors=True)
-                raise
-        except Exception as exc:
-            return _failure(
-                output_dir,
-                source_digest,
-                config_digest,
-                preparation_digest,
-                f"complex preparation failed: {exc}",
-            )
-        return ComplexPrepResult(
-            status=ExecutionStatus.SUCCEEDED,
-            output_dir=str(output_dir),
+        return _run_from_snapshot(
+            config,
+            output_dir,
+            source_bytes,
             source_digest=source_digest,
             config_digest=config_digest,
             preparation_digest=preparation_digest,
-            bundle=bundle,
-            executed=True,
+            coordinate_transformer=coordinate_transformer,
+            chirality_validator=chirality_validator,
         )
+
+
+def _run_from_snapshot(
+    config: ComplexPrepConfig,
+    output_dir: Path,
+    source_bytes: bytes,
+    *,
+    source_digest: str,
+    config_digest: str,
+    preparation_digest: str,
+    coordinate_transformer: CoordinateTransformer | None,
+    chirality_validator: ChiralityValidator | None,
+) -> ComplexPrepResult:
+    executed = False
+    snapshot_dir: Path | None = None
+
+    try:
+        snapshot_dir, snapshot_path = _make_source_snapshot(output_dir, source_bytes)
+        source_topology, source_positions = _load_source(str(snapshot_path))
+        _validate_source_against_decoy(source_topology, config)
+        cached = _inspect_existing(
+            output_dir,
+            config,
+            source_topology,
+            source_positions,
+            source_digest=source_digest,
+            config_digest=config_digest,
+            preparation_digest=preparation_digest,
+        )
+        if cached is not None:
+            return cached
+        if os.path.lexists(output_dir):
+            return _failure(
+                output_dir,
+                source_digest,
+                config_digest,
+                preparation_digest,
+                "output_dir already exists but is not an exact reusable bundle",
+                status=ExecutionStatus.INCOMPLETE,
+            )
+        executed = True
+        staging = _make_staging_dir(output_dir)
+        try:
+            state = _prepare_structure(
+                config,
+                source_topology,
+                source_positions,
+                source_path=str(snapshot_path),
+                coordinate_transformer=coordinate_transformer,
+                chirality_validator=chirality_validator,
+            )
+            _validate_preservation(state)
+            manifest = _materialize_bundle(
+                config,
+                state,
+                staging,
+                source_digest=source_digest,
+                config_digest=config_digest,
+                preparation_digest=preparation_digest,
+            )
+            shutil.rmtree(snapshot_dir)
+            snapshot_dir = None
+            _publish_staging(staging, output_dir)
+            bundle = _bundle_from_disk(
+                output_dir,
+                source_digest=source_digest,
+                config_digest=config_digest,
+                preparation_digest=preparation_digest,
+                manifest=manifest,
+            )
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+    except Exception as exc:
+        return _failure(
+            output_dir,
+            source_digest,
+            config_digest,
+            preparation_digest,
+            f"complex preparation failed: {exc}",
+            executed=executed,
+        )
+    finally:
+        if snapshot_dir is not None:
+            shutil.rmtree(snapshot_dir, ignore_errors=True)
+    return ComplexPrepResult(
+        status=ExecutionStatus.SUCCEEDED,
+        output_dir=str(output_dir),
+        source_digest=source_digest,
+        config_digest=config_digest,
+        preparation_digest=preparation_digest,
+        bundle=bundle,
+        executed=True,
+    )
 
 
 def compute_complex_config_digest(config: ComplexPrepConfig) -> str:
@@ -185,6 +232,7 @@ def compute_complex_config_digest(config: ComplexPrepConfig) -> str:
         "protein_force_field": PROTEIN_FORCE_FIELD,
         "water_force_field": WATER_FORCE_FIELD,
         "pH": 7.4,
+        "algorithm_versions": ALGORITHM_VERSIONS,
         "topology": _descriptor_payload(config),
         "coordinate_transformer_identity": config.coordinate_transformer_identity,
         "chirality_validator_identity": config.chirality_validator_identity,
@@ -209,7 +257,7 @@ def _descriptor_payload(config: ComplexPrepConfig) -> dict[str, Any]:
     return {
         "d_substitutions": [
             {"position": item.position, "residue": item.residue}
-            for item in descriptor.d_substitutions
+            for item in sorted(descriptor.d_substitutions, key=lambda value: value.position)
         ],
         "head_to_tail": None
         if descriptor.head_to_tail is None
@@ -218,7 +266,11 @@ def _descriptor_payload(config: ComplexPrepConfig) -> dict[str, Any]:
             "tail": descriptor.head_to_tail.tail,
         },
         "disulfides": [
-            {"first": item.first, "second": item.second} for item in descriptor.disulfides
+            {"first": first, "second": second}
+            for first, second in sorted(
+                (min(item.first, item.second), max(item.first, item.second))
+                for item in descriptor.disulfides
+            )
         ],
     }
 
@@ -261,15 +313,47 @@ def _make_staging_dir(output_dir: Path) -> Path:
     return Path(tempfile.mkdtemp(prefix=f".{output_dir.name}.staging-", dir=output_dir.parent))
 
 
+def _read_source_snapshot(path: Path) -> tuple[bytes, str]:
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError(f"source_pdb is not a regular file: {path}")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            data = handle.read()
+    finally:
+        if descriptor != -1:
+            os.close(descriptor)
+    if not data:
+        raise ValueError(f"source_pdb is empty: {path}")
+    return data, hashlib.sha256(data).hexdigest()
+
+
+def _make_source_snapshot(output_dir: Path, source_bytes: bytes) -> tuple[Path, Path]:
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_dir = Path(
+        tempfile.mkdtemp(prefix=f".{output_dir.name}.source-", dir=output_dir.parent)
+    )
+    snapshot_path = snapshot_dir / "source.pdb"
+    try:
+        snapshot_path.write_bytes(source_bytes)
+    except Exception:
+        shutil.rmtree(snapshot_dir, ignore_errors=True)
+        raise
+    return snapshot_dir, snapshot_path
+
+
 def _prepare_structure(
     config: ComplexPrepConfig,
     source_topology: object,
     source_positions: object,
     *,
+    source_path: str,
     coordinate_transformer: CoordinateTransformer | None,
     chirality_validator: ChiralityValidator | None,
 ) -> _StructureState:
-    topology, positions = _mutate_and_hydrate(config)
+    topology, positions = _mutate_and_hydrate(config, source_path, source_topology)
     reports: list[tuple[Any, ...]] = []
     if chirality_validator is not None:
         reports.append(
@@ -340,17 +424,19 @@ def _prepare_structure(
     )
 
 
-def _mutate_and_hydrate(config: ComplexPrepConfig) -> tuple[object, object]:
+def _mutate_and_hydrate(
+    config: ComplexPrepConfig, source_path: str, source_topology: object
+) -> tuple[object, object]:
     from pdbfixer import PDBFixer
 
     from biolab_runners.peptide_prep.mutation import apply_design_chain_mutation
 
     topology, positions = apply_design_chain_mutation(
-        backbone_pdb_path=config.source_pdb,
+        backbone_pdb_path=source_path,
         design_chain_id=DESIGN_CHAIN_ID,
         target_sequence=config.design_sequence,
     )
-    fixer = PDBFixer(filename=config.source_pdb)
+    fixer = PDBFixer(filename=source_path)
     fixer.topology = topology
     fixer.positions = positions
     fixer.missingResidues = {}
@@ -361,7 +447,34 @@ def _mutate_and_hydrate(config: ComplexPrepConfig) -> tuple[object, object]:
     fixer.positions = _restore_preexisting_coordinates(
         fixer.topology, fixer.positions, pre_hydrogen_records
     )
-    return fixer.topology, fixer.positions
+    return _remove_receptor_extras(fixer.topology, fixer.positions, source_topology)
+
+
+def _remove_receptor_extras(
+    topology: object, positions: object, source_topology: object
+) -> tuple[object, object]:
+    import openmm.app as app
+
+    source_keys = {
+        (*_residue_key(atom.residue), atom.name)
+        for atom in source_topology.atoms()  # type: ignore[attr-defined]
+        if atom.residue.chain.id in RECEPTOR_CHAIN_IDS
+        and atom.element is not None
+        and atom.element.symbol != "H"
+    }
+    extras = [
+        atom
+        for atom in topology.atoms()  # type: ignore[attr-defined]
+        if atom.residue.chain.id in RECEPTOR_CHAIN_IDS
+        and atom.element is not None
+        and atom.element.symbol != "H"
+        and (*_residue_key(atom.residue), atom.name) not in source_keys
+    ]
+    if not extras:
+        return topology, positions
+    modeller = app.Modeller(topology, positions)
+    modeller.delete(extras)
+    return modeller.topology, modeller.positions
 
 
 def _apply_chemistry(
@@ -411,6 +524,7 @@ def _apply_chemistry(
         )
     if disulfide_pairs:
         bond_records.extend(_disulfide_records(modeller.topology, tuple(disulfide_pairs)))
+    _validate_closure_geometry(modeller.topology, modeller.positions, bond_records)
     return modeller.topology, modeller.positions, bond_records
 
 
@@ -454,6 +568,37 @@ def _disulfide_records(
         )
         for first, second in pairs
     ]
+
+
+def _validate_closure_geometry(
+    topology: object, positions: object, bond_records: list[TopologyBondRecord]
+) -> None:
+    atoms = {atom.index: atom for atom in topology.atoms()}  # type: ignore[attr-defined]
+    limits = {
+        "head_to_tail": ("C", "N", DEFAULT_MAX_HEAD_TO_TAIL_DISTANCE_A),
+        "disulfide": ("SG", "SG", DEFAULT_MAX_DISULFIDE_DISTANCE_A),
+    }
+    for record in bond_records:
+        if record.bond_type not in limits:
+            continue
+        expected_first, expected_second, limit = limits[record.bond_type]
+        actual_names = (atoms[record.atom1_index].name, atoms[record.atom2_index].name)
+        if actual_names != (expected_first, expected_second):
+            raise ValueError(
+                f"{record.bond_type} closure does not connect the required terminal atoms"
+            )
+        distance_a = (
+            math.dist(
+                _position_at(positions, record.atom1_index),
+                _position_at(positions, record.atom2_index),
+            )
+            * 10.0
+        )
+        if not math.isfinite(distance_a) or distance_a > limit:
+            raise ValueError(
+                f"{record.bond_type} closure distance {distance_a:.6f} Å exceeds "
+                f"the physical limit of {limit:.6f} Å"
+            )
 
 
 def _build_system(topology: object) -> tuple[object, float]:
@@ -524,6 +669,10 @@ def _build_residue_audits(
 
 
 def _validate_preservation(state: _StructureState) -> None:
+    source_receptor = _receptor_heavy_snapshot(state.source_topology, state.source_positions)
+    prepared_receptor = _receptor_heavy_snapshot(state.topology, state.positions)
+    if source_receptor != prepared_receptor:
+        raise ValueError("receptor A/B heavy-atom identity or coordinates changed")
     source = _atom_records(state.source_topology, state.source_positions)
     prepared = _atom_records(state.topology, state.positions)
     for key, source_record in source.items():
@@ -534,6 +683,23 @@ def _validate_preservation(state: _StructureState) -> None:
             _require_same_geometry(key, source_record, prepared_record, "receptor")
         if key[0] == DESIGN_CHAIN_ID and key[3] in design_chain.D_BACKBONE_INVARIANT_ATOMS:
             _require_same_geometry(key, source_record, prepared_record, "design backbone")
+
+
+def _receptor_heavy_snapshot(topology: object, positions: object) -> tuple[Any, ...]:
+    chains: list[Any] = []
+    for chain in topology.chains():  # type: ignore[attr-defined]
+        if chain.id not in RECEPTOR_CHAIN_IDS:
+            continue
+        residues: list[Any] = []
+        for residue in chain.residues():
+            atoms = tuple(
+                (atom.name, atom.element.symbol, _position_at(positions, atom.index))
+                for atom in residue.atoms()
+                if atom.element is not None and atom.element.symbol != "H"
+            )
+            residues.append((str(residue.id), residue.name, atoms))
+        chains.append((chain.id, tuple(residues)))
+    return tuple(chains)
 
 
 def _require_same_geometry(
@@ -695,7 +861,13 @@ def _materialize_bundle(
     map_path.write_text(json.dumps(selection_map, indent=2, sort_keys=True) + "\n")
     map_digest = _required_sha(map_path)
     _validate_selection_map(
-        json.loads(map_path.read_text()), state.topology, index_path, map_digest
+        json.loads(map_path.read_text()),
+        state.source_topology,
+        state.source_positions,
+        state.topology,
+        state.positions,
+        index_path,
+        map_digest,
     )
     manifest_path = staging / MANIFEST_FILENAME
     manifest = _build_manifest(
@@ -711,7 +883,14 @@ def _materialize_bundle(
         grompp_status=grompp_status[1],
     )
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-    _verify_staging(staging, manifest, state.topology)
+    _verify_staging(
+        staging,
+        manifest,
+        state.source_topology,
+        state.source_positions,
+        state.topology,
+        state.positions,
+    )
     return manifest
 
 
@@ -836,11 +1015,21 @@ def _build_selection_map(
     prepared_residues = _residue_records(state.topology)
     common = sorted(set(source) & set(prepared))
     mapped = [_mapping_entry(source[key], prepared[key]) for key in common]
-    dropped = [_identity_record(source[key]) for key in sorted(set(source) - set(prepared))]
-    added = [_identity_record(prepared[key]) for key in sorted(set(prepared) - set(source))]
+    dropped = [
+        _map_atom_record(source[key], "source") for key in sorted(set(source) - set(prepared))
+    ]
+    added = [
+        _map_atom_record(prepared[key], "prepared") for key in sorted(set(prepared) - set(source))
+    ]
     residue_common = sorted(set(source_residues) & set(prepared_residues))
     residue_mapped = [
-        {"source": source_residues[key], "prepared": prepared_residues[key]}
+        {
+            "source": source_residues[key],
+            "prepared": prepared_residues[key],
+            "source_pdb_residue_index": source_residues[key]["residue_index"],
+            "prepared_pdb_residue_index": prepared_residues[key]["residue_index"],
+            "prepared_topology_residue_index": prepared_residues[key]["residue_index"],
+        }
         for key in residue_common
     ]
     return {
@@ -862,10 +1051,12 @@ def _build_selection_map(
         "dropped_atoms": dropped,
         "source_to_prepared_residues": residue_mapped,
         "added_residues": [
-            prepared_residues[key] for key in sorted(set(prepared_residues) - set(source_residues))
+            _map_residue_record(prepared_residues[key], "prepared")
+            for key in sorted(set(prepared_residues) - set(source_residues))
         ],
         "dropped_residues": [
-            source_residues[key] for key in sorted(set(source_residues) - set(prepared_residues))
+            _map_residue_record(source_residues[key], "source")
+            for key in sorted(set(source_residues) - set(prepared_residues))
         ],
         "selections": _selection_groups(state.topology),
         "chain_audits": [audit.to_dict() for audit in state.chain_audits],
@@ -885,6 +1076,33 @@ def _mapping_entry(source: dict[str, Any], prepared: dict[str, Any]) -> dict[str
         "prepared_topology_atom_index": prepared["atom_index"] + 1,
         "prepared_topology_residue_index": prepared["residue_index"] + 1,
     }
+
+
+def _map_atom_record(record: dict[str, Any], namespace: str) -> dict[str, Any]:
+    mapped = _identity_record(record)
+    if namespace == "source":
+        mapped.update(
+            source_pdb_atom_index=record["atom_index"] + 1,
+            source_pdb_residue_index=record["residue_index"] + 1,
+        )
+    else:
+        mapped.update(
+            prepared_pdb_atom_index=record["atom_index"] + 1,
+            prepared_pdb_residue_index=record["residue_index"] + 1,
+            prepared_topology_atom_index=record["atom_index"] + 1,
+            prepared_topology_residue_index=record["residue_index"] + 1,
+        )
+    return mapped
+
+
+def _map_residue_record(record: dict[str, Any], namespace: str) -> dict[str, Any]:
+    mapped = dict(record)
+    if namespace == "source":
+        mapped["source_pdb_residue_index"] = record["residue_index"]
+    else:
+        mapped["prepared_pdb_residue_index"] = record["residue_index"]
+        mapped["prepared_topology_residue_index"] = record["residue_index"]
+    return mapped
 
 
 def _identity_record(record: dict[str, Any]) -> dict[str, Any]:
@@ -933,7 +1151,7 @@ def _build_manifest(
         SELECTION_MAP_FILENAME: map_digest,
         INDEX_FILENAME: index_digest,
     }
-    return {
+    manifest = {
         "schema_version": PREPARATION_SCHEMA_VERSION,
         "runner": "complex_prep",
         "output_dir": str(output_dir),
@@ -945,6 +1163,11 @@ def _build_manifest(
         "design_sequence": config.design_sequence,
         "chain_roles": {"receptor": list(RECEPTOR_CHAIN_IDS), "design": DESIGN_CHAIN_ID},
         "force_field": {"protein": PROTEIN_FORCE_FIELD, "water": WATER_FORCE_FIELD, "pH": 7.4},
+        "algorithm_versions": dict(ALGORITHM_VERSIONS),
+        "closure_limits": {
+            "head_to_tail_angstrom": DEFAULT_MAX_HEAD_TO_TAIL_DISTANCE_A,
+            "disulfide_angstrom": DEFAULT_MAX_DISULFIDE_DISTANCE_A,
+        },
         "topology": _descriptor_payload(config),
         "artifacts": {
             name: {"path": str(output_dir / name), "sha256": digest}
@@ -961,9 +1184,26 @@ def _build_manifest(
         ],
         "bond_records": [asdict(record) for record in state.bond_records],
     }
+    manifest[MANIFEST_PAYLOAD_DIGEST_FIELD] = _manifest_payload_digest(manifest)
+    return manifest
 
 
-def _verify_staging(staging: Path, manifest: dict[str, Any], topology: object) -> None:
+def _manifest_payload_digest(manifest: dict[str, Any]) -> str:
+    payload = {
+        key: value for key, value in manifest.items() if key != MANIFEST_PAYLOAD_DIGEST_FIELD
+    }
+    return hashlib.sha256(_canonical_json(payload).encode()).hexdigest()
+
+
+def _verify_staging(
+    staging: Path,
+    manifest: dict[str, Any],
+    source_topology: object,
+    source_positions: object,
+    prepared_topology: object,
+    prepared_positions: object,
+) -> None:
+    _validate_manifest_shape(manifest)
     for filename in _OUTPUT_FILENAMES:
         path = staging / filename
         if path.is_symlink() or not path.is_file() or path.stat().st_size == 0:
@@ -972,7 +1212,10 @@ def _verify_staging(staging: Path, manifest: dict[str, Any], topology: object) -
             raise ValueError(f"staging artifact digest mismatch: {filename}")
     _validate_selection_map(
         json.loads((staging / SELECTION_MAP_FILENAME).read_text()),
-        topology,
+        source_topology,
+        source_positions,
+        prepared_topology,
+        prepared_positions,
         staging / INDEX_FILENAME,
         _required_sha(staging / SELECTION_MAP_FILENAME),
     )
@@ -980,10 +1223,8 @@ def _verify_staging(staging: Path, manifest: dict[str, Any], topology: object) -
 
 
 def _publish_staging(staging: Path, output_dir: Path) -> None:
-    if output_dir.exists():
-        if output_dir.is_symlink() or not output_dir.is_dir() or any(output_dir.iterdir()):
-            raise ValueError("output_dir became occupied before atomic publish")
-        output_dir.rmdir()
+    if os.path.lexists(output_dir):
+        raise ValueError("output_dir became occupied before atomic publish")
     os.replace(staging, output_dir)
 
 
@@ -994,18 +1235,16 @@ def _required_sha(path: Path) -> str:
     return digest
 
 
-def _inspect_existing(
+def _load_existing_manifest(
     output_dir: Path,
-    config: ComplexPrepConfig,
-    *,
     source_digest: str,
     config_digest: str,
     preparation_digest: str,
-) -> ComplexPrepResult | None:
-    if not output_dir.exists():
-        return None
+) -> tuple[dict[str, Any] | None, ComplexPrepResult | None]:
+    if not os.path.lexists(output_dir):
+        return None, None
     if output_dir.is_symlink() or not output_dir.is_dir():
-        return _failure(
+        return None, _failure(
             output_dir,
             source_digest,
             config_digest,
@@ -1013,10 +1252,10 @@ def _inspect_existing(
             "output_dir is not a directory",
         )
     if not any(output_dir.iterdir()):
-        return None
+        return None, None
     manifest_path = output_dir / MANIFEST_FILENAME
     if not manifest_path.is_file() or manifest_path.is_symlink():
-        return _failure(
+        return None, _failure(
             output_dir,
             source_digest,
             config_digest,
@@ -1027,7 +1266,7 @@ def _inspect_existing(
     try:
         manifest = json.loads(manifest_path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
-        return _failure(
+        return None, _failure(
             output_dir,
             source_digest,
             config_digest,
@@ -1036,7 +1275,7 @@ def _inspect_existing(
             status=ExecutionStatus.MALFORMED,
         )
     if not isinstance(manifest, dict):
-        return _failure(
+        return None, _failure(
             output_dir,
             source_digest,
             config_digest,
@@ -1044,6 +1283,26 @@ def _inspect_existing(
             "manifest is malformed",
             status=ExecutionStatus.MALFORMED,
         )
+    return manifest, None
+
+
+def _inspect_existing(
+    output_dir: Path,
+    config: ComplexPrepConfig,
+    source_topology: object,
+    source_positions: object,
+    *,
+    source_digest: str,
+    config_digest: str,
+    preparation_digest: str,
+) -> ComplexPrepResult | None:
+    manifest, early_result = _load_existing_manifest(
+        output_dir, source_digest, config_digest, preparation_digest
+    )
+    if early_result is not None:
+        return early_result
+    if manifest is None:
+        return None
     try:
         _validate_manifest_identity(
             manifest, config, source_digest, config_digest, preparation_digest
@@ -1061,10 +1320,20 @@ def _inspect_existing(
         prepared = app.PDBFile(str(output_dir / PREPARED_PDB_FILENAME))
         _validate_selection_map(
             map_data,
+            source_topology,
+            source_positions,
             prepared.topology,
+            prepared.positions,
             output_dir / INDEX_FILENAME,
             _required_sha(output_dir / SELECTION_MAP_FILENAME),
         )
+        if (
+            manifest["chain_audits"] != map_data["chain_audits"]
+            or manifest["residue_audits"] != map_data["residue_audits"]
+        ):
+            raise ValueError("cached manifest audits differ from selection-map audits")
+        if manifest["atom_count"] != prepared.topology.getNumAtoms():
+            raise ValueError("cached manifest atom count differs from prepared topology")
         return _cached_result(
             output_dir, manifest, source_digest, config_digest, preparation_digest
         )
@@ -1115,11 +1384,7 @@ def _validate_manifest_identity(
     config_digest: str,
     preparation_digest: str,
 ) -> None:
-    if (
-        manifest.get("schema_version") != PREPARATION_SCHEMA_VERSION
-        or manifest.get("runner") != "complex_prep"
-    ):
-        raise MalformedBundleError("manifest schema is unsupported")
+    _validate_manifest_shape(manifest)
     for key, expected in (
         ("source_pdb_sha256", source_digest),
         ("config_digest", config_digest),
@@ -1127,29 +1392,224 @@ def _validate_manifest_identity(
     ):
         if manifest.get(key) != expected:
             raise ValueError(f"cached bundle is stale: manifest {key} does not match request")
-    if manifest.get("design_sequence") != config.design_sequence or manifest.get(
+    _validate_manifest_request_values(manifest, config)
+
+
+def _validate_manifest_shape(manifest: dict[str, Any]) -> None:
+    if (
+        not _strict_int(manifest.get("schema_version"))
+        or manifest.get("schema_version") != PREPARATION_SCHEMA_VERSION
+        or manifest.get("runner") != "complex_prep"
+    ):
+        raise MalformedBundleError("manifest schema is unsupported")
+    if not _is_sha(manifest.get(MANIFEST_PAYLOAD_DIGEST_FIELD)):
+        raise MalformedBundleError("manifest scientific metadata digest is malformed")
+    if manifest.get(MANIFEST_PAYLOAD_DIGEST_FIELD) != _manifest_payload_digest(manifest):
+        raise ValueError("cached manifest scientific metadata digest does not match payload")
+    _validate_manifest_metadata_types(manifest)
+
+
+def _validate_manifest_request_values(manifest: dict[str, Any], config: ComplexPrepConfig) -> None:
+    if manifest["source_pdb"] != config.source_pdb:
+        raise ValueError("cached bundle source path does not match request")
+    if manifest["design_sequence"] != config.design_sequence or manifest[
         "topology"
-    ) != _descriptor_payload(config):
+    ] != _descriptor_payload(config):
         raise ValueError("cached bundle config descriptor does not match request")
-    if manifest.get("source_decoy") != config.source_decoy.to_dict():
+    if manifest["source_decoy"] != config.source_decoy.to_dict():
         raise ValueError("cached bundle source decoy identity does not match request")
-    if manifest.get("chain_roles") != {
+    if manifest["chain_roles"] != {
         "receptor": list(RECEPTOR_CHAIN_IDS),
         "design": DESIGN_CHAIN_ID,
     }:
         raise MalformedBundleError("manifest chain roles are malformed")
-    if manifest.get("force_field") != {
+    if manifest["force_field"] != {
         "protein": PROTEIN_FORCE_FIELD,
         "water": WATER_FORCE_FIELD,
         "pH": 7.4,
     }:
         raise MalformedBundleError("manifest force-field policy is malformed")
-    artifacts = manifest.get("artifacts")
+    if manifest["algorithm_versions"] != ALGORITHM_VERSIONS:
+        raise MalformedBundleError("manifest algorithm versions are stale")
+    if manifest["closure_limits"] != {
+        "head_to_tail_angstrom": DEFAULT_MAX_HEAD_TO_TAIL_DISTANCE_A,
+        "disulfide_angstrom": DEFAULT_MAX_DISULFIDE_DISTANCE_A,
+    }:
+        raise MalformedBundleError("manifest closure limits are stale")
+
+
+def _validate_manifest_metadata_types(manifest: dict[str, Any]) -> None:
+    for key in ("source_pdb_sha256", "config_digest", "preparation_digest"):
+        if not _is_sha(manifest.get(key)):
+            raise MalformedBundleError(f"manifest digest is malformed for {key}")
+    if not isinstance(manifest.get(MANIFEST_PAYLOAD_DIGEST_FIELD), str):
+        raise MalformedBundleError("manifest scientific metadata digest is malformed")
+    if not isinstance(manifest.get("source_pdb"), str) or not isinstance(
+        manifest.get("output_dir"), str
+    ):
+        raise MalformedBundleError("manifest path metadata is malformed")
+    if not isinstance(manifest.get("design_sequence"), str):
+        raise MalformedBundleError("manifest design sequence is malformed")
+    if not isinstance(manifest.get("source_decoy"), dict) or not isinstance(
+        manifest.get("topology"), dict
+    ):
+        raise MalformedBundleError("manifest source or topology metadata is malformed")
+    _validate_manifest_policies(manifest)
+    _validate_manifest_artifact_specs(manifest.get("artifacts"))
+    _validate_chain_audit_types(manifest.get("chain_audits"))
+    _validate_residue_audit_types(manifest.get("residue_audits"))
+    _validate_bond_record_types(manifest.get("bond_records"))
+    _validate_chirality_report_types(manifest.get("chirality_reports"))
+
+
+def _validate_manifest_policies(manifest: dict[str, Any]) -> None:
+    versions = manifest.get("algorithm_versions")
+    if not isinstance(versions, dict) or set(versions) != set(ALGORITHM_VERSIONS):
+        raise MalformedBundleError("manifest algorithm versions are malformed")
+    if any(not isinstance(value, str) for value in versions.values()):
+        raise MalformedBundleError("manifest algorithm versions are malformed")
+    limits = manifest.get("closure_limits")
+    if not isinstance(limits, dict) or set(limits) != {
+        "head_to_tail_angstrom",
+        "disulfide_angstrom",
+    }:
+        raise MalformedBundleError("manifest closure limits are malformed")
+    if any(not _finite_number(value) for value in limits.values()):
+        raise MalformedBundleError("manifest closure limits are malformed")
+    if manifest.get("grompp_audit_status") not in {GROMPP_NOT_RUN, GROMPP_PASSED}:
+        raise MalformedBundleError("manifest grompp status is malformed")
+    if not _finite_number(manifest.get("net_charge")):
+        raise MalformedBundleError("manifest net charge is malformed")
+    atom_count = manifest.get("atom_count")
+    if not isinstance(atom_count, int) or isinstance(atom_count, bool) or atom_count <= 0:
+        raise MalformedBundleError("manifest atom count is malformed")
+    if manifest.get("solvent_ion_boundaries") != {
+        "solvent": "not_staged",
+        "ions": "not_staged",
+    }:
+        raise MalformedBundleError("manifest solvent/ion policy is malformed")
+
+
+def _validate_manifest_artifact_specs(artifacts: object) -> None:
     if not isinstance(artifacts, dict) or set(artifacts) != set(_OUTPUT_FILENAMES):
         raise MalformedBundleError("manifest artifact list is malformed")
+    for filename, spec in artifacts.items():
+        if not isinstance(spec, dict) or not isinstance(spec.get("path"), str):
+            raise MalformedBundleError(f"manifest artifact spec is malformed for {filename}")
+        if not _is_sha(spec.get("sha256")):
+            raise MalformedBundleError(f"manifest artifact digest is malformed for {filename}")
+
+
+def _validate_chain_audit_types(value: object) -> None:
+    fields = {
+        "chain_id",
+        "role",
+        "source_residue_count",
+        "prepared_residue_count",
+        "source_atom_count",
+        "prepared_atom_count",
+    }
+    if not isinstance(value, list):
+        raise MalformedBundleError("manifest chain audits are malformed")
+    for audit in value:
+        if not isinstance(audit, dict) or set(audit) != fields:
+            raise MalformedBundleError("manifest chain audits are malformed")
+        if not isinstance(audit["chain_id"], str) or not isinstance(audit["role"], str):
+            raise MalformedBundleError("manifest chain audits are malformed")
+        if any(not _strict_int(audit[key]) for key in fields - {"chain_id", "role"}):
+            raise MalformedBundleError("manifest chain audits are malformed")
+
+
+def _validate_residue_audit_types(value: object) -> None:
+    fields = {
+        "chain_id",
+        "residue_number",
+        "insertion_code",
+        "source_name",
+        "prepared_name",
+        "source_atom_count",
+        "prepared_atom_count",
+        "source_index",
+        "prepared_index",
+    }
+    if not isinstance(value, list):
+        raise MalformedBundleError("manifest residue audits are malformed")
+    for audit in value:
+        if not isinstance(audit, dict) or set(audit) != fields:
+            raise MalformedBundleError("manifest residue audits are malformed")
+        if any(
+            not isinstance(audit[key], str)
+            for key in ("chain_id", "insertion_code", "source_name", "prepared_name")
+        ):
+            raise MalformedBundleError("manifest residue audits are malformed")
+        if any(
+            not _strict_int(audit[key])
+            for key in fields - {"chain_id", "insertion_code", "source_name", "prepared_name"}
+        ):
+            raise MalformedBundleError("manifest residue audits are malformed")
+
+
+def _validate_bond_record_types(value: object) -> None:
+    fields = {
+        "atom1_index",
+        "atom2_index",
+        "bond_type",
+        "atom1_name",
+        "atom2_name",
+        "residue1_index",
+        "residue2_index",
+    }
+    if not isinstance(value, list):
+        raise MalformedBundleError("manifest bond records are malformed")
+    for record in value:
+        if not isinstance(record, dict) or set(record) != fields:
+            raise MalformedBundleError("manifest bond records are malformed")
+        if any(
+            not isinstance(record[key], str) for key in ("bond_type", "atom1_name", "atom2_name")
+        ):
+            raise MalformedBundleError("manifest bond records are malformed")
+        if any(
+            not _strict_int(record[key])
+            for key in fields - {"bond_type", "atom1_name", "atom2_name"}
+        ):
+            raise MalformedBundleError("manifest bond records are malformed")
+
+
+def _validate_chirality_report_types(value: object) -> None:
+    fields = {"residue_index", "residue_name", "expected", "observed", "valid", "detail"}
+    if not isinstance(value, list):
+        raise MalformedBundleError("manifest chirality reports are malformed")
+    for stage in value:
+        _validate_chirality_stage(stage, fields)
+
+
+def _validate_chirality_stage(stage: object, fields: set[str]) -> None:
+    if not isinstance(stage, list):
+        raise MalformedBundleError("manifest chirality reports are malformed")
+    for report in stage:
+        _validate_chirality_report(report, fields)
+
+
+def _validate_chirality_report(report: object, fields: set[str]) -> None:
+    if not isinstance(report, dict) or set(report) != fields:
+        raise MalformedBundleError("manifest chirality reports are malformed")
+    if not _strict_int(report["residue_index"]) or not isinstance(report["valid"], bool):
+        raise MalformedBundleError("manifest chirality reports are malformed")
+    if any(not isinstance(report[key], str) for key in fields - {"residue_index", "valid"}):
+        raise MalformedBundleError("manifest chirality reports are malformed")
+
+
+def _strict_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _finite_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def _validate_manifest_files(output_dir: Path, manifest: dict[str, Any]) -> None:
+    if manifest["output_dir"] != str(output_dir):
+        raise ValueError("manifest output directory binding is stale")
     manifest_path = output_dir / MANIFEST_FILENAME
     if (
         manifest_path.is_symlink()
@@ -1181,7 +1641,10 @@ def _validate_manifest_artifact(output_dir: Path, manifest: dict[str, Any], file
 
 def _validate_selection_map(
     data: object,
-    topology: object,
+    source_topology: object,
+    source_positions: object,
+    prepared_topology: object,
+    prepared_positions: object,
     index_path: Path,
     map_digest: str,
 ) -> None:
@@ -1191,9 +1654,25 @@ def _validate_selection_map(
         raise MalformedBundleError("selection map identity digests are malformed")
     if data.get("index_sha256") != _required_sha(index_path):
         raise ValueError("selection map/index digest binding is stale")
-    _validate_index_groups(data.get("selections"), index_path, topology.getNumAtoms())  # type: ignore[attr-defined]
-    _validate_atom_mapping(data, topology.getNumAtoms())  # type: ignore[attr-defined]
-    _validate_residue_mapping(data, topology.getNumResidues())  # type: ignore[attr-defined]
+    _validate_index_groups(
+        data.get("selections"),
+        index_path,
+        prepared_topology.getNumAtoms(),  # type: ignore[attr-defined]
+    )
+    source_atoms = _atom_records(source_topology, source_positions)
+    prepared_atoms = _atom_records(prepared_topology, prepared_positions)
+    _validate_atom_mapping(data, source_atoms, prepared_atoms)
+    source_residues = _residue_records(source_topology)
+    prepared_residues = _residue_records(prepared_topology)
+    _validate_residue_mapping(data, source_residues, prepared_residues)
+    if data.get("chain_audits") != [
+        audit.to_dict() for audit in _build_chain_audits(source_topology, prepared_topology)
+    ]:
+        raise ValueError("selection map chain audits differ from topologies")
+    if data.get("residue_audits") != [
+        audit.to_dict() for audit in _build_residue_audits(source_topology, prepared_topology)
+    ]:
+        raise ValueError("selection map residue audits differ from topologies")
     prepared_digests = data.get("prepared_artifact_sha256")
     if not isinstance(prepared_digests, dict) or set(prepared_digests) != set(
         _OUTPUT_FILENAMES[:3]
@@ -1203,6 +1682,11 @@ def _validate_selection_map(
         raise MalformedBundleError("selection map prepared artifact digests are malformed")
     if not _is_sha(map_digest):
         raise MalformedBundleError("selection map digest is malformed")
+    if data.get("solvent_ion_boundaries") != {
+        "solvent": "not_staged",
+        "ions": "not_staged",
+    }:
+        raise MalformedBundleError("selection map solvent/ion policy is malformed")
 
 
 def _validate_map_bindings(
@@ -1227,7 +1711,11 @@ def _validate_map_bindings(
         raise ValueError("selection map index binding is stale")
 
 
-def _validate_atom_mapping(data: dict[str, Any], atom_count: int) -> None:
+def _validate_atom_mapping(
+    data: dict[str, Any],
+    source_atoms: dict[tuple[str, int, str, str], dict[str, Any]],
+    prepared_atoms: dict[tuple[str, int, str, str], dict[str, Any]],
+) -> None:
     entries = data.get("source_to_prepared_atoms")
     added = data.get("added_atoms")
     dropped = data.get("dropped_atoms")
@@ -1235,8 +1723,8 @@ def _validate_atom_mapping(data: dict[str, Any], atom_count: int) -> None:
         raise MalformedBundleError("selection map atom mappings are malformed")
     if not isinstance(entries, list) or not isinstance(added, list):
         raise MalformedBundleError("selection map atom mappings are malformed")
-    prepared_indices: list[int] = []
-    source_keys: set[str] = set()
+    mapped_source: set[tuple[str, int, str, str]] = set()
+    mapped_prepared: set[tuple[str, int, str, str]] = set()
     for entry in entries:
         if (
             not isinstance(entry, dict)
@@ -1244,27 +1732,120 @@ def _validate_atom_mapping(data: dict[str, Any], atom_count: int) -> None:
             or not isinstance(entry.get("prepared"), dict)
         ):
             raise MalformedBundleError("selection map contains malformed mapped atom")
-        prepared_index = entry.get("prepared_topology_atom_index")
-        prepared_index = _checked_index(
-            prepared_index, atom_count, "selection map contains an out-of-range prepared atom"
-        )
-        prepared_indices.append(prepared_index)
-        source_keys.add(_identity_key(entry["source"]))
-    if len(prepared_indices) != len(set(prepared_indices)) or len(source_keys) != len(entries):
-        raise ValueError("selection map atom mapping is not bijective")
-    for record in added:
-        if not isinstance(record, dict):
-            raise ValueError("selection map added atom is out of range")
-        atom_index = record.get("atom_index")
-        atom_index = _checked_index(
-            atom_index, atom_count, "selection map added atom is out of range"
-        )
-        prepared_indices.append(atom_index)
-    if sorted(prepared_indices) != list(range(1, atom_count + 1)):
+        source_key = _validate_atom_map_side(entry["source"], source_atoms, "source")
+        prepared_key = _validate_atom_map_side(entry["prepared"], prepared_atoms, "prepared")
+        if source_key != prepared_key:
+            raise ValueError("selection map mapped atom identities do not correspond")
+        if source_key in mapped_source or prepared_key in mapped_prepared:
+            raise ValueError("selection map atom mapping is not bijective")
+        _validate_mapped_atom_indices(entry, source_atoms[source_key], prepared_atoms[prepared_key])
+        mapped_source.add(source_key)
+        mapped_prepared.add(prepared_key)
+    dropped_keys = _validate_partition_atoms(dropped, source_atoms, "source", mapped_source)
+    added_keys = _validate_partition_atoms(added, prepared_atoms, "prepared", mapped_prepared)
+    if mapped_source | dropped_keys != set(source_atoms):
+        raise ValueError("selection map does not cover exactly the source atoms")
+    if mapped_prepared | added_keys != set(prepared_atoms):
         raise ValueError("selection map does not cover exactly the prepared atoms")
 
 
-def _validate_residue_mapping(data: dict[str, Any], residue_count: int) -> None:
+def _validate_atom_map_side(
+    record: object,
+    actual: dict[tuple[str, int, str, str], dict[str, Any]],
+    namespace: str,
+) -> tuple[str, int, str, str]:
+    if not isinstance(record, dict):
+        raise MalformedBundleError(f"selection map {namespace} atom identity is malformed")
+    _validate_atom_identity_shape(record, namespace)
+    key = (
+        record["chain_id"],
+        record["residue_number"],
+        record["insertion_code"],
+        record["atom_name"],
+    )
+    expected = actual.get(key)
+    if expected is None or record["element"] != expected["element"]:
+        raise ValueError(f"selection map {namespace} atom identity differs from topology")
+    if (
+        record["atom_index"] != expected["atom_index"] + 1
+        or record["residue_index"] != expected["residue_index"] + 1
+    ):
+        raise ValueError(f"selection map {namespace} atom index does not match topology")
+    return key
+
+
+def _validate_atom_identity_shape(record: dict[str, Any], namespace: str) -> None:
+    fields = ("chain_id", "residue_number", "insertion_code", "atom_name", "element")
+    if any(not isinstance(record.get(field), str) for field in fields if field != "residue_number"):
+        raise MalformedBundleError(f"selection map {namespace} atom identity is malformed")
+    if not _strict_int(record.get("residue_number")):
+        raise MalformedBundleError(f"selection map {namespace} atom identity is malformed")
+    if not _strict_int(record.get("atom_index")) or not _strict_int(record.get("residue_index")):
+        raise MalformedBundleError(f"selection map {namespace} atom indices are malformed")
+
+
+def _validate_mapped_atom_indices(
+    entry: dict[str, Any],
+    source: dict[str, Any],
+    prepared: dict[str, Any],
+) -> None:
+    expected = {
+        "source_pdb_atom_index": source["atom_index"] + 1,
+        "source_pdb_residue_index": source["residue_index"] + 1,
+        "prepared_pdb_atom_index": prepared["atom_index"] + 1,
+        "prepared_pdb_residue_index": prepared["residue_index"] + 1,
+        "prepared_topology_atom_index": prepared["atom_index"] + 1,
+        "prepared_topology_residue_index": prepared["residue_index"] + 1,
+    }
+    for field, expected_value in expected.items():
+        if not _strict_int(entry.get(field)) or entry[field] != expected_value:
+            raise ValueError(f"selection map mapped atom index is stale: {field}")
+
+
+def _validate_partition_atoms(
+    records: object,
+    actual: dict[tuple[str, int, str, str], dict[str, Any]],
+    namespace: str,
+    excluded: set[tuple[str, int, str, str]],
+) -> set[tuple[str, int, str, str]]:
+    if not isinstance(records, list):
+        raise MalformedBundleError(f"selection map {namespace} atom partition is malformed")
+    result: set[tuple[str, int, str, str]] = set()
+    for record in records:
+        key = _validate_atom_map_side(record, actual, namespace)
+        if key in excluded or key in result:
+            raise ValueError(f"selection map {namespace} atom partition is not disjoint")
+        _validate_partition_atom_indices(record, actual[key], namespace)
+        result.add(key)
+    return result
+
+
+def _validate_partition_atom_indices(
+    record: dict[str, Any], actual: dict[str, Any], namespace: str
+) -> None:
+    fields = (
+        (
+            ("source_pdb_atom_index", "atom_index"),
+            ("source_pdb_residue_index", "residue_index"),
+        )
+        if namespace == "source"
+        else (
+            ("prepared_pdb_atom_index", "atom_index"),
+            ("prepared_pdb_residue_index", "residue_index"),
+            ("prepared_topology_atom_index", "atom_index"),
+            ("prepared_topology_residue_index", "residue_index"),
+        )
+    )
+    for field, actual_field in fields:
+        if not _strict_int(record.get(field)) or record[field] != actual[actual_field] + 1:
+            raise ValueError(f"selection map partition index is stale: {field}")
+
+
+def _validate_residue_mapping(
+    data: dict[str, Any],
+    source_residues: dict[tuple[str, int, str], dict[str, Any]],
+    prepared_residues: dict[tuple[str, int, str], dict[str, Any]],
+) -> None:
     entries = data.get("source_to_prepared_residues")
     added = data.get("added_residues")
     dropped = data.get("dropped_residues")
@@ -1272,8 +1853,24 @@ def _validate_residue_mapping(data: dict[str, Any], residue_count: int) -> None:
         raise MalformedBundleError("selection map residue mappings are malformed")
     if not isinstance(entries, list) or not isinstance(added, list):
         raise MalformedBundleError("selection map residue mappings are malformed")
-    prepared_indices: list[int] = []
-    source_keys: set[str] = set()
+    mapped_source, mapped_prepared = _validate_mapped_residue_entries(
+        entries, source_residues, prepared_residues
+    )
+    dropped_keys = _validate_partition_residues(dropped, source_residues, "source", mapped_source)
+    added_keys = _validate_partition_residues(added, prepared_residues, "prepared", mapped_prepared)
+    if mapped_source | dropped_keys != set(source_residues):
+        raise ValueError("selection map does not cover exactly the source residues")
+    if mapped_prepared | added_keys != set(prepared_residues):
+        raise ValueError("selection map does not cover exactly the prepared residues")
+
+
+def _validate_mapped_residue_entries(
+    entries: list[object],
+    source_residues: dict[tuple[str, int, str], dict[str, Any]],
+    prepared_residues: dict[tuple[str, int, str], dict[str, Any]],
+) -> tuple[set[tuple[str, int, str]], set[tuple[str, int, str]]]:
+    mapped_source: set[tuple[str, int, str]] = set()
+    mapped_prepared: set[tuple[str, int, str]] = set()
     for entry in entries:
         if not isinstance(entry, dict):
             raise MalformedBundleError("selection map contains malformed mapped residue")
@@ -1281,41 +1878,88 @@ def _validate_residue_mapping(data: dict[str, Any], residue_count: int) -> None:
         prepared = entry.get("prepared")
         if not isinstance(source, dict) or not isinstance(prepared, dict):
             raise MalformedBundleError("selection map contains malformed mapped residue")
-        index = _checked_index(
-            prepared.get("residue_index"),
-            residue_count,
-            "selection map contains an out-of-range prepared residue",
+        source_key = _validate_residue_map_side(source, source_residues, "source")
+        prepared_key = _validate_residue_map_side(prepared, prepared_residues, "prepared")
+        if source_key != prepared_key:
+            raise ValueError("selection map mapped residue identities do not correspond")
+        if source_key in mapped_source or prepared_key in mapped_prepared:
+            raise ValueError("selection map residue mapping is not bijective")
+        _validate_mapped_residue_indices(
+            entry, source_residues[source_key], prepared_residues[prepared_key]
         )
-        prepared_indices.append(index)
-        source_keys.add(_residue_identity_key(source))
-    if len(prepared_indices) != len(set(prepared_indices)) or len(source_keys) != len(entries):
-        raise ValueError("selection map residue mapping is not bijective")
-    for record in added:
-        if not isinstance(record, dict):
-            raise MalformedBundleError("selection map added residue is malformed")
-        prepared_indices.append(
-            _checked_index(
-                record.get("residue_index"),
-                residue_count,
-                "selection map added residue is out of range",
-            )
+        mapped_source.add(source_key)
+        mapped_prepared.add(prepared_key)
+    return mapped_source, mapped_prepared
+
+
+def _validate_residue_map_side(
+    record: object,
+    actual: dict[tuple[str, int, str], dict[str, Any]],
+    namespace: str,
+) -> tuple[str, int, str]:
+    if not isinstance(record, dict):
+        raise MalformedBundleError(f"selection map {namespace} residue identity is malformed")
+    fields = ("chain_id", "residue_number", "insertion_code", "residue_name")
+    if any(not isinstance(record.get(field), str) for field in fields if field != "residue_number"):
+        raise MalformedBundleError(f"selection map {namespace} residue identity is malformed")
+    if not _strict_int(record.get("residue_number")) or not _strict_int(
+        record.get("residue_index")
+    ):
+        raise MalformedBundleError(f"selection map {namespace} residue identity is malformed")
+    key = (record["chain_id"], record["residue_number"], record["insertion_code"])
+    expected = actual.get(key)
+    if expected is None or record["residue_name"] != expected["residue_name"]:
+        raise ValueError(f"selection map {namespace} residue identity differs from topology")
+    if record["residue_index"] != expected["residue_index"]:
+        raise ValueError(f"selection map {namespace} residue index does not match topology")
+    return key
+
+
+def _validate_mapped_residue_indices(
+    entry: dict[str, Any], source: dict[str, Any], prepared: dict[str, Any]
+) -> None:
+    expected = {
+        "source_pdb_residue_index": source["residue_index"],
+        "prepared_pdb_residue_index": prepared["residue_index"],
+        "prepared_topology_residue_index": prepared["residue_index"],
+    }
+    for field, expected_value in expected.items():
+        if not _strict_int(entry.get(field)) or entry[field] != expected_value:
+            raise ValueError(f"selection map mapped residue index is stale: {field}")
+
+
+def _validate_partition_residues(
+    records: object,
+    actual: dict[tuple[str, int, str], dict[str, Any]],
+    namespace: str,
+    excluded: set[tuple[str, int, str]],
+) -> set[tuple[str, int, str]]:
+    if not isinstance(records, list):
+        raise MalformedBundleError(f"selection map {namespace} residue partition is malformed")
+    result: set[tuple[str, int, str]] = set()
+    for record in records:
+        key = _validate_residue_map_side(record, actual, namespace)
+        if key in excluded or key in result:
+            raise ValueError(f"selection map {namespace} residue partition is not disjoint")
+        _validate_partition_residue_indices(record, actual[key], namespace)
+        result.add(key)
+    return result
+
+
+def _validate_partition_residue_indices(
+    record: dict[str, Any], actual: dict[str, Any], namespace: str
+) -> None:
+    fields = (
+        (("source_pdb_residue_index", "residue_index"),)
+        if namespace == "source"
+        else (
+            ("prepared_pdb_residue_index", "residue_index"),
+            ("prepared_topology_residue_index", "residue_index"),
         )
-    if sorted(prepared_indices) != list(range(1, residue_count + 1)):
-        raise ValueError("selection map does not cover exactly the prepared residues")
-
-
-def _residue_identity_key(record: dict[str, Any]) -> str:
-    fields = ("chain_id", "residue_number", "insertion_code")
-    if any(field not in record for field in fields):
-        raise MalformedBundleError("selection map residue identity is malformed")
-    return "|".join(str(record[field]) for field in fields)
-
-
-def _identity_key(record: dict[str, Any]) -> str:
-    fields = ("chain_id", "residue_number", "insertion_code", "atom_name")
-    if any(field not in record for field in fields):
-        raise MalformedBundleError("selection map atom identity is malformed")
-    return "|".join(str(record[field]) for field in fields)
+    )
+    for field, actual_field in fields:
+        if not _strict_int(record.get(field)) or record[field] != actual[actual_field]:
+            raise ValueError(f"selection map partition index is stale: {field}")
 
 
 def _validate_index_groups(groups: object, index_path: Path, atom_count: int) -> None:
@@ -1365,12 +2009,6 @@ def _parse_index_line(line: str, groups: dict[str, list[int]], current: str | No
 
 def _valid_index(value: object, upper: int) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= upper
-
-
-def _checked_index(value: object, upper: int, error: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= upper:
-        raise ValueError(error)
-    return value
 
 
 def _is_sha(value: object) -> bool:
@@ -1453,6 +2091,7 @@ def _failure(
     error: str,
     *,
     status: ExecutionStatus = ExecutionStatus.FAILED,
+    executed: bool = False,
 ) -> ComplexPrepResult:
     return ComplexPrepResult(
         status=status,
@@ -1461,4 +2100,5 @@ def _failure(
         config_digest=config_digest,
         preparation_digest=preparation_digest,
         error=error,
+        executed=executed,
     )
