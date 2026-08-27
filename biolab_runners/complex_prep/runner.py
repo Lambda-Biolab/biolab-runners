@@ -57,6 +57,8 @@ _OUTPUT_FILENAMES = (
 _GROUP_ORDER = ("receptor_ab", "design_c", "dimer_ab")
 _SHA256_LENGTH = 64
 _PDB_ROUNDTRIP_TOLERANCE_NM = 1.1e-4
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
 
 
 @dataclass(frozen=True)
@@ -187,16 +189,17 @@ def _run_from_snapshot(
                 config_digest=config_digest,
                 preparation_digest=preparation_digest,
             )
-            shutil.rmtree(snapshot_dir)
-            snapshot_dir = None
-            _publish_staging(staging, output_dir)
-            bundle = _bundle_from_disk(
+            bundle = _bundle_from_manifest(
                 output_dir,
                 source_digest=source_digest,
                 config_digest=config_digest,
                 preparation_digest=preparation_digest,
                 manifest=manifest,
+                manifest_digest=_required_sha(staging / MANIFEST_FILENAME),
             )
+            shutil.rmtree(snapshot_dir)
+            snapshot_dir = None
+            _publish_staging(staging, output_dir)
         except Exception:
             shutil.rmtree(staging, ignore_errors=True)
             raise
@@ -669,12 +672,26 @@ def _build_residue_audits(
 
 
 def _validate_preservation(state: _StructureState) -> None:
-    source_receptor = _receptor_heavy_snapshot(state.source_topology, state.source_positions)
-    prepared_receptor = _receptor_heavy_snapshot(state.topology, state.positions)
+    _validate_preserved_topologies(
+        state.source_topology,
+        state.source_positions,
+        state.topology,
+        state.positions,
+    )
+
+
+def _validate_preserved_topologies(
+    source_topology: object,
+    source_positions: object,
+    prepared_topology: object,
+    prepared_positions: object,
+) -> None:
+    source_receptor = _receptor_heavy_snapshot(source_topology, source_positions)
+    prepared_receptor = _receptor_heavy_snapshot(prepared_topology, prepared_positions)
     if source_receptor != prepared_receptor:
         raise ValueError("receptor A/B heavy-atom identity or coordinates changed")
-    source = _atom_records(state.source_topology, state.source_positions)
-    prepared = _atom_records(state.topology, state.positions)
+    source = _atom_records(source_topology, source_positions)
+    prepared = _atom_records(prepared_topology, prepared_positions)
     for key, source_record in source.items():
         prepared_record = prepared.get(key)
         if prepared_record is None:
@@ -813,6 +830,7 @@ def _materialize_bundle(
         closure_bond_records=state.bond_records,
     )
     _restore_pdb_residue_identifiers(pdb_path, state.topology)
+    _rewrite_pdb_closure_records(pdb_path, state.bond_records)
     exported = export.export_gromacs(
         state.topology,
         state.system,
@@ -899,14 +917,15 @@ def _grompp_status(
 ) -> tuple[bool, str]:
     import shutil as system_shutil
 
-    present = system_shutil.which("gmx") is not None
+    present_before = system_shutil.which("gmx") is not None
     okay, _message = export.gmx_grompp_pp_check(  # type: ignore[attr-defined]
         top_path,
         gro_path,
         audit_workdir=staging / ".grompp_audit",
     )
     shutil.rmtree(staging / ".grompp_audit", ignore_errors=True)
-    return okay, GROMPP_PASSED if present else GROMPP_NOT_RUN
+    present_after = system_shutil.which("gmx") is not None
+    return okay, GROMPP_PASSED if present_before and present_after else GROMPP_NOT_RUN
 
 
 def _positions_are_finite(positions: object) -> bool:
@@ -929,18 +948,22 @@ def _validate_exported_pdb(path: Path, state: _StructureState) -> None:
             for a, b in zip(record["position_nm"], actual[key]["position_nm"], strict=True)
         ):
             raise ValueError(f"prepared.pdb geometry differs for {key!r}")
+    if _topology_bond_pairs(parsed.topology) != _topology_bond_pairs(state.topology):
+        raise ValueError("prepared.pdb bond graph differs from prepared topology")
 
 
 def _restore_pdb_residue_identifiers(path: Path, topology: object) -> None:
     lines = path.read_text().splitlines()
     atoms = list(topology.atoms())  # type: ignore[attr-defined]
     atom_index = 0
+    last_residue: object | None = None
     output: list[str] = []
     for line in lines:
         if line.startswith(("ATOM  ", "HETATM")):
             if atom_index >= len(atoms):
                 raise ValueError("prepared.pdb contains more atoms than its topology")
-            _chain_id, number, insertion = _residue_key(atoms[atom_index].residue)
+            last_residue = atoms[atom_index].residue
+            _chain_id, number, insertion = _residue_key(last_residue)
             if len(insertion) > 1 or not -999 <= number <= 9999:
                 raise ValueError(
                     "residue identifier cannot be represented in PDB fixed-width fields"
@@ -948,11 +971,38 @@ def _restore_pdb_residue_identifiers(path: Path, topology: object) -> None:
             replacement = f"{number:4d}" + insertion
             output.append(line[:22] + replacement + line[27:])
             atom_index += 1
+        elif line.startswith("TER") and last_residue is not None:
+            _chain_id, number, insertion = _residue_key(last_residue)
+            output.append(line[:22] + f"{number:4d}{insertion}" + line[27:])
         else:
             output.append(line)
     if atom_index != len(atoms):
         raise ValueError("prepared.pdb contains fewer atoms than its topology")
     path.write_text("\n".join(output) + "\n")
+
+
+def _rewrite_pdb_closure_records(path: Path, bond_records: tuple[TopologyBondRecord, ...]) -> None:
+    lines = path.read_text().splitlines()
+    serials = [int(line[6:11]) for line in lines if line.startswith(("ATOM  ", "HETATM"))]
+    if any(
+        not 0 <= index < len(serials)
+        for record in bond_records
+        for index in (record.atom1_index, record.atom2_index)
+    ):
+        raise ValueError("closure bond index cannot be represented in prepared.pdb")
+    conect = [
+        f"CONECT{serials[record.atom1_index]:5d}{serials[record.atom2_index]:5d}"
+        for record in bond_records
+    ]
+    output = [line for line in lines if not line.startswith("CONECT") and line != "END"]
+    path.write_text("\n".join([*output, *conect, "END"]) + "\n")
+
+
+def _topology_bond_pairs(topology: object) -> set[tuple[int, int]]:
+    return {
+        (min(first.index, second.index), max(first.index, second.index))
+        for first, second in topology.bonds()  # type: ignore[attr-defined]
+    }
 
 
 def _verify_multichain_parity(
@@ -1223,9 +1273,40 @@ def _verify_staging(
 
 
 def _publish_staging(staging: Path, output_dir: Path) -> None:
-    if os.path.lexists(output_dir):
-        raise ValueError("output_dir became occupied before atomic publish")
-    os.replace(staging, output_dir)
+    try:
+        _rename_no_replace(staging, output_dir)
+    except FileExistsError as exc:
+        raise ValueError("output_dir became occupied before atomic publish") from exc
+
+
+def _rename_no_replace(source: Path, destination: Path) -> None:
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise RuntimeError("atomic no-replace directory publication is unavailable")
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    if (
+        renameat2(
+            _AT_FDCWD,
+            os.fsencode(source),
+            _AT_FDCWD,
+            os.fsencode(destination),
+            _RENAME_NOREPLACE,
+        )
+        == 0
+    ):
+        return
+    error_number = ctypes.get_errno()
+    raise OSError(error_number, os.strerror(error_number), str(destination))
 
 
 def _required_sha(path: Path) -> str:
@@ -1318,6 +1399,7 @@ def _inspect_existing(
         import openmm.app as app
 
         prepared = app.PDBFile(str(output_dir / PREPARED_PDB_FILENAME))
+        _restore_cached_disulfide_names(prepared.topology, config)
         _validate_selection_map(
             map_data,
             source_topology,
@@ -1334,6 +1416,15 @@ def _inspect_existing(
             raise ValueError("cached manifest audits differ from selection-map audits")
         if manifest["atom_count"] != prepared.topology.getNumAtoms():
             raise ValueError("cached manifest atom count differs from prepared topology")
+        _validate_cached_science(
+            output_dir,
+            config,
+            manifest,
+            source_topology,
+            source_positions,
+            prepared.topology,
+            prepared.positions,
+        )
         return _cached_result(
             output_dir, manifest, source_digest, config_digest, preparation_digest
         )
@@ -1363,6 +1454,124 @@ def _inspect_existing(
             preparation_digest,
             f"cached bundle rejected: {exc}",
         )
+
+
+def _validate_cached_science(
+    output_dir: Path,
+    config: ComplexPrepConfig,
+    manifest: dict[str, Any],
+    source_topology: object,
+    source_positions: object,
+    prepared_topology: object,
+    prepared_positions: object,
+) -> None:
+    from biolab_runners.peptide_prep import export
+
+    _validate_preserved_topologies(
+        source_topology,
+        source_positions,
+        prepared_topology,
+        prepared_positions,
+    )
+    records = _validate_cached_bond_records(config, manifest, prepared_topology)
+    _validate_closure_geometry(prepared_topology, prepared_positions, list(records))
+    system, net_charge = _build_system(prepared_topology)
+    if not math.isclose(net_charge, manifest["net_charge"], rel_tol=0.0, abs_tol=1e-9):
+        raise ValueError("cached manifest net charge differs from prepared topology")
+    parity_ok, parity_message = export.verify_export_parity(
+        prepared_topology,
+        system,
+        prepared_positions,
+        top_path=output_dir / PREPARED_TOP_FILENAME,
+        gro_path=output_dir / PREPARED_GRO_FILENAME,
+        no_nan=_positions_are_finite(prepared_positions),
+    )
+    if not parity_ok and parity_message.startswith("atom count mismatch:"):
+        parity_ok, parity_message = _verify_multichain_parity(
+            prepared_topology,
+            output_dir / PREPARED_TOP_FILENAME,
+            output_dir / PREPARED_GRO_FILENAME,
+        )
+    if not parity_ok:
+        raise ValueError(f"cached GROMACS parity check failed: {parity_message}")
+
+
+def _restore_cached_disulfide_names(topology: object, config: ComplexPrepConfig) -> None:
+    _, residues = design_chain.resolve_design_chain(
+        topology,
+        DESIGN_CHAIN_ID,
+        expected_length=len(config.design_sequence),
+    )
+    positions = {
+        position for bond in config.topology.disulfides for position in (bond.first, bond.second)
+    }
+    for position in positions:
+        residue = residues[position - 1]
+        if residue.name != "CYS":
+            raise ValueError("cached disulfide residue is not CYS in prepared.pdb")
+        residue.name = "CYX"
+
+
+def _validate_cached_bond_records(
+    config: ComplexPrepConfig,
+    manifest: dict[str, Any],
+    topology: object,
+) -> tuple[TopologyBondRecord, ...]:
+    expected = _expected_closure_records(config, topology)
+    actual = tuple(TopologyBondRecord(**record) for record in manifest["bond_records"])
+    if sorted(_canonical_json(asdict(record)) for record in actual) != sorted(
+        _canonical_json(asdict(record)) for record in expected
+    ):
+        raise ValueError("cached manifest bond records differ from requested topology")
+    topology_pairs = _topology_bond_pairs(topology)
+    if any(
+        (min(record.atom1_index, record.atom2_index), max(record.atom1_index, record.atom2_index))
+        not in topology_pairs
+        for record in actual
+    ):
+        raise ValueError("cached manifest closure bond is absent from prepared.pdb")
+    return actual
+
+
+def _expected_closure_records(
+    config: ComplexPrepConfig, topology: object
+) -> tuple[TopologyBondRecord, ...]:
+    _, residues = design_chain.resolve_design_chain(
+        topology,
+        DESIGN_CHAIN_ID,
+        expected_length=len(config.design_sequence),
+    )
+    records: list[TopologyBondRecord] = []
+    if config.topology.head_to_tail is not None:
+        head = residues[config.topology.head_to_tail.head - 1]
+        tail = residues[config.topology.head_to_tail.tail - 1]
+        tail_atom = _required_residue_atom(tail, "C")
+        head_atom = _required_residue_atom(head, "N")
+        records.append(
+            _bond_record(
+                topology,
+                tail_atom.index,
+                head_atom.index,
+                tail.index,
+                head.index,
+                "head_to_tail",
+            )
+        )
+    disulfide_pairs = tuple(
+        (residues[bond.first - 1].index, residues[bond.second - 1].index)
+        for bond in config.topology.disulfides
+    )
+    records.extend(_disulfide_records(topology, disulfide_pairs))
+    return tuple(records)
+
+
+def _required_residue_atom(residue: object, atom_name: str) -> object:
+    atoms = [atom for atom in residue.atoms() if atom.name == atom_name]  # type: ignore[attr-defined]
+    if len(atoms) != 1:
+        raise ValueError(
+            f"prepared topology residue {residue.index} lacks one unique {atom_name} atom"  # type: ignore[attr-defined]
+        )
+    return atoms[0]
 
 
 class IncompleteBundleError(ValueError):
@@ -1648,10 +1857,7 @@ def _validate_selection_map(
     index_path: Path,
     map_digest: str,
 ) -> None:
-    if not isinstance(data, dict) or data.get("schema_version") != PREPARATION_SCHEMA_VERSION:
-        raise MalformedBundleError("selection map schema is malformed")
-    if not _is_sha(data.get("preparation_digest")) or not _is_sha(data.get("source_pdb_sha256")):
-        raise MalformedBundleError("selection map identity digests are malformed")
+    data = _validated_selection_map_header(data)
     if data.get("index_sha256") != _required_sha(index_path):
         raise ValueError("selection map/index digest binding is stale")
     _validate_index_groups(
@@ -1659,6 +1865,8 @@ def _validate_selection_map(
         index_path,
         prepared_topology.getNumAtoms(),  # type: ignore[attr-defined]
     )
+    if data.get("selections") != _selection_groups(prepared_topology):
+        raise ValueError("selection map groups differ from prepared topology roles")
     source_atoms = _atom_records(source_topology, source_positions)
     prepared_atoms = _atom_records(prepared_topology, prepared_positions)
     _validate_atom_mapping(data, source_atoms, prepared_atoms)
@@ -1687,6 +1895,23 @@ def _validate_selection_map(
         "ions": "not_staged",
     }:
         raise MalformedBundleError("selection map solvent/ion policy is malformed")
+
+
+def _validated_selection_map_header(data: object) -> dict[str, Any]:
+    if not isinstance(data, dict) or data.get("schema_version") != PREPARATION_SCHEMA_VERSION:
+        raise MalformedBundleError("selection map schema is malformed")
+    if data.get("index_bases") != {
+        "source_pdb_atom": 1,
+        "source_pdb_residue": 1,
+        "prepared_pdb_atom": 1,
+        "prepared_pdb_residue": 1,
+        "prepared_topology_atom": 1,
+        "prepared_topology_residue": 1,
+    }:
+        raise MalformedBundleError("selection map index bases are malformed")
+    if not _is_sha(data.get("preparation_digest")) or not _is_sha(data.get("source_pdb_sha256")):
+        raise MalformedBundleError("selection map identity digests are malformed")
+    return data
 
 
 def _validate_map_bindings(
@@ -2050,9 +2275,31 @@ def _bundle_from_disk(
     preparation_digest: str,
     manifest: dict[str, Any],
 ) -> ComplexPrepBundle:
+    return _bundle_from_manifest(
+        output_dir,
+        source_digest=source_digest,
+        config_digest=config_digest,
+        preparation_digest=preparation_digest,
+        manifest=manifest,
+        manifest_digest=_required_sha(output_dir / MANIFEST_FILENAME),
+    )
+
+
+def _bundle_from_manifest(
+    output_dir: Path,
+    *,
+    source_digest: str,
+    config_digest: str,
+    preparation_digest: str,
+    manifest: dict[str, Any],
+    manifest_digest: str,
+) -> ComplexPrepBundle:
     references = {
-        filename: ArtifactReference.from_path(
-            output_dir / filename,
+        filename: ArtifactReference(
+            str(output_dir / filename),
+            digest=manifest_digest
+            if filename == MANIFEST_FILENAME
+            else manifest["artifacts"][filename]["sha256"],
             kind="structure"
             if filename == PREPARED_PDB_FILENAME
             else "topology"
@@ -2060,7 +2307,6 @@ def _bundle_from_disk(
             else "coordinates"
             if filename == PREPARED_GRO_FILENAME
             else "metadata",
-            root=output_dir,
         )
         for filename in (*_OUTPUT_FILENAMES, MANIFEST_FILENAME)
     }

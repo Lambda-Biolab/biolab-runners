@@ -477,6 +477,15 @@ def test_c_local_head_to_tail_closure_has_global_indices(tmp_path: Path) -> None
         line.startswith("ATOM") and line[21] == "C" and line[12:16].strip() == "OXT"
         for line in Path(result.bundle.prepared_pdb.path).read_text().splitlines()
     )
+    prepared = app.PDBFile(result.bundle.prepared_pdb.path)
+    atoms = list(prepared.topology.atoms())
+    closure_pair = {records[0]["atom1_index"], records[0]["atom2_index"]}
+    assert closure_pair in [
+        {first.index, second.index} for first, second in prepared.topology.bonds()
+    ]
+    assert {atoms[index].name for index in closure_pair} == {"C", "N"}
+    cached = ComplexPrepRunner().run(config)
+    assert cached.status is ExecutionStatus.CACHED, cached.error
 
 
 def test_far_head_to_tail_closure_fails_without_publishing(
@@ -547,6 +556,8 @@ def test_c_local_disulfide_maps_descriptor_positions_to_global_topology(
         for item in selection_map["source_to_prepared_atoms"]
         if item["source"]["chain_id"] == "C"
     )
+    cached = ComplexPrepRunner().run(config)
+    assert cached.status is ExecutionStatus.CACHED, cached.error
 
 
 def test_far_disulfide_fails_without_publishing(tmp_path: Path) -> None:
@@ -619,6 +630,26 @@ def _rewrite_map_and_manifest(output_dir: Path, mutate: Any) -> None:
     map_path.write_text(json.dumps(map_data, indent=2, sort_keys=True) + "\n")
     manifest_path = output_dir / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
+    manifest["artifacts"][SELECTION_MAP_FILENAME]["sha256"] = hashlib.sha256(
+        map_path.read_bytes()
+    ).hexdigest()
+    manifest[MANIFEST_PAYLOAD_DIGEST_FIELD] = complex_prep_runner._manifest_payload_digest(manifest)
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+
+def _refresh_bound_artifacts(output_dir: Path, *filenames: str) -> None:
+    map_path = output_dir / SELECTION_MAP_FILENAME
+    map_data = json.loads(map_path.read_text())
+    manifest_path = output_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    for filename in filenames:
+        digest = hashlib.sha256((output_dir / filename).read_bytes()).hexdigest()
+        manifest["artifacts"][filename]["sha256"] = digest
+        if filename == "index.ndx":
+            map_data["index_sha256"] = digest
+        else:
+            map_data["prepared_artifact_sha256"][filename] = digest
+    map_path.write_text(json.dumps(map_data, indent=2, sort_keys=True) + "\n")
     manifest["artifacts"][SELECTION_MAP_FILENAME]["sha256"] = hashlib.sha256(
         map_path.read_bytes()
     ).hexdigest()
@@ -720,6 +751,96 @@ def test_cache_rejects_map_audit_tampering(source_pdb: Path, tmp_path: Path) -> 
 
     assert result.status is ExecutionStatus.FAILED
     assert "chain audits" in result.error
+
+
+def test_cache_rejects_index_base_and_role_tampering(source_pdb: Path, tmp_path: Path) -> None:
+    base_output = tmp_path / "map-base"
+    base_config = _config(source_pdb, base_output)
+    assert ComplexPrepRunner().run(base_config).success
+
+    def change_base(data: dict[str, Any]) -> None:
+        data["index_bases"]["prepared_topology_atom"] = 0
+
+    _rewrite_map_and_manifest(base_output, change_base)
+    base_result = ComplexPrepRunner().run(base_config)
+    assert base_result.status is ExecutionStatus.MALFORMED
+    assert "index bases" in base_result.error
+
+    role_output = tmp_path / "map-role"
+    role_config = _config(source_pdb, role_output)
+    assert ComplexPrepRunner().run(role_config).success
+    map_path = role_output / SELECTION_MAP_FILENAME
+    map_data = json.loads(map_path.read_text())
+    moved = map_data["selections"]["receptor_ab"].pop(0)
+    map_data["selections"]["dimer_ab"].pop(0)
+    map_data["selections"]["design_c"].append(moved)
+    map_data["selections"]["design_c"].sort()
+    map_path.write_text(json.dumps(map_data, indent=2, sort_keys=True) + "\n")
+    (role_output / "index.ndx").write_text(
+        complex_prep_runner._render_index(map_data["selections"])
+    )
+    _refresh_bound_artifacts(role_output, "index.ndx")
+
+    role_result = ComplexPrepRunner().run(role_config)
+    assert role_result.status is ExecutionStatus.FAILED
+    assert "topology roles" in role_result.error
+
+
+def test_cache_revalidates_prepared_structure_and_topology(
+    source_pdb: Path, tmp_path: Path
+) -> None:
+    pdb_output = tmp_path / "pdb-science"
+    pdb_config = _config(source_pdb, pdb_output)
+    assert ComplexPrepRunner().run(pdb_config).success
+    pdb_path = pdb_output / "prepared.pdb"
+    lines = pdb_path.read_text().splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith("ATOM") and line[21] == "A" and line[12:16].strip() == "CA":
+            lines[index] = line[:30] + f"{float(line[30:38]) + 1.0:8.3f}" + line[38:]
+            break
+    pdb_path.write_text("\n".join(lines) + "\n")
+    _refresh_bound_artifacts(pdb_output, "prepared.pdb")
+
+    pdb_result = ComplexPrepRunner().run(pdb_config)
+    assert pdb_result.status is ExecutionStatus.FAILED
+    assert "receptor A/B heavy-atom" in pdb_result.error
+
+    top_output = tmp_path / "top-science"
+    top_config = _config(source_pdb, top_output)
+    assert ComplexPrepRunner().run(top_config).success
+    top_path = top_output / "prepared.top"
+    top_lines = top_path.read_text().splitlines()
+    in_atoms = False
+    for index, line in enumerate(top_lines):
+        if line.strip() == "[ atoms ]":
+            in_atoms = True
+        elif in_atoms and line.strip() and not line.lstrip().startswith(";"):
+            fields = line.split()
+            fields[6] = f"{float(fields[6]) + 0.1:.8f}"
+            top_lines[index] = " ".join(fields)
+            break
+    top_path.write_text("\n".join(top_lines) + "\n")
+    _refresh_bound_artifacts(top_output, "prepared.top")
+
+    top_result = ComplexPrepRunner().run(top_config)
+    assert top_result.status is ExecutionStatus.FAILED
+    assert "GROMACS parity" in top_result.error
+
+
+def test_atomic_publish_never_replaces_an_occupied_empty_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staging = tmp_path / "staging"
+    output = tmp_path / "output"
+    staging.mkdir()
+    output.mkdir()
+    monkeypatch.setattr(complex_prep_runner.os.path, "lexists", lambda _path: False)
+
+    with pytest.raises(ValueError, match="became occupied"):
+        complex_prep_runner._publish_staging(staging, output)
+
+    assert staging.is_dir()
+    assert output.is_dir()
 
 
 def test_source_digest_mismatch_and_callback_failure_publish_nothing(
