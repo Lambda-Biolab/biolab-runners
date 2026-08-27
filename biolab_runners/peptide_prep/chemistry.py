@@ -73,13 +73,15 @@ Failure modes:
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Protocol
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "apply_chain_head_to_tail_closure",
     "apply_disulfide_bonds",
     "apply_head_to_tail_closure",
+    "remove_chain_terminal_caps_for_cyclization",
     "remove_terminal_caps_for_cyclization",
     "rename_cysteines_to_cyx",
 ]
@@ -95,6 +97,10 @@ __all__ = [
 # ``_verify_cyclic_topology_chemistry``.
 N_TERMINAL_CAP_ATOM_NAMES: frozenset[str] = frozenset({"H2", "H3"})
 C_TERMINAL_CAP_ATOM_NAMES: frozenset[str] = frozenset({"OXT"})
+
+
+class _TerminalAtom(Protocol):
+    index: int
 
 
 def rename_cysteines_to_cyx(
@@ -320,3 +326,105 @@ def apply_head_to_tail_closure(
 
     topology.addBond(c_atom, n_atom, type=app_module.Single)
     return c_atom.index, n_atom.index
+
+
+def remove_chain_terminal_caps_for_cyclization(
+    modeller: object,
+    *,
+    design_chain_id: str,
+) -> tuple[Any, int, int]:
+    """Delete cyclization caps only from one configured chain.
+
+    Args:
+        modeller: OpenMM ``app.Modeller`` carrying the full complex.
+        design_chain_id: Exact chain ID whose termini are cyclized.
+
+    Returns:
+        ``(modeller, head_residue_index, tail_residue_index)`` using
+        global topology residue indices after cap removal.
+
+    Raises:
+        ValueError: When the chain is absent, ambiguous, too short, or
+            missing the required terminal backbone atoms.
+    """
+    residues = _resolve_unique_chain_residues(modeller.topology, design_chain_id)
+    if len(residues) < 2:
+        raise ValueError(f"head-to-tail closure requires at least 2 residues; got {len(residues)}")
+
+    head_residue = residues[0]
+    tail_residue = residues[-1]
+    _require_terminal_atom(head_residue, "N", design_chain_id, "head")
+    _require_terminal_atom(tail_residue, "C", design_chain_id, "tail")
+
+    atoms_to_delete = [
+        atom for atom in head_residue.atoms() if atom.name in N_TERMINAL_CAP_ATOM_NAMES
+    ]
+    atoms_to_delete.extend(
+        atom for atom in tail_residue.atoms() if atom.name in C_TERMINAL_CAP_ATOM_NAMES
+    )
+    if atoms_to_delete:
+        modeller.delete(atoms_to_delete)
+        residues = _resolve_unique_chain_residues(modeller.topology, design_chain_id)
+
+    return modeller, residues[0].index, residues[-1].index
+
+
+def apply_chain_head_to_tail_closure(
+    topology: object,
+    *,
+    design_chain_id: str,
+    app_module: object,
+) -> tuple[int, int]:
+    """Add a tail-C to head-N bond within one configured chain.
+
+    Args:
+        topology: OpenMM ``app.Topology`` for the full complex.
+        design_chain_id: Exact chain ID whose termini are cyclized.
+        app_module: ``openmm.app`` module providing ``Single``.
+
+    Returns:
+        ``(tail_c_index, head_n_index)`` in the full-complex topology.
+
+    Raises:
+        ValueError: When the chain or required atoms are invalid, or
+            when the closure bond already exists.
+    """
+    residues = _resolve_unique_chain_residues(topology, design_chain_id)
+    if len(residues) < 2:
+        raise ValueError(f"head-to-tail closure requires at least 2 residues; got {len(residues)}")
+
+    head_n = _require_terminal_atom(residues[0], "N", design_chain_id, "head")
+    tail_c = _require_terminal_atom(residues[-1], "C", design_chain_id, "tail")
+    closure_pair = {tail_c.index, head_n.index}
+    if any({bond.atom1.index, bond.atom2.index} == closure_pair for bond in topology.bonds()):
+        raise ValueError(f"head-to-tail closure already exists on design chain {design_chain_id!r}")
+
+    topology.addBond(tail_c, head_n, type=app_module.Single)
+    return tail_c.index, head_n.index
+
+
+def _resolve_unique_chain_residues(topology: object, chain_id: str) -> list[Any]:
+    chains = [chain for chain in topology.chains() if chain.id == chain_id]
+    if not chains:
+        raise ValueError(f"design chain {chain_id!r} not found in topology")
+    if len(chains) != 1:
+        raise ValueError(
+            f"design chain {chain_id!r} is ambiguous in topology; "
+            f"found {len(chains)} matching chains"
+        )
+    return list(chains[0].residues())
+
+
+def _require_terminal_atom(
+    residue: object,
+    atom_name: str,
+    chain_id: str,
+    terminus: str,
+) -> _TerminalAtom:
+    atom = next((candidate for candidate in residue.atoms() if candidate.name == atom_name), None)
+    if atom is None:
+        raise ValueError(
+            f"head-to-tail design chain {chain_id!r} {terminus} residue "
+            f"{residue.id} has no {atom_name} atom"
+        )
+    return atom
