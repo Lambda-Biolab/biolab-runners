@@ -1365,7 +1365,9 @@ class GromacsProtocolRunner:
 
         topology_stage = build_stage_plan()[0]
         source_changed = _prebuilt_source_changed(work_dir, config)
-        if source_changed:
+        if config.force and strict_sidecars_requested(config):
+            _invalidate_stages_from(work_dir, StageKind.TOPOLOGY, reason="force")
+        elif source_changed:
             logger.info(
                 "prebuilt source digests differ from cached values; "
                 "invalidating downstream dependent stages"

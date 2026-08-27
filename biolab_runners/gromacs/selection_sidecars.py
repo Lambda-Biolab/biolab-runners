@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from biolab_runners.gromacs.config import GromacsProtocolConfig
 
 PREPARED_PDB = "prepared.pdb"
+SOURCE_TOPOLOGY = "prepared-topol.top"
 SOURCE_SELECTION_MAP = "prepared-selection-map.json"
 SELECTION_MAP = "selection-map.json"
 SOURCE_INDEX = "prepared-index.ndx"
@@ -24,6 +25,9 @@ _GROUP_ORDER = ("receptor_ab", "design_c", "dimer_ab")
 _MANIFEST_DIGEST_FIELD = "scientific_metadata_sha256"
 _SOLVENT_RESIDUES = frozenset({"SOL", "HOH", "WAT", "TIP3", "TIP3P", "SPC", "SPCE"})
 _ION_RESIDUES = frozenset({"NA", "CL", "K", "MG", "ZN"})
+_GROMACS_STATE_STAGES = frozenset(
+    {"solvate", "ions", "minimize", "equil_nvt", "equil_npt", "production"}
+)
 
 
 @dataclass(frozen=True)
@@ -54,6 +58,7 @@ def stage_selection_sidecars(
     selection_map = _read_json(sources[SELECTION_MAP], SELECTION_MAP)
     _validate_bundle_sources(sources, manifest, selection_map)
     work_dir.mkdir(parents=True, exist_ok=True)
+    _copy(sources["prepared.top"], work_dir / SOURCE_TOPOLOGY)
     _copy(sources["prepared.top"], work_dir / "topol.top")
     _copy(sources["prepared.gro"], work_dir / "processed.gro")
     _copy(sources[PREPARED_PDB], work_dir / PREPARED_PDB)
@@ -62,23 +67,39 @@ def stage_selection_sidecars(
     _copy(sources[SELECTION_MAP], work_dir / SELECTION_MAP)
     _copy(sources[INDEX], work_dir / SOURCE_INDEX)
     _copy(sources[INDEX], work_dir / INDEX)
-    return _identity(work_dir, selection_map)
+    return validate_staged_selection_sidecars(work_dir)
 
 
 def validate_staged_selection_sidecars(work_dir: Path) -> dict[str, Any]:
     """Validate the current map/index and every identity they bind."""
+    return _validate_staged_selection_sidecars(work_dir)
+
+
+def _validate_staged_selection_sidecars(
+    work_dir: Path,
+    *,
+    mutable_checkpoint: Path | None = None,
+) -> dict[str, Any]:
     paths = _staged_paths(work_dir)
     for label, path in paths.items():
         _required_file(path, label)
+    _validate_staged_source_bundle(work_dir)
     source_map = _read_json(paths[SOURCE_SELECTION_MAP], SOURCE_SELECTION_MAP)
     current_map = _read_json(paths[SELECTION_MAP], SELECTION_MAP)
-    source_index_digest = _sha256(paths[SOURCE_INDEX])
-    _validate_map_and_index(source_map, paths[SOURCE_INDEX], source_index_digest)
-    if current_map.get("schema_version") == 1:
+    if type(current_map.get("schema_version")) is int and current_map["schema_version"] == 1:
         if _sha256(paths[SELECTION_MAP]) != _sha256(paths[SOURCE_SELECTION_MAP]):
             raise ValueError("staged selection-map.json differs from its prepared source")
-    elif current_map.get("schema_version") == 2:
-        _validate_final_map(work_dir, current_map, source_map)
+        if _sha256(paths[INDEX]) != _sha256(paths[SOURCE_INDEX]):
+            raise ValueError("staged index.ndx differs from its prepared source")
+        if _sha256(work_dir / "topol.top") != _sha256(paths[SOURCE_TOPOLOGY]):
+            raise ValueError("staged topol.top differs from its prepared source")
+    elif type(current_map.get("schema_version")) is int and current_map["schema_version"] == 2:
+        _validate_final_map(
+            work_dir,
+            current_map,
+            source_map,
+            mutable_checkpoint=mutable_checkpoint,
+        )
     else:
         raise ValueError("selection-map.json schema_version must be 1 or 2")
     return _identity(work_dir, current_map)
@@ -95,8 +116,8 @@ def refresh_selection_sidecars(
     """Regenerate the final map/index after a GROMACS state transition."""
     source_map_path = work_dir / SOURCE_SELECTION_MAP
     source_index_path = work_dir / SOURCE_INDEX
+    _validate_staged_source_bundle(work_dir)
     source_map = _read_json(source_map_path, SOURCE_SELECTION_MAP)
-    _validate_map_and_index(source_map, source_index_path, _sha256(source_index_path))
     _required_file(topology_path, topology_path.name)
     prepared_atoms = _parse_gro(work_dir / "processed.gro")
     final_atoms = _parse_gro(coordinates_path)
@@ -126,19 +147,21 @@ def bind_checkpoint_identity(
 ) -> dict[str, Any]:
     """Bind the current selection space to one exact checkpoint payload."""
     _required_file(checkpoint, checkpoint.name)
+    _validate_staged_selection_sidecars(work_dir, mutable_checkpoint=checkpoint)
     current = _read_json(work_dir / SELECTION_MAP, SELECTION_MAP)
     state = current.get("gromacs_state")
     if not isinstance(state, dict):
         raise ValueError("selection-map.json has no GROMACS state to bind")
+    checkpoint_digest = _sha256(checkpoint)
     state["stage"] = stage
     state["checkpoint_file"] = checkpoint.name
-    state["checkpoint_sha256"] = _sha256(checkpoint)
+    state["checkpoint_sha256"] = checkpoint_digest
     _write_json_atomic(work_dir / SELECTION_MAP, current)
     identity = validate_staged_selection_sidecars(work_dir)
     return {
         **identity,
         "checkpoint_file": checkpoint.name,
-        "checkpoint_sha256": _sha256(checkpoint),
+        "checkpoint_sha256": checkpoint_digest,
     }
 
 
@@ -182,12 +205,30 @@ def _source_paths(config: GromacsProtocolConfig) -> dict[str, Path]:
 def _staged_paths(work_dir: Path) -> dict[str, Path]:
     return {
         PREPARED_PDB: work_dir / PREPARED_PDB,
+        SOURCE_TOPOLOGY: work_dir / SOURCE_TOPOLOGY,
+        "prepared.gro": work_dir / "processed.gro",
         SOURCE_SELECTION_MAP: work_dir / SOURCE_SELECTION_MAP,
         SELECTION_MAP: work_dir / SELECTION_MAP,
         SOURCE_INDEX: work_dir / SOURCE_INDEX,
         INDEX: work_dir / INDEX,
         BUNDLE_MANIFEST: work_dir / BUNDLE_MANIFEST,
     }
+
+
+def _validate_staged_source_bundle(work_dir: Path) -> None:
+    sources = {
+        PREPARED_PDB: work_dir / PREPARED_PDB,
+        "prepared.top": work_dir / SOURCE_TOPOLOGY,
+        "prepared.gro": work_dir / "processed.gro",
+        SELECTION_MAP: work_dir / SOURCE_SELECTION_MAP,
+        INDEX: work_dir / SOURCE_INDEX,
+        BUNDLE_MANIFEST: work_dir / BUNDLE_MANIFEST,
+    }
+    _validate_bundle_sources(
+        sources,
+        _read_json(sources[BUNDLE_MANIFEST], BUNDLE_MANIFEST),
+        _read_json(sources[SELECTION_MAP], SOURCE_SELECTION_MAP),
+    )
 
 
 def _validate_bundle_sources(
@@ -198,6 +239,23 @@ def _validate_bundle_sources(
     for label, path in sources.items():
         _required_file(path, label)
     _validate_manifest(manifest)
+    _validate_bundle_bindings(sources, manifest, selection_map)
+    atoms = _parse_gro(sources["prepared.gro"])
+    _validate_map_and_index(
+        selection_map,
+        sources[INDEX],
+        _sha256(sources[INDEX]),
+        atom_count=len(atoms),
+    )
+    if type(manifest.get("atom_count")) is not int or manifest["atom_count"] != len(atoms):
+        raise ValueError("prepared.gro atom count mismatches complex-prep manifest")
+
+
+def _validate_bundle_bindings(
+    sources: dict[str, Path],
+    manifest: dict[str, Any],
+    selection_map: dict[str, Any],
+) -> None:
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, dict):
         raise ValueError("complex-prep manifest artifacts must be an object")
@@ -208,20 +266,24 @@ def _validate_bundle_sources(
             raise ValueError(f"{name} digest mismatch against complex-prep manifest")
     if selection_map.get("preparation_digest") != manifest.get("preparation_digest"):
         raise ValueError("selection-map preparation_digest mismatches complex-prep manifest")
+    source_digest = selection_map.get("source_pdb_sha256")
+    if not _is_sha(source_digest) or source_digest != manifest.get("source_pdb_sha256"):
+        raise ValueError("selection-map source digest mismatches complex-prep manifest")
     prepared = selection_map.get("prepared_artifact_sha256")
-    if not isinstance(prepared, dict):
+    prepared_names = {PREPARED_PDB, "prepared.top", "prepared.gro"}
+    if not isinstance(prepared, dict) or set(prepared) != prepared_names:
         raise ValueError("selection-map prepared_artifact_sha256 must be an object")
     for name in (PREPARED_PDB, "prepared.top", "prepared.gro"):
         if prepared.get(name) != _sha256(sources[name]):
             raise ValueError(f"selection-map {name} digest mismatch")
-    _validate_map_and_index(selection_map, sources[INDEX], _sha256(sources[INDEX]))
-    atoms = _parse_gro(sources["prepared.gro"])
-    if manifest.get("atom_count") != len(atoms):
-        raise ValueError("prepared.gro atom count mismatches complex-prep manifest")
 
 
 def _validate_manifest(manifest: dict[str, Any]) -> None:
-    if manifest.get("schema_version") != 1 or manifest.get("runner") != "complex_prep":
+    if (
+        type(manifest.get("schema_version")) is not int
+        or manifest["schema_version"] != 1
+        or manifest.get("runner") != "complex_prep"
+    ):
         raise ValueError("complex-prep manifest identity is invalid")
     expected = manifest.get(_MANIFEST_DIGEST_FIELD)
     if not _is_sha(expected):
@@ -235,11 +297,27 @@ def _validate_map_and_index(
     selection_map: dict[str, Any],
     index_path: Path,
     index_digest: str,
+    *,
+    atom_count: int,
 ) -> None:
-    if selection_map.get("schema_version") != 1:
+    if type(selection_map.get("schema_version")) is not int or selection_map["schema_version"] != 1:
         raise ValueError("prepared selection-map.json schema_version must be 1")
     if not _is_sha(selection_map.get("preparation_digest")):
         raise ValueError("selection-map preparation_digest is invalid")
+    if selection_map.get("index_bases") != {
+        "source_pdb_atom": 1,
+        "source_pdb_residue": 1,
+        "prepared_pdb_atom": 1,
+        "prepared_pdb_residue": 1,
+        "prepared_topology_atom": 1,
+        "prepared_topology_residue": 1,
+    }:
+        raise ValueError("selection-map index bases are invalid")
+    if selection_map.get("solvent_ion_boundaries") != {
+        "solvent": "not_staged",
+        "ions": "not_staged",
+    }:
+        raise ValueError("prepared selection-map solvent/ion boundaries are invalid")
     if selection_map.get("index_sha256") != index_digest:
         raise ValueError("index.ndx digest mismatch against selection-map.json")
     groups = _parse_index(index_path)
@@ -247,24 +325,48 @@ def _validate_map_and_index(
     if groups != selections:
         raise ValueError("index.ndx groups disagree with selection-map.json")
     indices = [value for values in selections.values() for value in values]
-    atom_count = len(_parse_gro_from_map(selection_map))
-    if atom_count and max(indices, default=0) > atom_count:
+    if max(indices, default=0) > atom_count:
         raise ValueError("selection-map atom index exceeds prepared atom count")
+    _validate_prepared_atom_partition(selection_map, atom_count)
+    _validate_prepared_residue_records(selection_map)
 
 
-def _parse_gro_from_map(selection_map: dict[str, Any]) -> list[int]:
-    records = selection_map.get("source_to_prepared_atoms")
+def _validate_prepared_atom_partition(selection_map: dict[str, Any], atom_count: int) -> None:
+    indices: list[int] = []
+    for field in ("source_to_prepared_atoms", "added_atoms"):
+        indices.extend(_prepared_atom_indices(selection_map.get(field), field, atom_count))
+    if sorted(indices) != list(range(1, atom_count + 1)):
+        raise ValueError("selection-map prepared atom partition is incomplete or duplicated")
+
+
+def _prepared_atom_indices(records: object, field: str, atom_count: int) -> list[int]:
     if not isinstance(records, list):
-        raise ValueError("source_to_prepared_atoms must be a list")
-    result: list[int] = []
+        raise ValueError(f"{field} must be a list")
+    indices: list[int] = []
     for record in records:
         if not isinstance(record, dict):
-            raise ValueError("source_to_prepared_atoms entry must be an object")
-        value = record.get("prepared_topology_atom_index")
-        if type(value) is not int or value < 1:
-            raise ValueError("prepared_topology_atom_index must be a positive integer")
-        result.append(value)
-    return result
+            raise ValueError(f"{field} entry must be an object")
+        atom_index = record.get("prepared_topology_atom_index")
+        residue_index = record.get("prepared_topology_residue_index")
+        if type(atom_index) is not int or not 1 <= atom_index <= atom_count:
+            raise ValueError("prepared_topology_atom_index is outside the prepared topology")
+        if type(residue_index) is not int or residue_index < 1:
+            raise ValueError("prepared_topology_residue_index must be a positive integer")
+        indices.append(atom_index)
+    return indices
+
+
+def _validate_prepared_residue_records(selection_map: dict[str, Any]) -> None:
+    for field in ("source_to_prepared_residues", "added_residues"):
+        records = selection_map.get(field)
+        if not isinstance(records, list):
+            raise ValueError(f"{field} must be a list")
+        for record in records:
+            if not isinstance(record, dict):
+                raise ValueError(f"{field} entry must be an object")
+            value = record.get("prepared_topology_residue_index")
+            if type(value) is not int or value < 1:
+                raise ValueError("prepared_topology_residue_index must be a positive integer")
 
 
 def _selection_groups(selection_map: dict[str, Any]) -> dict[str, list[int]]:
@@ -405,11 +507,12 @@ def _build_final_map(
 
 
 def _add_final_indices(selection_map: dict[str, Any]) -> None:
-    for record in selection_map["source_to_prepared_atoms"]:
-        record["final_topology_atom_index"] = record["prepared_topology_atom_index"]
-        record["final_topology_residue_index"] = record["prepared_topology_residue_index"]
-    for record in selection_map.get("source_to_prepared_residues", []):
-        if isinstance(record, dict) and "prepared_topology_residue_index" in record:
+    for field in ("source_to_prepared_atoms", "added_atoms"):
+        for record in selection_map[field]:
+            record["final_topology_atom_index"] = record["prepared_topology_atom_index"]
+            record["final_topology_residue_index"] = record["prepared_topology_residue_index"]
+    for field in ("source_to_prepared_residues", "added_residues"):
+        for record in selection_map[field]:
             record["final_topology_residue_index"] = record["prepared_topology_residue_index"]
 
 
@@ -452,6 +555,8 @@ def _validate_final_map(
     work_dir: Path,
     current: dict[str, Any],
     source: dict[str, Any],
+    *,
+    mutable_checkpoint: Path | None = None,
 ) -> None:
     if current.get("parent_selection_map_sha256") != _sha256(work_dir / SOURCE_SELECTION_MAP):
         raise ValueError("final selection map parent digest mismatch")
@@ -461,6 +566,7 @@ def _validate_final_map(
         raise ValueError("final selection map index digest mismatch")
     if _selection_groups(current) != _selection_groups(source):
         raise ValueError("final named selections differ from the prepared map")
+    _validate_inherited_map_fields(current, source)
     state = current.get("gromacs_state")
     if not isinstance(state, dict):
         raise ValueError("final selection map gromacs_state must be an object")
@@ -468,7 +574,77 @@ def _validate_final_map(
     _validate_state_file(work_dir, state, "coordinates")
     checkpoint_file = state.get("checkpoint_file")
     if checkpoint_file is not None:
-        _validate_state_file(work_dir, state, "checkpoint")
+        if mutable_checkpoint is not None and checkpoint_file == mutable_checkpoint.name:
+            _required_file(mutable_checkpoint, mutable_checkpoint.name)
+        else:
+            _validate_state_file(work_dir, state, "checkpoint")
+    _validate_final_state_payload(work_dir, current, state)
+
+
+def _validate_inherited_map_fields(
+    current: dict[str, Any],
+    source: dict[str, Any],
+) -> None:
+    expected_source = json.loads(json.dumps(source))
+    _add_final_indices(expected_source)
+    for key, value in expected_source.items():
+        if (
+            key not in {"schema_version", "index_sha256", "solvent_ion_boundaries"}
+            and current.get(key) != value
+        ):
+            raise ValueError(f"final selection map changed prepared field {key}")
+    expected_keys = set(expected_source) | {
+        "parent_selection_map_sha256",
+        "parent_index_sha256",
+        "gromacs_added_atoms",
+        "gromacs_state",
+    }
+    if set(current) != expected_keys:
+        raise ValueError("final selection map fields are incomplete or unexpected")
+
+
+def _validate_final_state_payload(
+    work_dir: Path,
+    current: dict[str, Any],
+    state: dict[str, Any],
+) -> None:
+    base_fields = {
+        "stage",
+        "topology_file",
+        "topology_sha256",
+        "coordinates_file",
+        "coordinates_sha256",
+        "atom_count",
+        "solute_atom_count",
+    }
+    checkpoint_fields = {"checkpoint_file", "checkpoint_sha256"}
+    state_fields = set(state)
+    if state_fields != base_fields and state_fields != base_fields | checkpoint_fields:
+        raise ValueError("final selection map GROMACS state fields are invalid")
+    if state.get("stage") not in _GROMACS_STATE_STAGES:
+        raise ValueError("final selection map GROMACS stage is invalid")
+    prepared_atoms = _parse_gro(work_dir / "processed.gro")
+    coordinates = work_dir / state["coordinates_file"]
+    final_atoms = _parse_gro(coordinates)
+    _validate_solute_identity(prepared_atoms, final_atoms)
+    if type(state.get("solute_atom_count")) is not int or state["solute_atom_count"] != len(
+        prepared_atoms
+    ):
+        raise ValueError("final selection map solute atom count mismatch")
+    if type(state.get("atom_count")) is not int or state["atom_count"] != len(final_atoms):
+        raise ValueError("final selection map atom count mismatch")
+    expected_added = [
+        _gro_atom_payload(atom, index)
+        for index, atom in enumerate(
+            final_atoms[len(prepared_atoms) :], start=len(prepared_atoms) + 1
+        )
+    ]
+    if current.get("gromacs_added_atoms") != expected_added:
+        raise ValueError("final selection map added atoms mismatch")
+    if current.get("solvent_ion_boundaries") != _environment_boundaries(
+        prepared_atoms, final_atoms
+    ):
+        raise ValueError("final selection map solvent/ion boundaries mismatch")
 
 
 def _validate_state_file(work_dir: Path, state: dict[str, Any], label: str) -> None:

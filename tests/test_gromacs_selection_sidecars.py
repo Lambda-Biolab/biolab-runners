@@ -6,6 +6,7 @@ import hashlib
 import json
 import signal
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -143,6 +144,7 @@ def _write_bundle(tmp_path: Path) -> dict[str, Path]:
         "schema_version": 1,
         "runner": "complex_prep",
         "preparation_digest": map_payload["preparation_digest"],
+        "source_pdb_sha256": map_payload["source_pdb_sha256"],
         "artifacts": {
             name: {"path": str(tmp_path / name), "sha256": digest}
             for name, digest in artifacts.items()
@@ -161,6 +163,32 @@ def _write_bundle(tmp_path: Path) -> dict[str, Path]:
         "index": index,
         "manifest": manifest,
     }
+
+
+def _rebind_bundle(bundle: dict[str, Path]) -> None:
+    selection_map = json.loads(bundle["map"].read_text())
+    selection_map["prepared_artifact_sha256"] = {
+        "prepared.pdb": _sha256(bundle["pdb"]),
+        "prepared.top": _sha256(bundle["top"]),
+        "prepared.gro": _sha256(bundle["gro"]),
+    }
+    selection_map["index_sha256"] = _sha256(bundle["index"])
+    bundle["map"].write_text(json.dumps(selection_map, indent=2, sort_keys=True))
+
+    manifest = json.loads(bundle["manifest"].read_text())
+    for name, key in (
+        ("prepared.pdb", "pdb"),
+        ("prepared.top", "top"),
+        ("prepared.gro", "gro"),
+        ("selection-map.json", "map"),
+        ("index.ndx", "index"),
+    ):
+        manifest["artifacts"][name]["sha256"] = _sha256(bundle[key])
+    manifest["atom_count"] = int(bundle["gro"].read_text().splitlines()[1])
+    manifest["scientific_metadata_sha256"] = _canonical_digest(
+        manifest, excluded="scientific_metadata_sha256"
+    )
+    bundle["manifest"].write_text(json.dumps(manifest, indent=2, sort_keys=True))
 
 
 def _strict_config(tmp_path: Path, bundle: dict[str, Path]) -> GromacsProtocolConfig:
@@ -296,6 +324,65 @@ def test_stage_selection_sidecars_copies_and_binds_complete_bundle(tmp_path: Pat
     assert identity["index_sha256"] == _sha256(bundle["index"])
 
 
+def test_stage_selection_sidecars_accepts_preparation_added_atoms(tmp_path: Path) -> None:
+    from biolab_runners.gromacs.selection_sidecars import (
+        refresh_selection_sidecars,
+        stage_selection_sidecars,
+    )
+
+    bundle = _write_bundle(tmp_path / "bundle")
+    _write_gro(
+        bundle["gro"],
+        [(1, "ALA", "N", 1), (2, "GLY", "CA", 2), (2, "GLY", "H", 3)],
+    )
+    selection_map = json.loads(bundle["map"].read_text())
+    selection_map["added_atoms"] = [
+        {
+            "chain_id": "C",
+            "residue_number": 1,
+            "insertion_code": "",
+            "atom_name": "H",
+            "element": "H",
+            "prepared_pdb_atom_index": 3,
+            "prepared_pdb_residue_index": 2,
+            "prepared_topology_atom_index": 3,
+            "prepared_topology_residue_index": 2,
+        }
+    ]
+    selection_map["selections"]["design_c"] = [2, 3]
+    bundle["map"].write_text(json.dumps(selection_map, indent=2, sort_keys=True))
+    bundle["index"].write_text("[ receptor_ab ]\n1\n[ design_c ]\n2 3\n[ dimer_ab ]\n1\n")
+    _rebind_bundle(bundle)
+    work_dir = tmp_path / "work"
+
+    stage_selection_sidecars(_strict_config(tmp_path, bundle), work_dir)
+    refresh_selection_sidecars(
+        work_dir,
+        stage="ions",
+        topology_path=work_dir / "topol.top",
+        coordinates_path=work_dir / "processed.gro",
+    )
+
+    final_map = json.loads((work_dir / "selection-map.json").read_text())
+    assert final_map["added_atoms"][0]["final_topology_atom_index"] == 3
+    assert final_map["added_atoms"][0]["final_topology_residue_index"] == 2
+
+
+def test_validate_staged_sidecars_refuses_modified_prepared_bundle_file(tmp_path: Path) -> None:
+    from biolab_runners.gromacs.selection_sidecars import (
+        stage_selection_sidecars,
+        validate_staged_selection_sidecars,
+    )
+
+    bundle = _write_bundle(tmp_path / "bundle")
+    work_dir = tmp_path / "work"
+    stage_selection_sidecars(_strict_config(tmp_path, bundle), work_dir)
+    (work_dir / "prepared.pdb").write_text("replaced prepared structure\n")
+
+    with pytest.raises(ValueError, match=r"prepared\.pdb digest mismatch"):
+        validate_staged_selection_sidecars(work_dir)
+
+
 def test_stage_selection_sidecars_rejects_manifest_artifact_mismatch(tmp_path: Path) -> None:
     from biolab_runners.gromacs.selection_sidecars import stage_selection_sidecars
 
@@ -396,6 +483,32 @@ def test_refresh_sidecars_after_ions_records_ion_indices(tmp_path: Path) -> None
     assert [entry["prepared_topology_atom_index"] for entry in mapped] == [1, 2]
 
 
+def test_validate_final_sidecars_refuses_modified_prepared_provenance(tmp_path: Path) -> None:
+    from biolab_runners.gromacs.selection_sidecars import (
+        refresh_selection_sidecars,
+        stage_selection_sidecars,
+        validate_staged_selection_sidecars,
+    )
+
+    bundle = _write_bundle(tmp_path / "bundle")
+    work_dir = tmp_path / "work"
+    stage_selection_sidecars(_strict_config(tmp_path, bundle), work_dir)
+    refresh_selection_sidecars(
+        work_dir,
+        stage="ions",
+        topology_path=work_dir / "topol.top",
+        coordinates_path=work_dir / "processed.gro",
+    )
+    final_map = json.loads((work_dir / "selection-map.json").read_text())
+    final_map["source_pdb_sha256"] = "c" * 64
+    (work_dir / "selection-map.json").write_text(
+        json.dumps(final_map, indent=2, sort_keys=True) + "\n"
+    )
+
+    with pytest.raises(ValueError, match="changed prepared field source_pdb_sha256"):
+        validate_staged_selection_sidecars(work_dir)
+
+
 def test_refresh_sidecars_rejects_changed_solute_atom_identity(tmp_path: Path) -> None:
     from biolab_runners.gromacs.selection_sidecars import (
         refresh_selection_sidecars,
@@ -451,6 +564,36 @@ def test_checkpoint_binding_reuses_exact_digest_and_refuses_replacement(tmp_path
     checkpoint.write_bytes(b"checkpoint-v2")
     with pytest.raises(ValueError, match="checkpoint digest mismatch"):
         validate_checkpoint_identity(work_dir, stage="production", checkpoint=checkpoint)
+
+
+def test_checkpoint_binding_refreshes_checkpoint_replaced_by_resumed_stage(tmp_path: Path) -> None:
+    from biolab_runners.gromacs.selection_sidecars import (
+        bind_checkpoint_identity,
+        refresh_selection_sidecars,
+        stage_selection_sidecars,
+        validate_checkpoint_identity,
+    )
+
+    bundle = _write_bundle(tmp_path / "bundle")
+    work_dir = tmp_path / "work"
+    stage_selection_sidecars(_strict_config(tmp_path, bundle), work_dir)
+    refresh_selection_sidecars(
+        work_dir,
+        stage="ions",
+        topology_path=work_dir / "topol.top",
+        coordinates_path=work_dir / "processed.gro",
+    )
+    checkpoint = work_dir / "min.cpt"
+    checkpoint.write_bytes(b"first-interruption")
+    bind_checkpoint_identity(work_dir, stage="minimize", checkpoint=checkpoint)
+    checkpoint.write_bytes(b"second-interruption")
+
+    rebound = bind_checkpoint_identity(work_dir, stage="minimize", checkpoint=checkpoint)
+
+    assert rebound["checkpoint_sha256"] == _sha256(checkpoint)
+    assert validate_checkpoint_identity(work_dir, stage="minimize", checkpoint=checkpoint)[
+        "checkpoint_sha256"
+    ] == _sha256(checkpoint)
 
 
 def test_validate_staged_sidecars_refuses_missing_index(tmp_path: Path) -> None:
@@ -696,6 +839,7 @@ def test_protocol_runner_binds_sidecar_source_changes_into_stage_identity(tmp_pa
     selection_map["source_pdb_sha256"] = "c" * 64
     bundle["map"].write_text(json.dumps(selection_map, indent=2, sort_keys=True))
     manifest = json.loads(bundle["manifest"].read_text())
+    manifest["source_pdb_sha256"] = selection_map["source_pdb_sha256"]
     manifest["artifacts"]["selection-map.json"]["sha256"] = _sha256(bundle["map"])
     manifest["scientific_metadata_sha256"] = _canonical_digest(
         manifest,
@@ -709,3 +853,31 @@ def test_protocol_runner_binds_sidecar_source_changes_into_stage_identity(tmp_pa
     assert second.error == ""
     assert second_identity != first_identity
     assert (work_dir / "selection-map.json").read_bytes() == bundle["map"].read_bytes()
+
+
+def test_protocol_runner_force_restarts_strict_bundle_without_stale_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from biolab_runners.gromacs.runner import GromacsProtocolRunner
+
+    bundle = _write_bundle(tmp_path / "bundle")
+    config = _strict_config(tmp_path, bundle)
+    first_runner = GromacsProtocolRunner(binary_prefix=["gmx"])
+    monkeypatch.setattr(first_runner, "_run_subprocess", _protocol_invoker([], []))
+    first = first_runner.run_protocol(config)
+    forced_commands: list[list[str]] = []
+    forced_runner = GromacsProtocolRunner(binary_prefix=["gmx"])
+    monkeypatch.setattr(
+        forced_runner,
+        "_run_subprocess",
+        _protocol_invoker(forced_commands, []),
+    )
+
+    forced = forced_runner.run_protocol(replace(config, force=True))
+
+    assert first.failed == 0
+    assert forced.failed == 0
+    assert forced.succeeded == 8
+    assert forced.skipped == 0
+    assert all("-cpi" not in command for command in forced_commands)
