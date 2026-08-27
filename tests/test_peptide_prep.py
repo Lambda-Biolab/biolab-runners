@@ -47,6 +47,7 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
@@ -624,6 +625,50 @@ class _SidechainOnlyDTransform:
             if name not in ("N", "CA", "C"):
                 out[name] = (x + 0.5, y, z)
         return out
+
+
+class _RecordingSidechainOnlyDTransform(_SidechainOnlyDTransform):
+    """Side-chain transform that records the callback's observable inputs."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[dict[str, tuple[float, float, float]], str, int]] = []
+
+    def __call__(
+        self,
+        mapping: dict[str, tuple[float, float, float]],
+        residue_name: str,
+        residue_index: int,
+        **kwargs: Any,
+    ) -> dict[str, tuple[float, float, float]]:
+        self.calls.append((dict(mapping), residue_name, residue_index))
+        return super().__call__(mapping, residue_name, residue_index, **kwargs)
+
+
+class _RecordingValidator:
+    """Always-valid validator that records each residue-scoped invocation."""
+
+    def __init__(self) -> None:
+        self.calls: list[
+            tuple[dict[str, tuple[float, float, float]], str, int, str, dict[str, object]]
+        ] = []
+
+    def __call__(
+        self,
+        mapping: dict[str, tuple[float, float, float]],
+        residue_name: str,
+        residue_index: int,
+        *,
+        expected: str,
+        **kwargs: object,
+    ) -> ChiralityReport:
+        self.calls.append((dict(mapping), residue_name, residue_index, expected, dict(kwargs)))
+        return ChiralityReport(
+            residue_index=residue_index,
+            residue_name=residue_name,
+            expected=expected,
+            observed=expected,
+            valid=True,
+        )
 
 
 class _BackboneMovingDTransform:
@@ -1979,6 +2024,148 @@ class TestPeptidePrepDSubs:
             chirality_validator=_AlwaysValidValidator(),
         )
         assert result.success, f"wrapped-transformer run failed: {result.error}"
+
+
+class TestPeptidePrepDesignChainScoping:
+    """D transforms and chirality validation stay on the configured chain."""
+
+    def test_d_transform_excludes_receptors_and_updates_only_design_residue(
+        self, full_complex_pdb: Path, tmp_output_dir: Path
+    ) -> None:
+        cfg = _make_linear_config(
+            str(tmp_output_dir),
+            name="full_complex_d_transform",
+            backbone_pdb=str(full_complex_pdb),
+            sequence="AA",
+            chain_id="C",
+            topology=PeptideTopologyDescriptor(d_substitutions=(_FakeDSub(1, "ALA"),)),
+            coordinate_transformer_identity="test-ct-v1",
+            chirality_validator_identity="test-cv-v1",
+        )
+        pdb = app.PDBFile(str(full_complex_pdb))
+        artifacts = SimpleNamespace(topology=pdb.topology, positions=pdb.positions)
+        before = [
+            tuple(float(component) for component in position)
+            for position in pdb.positions.value_in_unit(openmm.unit.nanometer)
+        ]
+        transformer = _RecordingSidechainOnlyDTransform()
+
+        PeptidePrepRunner()._apply_d_transform(cfg, artifacts, transformer)
+
+        after = [
+            tuple(float(component / openmm.unit.nanometer) for component in position)
+            for position in artifacts.positions
+        ]
+        assert len(transformer.calls) == 1
+        mapping, residue_name, residue_index = transformer.calls[0]
+        assert residue_name == "ALA"
+        assert residue_index == 0
+        assert mapping["N"][1] == pytest.approx(20.0, abs=1e-9)
+
+        for atom in artifacts.topology.atoms():
+            if atom.residue.chain.id in {"A", "B"}:
+                assert tuple(after[atom.index]) == pytest.approx(
+                    tuple(before[atom.index]), abs=1e-12
+                )
+
+        design_chain = next(chain for chain in artifacts.topology.chains() if chain.id == "C")
+        design_residues = list(design_chain.residues())
+        transformed_atom = next(atom for atom in design_residues[0].atoms() if atom.name == "CB")
+        untouched_atom = next(atom for atom in design_residues[1].atoms() if atom.name == "CB")
+        assert after[transformed_atom.index][0] == pytest.approx(
+            before[transformed_atom.index][0] + 0.05, abs=1e-12
+        )
+        assert tuple(after[untouched_atom.index]) == pytest.approx(
+            tuple(before[untouched_atom.index]), abs=1e-12
+        )
+
+    def test_chirality_validation_excludes_receptors_and_skips_design_glycine(
+        self, tmp_output_dir: Path
+    ) -> None:
+        glycine_complex_pdb = tmp_output_dir / "full_complex_glycine.pdb"
+        glycine_lines: list[str] = []
+        for line in _full_complex_pdb_text().splitlines():
+            if line.startswith("ATOM") and line[21] == "C" and line[22:26].strip() == "31":
+                if line[12:16].strip() == "CB":
+                    continue
+                line = f"{line[:17]}GLY{line[20:]}"
+            glycine_lines.append(line)
+        glycine_complex_pdb.write_text("\n".join(glycine_lines) + "\n")
+
+        cfg = _make_linear_config(
+            str(tmp_output_dir),
+            name="full_complex_chirality",
+            backbone_pdb=str(glycine_complex_pdb),
+            sequence="AG",
+            chain_id="C",
+            topology=PeptideTopologyDescriptor(d_substitutions=(_FakeDSub(1, "ALA"),)),
+            coordinate_transformer_identity="test-ct-v1",
+            chirality_validator_identity="test-cv-v1",
+        )
+        pdb = app.PDBFile(str(glycine_complex_pdb))
+        validator = _RecordingValidator()
+
+        reports = PeptidePrepRunner()._run_chirality_validation(
+            pdb.topology,
+            pdb.positions,
+            cfg.sequence,
+            cfg.topology,
+            validator,
+            design_chain_id=cfg.chain_id,
+            stage="pre",
+        )
+
+        assert len(reports) == 1
+        assert [(call[1], call[2], call[3]) for call in validator.calls] == [("ALA", 0, "D")]
+        assert validator.calls[0][0]["N"][1] == pytest.approx(20.0, abs=1e-9)
+        assert validator.calls[0][4] == {"stage": "pre"}
+
+    @pytest.mark.parametrize(
+        ("design_chain_id", "chain_ids", "design_residue_count", "match"),
+        [
+            ("D", ("A", "B", "C"), 2, "not found"),
+            ("C", ("A", "B", "C", "C"), 2, "ambiguous"),
+            ("C", ("A", "B", "C"), 1, "residue count must equal sequence length"),
+        ],
+    )
+    @pytest.mark.parametrize("operation", ["transform", "validate"])
+    def test_design_chain_resolution_fails_closed(
+        self,
+        design_chain_id: str,
+        chain_ids: tuple[str, ...],
+        design_residue_count: int,
+        match: str,
+        operation: str,
+        tmp_output_dir: Path,
+    ) -> None:
+        cfg = _make_linear_config(
+            str(tmp_output_dir),
+            name=f"chain_resolution_{operation}_{design_chain_id}_{design_residue_count}",
+            sequence="AA",
+            chain_id=design_chain_id,
+            topology=PeptideTopologyDescriptor(d_substitutions=(_FakeDSub(1, "ALA"),)),
+            coordinate_transformer_identity="test-ct-v1",
+            chirality_validator_identity="test-cv-v1",
+        )
+        modeller = _closure_test_modeller(
+            chain_ids=chain_ids,
+            design_residue_count=design_residue_count,
+        )
+        artifacts = SimpleNamespace(topology=modeller.topology, positions=modeller.positions)
+
+        with pytest.raises(ValueError, match=match):
+            if operation == "transform":
+                PeptidePrepRunner()._apply_d_transform(cfg, artifacts, _IdentityTransformer())
+            else:
+                PeptidePrepRunner()._run_chirality_validation(
+                    modeller.topology,
+                    modeller.positions,
+                    cfg.sequence,
+                    cfg.topology,
+                    _RecordingValidator(),
+                    design_chain_id=cfg.chain_id,
+                    stage="pre",
+                )
 
 
 # ---------------------------------------------------------------------------
