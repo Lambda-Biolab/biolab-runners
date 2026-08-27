@@ -59,7 +59,6 @@ from biolab_runners.peptide_prep.protocols import ChiralityReport
 from biolab_runners.peptide_prep.utils import (
     THREE_LETTER,
     TopologyBondRecord,
-    collect_atom_mapping,
     file_sha256,
     manifest_load,
     manifest_save,
@@ -1473,53 +1472,21 @@ class PeptidePrepRunner:
         catches it and returns a structured failure so a callback
         exception never escapes the orchestrator.
         """
-        from biolab_runners.peptide_prep.protocols import extract_coordinate_mapping
+        from biolab_runners.peptide_prep import design_chain
 
-        positions = artifacts.positions
-        atoms = list(artifacts.topology.atoms())
-        _, design_residues = _resolve_design_chain(
+        _resolve_design_chain(
             artifacts.topology,
             config.chain_id,
             expected_length=len(config.sequence),
         )
-
-        nm_positions: list[tuple[float, float, float]] = []
-        for pos in positions:
-            nm_positions.append(
-                (
-                    _to_nm(pos[0]),
-                    _to_nm(pos[1]),
-                    _to_nm(pos[2]),
-                )
-            )
-
-        for d in config.topology.d_substitutions:
-            pos_idx_raw = getattr(d, "position", None)
-            pos_idx = (pos_idx_raw - 1) if pos_idx_raw is not None else 0
-            residue_aa = getattr(d, "residue", "ALA")
-            design_residue = design_residues[pos_idx]
-            mapping = collect_atom_mapping(artifacts.topology, positions, design_residue.index)
-            _verify_d_backbone_invariance(mapping, pos_idx)
-
-            raw = transformer(mapping, residue_aa, pos_idx)
-            transformed = extract_coordinate_mapping(raw)
-            _verify_d_backbone_invariance(transformed, pos_idx, before=mapping)
-            _verify_d_mapping_complete(mapping, transformed, pos_idx)
-
-            for atom in atoms:
-                if atom.residue is not design_residue:
-                    continue
-                atom_name = atom.name
-                if atom_name not in transformed:
-                    continue
-                tx, ty, tz = transformed[atom_name]
-                nm_positions[atom.index] = (
-                    tx / 10.0,
-                    ty / 10.0,
-                    tz / 10.0,
-                )
-
-        artifacts.positions = _build_positions(artifacts.topology, nm_positions)
+        artifacts.positions = design_chain.apply_d_coordinate_transform(
+            artifacts.topology,
+            artifacts.positions,
+            config.sequence,
+            config.topology,
+            transformer,
+            design_chain_id=config.chain_id,
+        )
         return artifacts
 
     def _run_chirality_validation(
@@ -1574,35 +1541,17 @@ class PeptidePrepRunner:
         ``**kwargs`` audit hint so recording validators can
         attribute calls without inferring from call order.
         """
-        _, design_residues = _resolve_design_chain(
+        from biolab_runners.peptide_prep import design_chain
+
+        return design_chain.run_chirality_validation(
             topology,
-            design_chain_id,
-            expected_length=len(sequence),
+            positions,
+            sequence,
+            topology_descriptor,  # type: ignore[arg-type]
+            validator,
+            design_chain_id=design_chain_id,
+            stage=stage,
         )
-        # The post-hydrogenation stage runs BEFORE the D
-        # transform. Apply the descriptor's D annotations ONLY
-        # at the post-transform stages so the validator's
-        # ``expected`` value matches the geometry it actually
-        # sees.
-        apply_d_annotations = stage != "post_h"
-        reports: list[ChiralityReport] = []
-        for index, (aa, residue) in enumerate(zip(sequence, design_residues, strict=True)):
-            if aa == "G":
-                continue
-            mapping = collect_atom_mapping(topology, positions, residue.index)
-            is_d_position = apply_d_annotations and any(
-                getattr(d, "position", -1) == index + 1 for d in topology_descriptor.d_substitutions
-            )
-            expected = "D" if is_d_position else "L"
-            report = validator(
-                mapping,
-                three_letter_for(index, aa),
-                index,
-                expected=expected,
-                stage=stage,
-            )
-            reports.append(report)
-        return tuple(reports)
 
     def _closure_distances(
         self,
@@ -1924,32 +1873,16 @@ _D_BACKBONE_INVARIANT_ATOMS = ("N", "CA", "C")
 _D_TRANSFORM_BACKBONE_TOLERANCE_A = 1e-3
 
 
-def _resolve_design_chain(
+def _resolve_design_chain(  # pyright: ignore[reportUnusedFunction]
     topology: object,
     design_chain_id: str,
     *,
     expected_length: int,
 ) -> tuple[Any, list[Any]]:
     """Resolve one design chain and verify its residue count."""
-    chains = [
-        chain
-        for chain in topology.chains()  # type: ignore[attr-defined]
-        if chain.id == design_chain_id
-    ]
-    if not chains:
-        raise ValueError(f"design chain {design_chain_id!r} not found in topology")
-    if len(chains) != 1:
-        raise ValueError(
-            f"design chain {design_chain_id!r} is ambiguous in topology; "
-            f"found {len(chains)} matching chains"
-        )
-    residues = list(chains[0].residues())
-    if len(residues) != expected_length:
-        raise ValueError(
-            f"design chain {design_chain_id!r} has {len(residues)} residues but "
-            f"sequence has {expected_length}; residue count must equal sequence length"
-        )
-    return chains[0], residues
+    from biolab_runners.peptide_prep.design_chain import resolve_design_chain
+
+    return resolve_design_chain(topology, design_chain_id, expected_length=expected_length)
 
 
 def three_letter_for(index: int, one_letter: str) -> str:  # noqa: ARG001
@@ -1957,7 +1890,7 @@ def three_letter_for(index: int, one_letter: str) -> str:  # noqa: ARG001
     return THREE_LETTER[one_letter]
 
 
-def _verify_d_backbone_invariance(
+def _verify_d_backbone_invariance(  # pyright: ignore[reportUnusedFunction]
     mapping: dict[str, tuple[float, float, float]],
     residue_index: int,
     *,
@@ -1979,32 +1912,12 @@ def _verify_d_backbone_invariance(
     Raises:
         ValueError: naming the residue and the violating atom.
     """
-    from biolab_runners.peptide_prep.utils import distance
+    from biolab_runners.peptide_prep.design_chain import verify_d_backbone_invariance
 
-    backbone = {name: mapping[name] for name in _D_BACKBONE_INVARIANT_ATOMS if name in mapping}
-    if len(backbone) != len(_D_BACKBONE_INVARIANT_ATOMS):
-        missing = sorted(set(_D_BACKBONE_INVARIANT_ATOMS) - set(backbone))
-        raise ValueError(
-            f"D-coordinate transform: residue {residue_index + 1} mapping is missing "
-            f"backbone atom(s) {missing!r}; the transformer must preserve the "
-            f"full N/CA/C backbone (the D mirror reflects side chains only)"
-        )
-    if before is None:
-        return
-
-    for name in _D_BACKBONE_INVARIANT_ATOMS:
-        moved = distance(before[name], backbone[name])
-        if moved > _D_TRANSFORM_BACKBONE_TOLERANCE_A:
-            raise ValueError(
-                f"D-coordinate transform: residue {residue_index + 1} moved backbone "
-                f"atom {name!r} by {moved:.6f} Å (tolerance "
-                f"{_D_TRANSFORM_BACKBONE_TOLERANCE_A:.6f} Å). The D mirror "
-                f"reflects side-chain atoms through the N-CA-C plane; "
-                f"N/CA/C must be invariant."
-            )
+    verify_d_backbone_invariance(mapping, residue_index, before=before)
 
 
-def _verify_d_mapping_complete(
+def _verify_d_mapping_complete(  # pyright: ignore[reportUnusedFunction]
     mapping: dict[str, tuple[float, float, float]],
     transformed: dict[str, tuple[float, float, float]],
     residue_index: int,
@@ -2021,13 +1934,9 @@ def _verify_d_mapping_complete(
     Raises:
         ValueError: naming the residue and the dropped atom(s).
     """
-    missing = sorted(set(mapping) - set(transformed))
-    if missing:
-        raise ValueError(
-            f"D-coordinate transform: residue {residue_index + 1} returned mapping "
-            f"dropped atom(s) {missing!r}; the transformer must return every atom "
-            f"it was given (side chains may move, none may vanish)"
-        )
+    from biolab_runners.peptide_prep.design_chain import verify_d_mapping_complete
+
+    verify_d_mapping_complete(mapping, transformed, residue_index)
 
 
 def label_for_bond(rec: TopologyBondRecord) -> str:
@@ -2146,7 +2055,10 @@ def _disulfide_entry(entry: object) -> dict[str, Any]:
     }
 
 
-def _build_positions(topology: object, xyz_nm: list[tuple[float, float, float]]) -> object:  # noqa: ARG001
+def _build_positions(  # pyright: ignore[reportUnusedFunction]
+    topology: object,  # noqa: ARG001
+    xyz_nm: list[tuple[float, float, float]],
+) -> object:
     """Construct an OpenMM positions vector from a flat list of nm coordinates."""
     import openmm.unit as unit
 
