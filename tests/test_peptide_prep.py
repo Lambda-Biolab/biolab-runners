@@ -1095,13 +1095,13 @@ class TestPeptidePrepChainLocalClosure:
         assert atoms[head_n].residue.index == head_index
         assert atoms[tail_c].residue.chain.id == "C"
         assert atoms[head_n].residue.chain.id == "C"
-        assert (
-            sum(
-                {bond.atom1.index, bond.atom2.index} == {tail_c, head_n}
-                for bond in modeller.topology.bonds()
-            )
-            == 1
-        )
+        closure_bonds = [
+            bond
+            for bond in modeller.topology.bonds()
+            if {bond.atom1.index, bond.atom2.index} == {tail_c, head_n}
+        ]
+        assert len(closure_bonds) == 1
+        assert closure_bonds[0].type == app.Single
 
     @pytest.mark.parametrize(
         ("chain_id", "chain_ids", "match"),
@@ -1156,7 +1156,7 @@ class TestPeptidePrepChainLocalClosure:
             modeller,
             design_chain_id="C",
         )
-        chemistry.apply_chain_head_to_tail_closure(
+        tail_c, head_n = chemistry.apply_chain_head_to_tail_closure(
             modeller.topology,
             design_chain_id="C",
             app_module=app,
@@ -1168,6 +1168,13 @@ class TestPeptidePrepChainLocalClosure:
                 design_chain_id="C",
                 app_module=app,
             )
+        assert (
+            sum(
+                {bond.atom1.index, bond.atom2.index} == {tail_c, head_n}
+                for bond in modeller.topology.bonds()
+            )
+            == 1
+        )
 
 
 # ---------------------------------------------------------------------------
