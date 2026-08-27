@@ -160,6 +160,14 @@ class GromacsProtocolConfig:
         force: Re-run stages that already completed (default
             ``False``). Equivalent to ``runner.run(force=True)``
             in the legacy path.
+        prebuilt_prepared_pdb: Prepared PDB from a strict
+            ``ComplexPrepBundle`` input.
+        prebuilt_selection_map: Versioned ``selection-map.json``
+            from the same preparation bundle.
+        prebuilt_index: GROMACS ``index.ndx`` from the same
+            preparation bundle.
+        prebuilt_bundle_manifest: ``ComplexPrepBundle`` manifest
+            binding the prepared PDB/TOP/GRO and selection sidecars.
     """
 
     name: str = "gromacs-protocol"
@@ -200,6 +208,10 @@ class GromacsProtocolConfig:
     # and fails fast at construction.
     prebuilt_topology: str = ""
     prebuilt_coordinates: str = ""
+    prebuilt_prepared_pdb: str = ""
+    prebuilt_selection_map: str = ""
+    prebuilt_index: str = ""
+    prebuilt_bundle_manifest: str = ""
 
     def __post_init__(self) -> None:
         """Validate required paths and parameter ranges."""
@@ -217,6 +229,7 @@ class GromacsProtocolConfig:
         self._validate_thermodynamics()
         self._validate_replicas()
         self._validate_prebuilt()
+        self._validate_selection_sidecars()
 
     def _validate_paths(self) -> None:
         """Validate the path-bearing required fields.
@@ -263,6 +276,27 @@ class GromacsProtocolConfig:
                 "or both be empty; got "
                 f"prebuilt_topology={self.prebuilt_topology!r}, "
                 f"prebuilt_coordinates={self.prebuilt_coordinates!r}"
+            )
+
+    def _validate_selection_sidecars(self) -> None:
+        """Require strict BR-C4 sidecars as one complete optional bundle."""
+        sidecars = (
+            self.prebuilt_prepared_pdb,
+            self.prebuilt_selection_map,
+            self.prebuilt_index,
+            self.prebuilt_bundle_manifest,
+        )
+        if not any(sidecars):
+            return
+        if not (self.prebuilt_topology and self.prebuilt_coordinates):
+            raise ValueError(
+                "selection sidecar bundle requires prebuilt_topology and prebuilt_coordinates"
+            )
+        if not all(sidecars):
+            raise ValueError(
+                "selection sidecar bundle fields must all be set or all be empty: "
+                "prebuilt_prepared_pdb, prebuilt_selection_map, prebuilt_index, "
+                "prebuilt_bundle_manifest"
             )
 
     def _validate_geometry(self) -> None:
