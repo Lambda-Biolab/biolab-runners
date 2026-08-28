@@ -379,7 +379,7 @@ def _validate_interface_mapping(
     atom_count: int,
 ) -> None:
     pdb_chains = _pdb_chain_groups(pdb_atoms)
-    if tuple(pdb_chains) != _FULL_COMPLEX_CHAINS:
+    if set(pdb_chains) != set(_FULL_COMPLEX_CHAINS):
         raise ValueError("prepared.pdb must contain exactly explicit chains A, B, and C")
     if sum(len(values) for values in pdb_chains.values()) != atom_count:
         raise ValueError("prepared.pdb atom count differs from prepared.gro")
