@@ -456,10 +456,15 @@ def _validate_full_complex_chain_audits(
     if not isinstance(audits, list) or len(audits) != len(_FULL_COMPLEX_CHAINS):
         raise ValueError("selection map chain_audits must describe explicit A, B, and C chains")
     for audit, chain_id in zip(audits, _FULL_COMPLEX_CHAINS, strict=True):
-        _validate_chain_audit(audit, chain_id, pdb_atoms)
+        _validate_chain_audit(audit, chain_id, pdb_atoms, selection_map)
 
 
-def _validate_chain_audit(audit: object, chain_id: str, pdb_atoms: list[_PdbAtom]) -> None:
+def _validate_chain_audit(
+    audit: object,
+    chain_id: str,
+    pdb_atoms: list[_PdbAtom],
+    selection_map: dict[str, Any],
+) -> None:
     if not isinstance(audit, dict) or set(audit) != _CHAIN_AUDIT_FIELDS:
         raise ValueError("selection map chain_audits are malformed")
     expected_role = "design" if chain_id == "C" else "receptor"
@@ -469,11 +474,29 @@ def _validate_chain_audit(audit: object, chain_id: str, pdb_atoms: list[_PdbAtom
         type(audit[field]) is not int or audit[field] < 1 for field in _CHAIN_AUDIT_COUNT_FIELDS
     ):
         raise ValueError("selection map chain_audits contain invalid counts")
+    if audit["source_residue_count"] != audit["prepared_residue_count"]:
+        raise ValueError("selection map source and prepared residue audits differ")
     chain_atoms = [atom for atom in pdb_atoms if atom.chain_id == chain_id]
+    if audit["source_atom_count"] != _source_chain_atom_count(selection_map, chain_id):
+        raise ValueError("selection map source chain audit differs from source atom mapping")
     if audit["prepared_atom_count"] != len(chain_atoms):
         raise ValueError("selection map prepared chain audit differs from prepared.pdb")
     if audit["prepared_residue_count"] != len({atom.residue_key for atom in chain_atoms}):
         raise ValueError("selection map prepared residue audit differs from prepared.pdb")
+
+
+def _source_chain_atom_count(selection_map: dict[str, Any], chain_id: str) -> int:
+    count = 0
+    for field in ("source_to_prepared_atoms", "dropped_atoms"):
+        records = selection_map.get(field)
+        if not isinstance(records, list):
+            raise ValueError(f"selection map {field} is malformed")
+        for record in records:
+            identity = record.get("source") if field == "source_to_prepared_atoms" else record
+            if not isinstance(identity, dict):
+                raise ValueError(f"selection map {field} is malformed")
+            count += identity.get("chain_id") == chain_id
+    return count
 
 
 def _parse_pdb_atoms(path: Path) -> list[_PdbAtom]:
