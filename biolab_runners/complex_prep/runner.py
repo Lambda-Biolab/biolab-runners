@@ -1027,14 +1027,16 @@ def _selection_groups(topology: object) -> dict[str, list[int]]:
     for atom in topology.atoms():  # type: ignore[attr-defined]
         if atom.residue.chain.id in RECEPTOR_CHAIN_IDS:
             groups["receptor_ab"].append(atom.index + 1)
-            groups["dimer_ab"].append(atom.index + 1)
         elif atom.residue.chain.id == DESIGN_CHAIN_ID:
             groups["design_c"].append(atom.index + 1)
         else:
             raise ValueError(f"unexpected chain {atom.residue.chain.id!r} in index groups")
+    groups["dimer_ab"] = list(groups["receptor_ab"])
     for group in groups.values():
         if group != sorted(set(group)) or not group:
             raise ValueError("index group is not ascending and unique")
+    if groups["receptor_ab"] != groups["dimer_ab"]:
+        raise ValueError("receptor_ab and dimer_ab selections differ")
     return groups
 
 
@@ -1109,6 +1111,7 @@ def _build_selection_map(
             for key in sorted(set(source_residues) - set(prepared_residues))
         ],
         "selections": _selection_groups(state.topology),
+        "interface_mapping": _interface_mapping(state.topology),
         "chain_audits": [audit.to_dict() for audit in state.chain_audits],
         "residue_audits": [audit.to_dict() for audit in state.residue_audits],
         "solvent_ion_boundaries": {"solvent": "not_staged", "ions": "not_staged"},
@@ -1867,6 +1870,7 @@ def _validate_selection_map(
     )
     if data.get("selections") != _selection_groups(prepared_topology):
         raise ValueError("selection map groups differ from prepared topology roles")
+    _validate_interface_mapping(data, prepared_topology)
     source_atoms = _atom_records(source_topology, source_positions)
     prepared_atoms = _atom_records(prepared_topology, prepared_positions)
     _validate_atom_mapping(data, source_atoms, prepared_atoms)
@@ -2201,6 +2205,71 @@ def _validate_index_groups(groups: object, index_path: Path, atom_count: int) ->
             raise ValueError("index.ndx contains duplicate or out-of-range atom indices")
     if parsed["receptor_ab"] != parsed["dimer_ab"]:
         raise ValueError("receptor_ab and dimer_ab selections differ")
+
+
+def _interface_mapping(topology: object) -> dict[str, list[int]]:
+    mapping = {name: [] for name in ("receptor_a", "receptor_b", "dimer_ab", "design_c")}
+    for atom in topology.atoms():  # type: ignore[attr-defined]
+        chain_id = atom.residue.chain.id
+        atom_index = atom.index + 1
+        if chain_id == RECEPTOR_CHAIN_IDS[0]:
+            mapping["receptor_a"].append(atom_index)
+        elif chain_id == RECEPTOR_CHAIN_IDS[1]:
+            mapping["receptor_b"].append(atom_index)
+        elif chain_id == DESIGN_CHAIN_ID:
+            mapping["design_c"].append(atom_index)
+        else:
+            raise ValueError(f"unexpected chain {chain_id!r} in interface mapping")
+    mapping["dimer_ab"] = sorted(mapping["receptor_a"] + mapping["receptor_b"])
+    _validate_interface_mapping_values(mapping)
+    return mapping
+
+
+def _validate_interface_mapping(data: dict[str, Any], prepared_topology: object) -> None:
+    atom_count = prepared_topology.getNumAtoms()  # type: ignore[attr-defined]
+    mapping = _normalized_interface_mapping(data.get("interface_mapping"), atom_count)
+    expected = _interface_mapping(prepared_topology)
+    if mapping != expected:
+        raise ValueError("interface mapping differs from prepared topology chain roles")
+    selections = data.get("selections")
+    if not isinstance(selections, dict):
+        raise ValueError("selection map selections are malformed")
+    if mapping["dimer_ab"] != selections.get("receptor_ab") or mapping["dimer_ab"] != (
+        selections.get("dimer_ab")
+    ):
+        raise ValueError("interface mapping dimer_ab differs from receptor selections")
+    if mapping["design_c"] != selections.get("design_c"):
+        raise ValueError("interface mapping design_c differs from design selection")
+
+
+def _normalized_interface_mapping(value: object, atom_count: int) -> dict[str, list[int]]:
+    names = ("receptor_a", "receptor_b", "dimer_ab", "design_c")
+    if not isinstance(value, dict) or set(value) != set(names):
+        raise ValueError("selection map interface_mapping groups are malformed")
+    return {name: _validated_interface_group(value.get(name), name, atom_count) for name in names}
+
+
+def _validated_interface_group(value: object, name: str, atom_count: int) -> list[int]:
+    if not isinstance(value, list):
+        raise ValueError(f"interface mapping {name} must be a list")
+    if not value or any(not _valid_index(item, atom_count) for item in value):
+        raise ValueError(f"interface mapping {name} contains an invalid atom index")
+    if value != sorted(set(value)):
+        raise ValueError(f"interface mapping {name} must be sorted and unique")
+    return list(value)
+
+
+def _validate_interface_mapping_values(mapping: dict[str, list[int]]) -> None:
+    receptor_a = mapping["receptor_a"]
+    receptor_b = mapping["receptor_b"]
+    dimer_ab = mapping["dimer_ab"]
+    design_c = mapping["design_c"]
+    if set(receptor_a) & set(receptor_b):
+        raise ValueError("interface mapping receptor_a and receptor_b overlap")
+    if dimer_ab != sorted(receptor_a + receptor_b):
+        raise ValueError("interface mapping dimer_ab is not the sorted A+B union")
+    if set(dimer_ab) & set(design_c):
+        raise ValueError("interface mapping receptor dimer overlaps design C")
 
 
 def _parse_index(path: Path) -> dict[str, list[int]]:

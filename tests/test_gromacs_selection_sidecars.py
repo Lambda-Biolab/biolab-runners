@@ -52,10 +52,15 @@ def _write_bundle(tmp_path: Path) -> dict[str, Path]:
     selection_map = tmp_path / "selection-map.json"
     manifest = tmp_path / "manifest.json"
 
-    prepared_pdb.write_text("ATOM      1  N   ALA A   1\nATOM      2  CA  GLY C   1\nEND\n")
+    prepared_pdb.write_text(
+        "ATOM      1  N   ALA A   1\nATOM      2  CA  GLY B   1\nATOM      3  CA  GLY C   1\nEND\n"
+    )
     prepared_top.write_text("; prepared topology\n")
-    _write_gro(prepared_gro, [(1, "ALA", "N", 1), (2, "GLY", "CA", 2)])
-    index.write_text("[ receptor_ab ]\n1\n[ design_c ]\n2\n[ dimer_ab ]\n1\n")
+    _write_gro(
+        prepared_gro,
+        [(1, "ALA", "N", 1), (1, "GLY", "CA", 2), (1, "GLY", "CA", 3)],
+    )
+    index.write_text("[ receptor_ab ]\n1 2\n[ design_c ]\n3\n[ dimer_ab ]\n1 2\n")
 
     index_digest = _sha256(index)
     prepared_digests = {
@@ -102,6 +107,28 @@ def _write_bundle(tmp_path: Path) -> dict[str, Path]:
             },
             {
                 "source": {
+                    "chain_id": "B",
+                    "residue_number": 1,
+                    "insertion_code": "",
+                    "atom_name": "CA",
+                    "element": "C",
+                },
+                "prepared": {
+                    "chain_id": "B",
+                    "residue_number": 1,
+                    "insertion_code": "",
+                    "atom_name": "CA",
+                    "element": "C",
+                },
+                "source_pdb_atom_index": 2,
+                "source_pdb_residue_index": 1,
+                "prepared_pdb_atom_index": 2,
+                "prepared_pdb_residue_index": 1,
+                "prepared_topology_atom_index": 2,
+                "prepared_topology_residue_index": 1,
+            },
+            {
+                "source": {
                     "chain_id": "C",
                     "residue_number": 1,
                     "insertion_code": "",
@@ -115,12 +142,12 @@ def _write_bundle(tmp_path: Path) -> dict[str, Path]:
                     "atom_name": "CA",
                     "element": "C",
                 },
-                "source_pdb_atom_index": 2,
-                "source_pdb_residue_index": 2,
-                "prepared_pdb_atom_index": 2,
-                "prepared_pdb_residue_index": 2,
-                "prepared_topology_atom_index": 2,
-                "prepared_topology_residue_index": 2,
+                "source_pdb_atom_index": 3,
+                "source_pdb_residue_index": 1,
+                "prepared_pdb_atom_index": 3,
+                "prepared_pdb_residue_index": 1,
+                "prepared_topology_atom_index": 3,
+                "prepared_topology_residue_index": 1,
             },
         ],
         "added_atoms": [],
@@ -128,8 +155,39 @@ def _write_bundle(tmp_path: Path) -> dict[str, Path]:
         "source_to_prepared_residues": [],
         "added_residues": [],
         "dropped_residues": [],
-        "selections": {"receptor_ab": [1], "design_c": [2], "dimer_ab": [1]},
-        "chain_audits": [],
+        "selections": {"receptor_ab": [1, 2], "design_c": [3], "dimer_ab": [1, 2]},
+        "interface_mapping": {
+            "receptor_a": [1],
+            "receptor_b": [2],
+            "dimer_ab": [1, 2],
+            "design_c": [3],
+        },
+        "chain_audits": [
+            {
+                "chain_id": "A",
+                "role": "receptor",
+                "source_residue_count": 1,
+                "prepared_residue_count": 1,
+                "source_atom_count": 1,
+                "prepared_atom_count": 1,
+            },
+            {
+                "chain_id": "B",
+                "role": "receptor",
+                "source_residue_count": 1,
+                "prepared_residue_count": 1,
+                "source_atom_count": 1,
+                "prepared_atom_count": 1,
+            },
+            {
+                "chain_id": "C",
+                "role": "design",
+                "source_residue_count": 1,
+                "prepared_residue_count": 1,
+                "source_atom_count": 1,
+                "prepared_atom_count": 1,
+            },
+        ],
         "residue_audits": [],
         "solvent_ion_boundaries": {"solvent": "not_staged", "ions": "not_staged"},
     }
@@ -145,11 +203,14 @@ def _write_bundle(tmp_path: Path) -> dict[str, Path]:
         "runner": "complex_prep",
         "preparation_digest": map_payload["preparation_digest"],
         "source_pdb_sha256": map_payload["source_pdb_sha256"],
+        "chain_roles": {"receptor": ["A", "B"], "design": "C"},
+        "chain_audits": map_payload["chain_audits"],
+        "residue_audits": map_payload["residue_audits"],
         "artifacts": {
             name: {"path": str(tmp_path / name), "sha256": digest}
             for name, digest in artifacts.items()
         },
-        "atom_count": 2,
+        "atom_count": 3,
     }
     manifest_payload["scientific_metadata_sha256"] = _canonical_digest(
         manifest_payload, excluded="scientific_metadata_sha256"
@@ -185,6 +246,8 @@ def _rebind_bundle(bundle: dict[str, Path]) -> None:
     ):
         manifest["artifacts"][name]["sha256"] = _sha256(bundle[key])
     manifest["atom_count"] = int(bundle["gro"].read_text().splitlines()[1])
+    manifest["chain_audits"] = selection_map["chain_audits"]
+    manifest["residue_audits"] = selection_map["residue_audits"]
     manifest["scientific_metadata_sha256"] = _canonical_digest(
         manifest, excluded="scientific_metadata_sha256"
     )
@@ -210,24 +273,29 @@ def _protocol_invoker(
 ) -> Callable[[list[str], Path, int], int]:
     solvent_atoms = [
         (1, "ALA", "N", 1),
-        (2, "GLY", "CA", 2),
-        (3, "SOL", "OW", 3),
-        (3, "SOL", "HW1", 4),
-        (3, "SOL", "HW2", 5),
+        (1, "GLY", "CA", 2),
+        (1, "GLY", "CA", 3),
+        (2, "SOL", "OW", 4),
+        (2, "SOL", "HW1", 5),
+        (2, "SOL", "HW2", 6),
     ]
     ionized_atoms = [
         (1, "ALA", "N", 1),
-        (2, "GLY", "CA", 2),
-        (3, "SOL", "OW", 3),
-        (4, "NA", "NA", 4),
-        (5, "CL", "CL", 5),
+        (1, "GLY", "CA", 2),
+        (1, "GLY", "CA", 3),
+        (2, "SOL", "OW", 4),
+        (3, "NA", "NA", 5),
+        (4, "CL", "CL", 6),
     ]
 
     def _invoke(command: list[str], work_dir: Path, _timeout: int) -> int:
         commands.append(command)
         subcommand = command[1]
         if subcommand == "editconf":
-            _write_gro(work_dir / "boxed.gro", [(1, "ALA", "N", 1), (2, "GLY", "CA", 2)])
+            _write_gro(
+                work_dir / "boxed.gro",
+                [(1, "ALA", "N", 1), (1, "GLY", "CA", 2), (1, "GLY", "CA", 3)],
+            )
         elif subcommand == "solvate":
             _write_gro(work_dir / "solvated.gro", solvent_atoms)
             (work_dir / "topol.top").write_text("; topology with solvent\n")
@@ -324,6 +392,38 @@ def test_stage_selection_sidecars_copies_and_binds_complete_bundle(tmp_path: Pat
     assert identity["index_sha256"] == _sha256(bundle["index"])
 
 
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda mapping: mapping.pop("receptor_b"), "exactly receptor_a"),
+        (lambda mapping: mapping["receptor_a"].__setitem__(0, 0), "out-of-range"),
+        (lambda mapping: mapping["receptor_b"].__setitem__(0, 1), "overlap"),
+        (
+            lambda mapping: mapping.update({"receptor_a": [2], "receptor_b": [1]}),
+            "explicit chain A",
+        ),
+        (lambda mapping: mapping["dimer_ab"].pop(), r"sorted A\+B union"),
+        (lambda mapping: mapping["design_c"].__setitem__(0, 1), "overlaps design C"),
+    ],
+    ids=("missing", "zero-based", "overlap", "wrong-chain", "wrong-union", "wrong-design"),
+)
+def test_stage_selection_sidecars_rejects_invalid_interface_mapping(
+    tmp_path: Path,
+    mutation: Callable[[dict[str, list[int]]], object],
+    message: str,
+) -> None:
+    from biolab_runners.gromacs.selection_sidecars import stage_selection_sidecars
+
+    bundle = _write_bundle(tmp_path / "bundle")
+    selection_map = json.loads(bundle["map"].read_text())
+    mutation(selection_map["interface_mapping"])
+    bundle["map"].write_text(json.dumps(selection_map, indent=2, sort_keys=True))
+    _rebind_bundle(bundle)
+
+    with pytest.raises(ValueError, match=message):
+        stage_selection_sidecars(_strict_config(tmp_path, bundle), tmp_path / "work")
+
+
 def test_stage_selection_sidecars_accepts_preparation_added_atoms(tmp_path: Path) -> None:
     from biolab_runners.gromacs.selection_sidecars import (
         refresh_selection_sidecars,
@@ -333,7 +433,19 @@ def test_stage_selection_sidecars_accepts_preparation_added_atoms(tmp_path: Path
     bundle = _write_bundle(tmp_path / "bundle")
     _write_gro(
         bundle["gro"],
-        [(1, "ALA", "N", 1), (2, "GLY", "CA", 2), (2, "GLY", "H", 3)],
+        [
+            (1, "ALA", "N", 1),
+            (1, "GLY", "CA", 2),
+            (1, "GLY", "CA", 3),
+            (1, "GLY", "H", 4),
+        ],
+    )
+    bundle["pdb"].write_text(
+        "ATOM      1  N   ALA A   1\n"
+        "ATOM      2  CA  GLY B   1\n"
+        "ATOM      3  CA  GLY C   1\n"
+        "ATOM      4  H   GLY C   1\n"
+        "END\n"
     )
     selection_map = json.loads(bundle["map"].read_text())
     selection_map["added_atoms"] = [
@@ -343,15 +455,17 @@ def test_stage_selection_sidecars_accepts_preparation_added_atoms(tmp_path: Path
             "insertion_code": "",
             "atom_name": "H",
             "element": "H",
-            "prepared_pdb_atom_index": 3,
-            "prepared_pdb_residue_index": 2,
-            "prepared_topology_atom_index": 3,
-            "prepared_topology_residue_index": 2,
+            "prepared_pdb_atom_index": 4,
+            "prepared_pdb_residue_index": 1,
+            "prepared_topology_atom_index": 4,
+            "prepared_topology_residue_index": 1,
         }
     ]
-    selection_map["selections"]["design_c"] = [2, 3]
+    selection_map["selections"]["design_c"] = [3, 4]
+    selection_map["interface_mapping"]["design_c"] = [3, 4]
+    selection_map["chain_audits"][2]["prepared_atom_count"] = 2
     bundle["map"].write_text(json.dumps(selection_map, indent=2, sort_keys=True))
-    bundle["index"].write_text("[ receptor_ab ]\n1\n[ design_c ]\n2 3\n[ dimer_ab ]\n1\n")
+    bundle["index"].write_text("[ receptor_ab ]\n1 2\n[ design_c ]\n3 4\n[ dimer_ab ]\n1 2\n")
     _rebind_bundle(bundle)
     work_dir = tmp_path / "work"
 
@@ -364,8 +478,8 @@ def test_stage_selection_sidecars_accepts_preparation_added_atoms(tmp_path: Path
     )
 
     final_map = json.loads((work_dir / "selection-map.json").read_text())
-    assert final_map["added_atoms"][0]["final_topology_atom_index"] == 3
-    assert final_map["added_atoms"][0]["final_topology_residue_index"] == 2
+    assert final_map["added_atoms"][0]["final_topology_atom_index"] == 4
+    assert final_map["added_atoms"][0]["final_topology_residue_index"] == 1
 
 
 def test_validate_staged_sidecars_refuses_modified_prepared_bundle_file(tmp_path: Path) -> None:
@@ -413,10 +527,11 @@ def test_refresh_sidecars_after_solvation_binds_final_topology_and_coordinates(
         coordinates,
         [
             (1, "ALA", "N", 1),
-            (2, "GLY", "CA", 2),
-            (3, "SOL", "OW", 3),
-            (3, "SOL", "HW1", 4),
-            (3, "SOL", "HW2", 5),
+            (1, "GLY", "CA", 2),
+            (1, "GLY", "CA", 3),
+            (2, "SOL", "OW", 4),
+            (2, "SOL", "HW1", 5),
+            (2, "SOL", "HW2", 6),
         ],
     )
 
@@ -430,18 +545,18 @@ def test_refresh_sidecars_after_solvation_binds_final_topology_and_coordinates(
 
     assert final_map["schema_version"] == 2
     assert final_map["selections"] == {
-        "receptor_ab": [1],
-        "design_c": [2],
-        "dimer_ab": [1],
+        "receptor_ab": [1, 2],
+        "design_c": [3],
+        "dimer_ab": [1, 2],
     }
     assert final_map["gromacs_state"]["topology_sha256"] == _sha256(topology)
     assert final_map["gromacs_state"]["coordinates_sha256"] == _sha256(coordinates)
-    assert final_map["solvent_ion_boundaries"]["solute_atom_count"] == 2
-    assert final_map["solvent_ion_boundaries"]["solvent_atom_indices"] == [3, 4, 5]
+    assert final_map["solvent_ion_boundaries"]["solute_atom_count"] == 3
+    assert final_map["solvent_ion_boundaries"]["solvent_atom_indices"] == [4, 5, 6]
     assert final_map["solvent_ion_boundaries"]["ion_atom_indices"] == []
     assert identity["selection_map_sha256"] == _sha256(work_dir / "selection-map.json")
     assert (work_dir / "index.ndx").read_text() == (
-        "[ receptor_ab ]\n1\n[ design_c ]\n2\n[ dimer_ab ]\n1\n"
+        "[ receptor_ab ]\n1 2\n[ design_c ]\n3\n[ dimer_ab ]\n1 2\n"
     )
 
 
@@ -462,10 +577,11 @@ def test_refresh_sidecars_after_ions_records_ion_indices(tmp_path: Path) -> None
         coordinates,
         [
             (1, "ALA", "N", 1),
-            (2, "GLY", "CA", 2),
-            (3, "SOL", "OW", 3),
-            (4, "NA", "NA", 4),
-            (5, "CL", "CL", 5),
+            (1, "GLY", "CA", 2),
+            (1, "GLY", "CA", 3),
+            (2, "SOL", "OW", 4),
+            (3, "NA", "NA", 5),
+            (4, "CL", "CL", 6),
         ],
     )
 
@@ -477,10 +593,10 @@ def test_refresh_sidecars_after_ions_records_ion_indices(tmp_path: Path) -> None
     )
     final_map = json.loads((work_dir / "selection-map.json").read_text())
 
-    assert final_map["solvent_ion_boundaries"]["solvent_atom_indices"] == [3]
-    assert final_map["solvent_ion_boundaries"]["ion_atom_indices"] == [4, 5]
+    assert final_map["solvent_ion_boundaries"]["solvent_atom_indices"] == [4]
+    assert final_map["solvent_ion_boundaries"]["ion_atom_indices"] == [5, 6]
     mapped = final_map["source_to_prepared_atoms"]
-    assert [entry["prepared_topology_atom_index"] for entry in mapped] == [1, 2]
+    assert [entry["prepared_topology_atom_index"] for entry in mapped] == [1, 2, 3]
 
 
 def test_validate_final_sidecars_refuses_modified_prepared_provenance(tmp_path: Path) -> None:
@@ -522,7 +638,10 @@ def test_refresh_sidecars_rejects_changed_solute_atom_identity(tmp_path: Path) -
     topology = work_dir / "topol.top"
     topology.write_text("; topology\n")
     coordinates = work_dir / "solvated.gro"
-    _write_gro(coordinates, [(1, "ALA", "CA", 1), (2, "GLY", "CA", 2)])
+    _write_gro(
+        coordinates,
+        [(1, "ALA", "CA", 1), (1, "GLY", "CA", 2), (1, "GLY", "CA", 3)],
+    )
 
     with pytest.raises(ValueError, match="solute atom identity mismatch"):
         refresh_selection_sidecars(
@@ -661,10 +780,32 @@ def test_protocol_runner_refreshes_strict_sidecars_through_every_state_transitio
     assert final_map["gromacs_state"]["stage"] == "production"
     assert final_map["gromacs_state"]["checkpoint_file"] == "prod.cpt"
     assert final_map["gromacs_state"]["checkpoint_sha256"] == _sha256(work_dir / "prod.cpt")
-    assert final_map["solvent_ion_boundaries"]["solvent_atom_indices"] == [3]
-    assert final_map["solvent_ion_boundaries"]["ion_atom_indices"] == [4, 5]
+    assert final_map["solvent_ion_boundaries"]["solvent_atom_indices"] == [4]
+    assert final_map["solvent_ion_boundaries"]["ion_atom_indices"] == [5, 6]
     assert len(manifest["stages"]["topology"]["protocol_identity"]) == 64
     assert any(command[1] == "mdrun" for command in commands)
+
+
+def test_protocol_runner_refuses_invalid_interface_before_subprocess(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from biolab_runners.gromacs.runner import GromacsProtocolRunner
+
+    bundle = _write_bundle(tmp_path / "bundle")
+    selection_map = json.loads(bundle["map"].read_text())
+    selection_map["interface_mapping"]["receptor_b"] = [1]
+    bundle["map"].write_text(json.dumps(selection_map, indent=2, sort_keys=True))
+    _rebind_bundle(bundle)
+    commands: list[list[str]] = []
+    runner = GromacsProtocolRunner(binary_prefix=["gmx"])
+    monkeypatch.setattr(runner, "_run_subprocess", _protocol_invoker(commands, []))
+
+    result = runner.run_protocol(_strict_config(tmp_path, bundle))
+
+    assert result.failed == 1
+    assert "selection sidecar staging failed" in result.error
+    assert commands == []
 
 
 def test_protocol_runner_binds_interruption_and_resumes_only_exact_checkpoint(

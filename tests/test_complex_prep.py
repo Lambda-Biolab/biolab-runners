@@ -520,10 +520,40 @@ def test_selection_map_and_index_round_trip_exactly(source_pdb: Path, tmp_path: 
     assert tuple(parsed) == ("receptor_ab", "design_c", "dimer_ab")
     assert parsed == data["selections"]
     assert parsed["receptor_ab"] == parsed["dimer_ab"]
+    receptor_a_count = data["chain_audits"][0]["prepared_atom_count"]
+    receptor_b_count = data["chain_audits"][1]["prepared_atom_count"]
+    dimer_count = receptor_a_count + receptor_b_count
+    assert receptor_a_count != receptor_b_count
+    assert data["interface_mapping"] == {
+        "receptor_a": list(range(1, receptor_a_count + 1)),
+        "receptor_b": list(range(receptor_a_count + 1, dimer_count + 1)),
+        "dimer_ab": list(range(1, dimer_count + 1)),
+        "design_c": list(range(dimer_count + 1, result.bundle.atom_count + 1)),
+    }
+    assert set(data["interface_mapping"]["dimer_ab"]).isdisjoint(
+        data["interface_mapping"]["design_c"]
+    )
     assert data["index_bases"]["prepared_topology_atom"] == 1
     assert data["solvent_ion_boundaries"] == {"ions": "not_staged", "solvent": "not_staged"}
     assert data["preparation_digest"] == result.preparation_digest
     assert data["added_atoms"]
+
+
+def test_cache_rejects_changed_interface_mapping(source_pdb: Path, tmp_path: Path) -> None:
+    output_dir = tmp_path / "interface-map-tampered"
+    config = _config(source_pdb, output_dir)
+    first = ComplexPrepRunner().run(config)
+    assert first.success
+
+    def mutate(data: dict[str, Any]) -> None:
+        data["interface_mapping"]["receptor_a"].pop()
+
+    _rewrite_map_and_manifest(output_dir, mutate)
+
+    result = ComplexPrepRunner().run(config)
+
+    assert result.status is ExecutionStatus.FAILED
+    assert "interface mapping" in result.error
 
 
 def test_c_local_disulfide_maps_descriptor_positions_to_global_topology(

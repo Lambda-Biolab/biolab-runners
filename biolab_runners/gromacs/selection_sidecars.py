@@ -22,6 +22,22 @@ INDEX = "index.ndx"
 BUNDLE_MANIFEST = "complex-prep-manifest.json"
 
 _GROUP_ORDER = ("receptor_ab", "design_c", "dimer_ab")
+_INTERFACE_GROUP_ORDER = ("receptor_a", "receptor_b", "dimer_ab", "design_c")
+_FULL_COMPLEX_CHAINS = ("A", "B", "C")
+_CHAIN_AUDIT_FIELDS: set[str] = {
+    "chain_id",
+    "role",
+    "source_residue_count",
+    "prepared_residue_count",
+    "source_atom_count",
+    "prepared_atom_count",
+}
+_CHAIN_AUDIT_COUNT_FIELDS = (
+    "source_residue_count",
+    "prepared_residue_count",
+    "source_atom_count",
+    "prepared_atom_count",
+)
 _MANIFEST_DIGEST_FIELD = "scientific_metadata_sha256"
 _SOLVENT_RESIDUES = frozenset({"SOL", "HOH", "WAT", "TIP3", "TIP3P", "SPC", "SPCE"})
 _ION_RESIDUES = frozenset({"NA", "CL", "K", "MG", "ZN"})
@@ -39,6 +55,12 @@ class _GroAtom:
 
     def identity(self) -> tuple[int, str, str, int]:
         return (self.residue_number, self.residue_name, self.atom_name, self.atom_number)
+
+
+@dataclass(frozen=True)
+class _PdbAtom:
+    chain_id: str
+    residue_key: tuple[int, str]
 
 
 def strict_sidecars_requested(config: GromacsProtocolConfig) -> bool:
@@ -246,6 +268,7 @@ def _validate_bundle_sources(
         sources[INDEX],
         _sha256(sources[INDEX]),
         atom_count=len(atoms),
+        prepared_pdb_path=sources[PREPARED_PDB],
     )
     if type(manifest.get("atom_count")) is not int or manifest["atom_count"] != len(atoms):
         raise ValueError("prepared.gro atom count mismatches complex-prep manifest")
@@ -256,6 +279,7 @@ def _validate_bundle_bindings(
     manifest: dict[str, Any],
     selection_map: dict[str, Any],
 ) -> None:
+    _validate_manifest_chain_identity(manifest, selection_map)
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, dict):
         raise ValueError("complex-prep manifest artifacts must be an object")
@@ -276,6 +300,17 @@ def _validate_bundle_bindings(
     for name in (PREPARED_PDB, "prepared.top", "prepared.gro"):
         if prepared.get(name) != _sha256(sources[name]):
             raise ValueError(f"selection-map {name} digest mismatch")
+
+
+def _validate_manifest_chain_identity(
+    manifest: dict[str, Any], selection_map: dict[str, Any]
+) -> None:
+    if manifest.get("chain_roles") != {"receptor": ["A", "B"], "design": "C"}:
+        raise ValueError("complex-prep manifest chain roles are not the explicit A+B+C contract")
+    if manifest.get("chain_audits") != selection_map.get("chain_audits"):
+        raise ValueError("complex-prep manifest chain audits differ from selection-map audits")
+    if manifest.get("residue_audits") != selection_map.get("residue_audits"):
+        raise ValueError("complex-prep manifest residue audits differ from selection-map audits")
 
 
 def _validate_manifest(manifest: dict[str, Any]) -> None:
@@ -299,6 +334,7 @@ def _validate_map_and_index(
     index_digest: str,
     *,
     atom_count: int,
+    prepared_pdb_path: Path,
 ) -> None:
     if type(selection_map.get("schema_version")) is not int or selection_map["schema_version"] != 1:
         raise ValueError("prepared selection-map.json schema_version must be 1")
@@ -329,6 +365,164 @@ def _validate_map_and_index(
         raise ValueError("selection-map atom index exceeds prepared atom count")
     _validate_prepared_atom_partition(selection_map, atom_count)
     _validate_prepared_residue_records(selection_map)
+    _validate_interface_mapping(
+        selection_map,
+        _parse_pdb_atoms(prepared_pdb_path),
+        atom_count=atom_count,
+    )
+
+
+def _validate_interface_mapping(
+    selection_map: dict[str, Any],
+    pdb_atoms: list[_PdbAtom],
+    *,
+    atom_count: int,
+) -> None:
+    pdb_chains = _pdb_chain_groups(pdb_atoms)
+    if set(pdb_chains) != set(_FULL_COMPLEX_CHAINS):
+        raise ValueError("prepared.pdb must contain exactly explicit chains A, B, and C")
+    if sum(len(values) for values in pdb_chains.values()) != atom_count:
+        raise ValueError("prepared.pdb atom count differs from prepared.gro")
+    mapping = _normalized_interface_mapping(selection_map.get("interface_mapping"), atom_count)
+    _validate_interface_partition(mapping)
+    _validate_interface_selections(mapping, selection_map)
+    _validate_interface_chain_bindings(mapping, pdb_chains)
+    _validate_full_complex_chain_audits(selection_map, pdb_atoms)
+
+
+def _normalized_interface_mapping(value: object, atom_count: int) -> dict[str, list[int]]:
+    if not isinstance(value, dict) or set(value) != set(_INTERFACE_GROUP_ORDER):
+        raise ValueError(
+            "selection map interface_mapping must contain exactly "
+            "receptor_a, receptor_b, dimer_ab, design_c"
+        )
+    return {
+        name: _validated_interface_group(value.get(name), name, atom_count)
+        for name in _INTERFACE_GROUP_ORDER
+    }
+
+
+def _validated_interface_group(value: object, name: str, atom_count: int) -> list[int]:
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"interface mapping {name} must be a non-empty list")
+    if any(type(item) is not int or not 1 <= item <= atom_count for item in value):
+        raise ValueError(f"interface mapping {name} contains an out-of-range atom index")
+    if value != sorted(set(value)):
+        raise ValueError(f"interface mapping {name} must be sorted and unique")
+    return list(value)
+
+
+def _validate_interface_selections(
+    mapping: dict[str, list[int]], selection_map: dict[str, Any]
+) -> None:
+    selections = selection_map.get("selections")
+    if not isinstance(selections, dict):
+        raise ValueError("selection map selections are malformed")
+    if mapping["dimer_ab"] != selections.get("receptor_ab") or mapping["dimer_ab"] != (
+        selections.get("dimer_ab")
+    ):
+        raise ValueError("interface mapping dimer_ab differs from receptor selections")
+    if mapping["design_c"] != selections.get("design_c"):
+        raise ValueError("interface mapping design_c differs from design selection")
+
+
+def _validate_interface_partition(mapping: dict[str, list[int]]) -> None:
+    if set(mapping["receptor_a"]) & set(mapping["receptor_b"]):
+        raise ValueError("interface mapping receptor_a and receptor_b overlap")
+    if mapping["dimer_ab"] != sorted(mapping["receptor_a"] + mapping["receptor_b"]):
+        raise ValueError("interface mapping dimer_ab is not the sorted A+B union")
+    if set(mapping["dimer_ab"]) & set(mapping["design_c"]):
+        raise ValueError("interface mapping receptor dimer overlaps design C")
+
+
+def _validate_interface_chain_bindings(
+    mapping: dict[str, list[int]], pdb_chains: dict[str, list[int]]
+) -> None:
+    if mapping["receptor_a"] != pdb_chains["A"]:
+        raise ValueError("interface mapping receptor_a differs from explicit chain A")
+    if mapping["receptor_b"] != pdb_chains["B"]:
+        raise ValueError("interface mapping receptor_b differs from explicit chain B")
+    if mapping["design_c"] != pdb_chains["C"]:
+        raise ValueError("interface mapping design_c differs from explicit chain C")
+    if mapping["dimer_ab"] != sorted(pdb_chains["A"] + pdb_chains["B"]):
+        raise ValueError("interface mapping dimer_ab differs from explicit A+B chains")
+
+
+def _validate_full_complex_chain_audits(
+    selection_map: dict[str, Any],
+    pdb_atoms: list[_PdbAtom],
+) -> None:
+    audits = selection_map.get("chain_audits")
+    if not isinstance(audits, list) or len(audits) != len(_FULL_COMPLEX_CHAINS):
+        raise ValueError("selection map chain_audits must describe explicit A, B, and C chains")
+    for audit, chain_id in zip(audits, _FULL_COMPLEX_CHAINS, strict=True):
+        _validate_chain_audit(audit, chain_id, pdb_atoms, selection_map)
+
+
+def _validate_chain_audit(
+    audit: object,
+    chain_id: str,
+    pdb_atoms: list[_PdbAtom],
+    selection_map: dict[str, Any],
+) -> None:
+    if not isinstance(audit, dict) or set(audit) != _CHAIN_AUDIT_FIELDS:
+        raise ValueError("selection map chain_audits are malformed")
+    expected_role = "design" if chain_id == "C" else "receptor"
+    if audit["chain_id"] != chain_id or audit["role"] != expected_role:
+        raise ValueError("selection map chain_audits do not match explicit chain roles")
+    if any(
+        type(audit[field]) is not int or audit[field] < 1 for field in _CHAIN_AUDIT_COUNT_FIELDS
+    ):
+        raise ValueError("selection map chain_audits contain invalid counts")
+    if audit["source_residue_count"] != audit["prepared_residue_count"]:
+        raise ValueError("selection map source and prepared residue audits differ")
+    chain_atoms = [atom for atom in pdb_atoms if atom.chain_id == chain_id]
+    if audit["source_atom_count"] != _source_chain_atom_count(selection_map, chain_id):
+        raise ValueError("selection map source chain audit differs from source atom mapping")
+    if audit["prepared_atom_count"] != len(chain_atoms):
+        raise ValueError("selection map prepared chain audit differs from prepared.pdb")
+    if audit["prepared_residue_count"] != len({atom.residue_key for atom in chain_atoms}):
+        raise ValueError("selection map prepared residue audit differs from prepared.pdb")
+
+
+def _source_chain_atom_count(selection_map: dict[str, Any], chain_id: str) -> int:
+    count = 0
+    for field in ("source_to_prepared_atoms", "dropped_atoms"):
+        records = selection_map.get(field)
+        if not isinstance(records, list):
+            raise ValueError(f"selection map {field} is malformed")
+        for record in records:
+            identity = record.get("source") if field == "source_to_prepared_atoms" else record
+            if not isinstance(identity, dict):
+                raise ValueError(f"selection map {field} is malformed")
+            count += identity.get("chain_id") == chain_id
+    return count
+
+
+def _parse_pdb_atoms(path: Path) -> list[_PdbAtom]:
+    _required_file(path, path.name)
+    atoms: list[_PdbAtom] = []
+    for line in path.read_text().splitlines():
+        if not line.startswith(("ATOM  ", "HETATM")):
+            continue
+        if len(line) < 26 or not line[21].strip():
+            raise ValueError(f"{path.name} contains an invalid prepared atom record")
+        try:
+            residue_number = int(line[22:26].strip())
+        except ValueError as exc:
+            raise ValueError(f"{path.name} contains an invalid residue number") from exc
+        insertion_code = line[26].strip() if len(line) > 26 else ""
+        atoms.append(_PdbAtom(line[21], (residue_number, insertion_code)))
+    if not atoms:
+        raise ValueError(f"{path.name} contains no prepared atom records")
+    return atoms
+
+
+def _pdb_chain_groups(atoms: list[_PdbAtom]) -> dict[str, list[int]]:
+    groups: dict[str, list[int]] = {}
+    for index, atom in enumerate(atoms, start=1):
+        groups.setdefault(atom.chain_id, []).append(index)
+    return groups
 
 
 def _validate_prepared_atom_partition(selection_map: dict[str, Any], atom_count: int) -> None:
