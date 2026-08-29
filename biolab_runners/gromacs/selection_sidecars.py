@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -143,7 +144,7 @@ def refresh_selection_sidecars(
     _required_file(topology_path, topology_path.name)
     prepared_atoms = _parse_gro(work_dir / "processed.gro")
     final_atoms = _parse_gro(coordinates_path)
-    _validate_solute_identity(prepared_atoms, final_atoms)
+    _validate_solute_identity(prepared_atoms, final_atoms, source_map)
     selections = _selection_groups(source_map)
     _write_atomic(work_dir / INDEX, _render_index(selections))
     final_map = _build_final_map(
@@ -650,12 +651,75 @@ def _parse_gro_atom(filename: str, line: str) -> _GroAtom:
         raise ValueError(f"{filename} contains an invalid atom identity") from exc
 
 
-def _validate_solute_identity(prepared: list[_GroAtom], final: list[_GroAtom]) -> None:
+def _validate_solute_identity(
+    prepared: list[_GroAtom], final: list[_GroAtom], selection_map: dict[str, Any]
+) -> None:
     if len(final) < len(prepared):
         raise ValueError("final GRO has fewer atoms than the prepared solute")
     for index, (before, after) in enumerate(zip(prepared, final, strict=False), start=1):
         if before.identity() != after.identity():
             raise ValueError(f"solute atom identity mismatch at one-based index {index}")
+    _validate_solute_residue_numbers(prepared, final, selection_map)
+
+
+def _validate_solute_residue_numbers(
+    prepared: list[_GroAtom], final: list[_GroAtom], selection_map: dict[str, Any]
+) -> None:
+    residue_keys = _prepared_residue_keys(selection_map, len(prepared))
+    residue_numbers, chain_order = _collect_solute_residues(prepared, final, residue_keys)
+    for order in chain_order.values():
+        _validate_chain_residue_numbers(order, residue_numbers)
+
+
+def _collect_solute_residues(
+    prepared: list[_GroAtom],
+    final: list[_GroAtom],
+    residue_keys: list[tuple[str, int]],
+) -> tuple[
+    dict[tuple[str, int], tuple[int, int]],
+    dict[str, list[tuple[str, int]]],
+]:
+    residue_numbers: dict[tuple[str, int], tuple[int, int]] = {}
+    chain_order: dict[str, list[tuple[str, int]]] = {}
+    for index, (before, after, key) in enumerate(
+        zip(prepared, final, residue_keys, strict=False), start=1
+    ):
+        numbers = (before.residue_number, after.residue_number)
+        existing = residue_numbers.setdefault(key, numbers)
+        if existing != numbers:
+            raise ValueError(f"solute residue identity mismatch at one-based index {index}")
+        order = chain_order.setdefault(key[0], [])
+        if not order or order[-1] != key:
+            if key in order:
+                raise ValueError("prepared solute residue atoms are not contiguous")
+            order.append(key)
+    return residue_numbers, chain_order
+
+
+def _validate_chain_residue_numbers(
+    order: list[tuple[str, int]],
+    residue_numbers: dict[tuple[str, int], tuple[int, int]],
+) -> None:
+    prepared_numbers = [residue_numbers[key][0] for key in order]
+    final_numbers = [residue_numbers[key][1] for key in order]
+    if final_numbers == prepared_numbers:
+        return
+    if len(set(final_numbers)) != len(final_numbers):
+        raise ValueError("final GRO merged distinct solute residues")
+    if any(current != previous + 1 for previous, current in pairwise(final_numbers)):
+        raise ValueError("final GRO solute residue renumbering is not consecutive")
+
+
+def _prepared_residue_keys(selection_map: dict[str, Any], atom_count: int) -> list[tuple[str, int]]:
+    keys = [("", 0)] * atom_count
+    for field in ("source_to_prepared_atoms", "added_atoms"):
+        for record in selection_map[field]:
+            identity = record.get("prepared") if field == "source_to_prepared_atoms" else record
+            keys[record["prepared_topology_atom_index"] - 1] = (
+                identity["chain_id"],
+                record["prepared_topology_residue_index"],
+            )
+    return keys
 
 
 def _build_final_map(
@@ -820,7 +884,7 @@ def _validate_final_state_payload(
     prepared_atoms = _parse_gro(work_dir / "processed.gro")
     coordinates = work_dir / state["coordinates_file"]
     final_atoms = _parse_gro(coordinates)
-    _validate_solute_identity(prepared_atoms, final_atoms)
+    _validate_solute_identity(prepared_atoms, final_atoms, current)
     if type(state.get("solute_atom_count")) is not int or state["solute_atom_count"] != len(
         prepared_atoms
     ):

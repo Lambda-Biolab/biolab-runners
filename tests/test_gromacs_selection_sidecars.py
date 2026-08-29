@@ -637,6 +637,65 @@ def test_refresh_sidecars_accepts_molecule_boundary_residue_number_restart(
     assert final_map["gromacs_added_atoms"][0]["residue_number"] == 2
 
 
+@pytest.mark.parametrize(
+    "final_numbers, message",
+    [
+        ([1, 2, 3, 3], "residue identity mismatch"),
+        ([1, 1, 1, 1], "merged distinct solute residues"),
+        ([1, 1, 3, 3], "renumbering is not consecutive"),
+    ],
+    ids=("split-residue", "merged-residues", "nonconsecutive-renumbering"),
+)
+def test_solute_residue_renumbering_preserves_residue_partition(
+    final_numbers: list[int], message: str
+) -> None:
+    from biolab_runners.gromacs.selection_sidecars import (
+        _GroAtom,
+        _validate_solute_identity,
+    )
+
+    prepared = [
+        _GroAtom(114, "ALA", "N", 1),
+        _GroAtom(114, "ALA", "CA", 2),
+        _GroAtom(115, "GLY", "N", 3),
+        _GroAtom(115, "GLY", "CA", 4),
+    ]
+    final = [
+        _GroAtom(number, atom.residue_name, atom.atom_name, atom.atom_number)
+        for number, atom in zip(final_numbers, prepared, strict=True)
+    ]
+    selection_map = {
+        "source_to_prepared_atoms": [
+            {
+                "prepared": {"chain_id": "A"},
+                "prepared_topology_atom_index": index,
+                "prepared_topology_residue_index": 1 if index <= 2 else 2,
+            }
+            for index in range(1, 5)
+        ],
+        "added_atoms": [],
+    }
+
+    _validate_solute_identity(
+        prepared,
+        [
+            _GroAtom(1 if index <= 2 else 2, atom.residue_name, atom.atom_name, atom.atom_number)
+            for index, atom in enumerate(prepared, 1)
+        ],
+        selection_map,
+    )
+    repeated_source_numbers = [
+        _GroAtom(114, atom.residue_name, atom.atom_name, atom.atom_number) for atom in prepared
+    ]
+    _validate_solute_identity(
+        repeated_source_numbers,
+        repeated_source_numbers,
+        selection_map,
+    )
+    with pytest.raises(ValueError, match=message):
+        _validate_solute_identity(prepared, final, selection_map)
+
+
 def test_validate_final_sidecars_refuses_modified_prepared_provenance(tmp_path: Path) -> None:
     from biolab_runners.gromacs.selection_sidecars import (
         refresh_selection_sidecars,

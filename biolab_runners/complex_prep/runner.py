@@ -477,7 +477,47 @@ def _mutate_and_hydrate(
     fixer.positions = _restore_preexisting_coordinates(
         fixer.topology, fixer.positions, pre_hydrogen_records
     )
-    return _remove_receptor_extras(fixer.topology, fixer.positions, source_topology)
+    topology, positions = _remove_receptor_extras(fixer.topology, fixer.positions, source_topology)
+    _restore_receptor_disulfides(topology, source_topology)
+    return topology, positions
+
+
+def _restore_receptor_disulfides(topology: object, source_topology: object) -> None:
+    source_pairs = _receptor_disulfide_pairs(source_topology)
+    prepared_pairs = _receptor_disulfide_pairs(topology)
+    if not prepared_pairs <= source_pairs:
+        raise ValueError("receptor disulfide identity changed during preparation")
+    atoms = {
+        (*_residue_key(atom.residue), atom.name): atom
+        for atom in topology.atoms()  # type: ignore[attr-defined]
+    }
+    for first, second in source_pairs - prepared_pairs:
+        try:
+            topology.addBond(atoms[first], atoms[second])  # type: ignore[attr-defined]
+        except KeyError as exc:
+            raise ValueError("receptor disulfide atom was lost during preparation") from exc
+
+
+def _receptor_disulfide_pairs(
+    topology: object,
+) -> set[tuple[tuple[str, int, str, str], tuple[str, int, str, str]]]:
+    pairs = set()
+    for first, second in topology.bonds():  # type: ignore[attr-defined]
+        if (
+            first.name != "SG"
+            or second.name != "SG"
+            or first.residue.chain.id not in RECEPTOR_CHAIN_IDS
+            or second.residue.chain.id not in RECEPTOR_CHAIN_IDS
+        ):
+            continue
+        identities = sorted(
+            (
+                (*_residue_key(first.residue), first.name),
+                (*_residue_key(second.residue), second.name),
+            )
+        )
+        pairs.add((identities[0], identities[1]))
+    return pairs
 
 
 def _remove_receptor_extras(
@@ -723,6 +763,8 @@ def _validate_preserved_topologies(
     prepared_topology: object,
     prepared_positions: object,
 ) -> None:
+    if _receptor_disulfide_pairs(source_topology) != _receptor_disulfide_pairs(prepared_topology):
+        raise ValueError("receptor disulfide identity changed")
     source_receptor = _receptor_heavy_snapshot(source_topology, source_positions)
     prepared_receptor = _receptor_heavy_snapshot(prepared_topology, prepared_positions)
     if source_receptor != prepared_receptor:
@@ -861,14 +903,15 @@ def _materialize_bundle(
     pdb_path = staging / PREPARED_PDB_FILENAME
     top_path = staging / PREPARED_TOP_FILENAME
     gro_path = staging / PREPARED_GRO_FILENAME
+    pdb_bond_records = _pdb_bond_records(state.topology, state.bond_records)
     export.write_prepared_pdb(
         pdb_path,
         state.topology,
         state.positions,
-        closure_bond_records=state.bond_records,
+        closure_bond_records=pdb_bond_records,
     )
     _restore_pdb_residue_identifiers(pdb_path, state.topology)
-    _rewrite_pdb_closure_records(pdb_path, state.bond_records)
+    _rewrite_pdb_closure_records(pdb_path, pdb_bond_records)
     exported = export.export_gromacs(
         state.topology,
         state.system,
@@ -1034,6 +1077,38 @@ def _rewrite_pdb_closure_records(path: Path, bond_records: tuple[TopologyBondRec
     ]
     output = [line for line in lines if not line.startswith("CONECT") and line != "END"]
     path.write_text("\n".join([*output, *conect, "END"]) + "\n")
+
+
+def _pdb_bond_records(
+    topology: object, closure_records: tuple[TopologyBondRecord, ...]
+) -> tuple[TopologyBondRecord, ...]:
+    records = list(closure_records)
+    recorded_pairs = {
+        (min(record.atom1_index, record.atom2_index), max(record.atom1_index, record.atom2_index))
+        for record in records
+    }
+    for first, second in topology.bonds():  # type: ignore[attr-defined]
+        pair = (min(first.index, second.index), max(first.index, second.index))
+        if (
+            pair in recorded_pairs
+            or first.name != "SG"
+            or second.name != "SG"
+            or first.residue.chain.id not in RECEPTOR_CHAIN_IDS
+            or second.residue.chain.id not in RECEPTOR_CHAIN_IDS
+        ):
+            continue
+        records.append(
+            _bond_record(
+                topology,
+                first.index,
+                second.index,
+                first.residue.index,
+                second.residue.index,
+                "receptor_disulfide",
+            )
+        )
+        recorded_pairs.add(pair)
+    return tuple(records)
 
 
 def _topology_bond_pairs(topology: object) -> set[tuple[int, int]]:

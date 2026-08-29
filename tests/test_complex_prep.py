@@ -506,7 +506,7 @@ def test_full_complex_emits_exact_bundle_and_preserves_receptors(
 
 
 def test_full_complex_normalizes_preexisting_receptor_disulfide(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     source_pdb = tmp_path / "receptor-disulfide.pdb"
     source_pdb.write_text(_receptor_disulfide_complex_pdb_text())
@@ -517,21 +517,6 @@ def test_full_complex_normalizes_preexisting_receptor_disulfide(
         tmp_path / "out",
         source_decoy=_artifact(source_pdb, a_atom_count=15),
     )
-    mutate_and_hydrate = complex_prep_runner._mutate_and_hydrate
-
-    def retain_source_disulfide(
-        prep_config: ComplexPrepConfig, source_path: str, source_topology: object
-    ) -> tuple[object, object]:
-        topology, positions = mutate_and_hydrate(prep_config, source_path, source_topology)
-        sg_atoms = [
-            atom for atom in topology.atoms() if atom.residue.chain.id == "A" and atom.name == "SG"
-        ]
-        if not any(first.name == second.name == "SG" for first, second in topology.bonds()):
-            topology.addBond(*sg_atoms)
-        return topology, positions
-
-    monkeypatch.setattr(complex_prep_runner, "_mutate_and_hydrate", retain_source_disulfide)
-
     result = ComplexPrepRunner().run(config)
 
     assert result.success, result.error
@@ -550,6 +535,8 @@ def test_full_complex_normalizes_preexisting_receptor_disulfide(
     assert all(
         "HG" not in {atom.name for atom in residue.atoms()} for residue in receptor_cysteines
     )
+    prepared_text = Path(result.bundle.prepared_pdb.path).read_text()
+    assert any(line.startswith("CONECT") for line in prepared_text.splitlines())
     source_positions = source.positions.value_in_unit(unit.nanometer)
     prepared_positions = prepared.positions.value_in_unit(unit.nanometer)
     source_sg = {
@@ -655,6 +642,50 @@ def test_prepared_d_input_requires_runtime_chirality_validator(
 
     assert result.status is ExecutionStatus.FAILED
     assert "chirality validator callback" in result.error
+    assert not Path(config.output_dir).exists()
+
+
+def test_prepared_d_input_refuses_non_d_source_chirality(source_pdb: Path, tmp_path: Path) -> None:
+    class _RejectingValidator(_RecordingValidator):
+        def __call__(
+            self,
+            mapping: dict[str, tuple[float, float, float]],
+            residue_name: str,
+            residue_index: int,
+            *,
+            expected: str,
+            **kwargs: object,
+        ) -> ChiralityReport:
+            super().__call__(
+                mapping,
+                residue_name,
+                residue_index,
+                expected=expected,
+                **kwargs,
+            )
+            observed = "L" if expected == "D" else expected
+            return ChiralityReport(
+                residue_index,
+                residue_name,
+                expected,
+                observed,
+                observed == expected,
+            )
+
+    config = _config(
+        source_pdb,
+        tmp_path / "out-invalid-d",
+        topology=PeptideTopologyDescriptor(
+            d_substitutions=(SimpleNamespace(position=1, residue="LEU"),)
+        ),
+        d_coordinate_input_mode="prepared_d",
+        chirality_validator_identity="validator-v1",
+    )
+
+    result = ComplexPrepRunner().run(config, chirality_validator=_RejectingValidator())
+
+    assert result.status is ExecutionStatus.FAILED
+    assert "chirality validation failed" in result.error
     assert not Path(config.output_dir).exists()
 
 
