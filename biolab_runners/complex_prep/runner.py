@@ -1544,11 +1544,23 @@ def _restore_cached_disulfide_names(topology: object, config: ComplexPrepConfig)
         DESIGN_CHAIN_ID,
         expected_length=len(config.design_sequence),
     )
-    positions = {
-        position for bond in config.topology.disulfides for position in (bond.first, bond.second)
+    residue_indices = {
+        atom.residue.index
+        for first, second in topology.bonds()  # type: ignore[attr-defined]
+        if first.name == second.name == "SG"
+        for atom in (first, second)
     }
-    for position in positions:
-        residue = residues[position - 1]
+    residue_indices.update(
+        residues[position - 1].index
+        for bond in config.topology.disulfides
+        for position in (bond.first, bond.second)
+    )
+    residues_by_index = {
+        residue.index: residue
+        for residue in topology.residues()  # type: ignore[attr-defined]
+    }
+    for index in residue_indices:
+        residue = residues_by_index[index]
         if residue.name != "CYS":
             raise ValueError("cached disulfide residue is not CYS in prepared.pdb")
         residue.name = "CYX"

@@ -570,6 +570,10 @@ def test_full_complex_normalizes_preexisting_receptor_disulfide(
     manifest = json.loads(Path(result.bundle.manifest.path).read_text())
     assert manifest["bond_records"] == []
 
+    cached = ComplexPrepRunner().run(config)
+
+    assert cached.status is ExecutionStatus.CACHED, cached.error
+
 
 def test_d_callbacks_are_scoped_to_c_and_use_local_indices(
     source_pdb: Path, tmp_path: Path
