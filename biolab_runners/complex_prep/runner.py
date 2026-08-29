@@ -525,12 +525,22 @@ def _apply_chemistry(
         (design_residues[bond.first - 1].index, design_residues[bond.second - 1].index)
         for bond in config.topology.disulfides
     ]
+    bonded_cysteine_indices = {
+        atom.residue.index
+        for first, second in topology.bonds()  # type: ignore[attr-defined]
+        if first.name == second.name == "SG"
+        for atom in (first, second)
+    }
+    disulfide_cysteine_indices = bonded_cysteine_indices | {
+        index for pair in disulfide_pairs for index in pair
+    }
     modeller = app.Modeller(topology, positions)
-    if disulfide_pairs:
+    if disulfide_cysteine_indices:
         chemistry.rename_cysteines_to_cyx(
             modeller,
-            involved_residue_indices={index for pair in disulfide_pairs for index in pair},
+            involved_residue_indices=disulfide_cysteine_indices,
         )
+    if disulfide_pairs:
         chemistry.apply_disulfide_bonds(
             modeller.topology,
             disulfide_pairs=tuple(disulfide_pairs),
@@ -741,7 +751,8 @@ def _receptor_heavy_snapshot(topology: object, positions: object) -> tuple[Any, 
                 for atom in residue.atoms()
                 if atom.element is not None and atom.element.symbol != "H"
             )
-            residues.append((str(residue.id), residue.name, atoms))
+            residue_name = "CYS" if residue.name == "CYX" else residue.name
+            residues.append((str(residue.id), residue_name, atoms))
         chains.append((chain.id, tuple(residues)))
     return tuple(chains)
 

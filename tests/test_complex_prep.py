@@ -170,7 +170,44 @@ def _cys_complex_pdb_text(second_sg: tuple[float, float, float] = (3.2, 21.6, -1
     return "\n".join(lines) + "\n"
 
 
-def _artifact(source_pdb: Path, *, c_atom_count: int = 10) -> RosettaDecoyArtifact:
+def _receptor_disulfide_complex_pdb_text() -> str:
+    lines: list[str] = []
+    sg_serials: list[int] = []
+    serial = 0
+    for line in _complex_pdb_text().splitlines():
+        if line.startswith("ATOM"):
+            serial += 1
+            if line[21] == "A":
+                line = line[:17] + "CYS" + line[20:]
+                if line[22:26].strip() == "11" and line[12:16].strip() == "CB":
+                    line = line[:30] + f"{3.800:8.3f}{1.400:8.3f}{-1.000:8.3f}" + line[54:]
+            line = f"{line[:6]}{serial:5d}{line[11:]}"
+            lines.append(line)
+            if line[21] == "A" and line[12:16].strip() == "CB":
+                serial += 1
+                residue_number = int(line[22:26])
+                x, y = (2.300, -0.100) if residue_number == 10 else (4.050, 0.950)
+                sg_serial = serial
+                lines.append(
+                    f"ATOM  {serial:5d}  SG  CYS A{residue_number:4d}"
+                    f"    {x:8.3f}{y:8.3f}{-1.000:8.3f}  1.00  0.00           S"
+                )
+                sg_serials.append(sg_serial)
+                serial += 1
+                lines.append(
+                    f"ATOM  {serial:5d}  HG  CYS A{residue_number:4d}"
+                    f"    {x:8.3f}{y:8.3f}{0.300:8.3f}  1.00  0.00           H"
+                )
+        else:
+            lines.append(line)
+    lines.insert(-1, f"CONECT{sg_serials[0]:5d}{sg_serials[1]:5d}")
+    lines.insert(-1, f"CONECT{sg_serials[1]:5d}{sg_serials[0]:5d}")
+    return "\n".join(lines) + "\n"
+
+
+def _artifact(
+    source_pdb: Path, *, a_atom_count: int = 11, c_atom_count: int = 10
+) -> RosettaDecoyArtifact:
     digest = hashlib.sha256(source_pdb.read_bytes()).hexdigest()
     return RosettaDecoyArtifact(
         candidate_identity="candidate-1",
@@ -181,7 +218,7 @@ def _artifact(source_pdb: Path, *, c_atom_count: int = 10) -> RosettaDecoyArtifa
         input_pdb_identity=PDBIdentity("input", digest),
         output_pdb_identity=PDBIdentity("output", digest),
         chain_audits=(
-            ChainAudit("A", "receptor-alpha", 2, 11),
+            ChainAudit("A", "receptor-alpha", 2, a_atom_count),
             ChainAudit("B", "receptor-beta", 2, 9),
             ChainAudit("C", "binder", 2, c_atom_count),
         ),
@@ -466,6 +503,72 @@ def test_full_complex_emits_exact_bundle_and_preserves_receptors(
         assert tuple(prepared_positions[prepared_atom.index]) == pytest.approx(
             tuple(source_positions[source_atom.index]), abs=1e-6
         )
+
+
+def test_full_complex_normalizes_preexisting_receptor_disulfide(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_pdb = tmp_path / "receptor-disulfide.pdb"
+    source_pdb.write_text(_receptor_disulfide_complex_pdb_text())
+    source = app.PDBFile(str(source_pdb))
+    assert any(first.name == second.name == "SG" for first, second in source.topology.bonds())
+    config = _config(
+        source_pdb,
+        tmp_path / "out",
+        source_decoy=_artifact(source_pdb, a_atom_count=15),
+    )
+    mutate_and_hydrate = complex_prep_runner._mutate_and_hydrate
+
+    def retain_source_disulfide(
+        prep_config: ComplexPrepConfig, source_path: str, source_topology: object
+    ) -> tuple[object, object]:
+        topology, positions = mutate_and_hydrate(prep_config, source_path, source_topology)
+        sg_atoms = [
+            atom for atom in topology.atoms() if atom.residue.chain.id == "A" and atom.name == "SG"
+        ]
+        if not any(first.name == second.name == "SG" for first, second in topology.bonds()):
+            topology.addBond(*sg_atoms)
+        return topology, positions
+
+    monkeypatch.setattr(complex_prep_runner, "_mutate_and_hydrate", retain_source_disulfide)
+
+    result = ComplexPrepRunner().run(config)
+
+    assert result.success, result.error
+    assert result.bundle is not None
+    prepared_lines = Path(result.bundle.prepared_pdb.path).read_text().splitlines()
+    assert {
+        line[17:20]
+        for line in prepared_lines
+        if line.startswith(("ATOM", "HETATM")) and line[21] == "A"
+    } == {"CYX"}
+    prepared = app.PDBFile(result.bundle.prepared_pdb.path)
+    receptor_cysteines = [
+        residue for residue in prepared.topology.residues() if residue.chain.id == "A"
+    ]
+    assert len(receptor_cysteines) == 2
+    assert all(
+        "HG" not in {atom.name for atom in residue.atoms()} for residue in receptor_cysteines
+    )
+    source_positions = source.positions.value_in_unit(unit.nanometer)
+    prepared_positions = prepared.positions.value_in_unit(unit.nanometer)
+    source_sg = {
+        atom.residue.id: source_positions[atom.index]
+        for atom in source.topology.atoms()
+        if atom.residue.chain.id == "A" and atom.name == "SG"
+    }
+    prepared_sg = {
+        atom.residue.id: prepared_positions[atom.index]
+        for atom in prepared.topology.atoms()
+        if atom.residue.chain.id == "A" and atom.name == "SG"
+    }
+    assert prepared_sg.keys() == source_sg.keys()
+    for residue_id in source_sg:
+        assert tuple(prepared_sg[residue_id]) == pytest.approx(
+            tuple(source_sg[residue_id]), abs=1e-6
+        )
+    manifest = json.loads(Path(result.bundle.manifest.path).read_text())
+    assert manifest["bond_records"] == []
 
 
 def test_d_callbacks_are_scoped_to_c_and_use_local_indices(
