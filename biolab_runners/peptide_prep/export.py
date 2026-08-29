@@ -258,13 +258,14 @@ def export_gromacs(
     # overwrite ParmEd refuses to write the new files).
     struct.save(str(top_path), overwrite=True)
     struct.save(str(gro_path), overwrite=True)
-    heavy_atom_indices = tuple(
-        index for index, atom in enumerate(struct.atoms, start=1) if atom.element != 1
+    heavy_atom_indices_by_molecule = tuple(
+        tuple(index for index, atom in enumerate(molecule.atoms, start=1) if atom.element != 1)
+        for molecule, _copies in struct.split()
     )
     _materialize_gromacs_includes(
         top_path,
         gromacs_include_family,
-        heavy_atom_indices=heavy_atom_indices,
+        heavy_atom_indices_by_molecule=heavy_atom_indices_by_molecule,
         position_restraint_force_k_kjmol_nm2=position_restraint_force_k_kjmol_nm2,
     )
     return {
@@ -278,7 +279,7 @@ def _materialize_gromacs_includes(
     top_path: object,
     include_family: str,
     *,
-    heavy_atom_indices: tuple[int, ...],
+    heavy_atom_indices_by_molecule: tuple[tuple[int, ...], ...],
     position_restraint_force_k_kjmol_nm2: float,
 ) -> None:
     from pathlib import Path
@@ -299,21 +300,24 @@ def _materialize_gromacs_includes(
     section = ""
     inserted_nonbonded = False
     inserted_molecules = False
+    molecule_type_index = -1
     for line in lines:
         next_section = _section_name(line)
         if next_section is not None:
             if section == "atomtypes" and next_section != "atomtypes":
                 output.extend(["", *_AMBER99SB_ILDN_SOLVENT_ATOM_TYPES.splitlines(), ""])
                 inserted_nonbonded = True
+            molecule_type_index = _materialize_molecule_position_restraints(
+                output,
+                next_section,
+                molecule_type_index,
+                heavy_atom_indices_by_molecule,
+                position_restraint_force_k_kjmol_nm2,
+                GROMACS_POSITION_RESTRAINT_ALGORITHM_VERSION,
+            )
             if next_section == "system":
                 output.extend(
                     [
-                        *_position_restraints(
-                            heavy_atom_indices,
-                            position_restraint_force_k_kjmol_nm2,
-                            GROMACS_POSITION_RESTRAINT_ALGORITHM_VERSION,
-                        ),
-                        "",
                         *_AMBER99SB_ILDN_TIP3P.splitlines(),
                         "",
                         *_AMBER99SB_ILDN_IONS.splitlines(),
@@ -327,6 +331,47 @@ def _materialize_gromacs_includes(
     if not inserted_nonbonded or not inserted_molecules:
         raise ValueError("ParmEd topology lacks required atomtypes or system section")
     path.write_text("\n".join(output) + "\n")
+
+
+def _materialize_molecule_position_restraints(
+    output: list[str],
+    next_section: str,
+    molecule_type_index: int,
+    heavy_atom_indices_by_molecule: tuple[tuple[int, ...], ...],
+    force_k_kjmol_nm2: float,
+    algorithm_version: str,
+) -> int:
+    if next_section in {"moleculetype", "system"} and molecule_type_index >= 0:
+        output.extend(
+            [
+                *_position_restraints(
+                    heavy_atom_indices_by_molecule[molecule_type_index],
+                    force_k_kjmol_nm2,
+                    algorithm_version,
+                ),
+                "",
+            ]
+        )
+    if next_section == "moleculetype":
+        molecule_type_index += 1
+        _validate_molecule_type_count(
+            molecule_type_index + 1,
+            len(heavy_atom_indices_by_molecule),
+            complete=False,
+        )
+    if next_section == "system":
+        _validate_molecule_type_count(
+            molecule_type_index + 1,
+            len(heavy_atom_indices_by_molecule),
+            complete=True,
+        )
+    return molecule_type_index
+
+
+def _validate_molecule_type_count(encountered: int, expected: int, *, complete: bool) -> None:
+    mismatch = encountered != expected if complete else encountered > expected
+    if mismatch:
+        raise ValueError("ParmEd topology molecule types do not match structure components")
 
 
 def _position_restraints(
