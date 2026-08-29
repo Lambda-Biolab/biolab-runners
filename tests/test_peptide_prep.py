@@ -2216,6 +2216,113 @@ class TestPeptidePrepGromacsParity:
         solvent_moleculetype = topology_text.index("[ moleculetype ]", first_moleculetype + 1)
         assert first_moleculetype < posres < solvent_moleculetype
 
+    def test_export_scopes_posres_indices_to_each_disconnected_solute_molecule(
+        self, tmp_output_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import parmed
+        from biolab_runners.peptide_prep.export import export_gromacs
+
+        structure = parmed.Structure()
+        expected_by_molecule = ({1, 3}, {2, 4}, {1})
+        hydrogen_indices_by_molecule = ({2}, {1, 3}, {2})
+        atomic_numbers_by_molecule = ((6, 1, 8), (1, 7, 1, 6), (6, 1))
+        for molecule_index, atomic_numbers in enumerate(atomic_numbers_by_molecule, 1):
+            atoms = []
+            for atom_index, atomic_number in enumerate(atomic_numbers, 1):
+                atom = parmed.Atom(name=f"A{atom_index}", atomic_number=atomic_number, mass=1.0)
+                structure.add_atom(atom, f"M{molecule_index}", molecule_index)
+                atoms.append(atom)
+            for atom_index in range(len(atoms) - 1):
+                structure.bonds.append(parmed.Bond(atoms[atom_index], atoms[atom_index + 1]))
+
+        topology = """\
+[ defaults ]
+1 2 yes 0.5 0.8333
+[ atomtypes ]
+C 6 12.0 0.0 A 0.3 0.1
+H 1 1.0 0.0 A 0.1 0.01
+[ moleculetype ]
+M1 3
+[ atoms ]
+1 C 1 M1 C1 1 0.0 12.0
+2 H 1 M1 H1 1 0.0 1.0
+3 C 1 M1 C2 1 0.0 16.0
+[ moleculetype ]
+M2 3
+[ atoms ]
+1 H 1 M2 H1 1 0.0 1.0
+2 C 1 M2 N1 1 0.0 14.0
+3 H 1 M2 H2 1 0.0 1.0
+4 C 1 M2 C1 1 0.0 12.0
+[ moleculetype ]
+M3 3
+[ atoms ]
+1 C 1 M3 C1 1 0.0 12.0
+2 H 1 M3 H1 1 0.0 1.0
+[ system ]
+multi molecule solute
+[ molecules ]
+M1 1
+M2 1
+M3 1
+"""
+        top_path = tmp_output_dir / "multi.top"
+        gro_path = tmp_output_dir / "multi.gro"
+
+        def fake_save(_structure: object, path: str, *, overwrite: bool) -> None:
+            del overwrite
+            Path(path).write_text(topology if path.endswith(".top") else "coordinates\n")
+
+        monkeypatch.setattr(parmed.openmm, "load_topology", lambda *args, **kwargs: structure)
+        monkeypatch.setattr(parmed.Structure, "save", fake_save)
+
+        export_gromacs(
+            object(),
+            object(),
+            object(),
+            top_path=top_path,
+            gro_path=gro_path,
+            gromacs_include_family="amber99sb-ildn-tip3p",
+            position_restraint_force_k_kjmol_nm2=1000.0,
+        )
+
+        molecule_blocks = top_path.read_text().split("[ moleculetype ]")[1:]
+        solute_blocks = molecule_blocks[:3]
+        for block, expected, hydrogens in zip(
+            solute_blocks, expected_by_molecule, hydrogen_indices_by_molecule, strict=True
+        ):
+            restraint_block = block.split("#ifdef POSRES", 1)[1].split("#endif", 1)[0]
+            restrained = {
+                int(line.split()[0])
+                for line in restraint_block.splitlines()
+                if line.strip() and line.split()[0].isdigit()
+            }
+            atom_count = sum(
+                1
+                for line in block.split("[ atoms ]", 1)[1].split("[", 1)[0].splitlines()
+                if line.strip() and line.split()[0].isdigit()
+            )
+
+            assert restrained == expected
+            assert restrained.isdisjoint(hydrogens)
+            assert max(restrained) <= atom_count
+
+        assert all("#ifdef POSRES" not in block for block in molecule_blocks[3:])
+
+        structure.add_atom(parmed.Atom(name="C1", atomic_number=6, mass=12.0), "M4", 4)
+        with pytest.raises(
+            ValueError, match="topology molecule types do not match structure components"
+        ):
+            export_gromacs(
+                object(),
+                object(),
+                object(),
+                top_path=top_path,
+                gro_path=gro_path,
+                gromacs_include_family="amber99sb-ildn-tip3p",
+                position_restraint_force_k_kjmol_nm2=1000.0,
+            )
+
     def test_atom_count_matches_openmm(self, tmp_output_dir: Path, two_cys_pdb: Path) -> None:
         cfg = _make_linear_config(
             str(tmp_output_dir),

@@ -237,6 +237,7 @@ def compute_complex_config_digest(config: ComplexPrepConfig) -> str:
         "pH": 7.4,
         "algorithm_versions": ALGORITHM_VERSIONS,
         "topology": _descriptor_payload(config),
+        "d_coordinate_input_mode": config.d_coordinate_input_mode,
         "coordinate_transformer_identity": config.coordinate_transformer_identity,
         "chirality_validator_identity": config.chirality_validator_identity,
         "source_decoy": config.source_decoy.to_dict(),
@@ -367,20 +368,16 @@ def _prepare_structure(
                 config.topology,
                 chirality_validator,
                 design_chain_id=DESIGN_CHAIN_ID,
-                stage="post_h",
+                stage=_source_chirality_stage(config),
             )
         )
-    if config.topology.d_substitutions:
-        if coordinate_transformer is None or chirality_validator is None:
-            raise ValueError("D substitutions require both preparation callbacks")
-        positions = design_chain.apply_d_coordinate_transform(
-            topology,
-            positions,
-            config.design_sequence,
-            config.topology,
-            coordinate_transformer,
-            design_chain_id=DESIGN_CHAIN_ID,
-        )
+    positions = _prepare_d_coordinates(
+        config,
+        topology,
+        positions,
+        coordinate_transformer=coordinate_transformer,
+        chirality_validator=chirality_validator,
+    )
     if chirality_validator is not None:
         reports.append(
             design_chain.run_chirality_validation(
@@ -427,6 +424,36 @@ def _prepare_structure(
     )
 
 
+def _source_chirality_stage(config: ComplexPrepConfig) -> str:
+    return "source" if config.d_coordinate_input_mode == "prepared_d" else "post_h"
+
+
+def _prepare_d_coordinates(
+    config: ComplexPrepConfig,
+    topology: object,
+    positions: object,
+    *,
+    coordinate_transformer: CoordinateTransformer | None,
+    chirality_validator: ChiralityValidator | None,
+) -> object:
+    if not config.topology.d_substitutions:
+        return positions
+    if chirality_validator is None:
+        raise ValueError("D substitutions require a chirality validator callback")
+    if config.d_coordinate_input_mode == "prepared_d":
+        return positions
+    if coordinate_transformer is None:
+        raise ValueError("canonical-L D substitutions require a coordinate transformer callback")
+    return design_chain.apply_d_coordinate_transform(
+        topology,
+        positions,
+        config.design_sequence,
+        config.topology,
+        coordinate_transformer,
+        design_chain_id=DESIGN_CHAIN_ID,
+    )
+
+
 def _mutate_and_hydrate(
     config: ComplexPrepConfig, source_path: str, source_topology: object
 ) -> tuple[object, object]:
@@ -450,7 +477,47 @@ def _mutate_and_hydrate(
     fixer.positions = _restore_preexisting_coordinates(
         fixer.topology, fixer.positions, pre_hydrogen_records
     )
-    return _remove_receptor_extras(fixer.topology, fixer.positions, source_topology)
+    topology, positions = _remove_receptor_extras(fixer.topology, fixer.positions, source_topology)
+    _restore_receptor_disulfides(topology, source_topology)
+    return topology, positions
+
+
+def _restore_receptor_disulfides(topology: object, source_topology: object) -> None:
+    source_pairs = _receptor_disulfide_pairs(source_topology)
+    prepared_pairs = _receptor_disulfide_pairs(topology)
+    if not prepared_pairs <= source_pairs:
+        raise ValueError("receptor disulfide identity changed during preparation")
+    atoms = {
+        (*_residue_key(atom.residue), atom.name): atom
+        for atom in topology.atoms()  # type: ignore[attr-defined]
+    }
+    for first, second in source_pairs - prepared_pairs:
+        try:
+            topology.addBond(atoms[first], atoms[second])  # type: ignore[attr-defined]
+        except KeyError as exc:
+            raise ValueError("receptor disulfide atom was lost during preparation") from exc
+
+
+def _receptor_disulfide_pairs(
+    topology: object,
+) -> set[tuple[tuple[str, int, str, str], tuple[str, int, str, str]]]:
+    pairs = set()
+    for first, second in topology.bonds():  # type: ignore[attr-defined]
+        if (
+            first.name != "SG"
+            or second.name != "SG"
+            or first.residue.chain.id not in RECEPTOR_CHAIN_IDS
+            or second.residue.chain.id not in RECEPTOR_CHAIN_IDS
+        ):
+            continue
+        identities = sorted(
+            (
+                (*_residue_key(first.residue), first.name),
+                (*_residue_key(second.residue), second.name),
+            )
+        )
+        pairs.add((identities[0], identities[1]))
+    return pairs
 
 
 def _remove_receptor_extras(
@@ -498,12 +565,22 @@ def _apply_chemistry(
         (design_residues[bond.first - 1].index, design_residues[bond.second - 1].index)
         for bond in config.topology.disulfides
     ]
+    bonded_cysteine_indices = {
+        atom.residue.index
+        for first, second in topology.bonds()  # type: ignore[attr-defined]
+        if first.name == second.name == "SG"
+        for atom in (first, second)
+    }
+    disulfide_cysteine_indices = bonded_cysteine_indices | {
+        index for pair in disulfide_pairs for index in pair
+    }
     modeller = app.Modeller(topology, positions)
-    if disulfide_pairs:
+    if disulfide_cysteine_indices:
         chemistry.rename_cysteines_to_cyx(
             modeller,
-            involved_residue_indices={index for pair in disulfide_pairs for index in pair},
+            involved_residue_indices=disulfide_cysteine_indices,
         )
+    if disulfide_pairs:
         chemistry.apply_disulfide_bonds(
             modeller.topology,
             disulfide_pairs=tuple(disulfide_pairs),
@@ -686,6 +763,8 @@ def _validate_preserved_topologies(
     prepared_topology: object,
     prepared_positions: object,
 ) -> None:
+    if _receptor_disulfide_pairs(source_topology) != _receptor_disulfide_pairs(prepared_topology):
+        raise ValueError("receptor disulfide identity changed")
     source_receptor = _receptor_heavy_snapshot(source_topology, source_positions)
     prepared_receptor = _receptor_heavy_snapshot(prepared_topology, prepared_positions)
     if source_receptor != prepared_receptor:
@@ -714,7 +793,8 @@ def _receptor_heavy_snapshot(topology: object, positions: object) -> tuple[Any, 
                 for atom in residue.atoms()
                 if atom.element is not None and atom.element.symbol != "H"
             )
-            residues.append((str(residue.id), residue.name, atoms))
+            residue_name = "CYS" if residue.name == "CYX" else residue.name
+            residues.append((str(residue.id), residue_name, atoms))
         chains.append((chain.id, tuple(residues)))
     return tuple(chains)
 
@@ -823,14 +903,15 @@ def _materialize_bundle(
     pdb_path = staging / PREPARED_PDB_FILENAME
     top_path = staging / PREPARED_TOP_FILENAME
     gro_path = staging / PREPARED_GRO_FILENAME
+    pdb_bond_records = _pdb_bond_records(state.topology, state.bond_records)
     export.write_prepared_pdb(
         pdb_path,
         state.topology,
         state.positions,
-        closure_bond_records=state.bond_records,
+        closure_bond_records=pdb_bond_records,
     )
     _restore_pdb_residue_identifiers(pdb_path, state.topology)
-    _rewrite_pdb_closure_records(pdb_path, state.bond_records)
+    _rewrite_pdb_closure_records(pdb_path, pdb_bond_records)
     exported = export.export_gromacs(
         state.topology,
         state.system,
@@ -996,6 +1077,38 @@ def _rewrite_pdb_closure_records(path: Path, bond_records: tuple[TopologyBondRec
     ]
     output = [line for line in lines if not line.startswith("CONECT") and line != "END"]
     path.write_text("\n".join([*output, *conect, "END"]) + "\n")
+
+
+def _pdb_bond_records(
+    topology: object, closure_records: tuple[TopologyBondRecord, ...]
+) -> tuple[TopologyBondRecord, ...]:
+    records = list(closure_records)
+    recorded_pairs = {
+        (min(record.atom1_index, record.atom2_index), max(record.atom1_index, record.atom2_index))
+        for record in records
+    }
+    for first, second in topology.bonds():  # type: ignore[attr-defined]
+        pair = (min(first.index, second.index), max(first.index, second.index))
+        if (
+            pair in recorded_pairs
+            or first.name != "SG"
+            or second.name != "SG"
+            or first.residue.chain.id not in RECEPTOR_CHAIN_IDS
+            or second.residue.chain.id not in RECEPTOR_CHAIN_IDS
+        ):
+            continue
+        records.append(
+            _bond_record(
+                topology,
+                first.index,
+                second.index,
+                first.residue.index,
+                second.residue.index,
+                "receptor_disulfide",
+            )
+        )
+        recorded_pairs.add(pair)
+    return tuple(records)
 
 
 def _topology_bond_pairs(topology: object) -> set[tuple[int, int]]:
@@ -1222,6 +1335,7 @@ def _build_manifest(
             "disulfide_angstrom": DEFAULT_MAX_DISULFIDE_DISTANCE_A,
         },
         "topology": _descriptor_payload(config),
+        "d_coordinate_input_mode": config.d_coordinate_input_mode,
         "artifacts": {
             name: {"path": str(output_dir / name), "sha256": digest}
             for name, digest in artifact_digests.items()
@@ -1505,11 +1619,23 @@ def _restore_cached_disulfide_names(topology: object, config: ComplexPrepConfig)
         DESIGN_CHAIN_ID,
         expected_length=len(config.design_sequence),
     )
-    positions = {
-        position for bond in config.topology.disulfides for position in (bond.first, bond.second)
+    residue_indices = {
+        atom.residue.index
+        for first, second in topology.bonds()  # type: ignore[attr-defined]
+        if first.name == second.name == "SG"
+        for atom in (first, second)
     }
-    for position in positions:
-        residue = residues[position - 1]
+    residue_indices.update(
+        residues[position - 1].index
+        for bond in config.topology.disulfides
+        for position in (bond.first, bond.second)
+    )
+    residues_by_index = {
+        residue.index: residue
+        for residue in topology.residues()  # type: ignore[attr-defined]
+    }
+    for index in residue_indices:
+        residue = residues_by_index[index]
         if residue.name != "CYS":
             raise ValueError("cached disulfide residue is not CYS in prepared.pdb")
         residue.name = "CYX"
@@ -1628,6 +1754,8 @@ def _validate_manifest_request_values(manifest: dict[str, Any], config: ComplexP
         "topology"
     ] != _descriptor_payload(config):
         raise ValueError("cached bundle config descriptor does not match request")
+    if manifest["d_coordinate_input_mode"] != config.d_coordinate_input_mode:
+        raise ValueError("cached bundle D-coordinate input mode does not match request")
     if manifest["source_decoy"] != config.source_decoy.to_dict():
         raise ValueError("cached bundle source decoy identity does not match request")
     if manifest["chain_roles"] != {
@@ -1662,6 +1790,8 @@ def _validate_manifest_metadata_types(manifest: dict[str, Any]) -> None:
         raise MalformedBundleError("manifest path metadata is malformed")
     if not isinstance(manifest.get("design_sequence"), str):
         raise MalformedBundleError("manifest design sequence is malformed")
+    if manifest.get("d_coordinate_input_mode") not in {"canonical_l", "prepared_d"}:
+        raise MalformedBundleError("manifest D-coordinate input mode is malformed")
     if not isinstance(manifest.get("source_decoy"), dict) or not isinstance(
         manifest.get("topology"), dict
     ):

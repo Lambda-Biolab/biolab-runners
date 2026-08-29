@@ -30,10 +30,10 @@ SELECTION_MAP_FILENAME = "selection-map.json"
 INDEX_FILENAME = "index.ndx"
 GROMPP_NOT_RUN = "not_run_gmx_unavailable"
 GROMPP_PASSED = "passed"
-COMPLEX_PREPARATION_ALGORITHM_VERSION = "complex-preparation-v2"
+COMPLEX_PREPARATION_ALGORITHM_VERSION = "complex-preparation-v3"
 MUTATION_ALGORITHM_VERSION = "design-chain-mutation-v1"
 CLOSURE_ALGORITHM_VERSION = "head-tail-disulfide-closure-v1"
-D_COORDINATE_ALGORITHM_VERSION = "chain-local-d-coordinate-transform-v1"
+D_COORDINATE_ALGORITHM_VERSION = "chain-local-d-coordinate-input-v2"
 MANIFEST_PAYLOAD_DIGEST_FIELD = "scientific_metadata_sha256"
 ALGORITHM_VERSIONS = {
     "preparation": COMPLEX_PREPARATION_ALGORITHM_VERSION,
@@ -46,6 +46,7 @@ ALGORITHM_VERSIONS = {
 }
 
 _AMINO_ACIDS = frozenset("ACDEFGHIKLMNPQRSTVWY")
+_D_COORDINATE_INPUT_MODES = frozenset({"canonical_l", "prepared_d"})
 
 __all__ = [
     "ALGORITHM_VERSIONS",
@@ -187,6 +188,7 @@ class ComplexPrepConfig:
     output_dir: str
     design_sequence: str
     topology: PeptideTopologyDescriptor = field(default_factory=_empty_topology)
+    d_coordinate_input_mode: str = "canonical_l"
     coordinate_transformer_identity: str = ""
     chirality_validator_identity: str = ""
 
@@ -215,8 +217,15 @@ class ComplexPrepConfig:
             raise ValueError(f"design_sequence contains invalid characters {invalid!r}")
         object.__setattr__(self, "design_sequence", sequence)
         _validate_topology(self.topology, sequence)
+        if self.d_coordinate_input_mode not in _D_COORDINATE_INPUT_MODES:
+            raise ValueError("d_coordinate_input_mode must be 'canonical_l' or 'prepared_d'")
+        if self.d_coordinate_input_mode == "prepared_d" and not self.topology.d_substitutions:
+            raise ValueError("d_coordinate_input_mode='prepared_d' requires D substitutions")
         if self.topology.d_substitutions:
-            _require_string(self.coordinate_transformer_identity, "coordinate_transformer_identity")
+            if self.d_coordinate_input_mode == "canonical_l":
+                _require_string(
+                    self.coordinate_transformer_identity, "coordinate_transformer_identity"
+                )
             _require_string(self.chirality_validator_identity, "chirality_validator_identity")
 
 

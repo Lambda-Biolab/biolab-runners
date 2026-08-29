@@ -170,7 +170,44 @@ def _cys_complex_pdb_text(second_sg: tuple[float, float, float] = (3.2, 21.6, -1
     return "\n".join(lines) + "\n"
 
 
-def _artifact(source_pdb: Path, *, c_atom_count: int = 10) -> RosettaDecoyArtifact:
+def _receptor_disulfide_complex_pdb_text() -> str:
+    lines: list[str] = []
+    sg_serials: list[int] = []
+    serial = 0
+    for line in _complex_pdb_text().splitlines():
+        if line.startswith("ATOM"):
+            serial += 1
+            if line[21] == "A":
+                line = line[:17] + "CYS" + line[20:]
+                if line[22:26].strip() == "11" and line[12:16].strip() == "CB":
+                    line = line[:30] + f"{3.800:8.3f}{1.400:8.3f}{-1.000:8.3f}" + line[54:]
+            line = f"{line[:6]}{serial:5d}{line[11:]}"
+            lines.append(line)
+            if line[21] == "A" and line[12:16].strip() == "CB":
+                serial += 1
+                residue_number = int(line[22:26])
+                x, y = (2.300, -0.100) if residue_number == 10 else (4.050, 0.950)
+                sg_serial = serial
+                lines.append(
+                    f"ATOM  {serial:5d}  SG  CYS A{residue_number:4d}"
+                    f"    {x:8.3f}{y:8.3f}{-1.000:8.3f}  1.00  0.00           S"
+                )
+                sg_serials.append(sg_serial)
+                serial += 1
+                lines.append(
+                    f"ATOM  {serial:5d}  HG  CYS A{residue_number:4d}"
+                    f"    {x:8.3f}{y:8.3f}{0.300:8.3f}  1.00  0.00           H"
+                )
+        else:
+            lines.append(line)
+    lines.insert(-1, f"CONECT{sg_serials[0]:5d}{sg_serials[1]:5d}")
+    lines.insert(-1, f"CONECT{sg_serials[1]:5d}{sg_serials[0]:5d}")
+    return "\n".join(lines) + "\n"
+
+
+def _artifact(
+    source_pdb: Path, *, a_atom_count: int = 11, c_atom_count: int = 10
+) -> RosettaDecoyArtifact:
     digest = hashlib.sha256(source_pdb.read_bytes()).hexdigest()
     return RosettaDecoyArtifact(
         candidate_identity="candidate-1",
@@ -181,7 +218,7 @@ def _artifact(source_pdb: Path, *, c_atom_count: int = 10) -> RosettaDecoyArtifa
         input_pdb_identity=PDBIdentity("input", digest),
         output_pdb_identity=PDBIdentity("output", digest),
         chain_audits=(
-            ChainAudit("A", "receptor-alpha", 2, 11),
+            ChainAudit("A", "receptor-alpha", 2, a_atom_count),
             ChainAudit("B", "receptor-beta", 2, 9),
             ChainAudit("C", "binder", 2, c_atom_count),
         ),
@@ -245,6 +282,27 @@ def test_config_requires_successful_decoy_and_d_identities(
                 head_to_tail=SimpleNamespace(head=True, tail=2),
             ),
         )
+    with pytest.raises(ValueError, match="d_coordinate_input_mode"):
+        _config(
+            source_pdb,
+            tmp_path / "out-mode",
+            d_coordinate_input_mode="unknown",
+        )
+    with pytest.raises(ValueError, match="requires D substitutions"):
+        _config(
+            source_pdb,
+            tmp_path / "out-prepared-without-d",
+            d_coordinate_input_mode="prepared_d",
+        )
+    with pytest.raises(ValueError, match="chirality_validator_identity"):
+        _config(
+            source_pdb,
+            tmp_path / "out-prepared-without-validator",
+            topology=PeptideTopologyDescriptor(
+                d_substitutions=(SimpleNamespace(position=1, residue="LEU"),)
+            ),
+            d_coordinate_input_mode="prepared_d",
+        )
 
 
 def test_config_digest_normalizes_disulfide_pair_and_descriptor_order(
@@ -274,6 +332,26 @@ def test_config_digest_normalizes_disulfide_pair_and_descriptor_order(
     )
 
     assert compute_complex_config_digest(first) == compute_complex_config_digest(second)
+
+
+def test_config_digest_binds_d_coordinate_input_mode(source_pdb: Path, tmp_path: Path) -> None:
+    topology = PeptideTopologyDescriptor(
+        d_substitutions=(SimpleNamespace(position=1, residue="LEU"),)
+    )
+    common = {
+        "topology": topology,
+        "coordinate_transformer_identity": "transform-v1",
+        "chirality_validator_identity": "validator-v1",
+    }
+    canonical = _config(source_pdb, tmp_path / "canonical", **common)
+    prepared = _config(
+        source_pdb,
+        tmp_path / "prepared",
+        d_coordinate_input_mode="prepared_d",
+        **common,
+    )
+
+    assert compute_complex_config_digest(canonical) != compute_complex_config_digest(prepared)
 
 
 @pytest.mark.parametrize(
@@ -427,6 +505,63 @@ def test_full_complex_emits_exact_bundle_and_preserves_receptors(
         )
 
 
+def test_full_complex_normalizes_preexisting_receptor_disulfide(
+    tmp_path: Path,
+) -> None:
+    source_pdb = tmp_path / "receptor-disulfide.pdb"
+    source_pdb.write_text(_receptor_disulfide_complex_pdb_text())
+    source = app.PDBFile(str(source_pdb))
+    assert any(first.name == second.name == "SG" for first, second in source.topology.bonds())
+    config = _config(
+        source_pdb,
+        tmp_path / "out",
+        source_decoy=_artifact(source_pdb, a_atom_count=15),
+    )
+    result = ComplexPrepRunner().run(config)
+
+    assert result.success, result.error
+    assert result.bundle is not None
+    prepared_lines = Path(result.bundle.prepared_pdb.path).read_text().splitlines()
+    assert {
+        line[17:20]
+        for line in prepared_lines
+        if line.startswith(("ATOM", "HETATM")) and line[21] == "A"
+    } == {"CYX"}
+    prepared = app.PDBFile(result.bundle.prepared_pdb.path)
+    receptor_cysteines = [
+        residue for residue in prepared.topology.residues() if residue.chain.id == "A"
+    ]
+    assert len(receptor_cysteines) == 2
+    assert all(
+        "HG" not in {atom.name for atom in residue.atoms()} for residue in receptor_cysteines
+    )
+    prepared_text = Path(result.bundle.prepared_pdb.path).read_text()
+    assert any(line.startswith("CONECT") for line in prepared_text.splitlines())
+    source_positions = source.positions.value_in_unit(unit.nanometer)
+    prepared_positions = prepared.positions.value_in_unit(unit.nanometer)
+    source_sg = {
+        atom.residue.id: source_positions[atom.index]
+        for atom in source.topology.atoms()
+        if atom.residue.chain.id == "A" and atom.name == "SG"
+    }
+    prepared_sg = {
+        atom.residue.id: prepared_positions[atom.index]
+        for atom in prepared.topology.atoms()
+        if atom.residue.chain.id == "A" and atom.name == "SG"
+    }
+    assert prepared_sg.keys() == source_sg.keys()
+    for residue_id in source_sg:
+        assert tuple(prepared_sg[residue_id]) == pytest.approx(
+            tuple(source_sg[residue_id]), abs=1e-6
+        )
+    manifest = json.loads(Path(result.bundle.manifest.path).read_text())
+    assert manifest["bond_records"] == []
+
+    cached = ComplexPrepRunner().run(config)
+
+    assert cached.status is ExecutionStatus.CACHED, cached.error
+
+
 def test_d_callbacks_are_scoped_to_c_and_use_local_indices(
     source_pdb: Path, tmp_path: Path
 ) -> None:
@@ -452,6 +587,106 @@ def test_d_callbacks_are_scoped_to_c_and_use_local_indices(
     assert set(transformer.calls[0][0]) >= {"N", "CA", "C"}
     assert {index for index, _expected, _stage in validator.calls} == {0, 1}
     assert {stage for _index, _expected, stage in validator.calls} == {"post_h", "pre", "post"}
+
+
+def test_prepared_d_input_skips_transform_and_validates_source_as_d(
+    source_pdb: Path, tmp_path: Path
+) -> None:
+    transformer = _RecordingTransformer()
+    validator = _RecordingValidator()
+    config = _config(
+        source_pdb,
+        tmp_path / "out",
+        topology=PeptideTopologyDescriptor(
+            d_substitutions=(SimpleNamespace(position=1, residue="LEU"),)
+        ),
+        d_coordinate_input_mode="prepared_d",
+        chirality_validator_identity="validator-v1",
+    )
+
+    result = ComplexPrepRunner().run(
+        config, coordinate_transformer=transformer, chirality_validator=validator
+    )
+
+    assert result.success, result.error
+    assert transformer.calls == []
+    assert (0, "D", "source") in validator.calls
+    assert {stage for _index, _expected, stage in validator.calls} == {"source", "pre", "post"}
+    assert result.bundle is not None
+    manifest_path = Path(result.bundle.manifest.path)
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["d_coordinate_input_mode"] == "prepared_d"
+
+    manifest["d_coordinate_input_mode"] = "canonical_l"
+    manifest[MANIFEST_PAYLOAD_DIGEST_FIELD] = complex_prep_runner._manifest_payload_digest(manifest)
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    rejected = ComplexPrepRunner().run(config)
+    assert rejected.status is ExecutionStatus.FAILED
+    assert "D-coordinate input mode" in rejected.error
+
+
+def test_prepared_d_input_requires_runtime_chirality_validator(
+    source_pdb: Path, tmp_path: Path
+) -> None:
+    config = _config(
+        source_pdb,
+        tmp_path / "out",
+        topology=PeptideTopologyDescriptor(
+            d_substitutions=(SimpleNamespace(position=1, residue="LEU"),)
+        ),
+        d_coordinate_input_mode="prepared_d",
+        chirality_validator_identity="validator-v1",
+    )
+
+    result = ComplexPrepRunner().run(config)
+
+    assert result.status is ExecutionStatus.FAILED
+    assert "chirality validator callback" in result.error
+    assert not Path(config.output_dir).exists()
+
+
+def test_prepared_d_input_refuses_non_d_source_chirality(source_pdb: Path, tmp_path: Path) -> None:
+    class _RejectingValidator(_RecordingValidator):
+        def __call__(
+            self,
+            mapping: dict[str, tuple[float, float, float]],
+            residue_name: str,
+            residue_index: int,
+            *,
+            expected: str,
+            **kwargs: object,
+        ) -> ChiralityReport:
+            super().__call__(
+                mapping,
+                residue_name,
+                residue_index,
+                expected=expected,
+                **kwargs,
+            )
+            observed = "L" if expected == "D" else expected
+            return ChiralityReport(
+                residue_index,
+                residue_name,
+                expected,
+                observed,
+                observed == expected,
+            )
+
+    config = _config(
+        source_pdb,
+        tmp_path / "out-invalid-d",
+        topology=PeptideTopologyDescriptor(
+            d_substitutions=(SimpleNamespace(position=1, residue="LEU"),)
+        ),
+        d_coordinate_input_mode="prepared_d",
+        chirality_validator_identity="validator-v1",
+    )
+
+    result = ComplexPrepRunner().run(config, chirality_validator=_RejectingValidator())
+
+    assert result.status is ExecutionStatus.FAILED
+    assert "chirality validation failed" in result.error
+    assert not Path(config.output_dir).exists()
 
 
 def test_c_local_head_to_tail_closure_has_global_indices(tmp_path: Path) -> None:
