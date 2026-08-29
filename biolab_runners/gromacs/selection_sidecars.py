@@ -53,8 +53,8 @@ class _GroAtom:
     atom_name: str
     atom_number: int
 
-    def identity(self) -> tuple[int, str, str, int]:
-        return (self.residue_number, self.residue_name, self.atom_name, self.atom_number)
+    def identity(self) -> tuple[str, str, int]:
+        return (self.residue_name, self.atom_name, self.atom_number)
 
 
 @dataclass(frozen=True)

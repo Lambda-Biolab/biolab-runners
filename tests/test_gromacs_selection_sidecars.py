@@ -599,6 +599,44 @@ def test_refresh_sidecars_after_ions_records_ion_indices(tmp_path: Path) -> None
     assert [entry["prepared_topology_atom_index"] for entry in mapped] == [1, 2, 3]
 
 
+def test_refresh_sidecars_accepts_molecule_boundary_residue_number_restart(
+    tmp_path: Path,
+) -> None:
+    from biolab_runners.gromacs.selection_sidecars import (
+        refresh_selection_sidecars,
+        stage_selection_sidecars,
+    )
+
+    bundle = _write_bundle(tmp_path / "bundle")
+    _write_gro(
+        bundle["gro"],
+        [(114, "ALA", "N", 1), (115, "GLY", "CA", 2), (1, "GLY", "CA", 3)],
+    )
+    _rebind_bundle(bundle)
+    work_dir = tmp_path / "work"
+    stage_selection_sidecars(_strict_config(tmp_path, bundle), work_dir)
+    coordinates = work_dir / "ions.gro"
+    _write_gro(
+        coordinates,
+        [
+            (114, "ALA", "N", 1),
+            (1, "GLY", "CA", 2),
+            (1, "GLY", "CA", 3),
+            (2, "NA", "NA", 4),
+        ],
+    )
+
+    refresh_selection_sidecars(
+        work_dir,
+        stage="ions",
+        topology_path=work_dir / "topol.top",
+        coordinates_path=coordinates,
+    )
+
+    final_map = json.loads((work_dir / "selection-map.json").read_text())
+    assert final_map["gromacs_added_atoms"][0]["residue_number"] == 2
+
+
 def test_validate_final_sidecars_refuses_modified_prepared_provenance(tmp_path: Path) -> None:
     from biolab_runners.gromacs.selection_sidecars import (
         refresh_selection_sidecars,
@@ -625,7 +663,20 @@ def test_validate_final_sidecars_refuses_modified_prepared_provenance(tmp_path: 
         validate_staged_selection_sidecars(work_dir)
 
 
-def test_refresh_sidecars_rejects_changed_solute_atom_identity(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "atoms",
+    [
+        [(1, "GLY", "CA", 2), (1, "ALA", "N", 1), (1, "GLY", "CA", 3)],
+        [(1, "GLY", "N", 1), (1, "GLY", "CA", 2), (1, "GLY", "CA", 3)],
+        [(1, "ALA", "CA", 1), (1, "GLY", "CA", 2), (1, "GLY", "CA", 3)],
+        [(1, "ALA", "N", 9), (1, "GLY", "CA", 2), (1, "GLY", "CA", 3)],
+    ],
+    ids=("atom-order", "residue-name", "atom-name", "atom-number"),
+)
+def test_refresh_sidecars_rejects_changed_solute_atom_identity(
+    tmp_path: Path,
+    atoms: list[tuple[int, str, str, int]],
+) -> None:
     from biolab_runners.gromacs.selection_sidecars import (
         refresh_selection_sidecars,
         stage_selection_sidecars,
@@ -638,10 +689,7 @@ def test_refresh_sidecars_rejects_changed_solute_atom_identity(tmp_path: Path) -
     topology = work_dir / "topol.top"
     topology.write_text("; topology\n")
     coordinates = work_dir / "solvated.gro"
-    _write_gro(
-        coordinates,
-        [(1, "ALA", "CA", 1), (1, "GLY", "CA", 2), (1, "GLY", "CA", 3)],
-    )
+    _write_gro(coordinates, atoms)
 
     with pytest.raises(ValueError, match="solute atom identity mismatch"):
         refresh_selection_sidecars(
