@@ -245,6 +245,27 @@ def test_config_requires_successful_decoy_and_d_identities(
                 head_to_tail=SimpleNamespace(head=True, tail=2),
             ),
         )
+    with pytest.raises(ValueError, match="d_coordinate_input_mode"):
+        _config(
+            source_pdb,
+            tmp_path / "out-mode",
+            d_coordinate_input_mode="unknown",
+        )
+    with pytest.raises(ValueError, match="requires D substitutions"):
+        _config(
+            source_pdb,
+            tmp_path / "out-prepared-without-d",
+            d_coordinate_input_mode="prepared_d",
+        )
+    with pytest.raises(ValueError, match="chirality_validator_identity"):
+        _config(
+            source_pdb,
+            tmp_path / "out-prepared-without-validator",
+            topology=PeptideTopologyDescriptor(
+                d_substitutions=(SimpleNamespace(position=1, residue="LEU"),)
+            ),
+            d_coordinate_input_mode="prepared_d",
+        )
 
 
 def test_config_digest_normalizes_disulfide_pair_and_descriptor_order(
@@ -452,6 +473,34 @@ def test_d_callbacks_are_scoped_to_c_and_use_local_indices(
     assert set(transformer.calls[0][0]) >= {"N", "CA", "C"}
     assert {index for index, _expected, _stage in validator.calls} == {0, 1}
     assert {stage for _index, _expected, stage in validator.calls} == {"post_h", "pre", "post"}
+
+
+def test_prepared_d_input_skips_transform_and_validates_source_as_d(
+    source_pdb: Path, tmp_path: Path
+) -> None:
+    transformer = _RecordingTransformer()
+    validator = _RecordingValidator()
+    config = _config(
+        source_pdb,
+        tmp_path / "out",
+        topology=PeptideTopologyDescriptor(
+            d_substitutions=(SimpleNamespace(position=1, residue="LEU"),)
+        ),
+        d_coordinate_input_mode="prepared_d",
+        chirality_validator_identity="validator-v1",
+    )
+
+    result = ComplexPrepRunner().run(
+        config, coordinate_transformer=transformer, chirality_validator=validator
+    )
+
+    assert result.success, result.error
+    assert transformer.calls == []
+    assert (0, "D", "source") in validator.calls
+    assert {stage for _index, _expected, stage in validator.calls} == {"source", "pre", "post"}
+    assert result.bundle is not None
+    manifest = json.loads(Path(result.bundle.manifest.path).read_text())
+    assert manifest["d_coordinate_input_mode"] == "prepared_d"
 
 
 def test_c_local_head_to_tail_closure_has_global_indices(tmp_path: Path) -> None:

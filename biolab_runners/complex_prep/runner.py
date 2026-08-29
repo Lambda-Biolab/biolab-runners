@@ -237,6 +237,7 @@ def compute_complex_config_digest(config: ComplexPrepConfig) -> str:
         "pH": 7.4,
         "algorithm_versions": ALGORITHM_VERSIONS,
         "topology": _descriptor_payload(config),
+        "d_coordinate_input_mode": config.d_coordinate_input_mode,
         "coordinate_transformer_identity": config.coordinate_transformer_identity,
         "chirality_validator_identity": config.chirality_validator_identity,
         "source_decoy": config.source_decoy.to_dict(),
@@ -367,20 +368,16 @@ def _prepare_structure(
                 config.topology,
                 chirality_validator,
                 design_chain_id=DESIGN_CHAIN_ID,
-                stage="post_h",
+                stage=_source_chirality_stage(config),
             )
         )
-    if config.topology.d_substitutions:
-        if coordinate_transformer is None or chirality_validator is None:
-            raise ValueError("D substitutions require both preparation callbacks")
-        positions = design_chain.apply_d_coordinate_transform(
-            topology,
-            positions,
-            config.design_sequence,
-            config.topology,
-            coordinate_transformer,
-            design_chain_id=DESIGN_CHAIN_ID,
-        )
+    positions = _prepare_d_coordinates(
+        config,
+        topology,
+        positions,
+        coordinate_transformer=coordinate_transformer,
+        chirality_validator=chirality_validator,
+    )
     if chirality_validator is not None:
         reports.append(
             design_chain.run_chirality_validation(
@@ -424,6 +421,32 @@ def _prepare_structure(
         chirality_reports=tuple(reports),
         system=system,
         net_charge=net_charge,
+    )
+
+
+def _source_chirality_stage(config: ComplexPrepConfig) -> str:
+    return "source" if config.d_coordinate_input_mode == "prepared_d" else "post_h"
+
+
+def _prepare_d_coordinates(
+    config: ComplexPrepConfig,
+    topology: object,
+    positions: object,
+    *,
+    coordinate_transformer: CoordinateTransformer | None,
+    chirality_validator: ChiralityValidator | None,
+) -> object:
+    if not config.topology.d_substitutions or config.d_coordinate_input_mode == "prepared_d":
+        return positions
+    if coordinate_transformer is None or chirality_validator is None:
+        raise ValueError("D substitutions require both preparation callbacks")
+    return design_chain.apply_d_coordinate_transform(
+        topology,
+        positions,
+        config.design_sequence,
+        config.topology,
+        coordinate_transformer,
+        design_chain_id=DESIGN_CHAIN_ID,
     )
 
 
@@ -1222,6 +1245,7 @@ def _build_manifest(
             "disulfide_angstrom": DEFAULT_MAX_DISULFIDE_DISTANCE_A,
         },
         "topology": _descriptor_payload(config),
+        "d_coordinate_input_mode": config.d_coordinate_input_mode,
         "artifacts": {
             name: {"path": str(output_dir / name), "sha256": digest}
             for name, digest in artifact_digests.items()
@@ -1628,6 +1652,8 @@ def _validate_manifest_request_values(manifest: dict[str, Any], config: ComplexP
         "topology"
     ] != _descriptor_payload(config):
         raise ValueError("cached bundle config descriptor does not match request")
+    if manifest["d_coordinate_input_mode"] != config.d_coordinate_input_mode:
+        raise ValueError("cached bundle D-coordinate input mode does not match request")
     if manifest["source_decoy"] != config.source_decoy.to_dict():
         raise ValueError("cached bundle source decoy identity does not match request")
     if manifest["chain_roles"] != {
@@ -1662,6 +1688,8 @@ def _validate_manifest_metadata_types(manifest: dict[str, Any]) -> None:
         raise MalformedBundleError("manifest path metadata is malformed")
     if not isinstance(manifest.get("design_sequence"), str):
         raise MalformedBundleError("manifest design sequence is malformed")
+    if manifest.get("d_coordinate_input_mode") not in {"canonical_l", "prepared_d"}:
+        raise MalformedBundleError("manifest D-coordinate input mode is malformed")
     if not isinstance(manifest.get("source_decoy"), dict) or not isinstance(
         manifest.get("topology"), dict
     ):
