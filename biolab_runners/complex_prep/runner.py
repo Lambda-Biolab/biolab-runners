@@ -436,10 +436,14 @@ def _prepare_d_coordinates(
     coordinate_transformer: CoordinateTransformer | None,
     chirality_validator: ChiralityValidator | None,
 ) -> object:
-    if not config.topology.d_substitutions or config.d_coordinate_input_mode == "prepared_d":
+    if not config.topology.d_substitutions:
         return positions
-    if coordinate_transformer is None or chirality_validator is None:
-        raise ValueError("D substitutions require both preparation callbacks")
+    if chirality_validator is None:
+        raise ValueError("D substitutions require a chirality validator callback")
+    if config.d_coordinate_input_mode == "prepared_d":
+        return positions
+    if coordinate_transformer is None:
+        raise ValueError("canonical-L D substitutions require a coordinate transformer callback")
     return design_chain.apply_d_coordinate_transform(
         topology,
         positions,

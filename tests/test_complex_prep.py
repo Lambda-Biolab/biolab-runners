@@ -297,6 +297,26 @@ def test_config_digest_normalizes_disulfide_pair_and_descriptor_order(
     assert compute_complex_config_digest(first) == compute_complex_config_digest(second)
 
 
+def test_config_digest_binds_d_coordinate_input_mode(source_pdb: Path, tmp_path: Path) -> None:
+    topology = PeptideTopologyDescriptor(
+        d_substitutions=(SimpleNamespace(position=1, residue="LEU"),)
+    )
+    common = {
+        "topology": topology,
+        "coordinate_transformer_identity": "transform-v1",
+        "chirality_validator_identity": "validator-v1",
+    }
+    canonical = _config(source_pdb, tmp_path / "canonical", **common)
+    prepared = _config(
+        source_pdb,
+        tmp_path / "prepared",
+        d_coordinate_input_mode="prepared_d",
+        **common,
+    )
+
+    assert compute_complex_config_digest(canonical) != compute_complex_config_digest(prepared)
+
+
 @pytest.mark.parametrize(
     "prepared_names",
     [
@@ -499,8 +519,36 @@ def test_prepared_d_input_skips_transform_and_validates_source_as_d(
     assert (0, "D", "source") in validator.calls
     assert {stage for _index, _expected, stage in validator.calls} == {"source", "pre", "post"}
     assert result.bundle is not None
-    manifest = json.loads(Path(result.bundle.manifest.path).read_text())
+    manifest_path = Path(result.bundle.manifest.path)
+    manifest = json.loads(manifest_path.read_text())
     assert manifest["d_coordinate_input_mode"] == "prepared_d"
+
+    manifest["d_coordinate_input_mode"] = "canonical_l"
+    manifest[MANIFEST_PAYLOAD_DIGEST_FIELD] = complex_prep_runner._manifest_payload_digest(manifest)
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    rejected = ComplexPrepRunner().run(config)
+    assert rejected.status is ExecutionStatus.FAILED
+    assert "D-coordinate input mode" in rejected.error
+
+
+def test_prepared_d_input_requires_runtime_chirality_validator(
+    source_pdb: Path, tmp_path: Path
+) -> None:
+    config = _config(
+        source_pdb,
+        tmp_path / "out",
+        topology=PeptideTopologyDescriptor(
+            d_substitutions=(SimpleNamespace(position=1, residue="LEU"),)
+        ),
+        d_coordinate_input_mode="prepared_d",
+        chirality_validator_identity="validator-v1",
+    )
+
+    result = ComplexPrepRunner().run(config)
+
+    assert result.status is ExecutionStatus.FAILED
+    assert "chirality validator callback" in result.error
+    assert not Path(config.output_dir).exists()
 
 
 def test_c_local_head_to_tail_closure_has_global_indices(tmp_path: Path) -> None:
