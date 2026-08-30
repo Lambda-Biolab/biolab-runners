@@ -472,21 +472,29 @@ def _mutate_and_hydrate(
     fixer.missingResidues = {}
     fixer.findMissingAtoms()
     fixer.addMissingAtoms()
+    _synchronize_receptor_disulfides(fixer.topology, source_topology)
     pre_hydrogen_records = _atom_records(fixer.topology, fixer.positions)
     fixer.addMissingHydrogens(pH=7.4)
     fixer.positions = _restore_preexisting_coordinates(
         fixer.topology, fixer.positions, pre_hydrogen_records
     )
     topology, positions = _remove_receptor_extras(fixer.topology, fixer.positions, source_topology)
-    _restore_receptor_disulfides(topology, source_topology)
+    _synchronize_receptor_disulfides(topology, source_topology)
     return topology, positions
 
 
-def _restore_receptor_disulfides(topology: object, source_topology: object) -> None:
+def _synchronize_receptor_disulfides(topology: object, source_topology: object) -> None:
     source_pairs = _receptor_disulfide_pairs(source_topology)
+    bonds = getattr(topology, "_bonds", None)
+    if not isinstance(bonds, list):
+        raise ValueError("prepared topology does not expose mutable bonds")
+    bonds[:] = [
+        bond
+        for bond in bonds
+        if not _is_receptor_disulfide_bond(bond[0], bond[1])
+        or _bond_identity(bond[0], bond[1]) in source_pairs
+    ]
     prepared_pairs = _receptor_disulfide_pairs(topology)
-    if not prepared_pairs <= source_pairs:
-        raise ValueError("receptor disulfide identity changed during preparation")
     atoms = {
         (*_residue_key(atom.residue), atom.name): atom
         for atom in topology.atoms()  # type: ignore[attr-defined]
@@ -496,6 +504,32 @@ def _restore_receptor_disulfides(topology: object, source_topology: object) -> N
             topology.addBond(atoms[first], atoms[second])  # type: ignore[attr-defined]
         except KeyError as exc:
             raise ValueError("receptor disulfide atom was lost during preparation") from exc
+    if _receptor_disulfide_pairs(topology) != source_pairs:
+        raise ValueError("receptor disulfide identity changed during preparation")
+
+
+def _is_receptor_disulfide_bond(first: object, second: object) -> bool:
+    return (
+        getattr(first, "name", None) == getattr(second, "name", None) == "SG"
+        and getattr(getattr(getattr(first, "residue", None), "chain", None), "id", None)
+        in RECEPTOR_CHAIN_IDS
+        and getattr(getattr(getattr(second, "residue", None), "chain", None), "id", None)
+        in RECEPTOR_CHAIN_IDS
+    )
+
+
+def _bond_identity(
+    first: object, second: object
+) -> tuple[tuple[str, int, str, str], tuple[str, int, str, str]]:
+    first_name = first.name  # type: ignore[attr-defined]
+    second_name = second.name  # type: ignore[attr-defined]
+    identities = sorted(
+        (
+            (*_residue_key(first.residue), first_name),  # type: ignore[attr-defined]
+            (*_residue_key(second.residue), second_name),  # type: ignore[attr-defined]
+        )
+    )
+    return identities[0], identities[1]
 
 
 def _receptor_disulfide_pairs(
@@ -503,20 +537,9 @@ def _receptor_disulfide_pairs(
 ) -> set[tuple[tuple[str, int, str, str], tuple[str, int, str, str]]]:
     pairs = set()
     for first, second in topology.bonds():  # type: ignore[attr-defined]
-        if (
-            first.name != "SG"
-            or second.name != "SG"
-            or first.residue.chain.id not in RECEPTOR_CHAIN_IDS
-            or second.residue.chain.id not in RECEPTOR_CHAIN_IDS
-        ):
+        if not _is_receptor_disulfide_bond(first, second):
             continue
-        identities = sorted(
-            (
-                (*_residue_key(first.residue), first.name),
-                (*_residue_key(second.residue), second.name),
-            )
-        )
-        pairs.add((identities[0], identities[1]))
+        pairs.add(_bond_identity(first, second))
     return pairs
 
 

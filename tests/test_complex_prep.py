@@ -205,8 +205,68 @@ def _receptor_disulfide_complex_pdb_text() -> str:
     return "\n".join(lines) + "\n"
 
 
+def _complete_design_chain(text: str) -> str:
+    lines = text.splitlines()
+    terminal_index = max(index for index, line in enumerate(lines) if line == "TER")
+    lines.insert(
+        terminal_index,
+        "ATOM     35  OXT ALA C  31       6.800  21.500   0.000  1.00  0.00           O",
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _reduced_receptor_disulfide_complex_pdb_text() -> str:
+    return _complete_design_chain(
+        "\n".join(
+            line
+            for line in _receptor_disulfide_complex_pdb_text().splitlines()
+            if not line.startswith("CONECT")
+        )
+    )
+
+
+def _mixed_receptor_disulfide_complex_pdb_text() -> str:
+    lines: list[str] = []
+    serial = 36
+    for line in _complete_design_chain(_receptor_disulfide_complex_pdb_text()).splitlines():
+        if line.startswith("ATOM") and line[21] == "B":
+            line = line[:17] + "CYS" + line[20:]
+        lines.append(line)
+        if line.startswith("ATOM") and line[21] == "B" and line[12:16].strip() == "O":
+            residue_number = int(line[22:26])
+            x, y = (1.400, 9.000) if residue_number == 20 else (3.800, 11.400)
+            sg_x, sg_y = (2.300, 9.900) if residue_number == 20 else (4.050, 10.950)
+            lines.extend(
+                [
+                    f"ATOM  {serial:5d}  CB  CYS B{residue_number:4d}"
+                    f"    {x:8.3f}{y:8.3f}{-1.000:8.3f}  1.00  0.00           C",
+                    f"ATOM  {serial + 1:5d}  SG  CYS B{residue_number:4d}"
+                    f"    {sg_x:8.3f}{sg_y:8.3f}{-1.000:8.3f}  1.00  0.00           S",
+                    f"ATOM  {serial + 2:5d}  HG  CYS B{residue_number:4d}"
+                    f"    {sg_x:8.3f}{sg_y:8.3f}{0.300:8.3f}  1.00  0.00           H",
+                ]
+            )
+            serial += 3
+    return "\n".join(lines) + "\n"
+
+
+def _receptor_sg_pairs(topology: app.Topology) -> set[frozenset[tuple[str, str]]]:
+    return {
+        frozenset(
+            (
+                (first.residue.chain.id, first.residue.id),
+                (second.residue.chain.id, second.residue.id),
+            )
+        )
+        for first, second in topology.bonds()
+        if first.name == second.name == "SG"
+        and first.residue.chain.id in {"A", "B"}
+        and second.residue.chain.id in {"A", "B"}
+    }
+
+
 def _artifact(
-    source_pdb: Path, *, a_atom_count: int = 11, c_atom_count: int = 10
+    source_pdb: Path, *, a_atom_count: int = 11, b_atom_count: int = 9, c_atom_count: int = 10
 ) -> RosettaDecoyArtifact:
     digest = hashlib.sha256(source_pdb.read_bytes()).hexdigest()
     return RosettaDecoyArtifact(
@@ -219,7 +279,7 @@ def _artifact(
         output_pdb_identity=PDBIdentity("output", digest),
         chain_audits=(
             ChainAudit("A", "receptor-alpha", 2, a_atom_count),
-            ChainAudit("B", "receptor-beta", 2, 9),
+            ChainAudit("B", "receptor-beta", 2, b_atom_count),
             ChainAudit("C", "binder", 2, c_atom_count),
         ),
         relax_score=RelaxScore(total_score=-12.5),
@@ -560,6 +620,57 @@ def test_full_complex_normalizes_preexisting_receptor_disulfide(
     cached = ComplexPrepRunner().run(config)
 
     assert cached.status is ExecutionStatus.CACHED, cached.error
+
+
+def test_close_reduced_receptor_cysteines_remain_reduced_without_conect(
+    tmp_path: Path,
+) -> None:
+    source_pdb = tmp_path / "reduced-receptor-cys.pdb"
+    source_pdb.write_text(_reduced_receptor_disulfide_complex_pdb_text())
+    source = app.PDBFile(str(source_pdb))
+    assert _receptor_sg_pairs(source.topology) == set()
+
+    config = _config(
+        source_pdb,
+        tmp_path / "out",
+        source_decoy=_artifact(source_pdb, a_atom_count=15, c_atom_count=11),
+    )
+    result = ComplexPrepRunner().run(config)
+
+    assert result.success, result.error
+    assert result.bundle is not None
+    prepared = app.PDBFile(result.bundle.prepared_pdb.path)
+    assert _receptor_sg_pairs(prepared.topology) == set()
+    receptor_cysteines = [
+        residue for residue in prepared.topology.residues() if residue.chain.id == "A"
+    ]
+    assert {residue.name for residue in receptor_cysteines} == {"CYS"}
+    assert all("HG" in {atom.name for atom in residue.atoms()} for residue in receptor_cysteines)
+
+
+def test_mixed_receptor_disulfides_preserve_only_explicit_source_pair(
+    tmp_path: Path,
+) -> None:
+    source_pdb = tmp_path / "mixed-receptor-cys.pdb"
+    source_pdb.write_text(_mixed_receptor_disulfide_complex_pdb_text())
+    source = app.PDBFile(str(source_pdb))
+    source_pairs = _receptor_sg_pairs(source.topology)
+    assert source_pairs == {frozenset({("A", "10"), ("A", "11")})}
+
+    config = _config(
+        source_pdb,
+        tmp_path / "out",
+        source_decoy=_artifact(source_pdb, a_atom_count=15, b_atom_count=15, c_atom_count=11),
+    )
+    result = ComplexPrepRunner().run(config)
+
+    assert result.success, result.error
+    assert result.bundle is not None
+    prepared = app.PDBFile(result.bundle.prepared_pdb.path)
+    assert _receptor_sg_pairs(prepared.topology) == source_pairs
+    b_cysteines = [residue for residue in prepared.topology.residues() if residue.chain.id == "B"]
+    assert {residue.name for residue in b_cysteines} == {"CYS"}
+    assert all("HG" in {atom.name for atom in residue.atoms()} for residue in b_cysteines)
 
 
 def test_d_callbacks_are_scoped_to_c_and_use_local_indices(
