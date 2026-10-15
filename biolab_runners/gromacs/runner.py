@@ -308,12 +308,14 @@ def _mdp_content_for(stage: ProtocolStage, config: GromacsProtocolConfig) -> str
         return generate_minimization_mdp(
             config.minimization_max_iterations,
             replica_index=config.replica_index,
+            execution_seed=config.execution_seed,
         )
     if stage.kind == StageKind.EQUIL_NVT:
         return generate_equil_nvt_mdp(
             config.nvt_ps,
             config.temperature_k,
             replica_index=config.replica_index,
+            execution_seed=config.execution_seed,
         )
     if stage.kind == StageKind.EQUIL_NPT:
         return generate_equil_npt_mdp(
@@ -321,6 +323,7 @@ def _mdp_content_for(stage: ProtocolStage, config: GromacsProtocolConfig) -> str
             config.temperature_k,
             config.pressure_bar,
             replica_index=config.replica_index,
+            execution_seed=config.execution_seed,
         )
     if stage.kind == StageKind.PRODUCTION:
         return generate_production_mdp(
@@ -328,6 +331,7 @@ def _mdp_content_for(stage: ProtocolStage, config: GromacsProtocolConfig) -> str
             config.temperature_k,
             config.pressure_bar,
             replica_index=config.replica_index,
+            execution_seed=config.execution_seed,
         )
     return None
 
@@ -930,6 +934,8 @@ def _protocol_executed_config(config: GromacsProtocolConfig) -> dict[str, object
     from biolab_runners.gromacs.protocol import GROMACS_PROTOCOL_VERSION
 
     payload = dataclasses.asdict(config)
+    if config.execution_seed is None:
+        payload.pop("execution_seed")
     payload["protocol_version"] = GROMACS_PROTOCOL_VERSION
     payload["input_digests"] = _protocol_input_digests(config)
     payload["mdp_contents"] = {

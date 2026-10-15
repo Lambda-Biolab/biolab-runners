@@ -398,18 +398,27 @@ def test_openmm_minimization_produces_physically_plausible_energy() -> None:
         1 * unit.femtosecond,  # type: ignore[reportOperatorIssue]
     )
 
-    chosen_name, chosen_platform = _pick_openmm_platform()
+    chosen_name, _ = _pick_openmm_platform()
     t0 = time.perf_counter()
-    try:
-        sim = Simulation(modeller.topology, system, integrator, chosen_platform)
-    except Exception:
-        # CUDA/OpenCL platforms can be registered but unusable if /dev
-        # is wrong. Fall back to CPU to keep the test runnable.
-        if chosen_name == "CUDA":
-            chosen_name, chosen_platform = "OpenCL", Platform.getPlatformByName("OpenCL")
-            sim = Simulation(modeller.topology, system, integrator, chosen_platform)
-        else:
-            raise
+
+    # A platform can be registered but unusable: OpenMM raises only when
+    # the Context is created (e.g. clCreateContext fails when /dev/dri is
+    # absent under a sandboxed mount namespace). Walk the priority order
+    # from the preferred platform down to CPU so the test stays runnable
+    # on any workstation instead of aborting at the first unusable one.
+    candidates = [chosen_name, *(n for n in ("CUDA", "OpenCL", "CPU") if n != chosen_name)]
+    sim = None
+    for candidate in candidates:
+        try:
+            sim = Simulation(
+                modeller.topology, system, integrator, Platform.getPlatformByName(candidate)
+            )
+        except Exception:
+            continue
+        chosen_name = candidate
+        break
+    if sim is None:
+        pytest.fail(f"OpenMM could not create a context on any of {candidates}")
     sim.context.setPositions(modeller.positions)
     sim.minimizeEnergy(maxIterations=50)
 
