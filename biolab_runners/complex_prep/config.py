@@ -15,13 +15,18 @@ from biolab_runners.peptide_prep.config import (
 )
 from biolab_runners.peptide_prep.utils import THREE_LETTER
 from biolab_runners.provenance import build_execution_provenance
-from biolab_runners.rosetta.artifact import RosettaDecoyArtifact
+from biolab_runners.rosetta.artifact import ChainAudit, RosettaDecoyArtifact
 
 RECEPTOR_CHAIN_IDS = ("A", "B")
 DESIGN_CHAIN_ID = "C"
+RECEPTOR_ROLE = "receptor"
+DESIGN_ROLE = "design"
 PROTEIN_FORCE_FIELD = "amber99sbildn.xml"
 WATER_FORCE_FIELD = "tip3p.xml"
 PREPARATION_SCHEMA_VERSION = 1
+MULTIROLE_PREPARATION_SCHEMA_VERSION = 3
+FINAL_SCHEMA_VERSION = 2
+MULTIROLE_FINAL_SCHEMA_VERSION = 4
 MANIFEST_FILENAME = "manifest.json"
 PREPARED_PDB_FILENAME = "prepared.pdb"
 PREPARED_TOP_FILENAME = "prepared.top"
@@ -31,6 +36,7 @@ INDEX_FILENAME = "index.ndx"
 GROMPP_NOT_RUN = "not_run_gmx_unavailable"
 GROMPP_PASSED = "passed"
 COMPLEX_PREPARATION_ALGORITHM_VERSION = "complex-preparation-v4"
+MULTIROLE_COMPLEX_PREPARATION_ALGORITHM_VERSION = "complex-preparation-v5"
 MUTATION_ALGORITHM_VERSION = "design-chain-mutation-v1"
 CLOSURE_ALGORITHM_VERSION = "head-tail-disulfide-closure-v1"
 D_COORDINATE_ALGORITHM_VERSION = "chain-local-d-coordinate-input-v2"
@@ -53,12 +59,18 @@ __all__ = [
     "CLOSURE_ALGORITHM_VERSION",
     "COMPLEX_PREPARATION_ALGORITHM_VERSION",
     "DESIGN_CHAIN_ID",
+    "DESIGN_ROLE",
     "D_COORDINATE_ALGORITHM_VERSION",
+    "FINAL_SCHEMA_VERSION",
     "GROMPP_NOT_RUN",
     "GROMPP_PASSED",
     "INDEX_FILENAME",
+    "LEGACY_CHAIN_ROLES",
     "MANIFEST_FILENAME",
     "MANIFEST_PAYLOAD_DIGEST_FIELD",
+    "MULTIROLE_COMPLEX_PREPARATION_ALGORITHM_VERSION",
+    "MULTIROLE_FINAL_SCHEMA_VERSION",
+    "MULTIROLE_PREPARATION_SCHEMA_VERSION",
     "MUTATION_ALGORITHM_VERSION",
     "PREPARATION_SCHEMA_VERSION",
     "PREPARED_GRO_FILENAME",
@@ -66,18 +78,92 @@ __all__ = [
     "PREPARED_TOP_FILENAME",
     "PROTEIN_FORCE_FIELD",
     "RECEPTOR_CHAIN_IDS",
+    "RECEPTOR_ROLE",
     "SELECTION_MAP_FILENAME",
     "WATER_FORCE_FIELD",
     "ComplexChainAudit",
+    "ComplexChainRoles",
     "ComplexPrepBundle",
     "ComplexPrepConfig",
     "ComplexPrepResult",
     "ComplexResidueAudit",
+    "resolve_chain_roles",
 ]
 
 
 def _empty_topology() -> PeptideTopologyDescriptor:
     return PeptideTopologyDescriptor()
+
+
+@dataclass(frozen=True)
+class ComplexChainRoles:
+    """Resolved receptor/design chain assignment for one preparation."""
+
+    receptor_chain_ids: tuple[str, ...]
+    design_chain_id: str
+    legacy: bool
+
+    @property
+    def chain_ids(self) -> tuple[str, ...]:
+        """Return every prepared chain in deterministic audit order."""
+        return (*self.receptor_chain_ids, self.design_chain_id)
+
+    @property
+    def schema_version(self) -> int:
+        """Return the prepared selection-map and manifest schema for this role set."""
+        return PREPARATION_SCHEMA_VERSION if self.legacy else MULTIROLE_PREPARATION_SCHEMA_VERSION
+
+    @property
+    def algorithm_versions(self) -> dict[str, str]:
+        """Return the algorithm identity that binds this selection representation."""
+        if self.legacy:
+            return dict(ALGORITHM_VERSIONS)
+        return {
+            **ALGORITHM_VERSIONS,
+            "preparation": MULTIROLE_COMPLEX_PREPARATION_ALGORITHM_VERSION,
+        }
+
+    @property
+    def manifest_chain_roles(self) -> dict[str, Any]:
+        """Return the manifest chain-role record for this assignment."""
+        return {"receptor": list(self.receptor_chain_ids), "design": self.design_chain_id}
+
+    def role_for(self, chain_id: str) -> str:
+        """Return the fixed role name for one prepared chain."""
+        return DESIGN_ROLE if chain_id == self.design_chain_id else RECEPTOR_ROLE
+
+
+LEGACY_CHAIN_ROLES = ComplexChainRoles(RECEPTOR_CHAIN_IDS, DESIGN_CHAIN_ID, legacy=True)
+
+
+def resolve_chain_roles(chain_audits: tuple[ChainAudit, ...]) -> ComplexChainRoles:
+    """Resolve the single role source from source-decoy chain audits.
+
+    A decoy whose audits use the explicit ``receptor``/``design`` vocabulary is
+    prepared as a role-aware multi-receptor bundle: at least one receptor, exactly
+    one design chain, no other roles, and unique chain IDs. Any other role
+    vocabulary is the legacy opaque convention and keeps the fixed A/B receptor
+    and C design layout, so previously published decoys stay readable and
+    byte-stable.
+    """
+    chain_ids = [audit.chain_id for audit in chain_audits]
+    if len(chain_ids) != len(set(chain_ids)):
+        raise ValueError("chain_audits must have unique chain IDs")
+    role_by_chain = {audit.chain_id: audit.role for audit in chain_audits}
+    if not set(role_by_chain.values()) & {RECEPTOR_ROLE, DESIGN_ROLE}:
+        return ComplexChainRoles(RECEPTOR_CHAIN_IDS, DESIGN_CHAIN_ID, legacy=True)
+    unknown = sorted(set(role_by_chain.values()) - {RECEPTOR_ROLE, DESIGN_ROLE})
+    if unknown:
+        raise ValueError(f"chain_audits contains unsupported roles {unknown!r}")
+    receptor_ids = tuple(
+        sorted(chain_id for chain_id, role in role_by_chain.items() if role == RECEPTOR_ROLE)
+    )
+    design_ids = sorted(chain_id for chain_id, role in role_by_chain.items() if role == DESIGN_ROLE)
+    if not receptor_ids:
+        raise ValueError("chain_audits must contain at least one role='receptor'")
+    if len(design_ids) != 1:
+        raise ValueError("chain_audits must contain exactly one role='design'")
+    return ComplexChainRoles(receptor_ids, design_ids[0], legacy=False)
 
 
 def _require_string(value: object, field_name: str) -> None:
@@ -191,6 +277,7 @@ class ComplexPrepConfig:
     d_coordinate_input_mode: str = "canonical_l"
     coordinate_transformer_identity: str = ""
     chirality_validator_identity: str = ""
+    chain_roles: ComplexChainRoles = field(init=False, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         """Validate caller-owned identity and descriptor boundaries."""
@@ -204,6 +291,7 @@ class ComplexPrepConfig:
             self.topology, PeptideTopologyDescriptor
         ):
             raise ValueError("topology must be a PeptideTopologyDescriptor")
+        object.__setattr__(self, "chain_roles", resolve_chain_roles(self.source_decoy.chain_audits))
 
         if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
             self.design_sequence, str
