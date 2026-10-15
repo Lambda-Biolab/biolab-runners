@@ -153,6 +153,9 @@ class GromacsProtocolConfig:
         replicas_total: Total number of replicas for this name
             (default 1, no per-replica subdirectory). Used by
             callers that want deterministic replica addressing.
+        execution_seed: Optional positive GROMACS ``gen-seed`` value.
+            When set, it overrides the replica-derived ``gen-seed`` in
+            generated MD input without changing replica addressing.
         extra_mdrun_flags: Extra flags appended to every
             ``gmx mdrun`` invocation (e.g. ``("-nb", "gpu")``).
         timeout_seconds: Per-stage subprocess timeout (default
@@ -212,6 +215,7 @@ class GromacsProtocolConfig:
     prebuilt_selection_map: str = ""
     prebuilt_index: str = ""
     prebuilt_bundle_manifest: str = ""
+    execution_seed: int | None = None
 
     def __post_init__(self) -> None:
         """Validate required paths and parameter ranges."""
@@ -228,6 +232,7 @@ class GromacsProtocolConfig:
         self._validate_protocol_durations()
         self._validate_thermodynamics()
         self._validate_replicas()
+        self._validate_execution_seed()
         self._validate_prebuilt()
         self._validate_selection_sidecars()
 
@@ -345,6 +350,15 @@ class GromacsProtocolConfig:
             raise ValueError(
                 f"replica_index ({self.replica_index}) must be < "
                 f"replicas_total ({self.replicas_total})"
+            )
+
+    def _validate_execution_seed(self) -> None:
+        """Validate an optional explicit GROMACS RNG seed."""
+        if self.execution_seed is None:
+            return
+        if type(self.execution_seed) is not int or self.execution_seed <= 0:
+            raise ValueError(
+                f"execution_seed must be a positive integer; got {self.execution_seed!r}"
             )
 
     def effective_production_ns(self) -> float:

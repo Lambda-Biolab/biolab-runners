@@ -371,6 +371,58 @@ class TestMdpReplicaSeed:
             generate_equil_nvt_mdp(replica_index=-1)
 
 
+class TestExplicitExecutionSeed:
+    @pytest.mark.parametrize(
+        "generator",
+        [
+            generate_minimization_mdp,
+            generate_equil_nvt_mdp,
+            generate_equil_npt_mdp,
+            generate_production_mdp,
+        ],
+    )
+    def test_explicit_seed_overrides_replica_default(self, generator: Any) -> None:
+        mdp = generator(replica_index=4, execution_seed=37)
+
+        assert "gen-seed         = 37" in mdp
+        assert "gen-seed         = 5" not in mdp
+
+    @pytest.mark.parametrize("seed", [0, -1, True, 1.5, "37"])
+    def test_protocol_config_rejects_nonpositive_or_noninteger_seed(self, seed: Any) -> None:
+        with pytest.raises(ValueError, match="execution_seed"):
+            _valid_protocol_config(execution_seed=seed)
+
+    def test_seed_is_bound_to_mdp_and_legacy_executed_config_stays_unchanged(self) -> None:
+        stage = next(stage for stage in build_stage_plan() if stage.kind == StageKind.EQUIL_NVT)
+        legacy = _protocol_executed_config(
+            _valid_protocol_config(replica_index=2, replicas_total=3)
+        )
+        seeded = _protocol_executed_config(
+            _valid_protocol_config(replica_index=2, replicas_total=3, execution_seed=37)
+        )
+
+        assert "execution_seed" not in legacy
+        assert seeded["execution_seed"] == 37
+        assert seeded["replica_index"] == 2
+        mdp_contents = seeded["mdp_contents"]
+        assert isinstance(mdp_contents, dict)
+        for kind in (
+            StageKind.MINIMIZE,
+            StageKind.EQUIL_NVT,
+            StageKind.EQUIL_NPT,
+            StageKind.PRODUCTION,
+        ):
+            mdp = mdp_contents[kind.value]
+            assert isinstance(mdp, str)
+            assert "gen-seed         = 37" in mdp
+        assert _protocol_stage_identity(
+            stage, _valid_protocol_config(replica_index=2, replicas_total=3)
+        ) != _protocol_stage_identity(
+            stage,
+            _valid_protocol_config(replica_index=2, replicas_total=3, execution_seed=37),
+        )
+
+
 # ---------------------------------------------------------------------------
 # .mdp contract — input validation + determinism
 # ---------------------------------------------------------------------------
