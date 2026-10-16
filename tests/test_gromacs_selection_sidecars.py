@@ -1129,3 +1129,264 @@ def test_protocol_runner_force_restarts_strict_bundle_without_stale_checkpoint(
     assert forced.succeeded == 8
     assert forced.skipped == 0
     assert all("-cpi" not in command for command in forced_commands)
+
+
+def _role_atom_record(chain_id: str, index: int, atom_name: str, element: str) -> dict[str, Any]:
+    identity = {
+        "chain_id": chain_id,
+        "residue_number": 1,
+        "insertion_code": "",
+        "atom_name": atom_name,
+        "element": element,
+    }
+    return {
+        "source": dict(identity),
+        "prepared": dict(identity),
+        "source_pdb_atom_index": index,
+        "source_pdb_residue_index": 1,
+        "prepared_pdb_atom_index": index,
+        "prepared_pdb_residue_index": 1,
+        "prepared_topology_atom_index": index,
+        "prepared_topology_residue_index": 1,
+    }
+
+
+def _write_role_bundle(tmp_path: Path) -> dict[str, Path]:
+    tmp_path.mkdir(parents=True)
+    prepared_pdb = tmp_path / "prepared.pdb"
+    prepared_top = tmp_path / "prepared.top"
+    prepared_gro = tmp_path / "prepared.gro"
+    index = tmp_path / "index.ndx"
+    selection_map = tmp_path / "selection-map.json"
+    manifest = tmp_path / "manifest.json"
+
+    prepared_pdb.write_text(
+        "ATOM      1  N   ALA A   1\n"
+        "ATOM      2  CA  GLY B   1\n"
+        "ATOM      3  CA  GLY C   1\n"
+        "ATOM      4  CA  GLY D   1\n"
+        "END\n"
+    )
+    prepared_top.write_text("; prepared topology\n")
+    _write_gro(
+        prepared_gro,
+        [(1, "ALA", "N", 1), (1, "GLY", "CA", 2), (1, "GLY", "CA", 3), (1, "GLY", "CA", 4)],
+    )
+    index.write_text("[ receptor ]\n1 2 3\n[ design ]\n4\n")
+
+    index_digest = _sha256(index)
+    prepared_digests = {
+        "prepared.pdb": _sha256(prepared_pdb),
+        "prepared.top": _sha256(prepared_top),
+        "prepared.gro": _sha256(prepared_gro),
+    }
+    map_payload: dict[str, Any] = {
+        "schema_version": 3,
+        "preparation_digest": "a" * 64,
+        "source_pdb_sha256": "b" * 64,
+        "prepared_artifact_sha256": prepared_digests,
+        "index_sha256": index_digest,
+        "index_bases": {
+            "source_pdb_atom": 1,
+            "source_pdb_residue": 1,
+            "prepared_pdb_atom": 1,
+            "prepared_pdb_residue": 1,
+            "prepared_topology_atom": 1,
+            "prepared_topology_residue": 1,
+        },
+        "source_to_prepared_atoms": [
+            _role_atom_record("A", 1, "N", "N"),
+            _role_atom_record("B", 2, "CA", "C"),
+            _role_atom_record("C", 3, "CA", "C"),
+            _role_atom_record("D", 4, "CA", "C"),
+        ],
+        "added_atoms": [],
+        "dropped_atoms": [],
+        "source_to_prepared_residues": [],
+        "added_residues": [],
+        "dropped_residues": [],
+        "selections": {"receptor": [1, 2, 3], "design": [4]},
+        "interface_mapping": {
+            "receptor_chains": {"A": [1], "B": [2], "C": [3]},
+            "receptor": [1, 2, 3],
+            "design": [4],
+        },
+        "chain_audits": [
+            {
+                "chain_id": "A",
+                "role": "receptor",
+                "source_residue_count": 1,
+                "prepared_residue_count": 1,
+                "source_atom_count": 1,
+                "prepared_atom_count": 1,
+            },
+            {
+                "chain_id": "B",
+                "role": "receptor",
+                "source_residue_count": 1,
+                "prepared_residue_count": 1,
+                "source_atom_count": 1,
+                "prepared_atom_count": 1,
+            },
+            {
+                "chain_id": "C",
+                "role": "receptor",
+                "source_residue_count": 1,
+                "prepared_residue_count": 1,
+                "source_atom_count": 1,
+                "prepared_atom_count": 1,
+            },
+            {
+                "chain_id": "D",
+                "role": "design",
+                "source_residue_count": 1,
+                "prepared_residue_count": 1,
+                "source_atom_count": 1,
+                "prepared_atom_count": 1,
+            },
+        ],
+        "residue_audits": [],
+        "solvent_ion_boundaries": {"solvent": "not_staged", "ions": "not_staged"},
+    }
+    selection_map.write_text(json.dumps(map_payload, indent=2, sort_keys=True))
+
+    artifacts = {
+        **prepared_digests,
+        "selection-map.json": _sha256(selection_map),
+        "index.ndx": index_digest,
+    }
+    manifest_payload: dict[str, Any] = {
+        "schema_version": 3,
+        "runner": "complex_prep",
+        "preparation_digest": map_payload["preparation_digest"],
+        "source_pdb_sha256": map_payload["source_pdb_sha256"],
+        "chain_roles": {"receptor": ["A", "B", "C"], "design": "D"},
+        "chain_audits": map_payload["chain_audits"],
+        "residue_audits": map_payload["residue_audits"],
+        "artifacts": {
+            name: {"path": str(tmp_path / name), "sha256": digest}
+            for name, digest in artifacts.items()
+        },
+        "atom_count": 4,
+    }
+    manifest_payload["scientific_metadata_sha256"] = _canonical_digest(
+        manifest_payload, excluded="scientific_metadata_sha256"
+    )
+    manifest.write_text(json.dumps(manifest_payload, indent=2, sort_keys=True))
+    return {
+        "pdb": prepared_pdb,
+        "top": prepared_top,
+        "gro": prepared_gro,
+        "map": selection_map,
+        "index": index,
+        "manifest": manifest,
+    }
+
+
+def test_stage_role_aware_sidecars_accepts_generic_receptor_selection(tmp_path: Path) -> None:
+    from biolab_runners.gromacs.selection_sidecars import stage_selection_sidecars
+
+    bundle = _write_role_bundle(tmp_path / "bundle")
+    config = _strict_config(tmp_path, bundle)
+
+    identity = stage_selection_sidecars(config, tmp_path / "work")
+
+    final_map = json.loads((tmp_path / "work" / "selection-map.json").read_text())
+    assert final_map["schema_version"] == 3
+    assert final_map["selections"] == {"receptor": [1, 2, 3], "design": [4]}
+    assert identity["preparation_digest"] == "a" * 64
+
+
+def test_refresh_role_aware_sidecars_emits_schema_four_and_parent_binding(tmp_path: Path) -> None:
+    from biolab_runners.gromacs.selection_sidecars import (
+        refresh_selection_sidecars,
+        stage_selection_sidecars,
+    )
+
+    bundle = _write_role_bundle(tmp_path / "bundle")
+    config = _strict_config(tmp_path, bundle)
+    work_dir = tmp_path / "work"
+    stage_selection_sidecars(config, work_dir)
+    topology = work_dir / "topol.top"
+    topology.write_text("; topology with solvent\n")
+    coordinates = work_dir / "solvated.gro"
+    _write_gro(
+        coordinates,
+        [
+            (1, "ALA", "N", 1),
+            (1, "GLY", "CA", 2),
+            (1, "GLY", "CA", 3),
+            (1, "GLY", "CA", 4),
+            (2, "SOL", "OW", 5),
+            (2, "SOL", "HW1", 6),
+            (2, "SOL", "HW2", 7),
+        ],
+    )
+
+    identity = refresh_selection_sidecars(
+        work_dir,
+        stage="solvate",
+        topology_path=topology,
+        coordinates_path=coordinates,
+    )
+    final_map = json.loads((work_dir / "selection-map.json").read_text())
+
+    assert final_map["schema_version"] == 4
+    assert final_map["selections"] == {"receptor": [1, 2, 3], "design": [4]}
+    assert final_map["interface_mapping"] == {
+        "receptor_chains": {"A": [1], "B": [2], "C": [3]},
+        "receptor": [1, 2, 3],
+        "design": [4],
+    }
+    assert final_map["parent_selection_map_sha256"] == _sha256(
+        work_dir / "prepared-selection-map.json"
+    )
+    assert final_map["solvent_ion_boundaries"]["solute_atom_count"] == 4
+    assert final_map["solvent_ion_boundaries"]["solvent_atom_indices"] == [5, 6, 7]
+    assert identity["selection_map_sha256"] == _sha256(work_dir / "selection-map.json")
+    assert (work_dir / "index.ndx").read_text() == "[ receptor ]\n1 2 3\n[ design ]\n4\n"
+
+
+def test_role_aware_sidecars_reject_missing_design_role(tmp_path: Path) -> None:
+    from biolab_runners.gromacs.selection_sidecars import stage_selection_sidecars
+
+    bundle = _write_role_bundle(tmp_path / "bundle")
+    map_path = bundle["map"]
+    selection_map = json.loads(map_path.read_text())
+    selection_map["chain_audits"][3]["role"] = "receptor"
+    map_path.write_text(json.dumps(selection_map, indent=2, sort_keys=True))
+    _rebind_bundle(bundle)
+
+    with pytest.raises(ValueError, match="exactly one design role"):
+        stage_selection_sidecars(_strict_config(tmp_path, bundle), tmp_path / "work")
+
+
+def test_role_aware_sidecars_reject_tampered_interface_mapping(tmp_path: Path) -> None:
+    from biolab_runners.gromacs.selection_sidecars import stage_selection_sidecars
+
+    bundle = _write_role_bundle(tmp_path / "bundle")
+    map_path = bundle["map"]
+    selection_map = json.loads(map_path.read_text())
+    selection_map["interface_mapping"]["receptor"] = [1, 2]
+    map_path.write_text(json.dumps(selection_map, indent=2, sort_keys=True))
+    _rebind_bundle(bundle)
+
+    with pytest.raises(ValueError, match="receptor is not the sorted chain union"):
+        stage_selection_sidecars(_strict_config(tmp_path, bundle), tmp_path / "work")
+
+
+def test_prepared_selection_map_must_not_reuse_final_schema_two(tmp_path: Path) -> None:
+    from biolab_runners.gromacs import selection_sidecars
+
+    bundle = _write_role_bundle(tmp_path / "bundle")
+    selection_map = json.loads(bundle["map"].read_text())
+    selection_map["schema_version"] = 2
+
+    with pytest.raises(ValueError, match="must be 1 or 3"):
+        selection_sidecars._validate_map_and_index(
+            selection_map,
+            bundle["index"],
+            _sha256(bundle["index"]),
+            atom_count=4,
+            prepared_pdb_path=bundle["pdb"],
+        )

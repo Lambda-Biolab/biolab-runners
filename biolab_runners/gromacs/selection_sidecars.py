@@ -12,6 +12,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from biolab_runners.gromacs.config import GromacsProtocolConfig
+
+if TYPE_CHECKING:
     from biolab_runners.gromacs.config import GromacsProtocolConfig
 
 PREPARED_PDB = "prepared.pdb"
@@ -22,9 +27,24 @@ SOURCE_INDEX = "prepared-index.ndx"
 INDEX = "index.ndx"
 BUNDLE_MANIFEST = "complex-prep-manifest.json"
 
-_GROUP_ORDER = ("receptor_ab", "design_c", "dimer_ab")
-_INTERFACE_GROUP_ORDER = ("receptor_a", "receptor_b", "dimer_ab", "design_c")
+# These schema numbers mirror ``biolab_runners.complex_prep.config``. The
+# sidecar duplicates them so the gromacs package does not import the heavier
+# complex-prep package at module load.
+LEGACY_PREPARED_SCHEMA = 1
+LEGACY_FINAL_SCHEMA = 2
+ROLE_AWARE_PREPARED_SCHEMA = 3
+ROLE_AWARE_FINAL_SCHEMA = 4
+_FINAL_SCHEMA_BY_PREPARED: dict[object, int] = {
+    LEGACY_PREPARED_SCHEMA: LEGACY_FINAL_SCHEMA,
+    ROLE_AWARE_PREPARED_SCHEMA: ROLE_AWARE_FINAL_SCHEMA,
+}
+LEGACY_GROUP_ORDER = ("receptor_ab", "design_c", "dimer_ab")
+ROLE_GROUP_ORDER = ("receptor", "design")
+_LEGACY_INTERFACE_GROUP_ORDER = ("receptor_a", "receptor_b", "dimer_ab", "design_c")
+_ROLE_INTERFACE_GROUP_ORDER = ("receptor_chains", "receptor", "design")
 _FULL_COMPLEX_CHAINS = ("A", "B", "C")
+_RECEPTOR_ROLE = "receptor"
+_DESIGN_ROLE = "design"
 _CHAIN_AUDIT_FIELDS: set[str] = {
     "chain_id",
     "role",
@@ -109,14 +129,17 @@ def _validate_staged_selection_sidecars(
     _validate_staged_source_bundle(work_dir)
     source_map = _read_json(paths[SOURCE_SELECTION_MAP], SOURCE_SELECTION_MAP)
     current_map = _read_json(paths[SELECTION_MAP], SELECTION_MAP)
-    if type(current_map.get("schema_version")) is int and current_map["schema_version"] == 1:
+    schema = current_map.get("schema_version")
+    if type(schema) is not int:
+        raise ValueError("selection-map.json schema_version must be an integer")
+    if schema in (LEGACY_PREPARED_SCHEMA, ROLE_AWARE_PREPARED_SCHEMA):
         if _sha256(paths[SELECTION_MAP]) != _sha256(paths[SOURCE_SELECTION_MAP]):
             raise ValueError("staged selection-map.json differs from its prepared source")
         if _sha256(paths[INDEX]) != _sha256(paths[SOURCE_INDEX]):
             raise ValueError("staged index.ndx differs from its prepared source")
         if _sha256(work_dir / "topol.top") != _sha256(paths[SOURCE_TOPOLOGY]):
             raise ValueError("staged topol.top differs from its prepared source")
-    elif type(current_map.get("schema_version")) is int and current_map["schema_version"] == 2:
+    elif schema in (LEGACY_FINAL_SCHEMA, ROLE_AWARE_FINAL_SCHEMA):
         _validate_final_map(
             work_dir,
             current_map,
@@ -124,7 +147,7 @@ def _validate_staged_selection_sidecars(
             mutable_checkpoint=mutable_checkpoint,
         )
     else:
-        raise ValueError("selection-map.json schema_version must be 1 or 2")
+        raise ValueError("selection-map.json schema_version must be 1, 2, 3, or 4")
     return _identity(work_dir, current_map)
 
 
@@ -146,7 +169,10 @@ def refresh_selection_sidecars(
     final_atoms = _parse_gro(coordinates_path)
     _validate_solute_identity(prepared_atoms, final_atoms, source_map)
     selections = _selection_groups(source_map)
-    _write_atomic(work_dir / INDEX, _render_index(selections))
+    _write_atomic(
+        work_dir / INDEX,
+        _render_index(selections, _group_order_for_schema(source_map.get("schema_version"))),
+    )
     final_map = _build_final_map(
         source_map,
         source_map_path=source_map_path,
@@ -281,6 +307,8 @@ def _validate_bundle_bindings(
     selection_map: dict[str, Any],
 ) -> None:
     _validate_manifest_chain_identity(manifest, selection_map)
+    if manifest.get("schema_version") != selection_map.get("schema_version"):
+        raise ValueError("complex-prep manifest schema differs from the selection map")
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, dict):
         raise ValueError("complex-prep manifest artifacts must be an object")
@@ -306,18 +334,50 @@ def _validate_bundle_bindings(
 def _validate_manifest_chain_identity(
     manifest: dict[str, Any], selection_map: dict[str, Any]
 ) -> None:
-    if manifest.get("chain_roles") != {"receptor": ["A", "B"], "design": "C"}:
-        raise ValueError("complex-prep manifest chain roles are not the explicit A+B+C contract")
+    schema = manifest.get("schema_version")
+    if schema == LEGACY_PREPARED_SCHEMA:
+        if manifest.get("chain_roles") != {"receptor": ["A", "B"], "design": "C"}:
+            raise ValueError(
+                "complex-prep manifest chain roles are not the explicit A+B+C contract"
+            )
+    elif schema == ROLE_AWARE_PREPARED_SCHEMA:
+        if manifest.get("chain_roles") != _roles_from_chain_audits(selection_map):
+            raise ValueError("complex-prep manifest chain roles differ from its chain audits")
+    else:
+        raise ValueError("complex-prep manifest schema is invalid")
     if manifest.get("chain_audits") != selection_map.get("chain_audits"):
         raise ValueError("complex-prep manifest chain audits differ from selection-map audits")
     if manifest.get("residue_audits") != selection_map.get("residue_audits"):
         raise ValueError("complex-prep manifest residue audits differ from selection-map audits")
 
 
+def _roles_from_chain_audits(selection_map: dict[str, Any]) -> dict[str, Any]:
+    audits = selection_map.get("chain_audits")
+    if not isinstance(audits, list) or not audits:
+        raise ValueError("selection map chain_audits are malformed")
+    roles: list[str] = []
+    receptor_ids: list[str] = []
+    design_ids: list[str] = []
+    for audit in audits:
+        _, chain_id, role = _validate_chain_audit_fields(audit)
+        roles.append(role)
+        if role == _DESIGN_ROLE:
+            design_ids.append(chain_id)
+        elif role == _RECEPTOR_ROLE:
+            receptor_ids.append(chain_id)
+    if set(roles) - {_RECEPTOR_ROLE, _DESIGN_ROLE}:
+        raise ValueError("selection map chain_audits contain unsupported roles")
+    if not receptor_ids:
+        raise ValueError("selection map chain_audits lack a receptor role")
+    if len(design_ids) != 1:
+        raise ValueError("selection map chain_audits must contain exactly one design role")
+    return {"receptor": sorted(receptor_ids), "design": design_ids[0]}
+
+
 def _validate_manifest(manifest: dict[str, Any]) -> None:
     if (
         type(manifest.get("schema_version")) is not int
-        or manifest["schema_version"] != 1
+        or manifest["schema_version"] not in (LEGACY_PREPARED_SCHEMA, ROLE_AWARE_PREPARED_SCHEMA)
         or manifest.get("runner") != "complex_prep"
     ):
         raise ValueError("complex-prep manifest identity is invalid")
@@ -329,6 +389,14 @@ def _validate_manifest(manifest: dict[str, Any]) -> None:
         raise ValueError("complex-prep manifest scientific metadata digest mismatch")
 
 
+def _group_order_for_schema(schema: object) -> tuple[str, ...]:
+    if schema in (LEGACY_PREPARED_SCHEMA, LEGACY_FINAL_SCHEMA):
+        return LEGACY_GROUP_ORDER
+    if schema in (ROLE_AWARE_PREPARED_SCHEMA, ROLE_AWARE_FINAL_SCHEMA):
+        return ROLE_GROUP_ORDER
+    raise ValueError("selection-map.json schema_version is not supported")
+
+
 def _validate_map_and_index(
     selection_map: dict[str, Any],
     index_path: Path,
@@ -337,8 +405,12 @@ def _validate_map_and_index(
     atom_count: int,
     prepared_pdb_path: Path,
 ) -> None:
-    if type(selection_map.get("schema_version")) is not int or selection_map["schema_version"] != 1:
-        raise ValueError("prepared selection-map.json schema_version must be 1")
+    schema = selection_map.get("schema_version")
+    if type(schema) is not int or schema not in (
+        LEGACY_PREPARED_SCHEMA,
+        ROLE_AWARE_PREPARED_SCHEMA,
+    ):
+        raise ValueError("prepared selection-map.json schema_version must be 1 or 3")
     if not _is_sha(selection_map.get("preparation_digest")):
         raise ValueError("selection-map preparation_digest is invalid")
     if selection_map.get("index_bases") != {
@@ -357,7 +429,7 @@ def _validate_map_and_index(
         raise ValueError("prepared selection-map solvent/ion boundaries are invalid")
     if selection_map.get("index_sha256") != index_digest:
         raise ValueError("index.ndx digest mismatch against selection-map.json")
-    groups = _parse_index(index_path)
+    groups = _parse_index(index_path, _group_order_for_schema(schema))
     selections = _selection_groups(selection_map)
     if groups != selections:
         raise ValueError("index.ndx groups disagree with selection-map.json")
@@ -380,26 +452,53 @@ def _validate_interface_mapping(
     atom_count: int,
 ) -> None:
     pdb_chains = _pdb_chain_groups(pdb_atoms)
-    if set(pdb_chains) != set(_FULL_COMPLEX_CHAINS):
-        raise ValueError("prepared.pdb must contain exactly explicit chains A, B, and C")
     if sum(len(values) for values in pdb_chains.values()) != atom_count:
         raise ValueError("prepared.pdb atom count differs from prepared.gro")
-    mapping = _normalized_interface_mapping(selection_map.get("interface_mapping"), atom_count)
-    _validate_interface_partition(mapping)
-    _validate_interface_selections(mapping, selection_map)
-    _validate_interface_chain_bindings(mapping, pdb_chains)
-    _validate_full_complex_chain_audits(selection_map, pdb_atoms)
+    if selection_map.get("schema_version") == LEGACY_PREPARED_SCHEMA:
+        if set(pdb_chains) != set(_FULL_COMPLEX_CHAINS):
+            raise ValueError("prepared.pdb must contain exactly explicit chains A, B, and C")
+        mapping = _normalized_interface_mapping(selection_map.get("interface_mapping"), atom_count)
+        _validate_interface_partition(mapping)
+        _validate_interface_selections(mapping, selection_map)
+        _validate_interface_chain_bindings(mapping, pdb_chains)
+        _validate_full_complex_chain_audits(selection_map, pdb_atoms)
+        return
+    mapping = _normalized_role_interface_mapping(selection_map.get("interface_mapping"), atom_count)
+    _validate_role_interface_partition(mapping, pdb_chains, atom_count)
+    _validate_role_interface_selections(mapping, selection_map)
+    _validate_role_chain_audits(selection_map, pdb_chains)
 
 
 def _normalized_interface_mapping(value: object, atom_count: int) -> dict[str, list[int]]:
-    if not isinstance(value, dict) or set(value) != set(_INTERFACE_GROUP_ORDER):
+    if not isinstance(value, dict) or set(value) != set(_LEGACY_INTERFACE_GROUP_ORDER):
         raise ValueError(
             "selection map interface_mapping must contain exactly "
             "receptor_a, receptor_b, dimer_ab, design_c"
         )
     return {
         name: _validated_interface_group(value.get(name), name, atom_count)
-        for name in _INTERFACE_GROUP_ORDER
+        for name in _LEGACY_INTERFACE_GROUP_ORDER
+    }
+
+
+def _normalized_role_interface_mapping(value: object, atom_count: int) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != set(_ROLE_INTERFACE_GROUP_ORDER):
+        raise ValueError(
+            "selection map interface_mapping must contain exactly "
+            "receptor_chains, receptor, and design"
+        )
+    chains = value.get("receptor_chains")
+    if not isinstance(chains, dict) or not chains:
+        raise ValueError("interface mapping receptor_chains must be a non-empty object")
+    if any(not isinstance(chain_id, str) or not chain_id for chain_id in chains):
+        raise ValueError("interface mapping receptor_chains has an invalid chain ID")
+    return {
+        "receptor_chains": {
+            chain_id: _validated_interface_group(atoms, chain_id, atom_count)
+            for chain_id, atoms in chains.items()
+        },
+        "receptor": _validated_interface_group(value.get("receptor"), "receptor", atom_count),
+        "design": _validated_interface_group(value.get("design"), "design", atom_count),
     }
 
 
@@ -436,6 +535,68 @@ def _validate_interface_partition(mapping: dict[str, list[int]]) -> None:
         raise ValueError("interface mapping receptor dimer overlaps design C")
 
 
+def _validate_role_interface_partition(
+    mapping: dict[str, Any],
+    pdb_chains: dict[str, list[int]],
+    atom_count: int,
+) -> None:
+    receptor_chains = mapping["receptor_chains"]
+    design = mapping["design"]
+    design_chain_ids = [chain_id for chain_id, atoms in pdb_chains.items() if atoms == design]
+    if len(design_chain_ids) != 1:
+        raise ValueError("interface mapping design differs from exactly one prepared chain")
+    design_chain = design_chain_ids[0]
+    if set(receptor_chains) != set(pdb_chains) - {design_chain}:
+        raise ValueError("interface mapping receptor_chains differ from the prepared chains")
+    for chain_id, atoms in receptor_chains.items():
+        if atoms != pdb_chains[chain_id]:
+            raise ValueError(f"interface mapping receptor_chains[{chain_id!r}] differs from chain")
+    if mapping["receptor"] != sorted(
+        atom_index for atoms in receptor_chains.values() for atom_index in atoms
+    ):
+        raise ValueError("interface mapping receptor is not the sorted chain union")
+    covered = sorted([*mapping["receptor"], *design])
+    if covered != list(range(1, atom_count + 1)):
+        raise ValueError("interface mapping does not cover exactly the prepared atoms")
+
+
+def _validate_role_interface_selections(
+    mapping: dict[str, Any], selection_map: dict[str, Any]
+) -> None:
+    selections = selection_map.get("selections")
+    if not isinstance(selections, dict) or set(selections) != {_RECEPTOR_ROLE, _DESIGN_ROLE}:
+        raise ValueError("selection map selections are malformed")
+    if mapping["receptor"] != selections.get(_RECEPTOR_ROLE):
+        raise ValueError("interface mapping receptor differs from receptor selection")
+    if mapping["design"] != selections.get(_DESIGN_ROLE):
+        raise ValueError("interface mapping design differs from design selection")
+
+
+def _validate_role_chain_audits(
+    selection_map: dict[str, Any],
+    pdb_chains: dict[str, list[int]],
+) -> None:
+    audits = selection_map.get("chain_audits")
+    if not isinstance(audits, list) or not audits:
+        raise ValueError("selection map chain_audits are malformed")
+    chain_ids: list[str] = []
+    roles: list[str] = []
+    validated: list[dict[str, Any]] = []
+    for audit in audits:
+        parsed, chain_id, role = _validate_chain_audit_fields(audit)
+        validated.append(parsed)
+        chain_ids.append(chain_id)
+        roles.append(role)
+    if len(chain_ids) != len(set(chain_ids)) or set(chain_ids) != set(pdb_chains):
+        raise ValueError("selection map chain_audits do not match the prepared chains")
+    if set(roles) - {_RECEPTOR_ROLE, _DESIGN_ROLE}:
+        raise ValueError("selection map chain_audits contain unsupported roles")
+    if roles.count(_DESIGN_ROLE) != 1 or roles.count(_RECEPTOR_ROLE) < 1:
+        raise ValueError("selection map chain_audits must describe one design and a receptor set")
+    for audit in validated:
+        _validate_chain_audit_counts(audit, pdb_chains[audit["chain_id"]], selection_map)
+
+
 def _validate_interface_chain_bindings(
     mapping: dict[str, list[int]], pdb_chains: dict[str, list[int]]
 ) -> None:
@@ -466,23 +627,41 @@ def _validate_chain_audit(
     pdb_atoms: list[_PdbAtom],
     selection_map: dict[str, Any],
 ) -> None:
+    validated, actual_chain_id, role = _validate_chain_audit_fields(audit)
+    expected_role = _DESIGN_ROLE if chain_id == "C" else _RECEPTOR_ROLE
+    if actual_chain_id != chain_id or role != expected_role:
+        raise ValueError("selection map chain_audits do not match explicit chain roles")
+    chain_atoms = [atom for atom in pdb_atoms if atom.chain_id == chain_id]
+    _validate_chain_audit_counts(validated, chain_atoms, selection_map)
+
+
+def _validate_chain_audit_fields(
+    audit: object,
+) -> tuple[dict[str, Any], str, str]:
     if not isinstance(audit, dict) or set(audit) != _CHAIN_AUDIT_FIELDS:
         raise ValueError("selection map chain_audits are malformed")
-    expected_role = "design" if chain_id == "C" else "receptor"
-    if audit["chain_id"] != chain_id or audit["role"] != expected_role:
-        raise ValueError("selection map chain_audits do not match explicit chain roles")
+    if not isinstance(audit["chain_id"], str) or not isinstance(audit["role"], str):
+        raise ValueError("selection map chain_audits are malformed")
     if any(
         type(audit[field]) is not int or audit[field] < 1 for field in _CHAIN_AUDIT_COUNT_FIELDS
     ):
         raise ValueError("selection map chain_audits contain invalid counts")
     if audit["source_residue_count"] != audit["prepared_residue_count"]:
         raise ValueError("selection map source and prepared residue audits differ")
-    chain_atoms = [atom for atom in pdb_atoms if atom.chain_id == chain_id]
+    return audit, audit["chain_id"], audit["role"]
+
+
+def _validate_chain_audit_counts(
+    audit: dict[str, Any],
+    chain_atoms: Sequence[Any],
+    selection_map: dict[str, Any],
+) -> None:
+    chain_id = audit["chain_id"]
     if audit["source_atom_count"] != _source_chain_atom_count(selection_map, chain_id):
         raise ValueError("selection map source chain audit differs from source atom mapping")
     if audit["prepared_atom_count"] != len(chain_atoms):
         raise ValueError("selection map prepared chain audit differs from prepared.pdb")
-    if audit["prepared_residue_count"] != len({atom.residue_key for atom in chain_atoms}):
+    if audit["prepared_residue_count"] != len(set(chain_atoms)):
         raise ValueError("selection map prepared residue audit differs from prepared.pdb")
 
 
@@ -565,31 +744,42 @@ def _validate_prepared_residue_records(selection_map: dict[str, Any]) -> None:
 
 
 def _selection_groups(selection_map: dict[str, Any]) -> dict[str, list[int]]:
+    order, legacy = _selection_group_layout(selection_map)
     groups = selection_map.get("selections")
-    if not isinstance(groups, dict) or set(groups) != set(_GROUP_ORDER):
-        raise ValueError("selection map must contain exactly receptor_ab, design_c, dimer_ab")
-    result: dict[str, list[int]] = {}
-    for name in _GROUP_ORDER:
-        values = groups.get(name)
-        if not isinstance(values, list) or not values:
-            raise ValueError(f"selection {name} must be a non-empty list")
-        if any(type(value) is not int or value < 1 for value in values):
-            raise ValueError(f"selection {name} contains an invalid atom index")
-        if values != sorted(set(values)):
-            raise ValueError(f"selection {name} must be sorted and unique")
-        result[name] = list(values)
-    if result["receptor_ab"] != result["dimer_ab"]:
+    if not isinstance(groups, dict) or set(groups) != set(order):
+        raise ValueError(f"selection map must contain exactly {', '.join(order)}")
+    result = {name: _validated_selection(name, groups.get(name)) for name in order}
+    if legacy and result["receptor_ab"] != result["dimer_ab"]:
         raise ValueError("receptor_ab and dimer_ab selections must match")
     return result
 
 
-def _parse_index(path: Path) -> dict[str, list[int]]:
+def _selection_group_layout(selection_map: dict[str, Any]) -> tuple[tuple[str, ...], bool]:
+    schema = selection_map.get("schema_version")
+    if schema in (LEGACY_PREPARED_SCHEMA, LEGACY_FINAL_SCHEMA):
+        return LEGACY_GROUP_ORDER, True
+    if schema in (ROLE_AWARE_PREPARED_SCHEMA, ROLE_AWARE_FINAL_SCHEMA):
+        return ROLE_GROUP_ORDER, False
+    raise ValueError("selection-map.json schema_version is not supported")
+
+
+def _validated_selection(name: str, values: object) -> list[int]:
+    if not isinstance(values, list) or not values:
+        raise ValueError(f"selection {name} must be a non-empty list")
+    if any(type(value) is not int or value < 1 for value in values):
+        raise ValueError(f"selection {name} contains an invalid atom index")
+    if values != sorted(set(values)):
+        raise ValueError(f"selection {name} must be sorted and unique")
+    return list(values)
+
+
+def _parse_index(path: Path, order: tuple[str, ...]) -> dict[str, list[int]]:
     _required_file(path, path.name)
     groups: dict[str, list[int]] = {}
     current: str | None = None
     for raw in path.read_text().splitlines():
         current = _consume_index_line(raw.strip(), groups, current)
-    _validate_index_groups(groups)
+    _validate_index_groups(groups, order)
     return groups
 
 
@@ -615,9 +805,9 @@ def _consume_index_line(
     return current
 
 
-def _validate_index_groups(groups: dict[str, list[int]]) -> None:
-    if tuple(groups) != _GROUP_ORDER:
-        raise ValueError("index.ndx must contain exactly receptor_ab, design_c, dimer_ab")
+def _validate_index_groups(groups: dict[str, list[int]], order: tuple[str, ...]) -> None:
+    if tuple(groups) != order:
+        raise ValueError(f"index.ndx must contain exactly {', '.join(order)}")
     for name, values in groups.items():
         if not values or any(value < 1 for value in values) or values != sorted(set(values)):
             raise ValueError(f"index group {name} must be non-empty, sorted, and unique")
@@ -735,7 +925,7 @@ def _build_final_map(
     checkpoint: Path | None,
 ) -> dict[str, Any]:
     result = json.loads(json.dumps(source_map))
-    result["schema_version"] = 2
+    result["schema_version"] = _FINAL_SCHEMA_BY_PREPARED[source_map["schema_version"]]
     result["parent_selection_map_sha256"] = _sha256(source_map_path)
     result["parent_index_sha256"] = _sha256(source_index_path)
     result["index_sha256"] = _sha256(source_index_path.parent / INDEX)
@@ -822,6 +1012,8 @@ def _validate_final_map(
         raise ValueError("final selection map parent index digest mismatch")
     if current.get("index_sha256") != _sha256(work_dir / INDEX):
         raise ValueError("final selection map index digest mismatch")
+    if current.get("schema_version") != _FINAL_SCHEMA_BY_PREPARED.get(source.get("schema_version")):
+        raise ValueError("final selection map schema does not match its prepared parent")
     if _selection_groups(current) != _selection_groups(source):
         raise ValueError("final named selections differ from the prepared map")
     _validate_inherited_map_fields(current, source)
@@ -926,9 +1118,9 @@ def _identity(work_dir: Path, selection_map: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _render_index(groups: dict[str, list[int]]) -> str:
+def _render_index(groups: dict[str, list[int]], order: tuple[str, ...]) -> str:
     lines: list[str] = []
-    for name in _GROUP_ORDER:
+    for name in order:
         lines.append(f"[ {name} ]")
         values = groups[name]
         lines.extend(

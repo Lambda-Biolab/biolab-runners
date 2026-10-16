@@ -14,8 +14,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from biolab_runners.complex_prep.config import (
-    ALGORITHM_VERSIONS,
-    DESIGN_CHAIN_ID,
     GROMPP_NOT_RUN,
     GROMPP_PASSED,
     INDEX_FILENAME,
@@ -26,10 +24,10 @@ from biolab_runners.complex_prep.config import (
     PREPARED_PDB_FILENAME,
     PREPARED_TOP_FILENAME,
     PROTEIN_FORCE_FIELD,
-    RECEPTOR_CHAIN_IDS,
     SELECTION_MAP_FILENAME,
     WATER_FORCE_FIELD,
     ComplexChainAudit,
+    ComplexChainRoles,
     ComplexPrepBundle,
     ComplexPrepConfig,
     ComplexPrepResult,
@@ -54,11 +52,18 @@ _OUTPUT_FILENAMES = (
     SELECTION_MAP_FILENAME,
     INDEX_FILENAME,
 )
-_GROUP_ORDER = ("receptor_ab", "design_c", "dimer_ab")
+_LEGACY_GROUP_ORDER = ("receptor_ab", "design_c", "dimer_ab")
+_ROLE_GROUP_ORDER = ("receptor", "design")
+_LEGACY_INTERFACE_GROUPS = ("receptor_a", "receptor_b", "dimer_ab", "design_c")
+_ROLE_INTERFACE_GROUPS = ("receptor_chains", "receptor", "design")
 _SHA256_LENGTH = 64
 _PDB_ROUNDTRIP_TOLERANCE_NM = 1.1e-4
 _AT_FDCWD = -100
 _RENAME_NOREPLACE = 1
+
+
+def _group_order(roles: ComplexChainRoles) -> tuple[str, ...]:
+    return _LEGACY_GROUP_ORDER if roles.legacy else _ROLE_GROUP_ORDER
 
 
 @dataclass(frozen=True)
@@ -67,6 +72,7 @@ class _StructureState:
     positions: object
     source_topology: object
     source_positions: object
+    roles: ComplexChainRoles
     chain_audits: tuple[ComplexChainAudit, ...]
     residue_audits: tuple[ComplexResidueAudit, ...]
     bond_records: tuple[TopologyBondRecord, ...]
@@ -88,8 +94,11 @@ class ComplexPrepRunner:
         """Run or strictly reuse a complete preparation bundle."""
         output_dir = Path(config.output_dir)
         config_digest = compute_complex_config_digest(config)
+        schema_version = config.chain_roles.schema_version
         source_digest = ""
-        preparation_digest = compute_preparation_digest(source_digest, config_digest)
+        preparation_digest = compute_preparation_digest(
+            source_digest, config_digest, schema_version=schema_version
+        )
         if config.source_decoy.status is not ExecutionStatus.SUCCEEDED:
             return _failure(
                 output_dir,
@@ -106,10 +115,14 @@ class ComplexPrepRunner:
                 output_dir,
                 source_digest,
                 config_digest,
-                compute_preparation_digest(source_digest, config_digest),
+                compute_preparation_digest(
+                    source_digest, config_digest, schema_version=schema_version
+                ),
                 f"source_pdb read failed: {exc}",
             )
-        preparation_digest = compute_preparation_digest(source_digest, config_digest)
+        preparation_digest = compute_preparation_digest(
+            source_digest, config_digest, schema_version=schema_version
+        )
         if source_digest != config.source_decoy.output_pdb_identity.sha256:
             return _failure(
                 output_dir,
@@ -228,14 +241,15 @@ def _run_from_snapshot(
 
 def compute_complex_config_digest(config: ComplexPrepConfig) -> str:
     """Hash the fixed-policy scientific configuration canonically."""
+    roles = config.chain_roles
     payload = {
-        "schema_version": PREPARATION_SCHEMA_VERSION,
+        "schema_version": roles.schema_version,
         "design_sequence": config.design_sequence,
-        "chain_roles": {"receptor": RECEPTOR_CHAIN_IDS, "design": DESIGN_CHAIN_ID},
+        "chain_roles": roles.manifest_chain_roles,
         "protein_force_field": PROTEIN_FORCE_FIELD,
         "water_force_field": WATER_FORCE_FIELD,
         "pH": 7.4,
-        "algorithm_versions": ALGORITHM_VERSIONS,
+        "algorithm_versions": roles.algorithm_versions,
         "topology": _descriptor_payload(config),
         "d_coordinate_input_mode": config.d_coordinate_input_mode,
         "coordinate_transformer_identity": config.coordinate_transformer_identity,
@@ -245,10 +259,15 @@ def compute_complex_config_digest(config: ComplexPrepConfig) -> str:
     return hashlib.sha256(_canonical_json(payload).encode()).hexdigest()
 
 
-def compute_preparation_digest(source_digest: str, config_digest: str) -> str:
+def compute_preparation_digest(
+    source_digest: str,
+    config_digest: str,
+    *,
+    schema_version: int = PREPARATION_SCHEMA_VERSION,
+) -> str:
     """Hash the non-circular identity shared by manifest and descriptors."""
     payload = {
-        "schema_version": PREPARATION_SCHEMA_VERSION,
+        "schema_version": schema_version,
         "source_pdb_sha256": source_digest,
         "config_digest": config_digest,
         "runner": "complex_prep",
@@ -287,13 +306,17 @@ def _load_source(source_pdb: str) -> tuple[object, object]:
 
 
 def _validate_source_against_decoy(topology: object, config: ComplexPrepConfig) -> None:
+    roles = config.chain_roles
     chain_map = _chain_map(topology)
-    expected_chains = {*RECEPTOR_CHAIN_IDS, DESIGN_CHAIN_ID}
+    expected_chains = set(roles.chain_ids)
     if set(chain_map) != expected_chains:
-        raise ValueError("source PDB must contain exactly unique chains A, B, and C")
+        raise ValueError(
+            f"source PDB chains {sorted(chain_map)} do not match the decoy chain roles "
+            f"{sorted(expected_chains)}"
+        )
     audits = {audit.chain_id: audit for audit in config.source_decoy.chain_audits}
     if set(audits) != expected_chains:
-        raise ValueError("source decoy must contain exactly unique A/B/C chain audits")
+        raise ValueError("source decoy must contain exactly one audit per chain role")
     for chain_id, chain in chain_map.items():
         residues = list(chain.residues())
         atoms = list(chain.atoms())
@@ -357,7 +380,8 @@ def _prepare_structure(
     coordinate_transformer: CoordinateTransformer | None,
     chirality_validator: ChiralityValidator | None,
 ) -> _StructureState:
-    topology, positions = _mutate_and_hydrate(config, source_path, source_topology)
+    roles = config.chain_roles
+    topology, positions = _mutate_and_hydrate(config, source_path, source_topology, roles)
     reports: list[tuple[Any, ...]] = []
     if chirality_validator is not None:
         reports.append(
@@ -367,7 +391,7 @@ def _prepare_structure(
                 config.design_sequence,
                 config.topology,
                 chirality_validator,
-                design_chain_id=DESIGN_CHAIN_ID,
+                design_chain_id=roles.design_chain_id,
                 stage=_source_chirality_stage(config),
             )
         )
@@ -386,11 +410,11 @@ def _prepare_structure(
                 config.design_sequence,
                 config.topology,
                 chirality_validator,
-                design_chain_id=DESIGN_CHAIN_ID,
+                design_chain_id=roles.design_chain_id,
                 stage="pre",
             )
         )
-    topology, positions, bond_records = _apply_chemistry(config, topology, positions)
+    topology, positions, bond_records = _apply_chemistry(config, topology, positions, roles)
     if chirality_validator is not None:
         reports.append(
             design_chain.run_chirality_validation(
@@ -399,7 +423,7 @@ def _prepare_structure(
                 config.design_sequence,
                 config.topology,
                 chirality_validator,
-                design_chain_id=DESIGN_CHAIN_ID,
+                design_chain_id=roles.design_chain_id,
                 stage="post",
             )
         )
@@ -408,13 +432,14 @@ def _prepare_structure(
     system, net_charge = _build_system(topology)
     if system.getNumParticles() != topology.getNumAtoms():  # type: ignore[attr-defined]
         raise ValueError("OpenMM system particle count does not match prepared topology")
-    chain_audits = _build_chain_audits(source_topology, topology)
-    residue_audits = _build_residue_audits(source_topology, topology)
+    chain_audits = _build_chain_audits(source_topology, topology, roles)
+    residue_audits = _build_residue_audits(source_topology, topology, roles)
     return _StructureState(
         topology=topology,
         positions=positions,
         source_topology=source_topology,
         source_positions=source_positions,
+        roles=roles,
         chain_audits=chain_audits,
         residue_audits=residue_audits,
         bond_records=tuple(bond_records),
@@ -450,12 +475,15 @@ def _prepare_d_coordinates(
         config.design_sequence,
         config.topology,
         coordinate_transformer,
-        design_chain_id=DESIGN_CHAIN_ID,
+        design_chain_id=config.chain_roles.design_chain_id,
     )
 
 
 def _mutate_and_hydrate(
-    config: ComplexPrepConfig, source_path: str, source_topology: object
+    config: ComplexPrepConfig,
+    source_path: str,
+    source_topology: object,
+    roles: ComplexChainRoles,
 ) -> tuple[object, object]:
     from pdbfixer import PDBFixer
 
@@ -463,7 +491,7 @@ def _mutate_and_hydrate(
 
     topology, positions = apply_design_chain_mutation(
         backbone_pdb_path=source_path,
-        design_chain_id=DESIGN_CHAIN_ID,
+        design_chain_id=roles.design_chain_id,
         target_sequence=config.design_sequence,
     )
     fixer = PDBFixer(filename=source_path)
@@ -472,29 +500,33 @@ def _mutate_and_hydrate(
     fixer.missingResidues = {}
     fixer.findMissingAtoms()
     fixer.addMissingAtoms()
-    _synchronize_receptor_disulfides(fixer.topology, source_topology)
+    _synchronize_receptor_disulfides(fixer.topology, source_topology, roles)
     pre_hydrogen_records = _atom_records(fixer.topology, fixer.positions)
     fixer.addMissingHydrogens(pH=7.4)
     fixer.positions = _restore_preexisting_coordinates(
         fixer.topology, fixer.positions, pre_hydrogen_records
     )
-    topology, positions = _remove_receptor_extras(fixer.topology, fixer.positions, source_topology)
-    _synchronize_receptor_disulfides(topology, source_topology)
+    topology, positions = _remove_receptor_extras(
+        fixer.topology, fixer.positions, source_topology, roles
+    )
+    _synchronize_receptor_disulfides(topology, source_topology, roles)
     return topology, positions
 
 
-def _synchronize_receptor_disulfides(topology: object, source_topology: object) -> None:
-    source_pairs = _receptor_disulfide_pairs(source_topology)
+def _synchronize_receptor_disulfides(
+    topology: object, source_topology: object, roles: ComplexChainRoles
+) -> None:
+    source_pairs = _receptor_disulfide_pairs(source_topology, roles)
     bonds = getattr(topology, "_bonds", None)
     if not isinstance(bonds, list):
         raise ValueError("prepared topology does not expose mutable bonds")
     bonds[:] = [
         bond
         for bond in bonds
-        if not _is_receptor_disulfide_bond(bond[0], bond[1])
+        if not _is_receptor_disulfide_bond(bond[0], bond[1], roles)
         or _bond_identity(bond[0], bond[1]) in source_pairs
     ]
-    prepared_pairs = _receptor_disulfide_pairs(topology)
+    prepared_pairs = _receptor_disulfide_pairs(topology, roles)
     atoms = {
         (*_residue_key(atom.residue), atom.name): atom
         for atom in topology.atoms()  # type: ignore[attr-defined]
@@ -504,17 +536,18 @@ def _synchronize_receptor_disulfides(topology: object, source_topology: object) 
             topology.addBond(atoms[first], atoms[second])  # type: ignore[attr-defined]
         except KeyError as exc:
             raise ValueError("receptor disulfide atom was lost during preparation") from exc
-    if _receptor_disulfide_pairs(topology) != source_pairs:
+    if _receptor_disulfide_pairs(topology, roles) != source_pairs:
         raise ValueError("receptor disulfide identity changed during preparation")
 
 
-def _is_receptor_disulfide_bond(first: object, second: object) -> bool:
+def _is_receptor_disulfide_bond(first: object, second: object, roles: ComplexChainRoles) -> bool:
+    receptor_ids = roles.receptor_chain_ids
     return (
         getattr(first, "name", None) == getattr(second, "name", None) == "SG"
         and getattr(getattr(getattr(first, "residue", None), "chain", None), "id", None)
-        in RECEPTOR_CHAIN_IDS
+        in receptor_ids
         and getattr(getattr(getattr(second, "residue", None), "chain", None), "id", None)
-        in RECEPTOR_CHAIN_IDS
+        in receptor_ids
     )
 
 
@@ -534,31 +567,36 @@ def _bond_identity(
 
 def _receptor_disulfide_pairs(
     topology: object,
+    roles: ComplexChainRoles,
 ) -> set[tuple[tuple[str, int, str, str], tuple[str, int, str, str]]]:
     pairs = set()
     for first, second in topology.bonds():  # type: ignore[attr-defined]
-        if not _is_receptor_disulfide_bond(first, second):
+        if not _is_receptor_disulfide_bond(first, second, roles):
             continue
         pairs.add(_bond_identity(first, second))
     return pairs
 
 
 def _remove_receptor_extras(
-    topology: object, positions: object, source_topology: object
+    topology: object,
+    positions: object,
+    source_topology: object,
+    roles: ComplexChainRoles,
 ) -> tuple[object, object]:
     import openmm.app as app
 
+    receptor_ids = roles.receptor_chain_ids
     source_keys = {
         (*_residue_key(atom.residue), atom.name)
         for atom in source_topology.atoms()  # type: ignore[attr-defined]
-        if atom.residue.chain.id in RECEPTOR_CHAIN_IDS
+        if atom.residue.chain.id in receptor_ids
         and atom.element is not None
         and atom.element.symbol != "H"
     }
     extras = [
         atom
         for atom in topology.atoms()  # type: ignore[attr-defined]
-        if atom.residue.chain.id in RECEPTOR_CHAIN_IDS
+        if atom.residue.chain.id in receptor_ids
         and atom.element is not None
         and atom.element.symbol != "H"
         and (*_residue_key(atom.residue), atom.name) not in source_keys
@@ -574,14 +612,16 @@ def _apply_chemistry(
     config: ComplexPrepConfig,
     topology: object,
     positions: object,
+    roles: ComplexChainRoles,
 ) -> tuple[object, object, list[Any]]:
     import openmm.app as app
 
     from biolab_runners.peptide_prep import chemistry
 
+    design_chain_id = roles.design_chain_id
     _, design_residues = design_chain.resolve_design_chain(
         topology,
-        DESIGN_CHAIN_ID,
+        design_chain_id,
         expected_length=len(config.design_sequence),
     )
     disulfide_pairs = [
@@ -613,11 +653,11 @@ def _apply_chemistry(
     if config.topology.head_to_tail is not None:
         modeller, head_index, tail_index = chemistry.remove_chain_terminal_caps_for_cyclization(
             modeller,
-            design_chain_id=DESIGN_CHAIN_ID,
+            design_chain_id=design_chain_id,
         )
         tail_atom, head_atom = chemistry.apply_chain_head_to_tail_closure(
             modeller.topology,
-            design_chain_id=DESIGN_CHAIN_ID,
+            design_chain_id=design_chain_id,
             app_module=app,
         )
         bond_records.append(
@@ -715,20 +755,22 @@ def _build_system(topology: object) -> tuple[object, float]:
 
 
 def _build_chain_audits(
-    source_topology: object, prepared_topology: object
+    source_topology: object,
+    prepared_topology: object,
+    roles: ComplexChainRoles,
 ) -> tuple[ComplexChainAudit, ...]:
     source = _chain_map(source_topology)
     prepared = _chain_map(prepared_topology)
     if set(source) != set(prepared):
-        raise ValueError("prepared topology changed the exact A/B/C chain set")
+        raise ValueError("prepared topology changed the exact source chain set")
     audits: list[ComplexChainAudit] = []
-    for chain_id in (*RECEPTOR_CHAIN_IDS, DESIGN_CHAIN_ID):
+    for chain_id in roles.chain_ids:
         source_chain = source[chain_id]
         prepared_chain = prepared[chain_id]
         audits.append(
             ComplexChainAudit(
                 chain_id=chain_id,
-                role="receptor" if chain_id in RECEPTOR_CHAIN_IDS else "design",
+                role=roles.role_for(chain_id),
                 source_residue_count=len(list(source_chain.residues())),
                 prepared_residue_count=len(list(prepared_chain.residues())),
                 source_atom_count=len(list(source_chain.atoms())),
@@ -739,12 +781,14 @@ def _build_chain_audits(
 
 
 def _build_residue_audits(
-    source_topology: object, prepared_topology: object
+    source_topology: object,
+    prepared_topology: object,
+    roles: ComplexChainRoles,
 ) -> tuple[ComplexResidueAudit, ...]:
     source = _chain_map(source_topology)
     prepared = _chain_map(prepared_topology)
     audits: list[ComplexResidueAudit] = []
-    for chain_id in (*RECEPTOR_CHAIN_IDS, DESIGN_CHAIN_ID):
+    for chain_id in roles.chain_ids:
         source_residues = list(source[chain_id].residues())
         prepared_residues = list(prepared[chain_id].residues())
         if len(source_residues) != len(prepared_residues):
@@ -777,6 +821,7 @@ def _validate_preservation(state: _StructureState) -> None:
         state.source_positions,
         state.topology,
         state.positions,
+        state.roles,
     )
 
 
@@ -785,29 +830,41 @@ def _validate_preserved_topologies(
     source_positions: object,
     prepared_topology: object,
     prepared_positions: object,
+    roles: ComplexChainRoles,
 ) -> None:
-    if _receptor_disulfide_pairs(source_topology) != _receptor_disulfide_pairs(prepared_topology):
+    if _receptor_disulfide_pairs(source_topology, roles) != _receptor_disulfide_pairs(
+        prepared_topology, roles
+    ):
         raise ValueError("receptor disulfide identity changed")
-    source_receptor = _receptor_heavy_snapshot(source_topology, source_positions)
-    prepared_receptor = _receptor_heavy_snapshot(prepared_topology, prepared_positions)
+    source_receptor = _receptor_heavy_snapshot(source_topology, source_positions, roles)
+    prepared_receptor = _receptor_heavy_snapshot(prepared_topology, prepared_positions, roles)
     if source_receptor != prepared_receptor:
-        raise ValueError("receptor A/B heavy-atom identity or coordinates changed")
+        raise ValueError(f"{_receptor_label(roles)} heavy-atom identity or coordinates changed")
     source = _atom_records(source_topology, source_positions)
     prepared = _atom_records(prepared_topology, prepared_positions)
     for key, source_record in source.items():
         prepared_record = prepared.get(key)
         if prepared_record is None:
             continue
-        if key[0] in RECEPTOR_CHAIN_IDS and source_record["element"] != "H":
-            _require_same_geometry(key, source_record, prepared_record, "receptor")
-        if key[0] == DESIGN_CHAIN_ID and key[3] in design_chain.D_BACKBONE_INVARIANT_ATOMS:
+        if key[0] in roles.receptor_chain_ids and source_record["element"] != "H":
+            _require_same_geometry(key, source_record, prepared_record, _receptor_label(roles))
+        if key[0] == roles.design_chain_id and key[3] in design_chain.D_BACKBONE_INVARIANT_ATOMS:
             _require_same_geometry(key, source_record, prepared_record, "design backbone")
 
 
-def _receptor_heavy_snapshot(topology: object, positions: object) -> tuple[Any, ...]:
+def _receptor_label(roles: ComplexChainRoles) -> str:
+    return "receptor A/B" if roles.legacy else "receptor"
+
+
+def _receptor_heavy_snapshot(
+    topology: object,
+    positions: object,
+    roles: ComplexChainRoles,
+) -> tuple[Any, ...]:
+    receptor_ids = roles.receptor_chain_ids
     chains: list[Any] = []
     for chain in topology.chains():  # type: ignore[attr-defined]
-        if chain.id not in RECEPTOR_CHAIN_IDS:
+        if chain.id not in receptor_ids:
             continue
         residues: list[Any] = []
         for residue in chain.residues():
@@ -926,7 +983,8 @@ def _materialize_bundle(
     pdb_path = staging / PREPARED_PDB_FILENAME
     top_path = staging / PREPARED_TOP_FILENAME
     gro_path = staging / PREPARED_GRO_FILENAME
-    pdb_bond_records = _pdb_bond_records(state.topology, state.bond_records)
+    roles = state.roles
+    pdb_bond_records = _pdb_bond_records(state.topology, state.bond_records, roles)
     export.write_prepared_pdb(
         pdb_path,
         state.topology,
@@ -968,9 +1026,9 @@ def _materialize_bundle(
         PREPARED_TOP_FILENAME: _required_sha(top_path),
         PREPARED_GRO_FILENAME: _required_sha(gro_path),
     }
-    selections = _selection_groups(state.topology)
+    selections = _selection_groups(state.topology, roles)
     index_path = staging / INDEX_FILENAME
-    index_path.write_text(_render_index(selections))
+    index_path.write_text(_render_index(selections, _group_order(roles)))
     index_digest = _required_sha(index_path)
     selection_map = _build_selection_map(
         state,
@@ -990,6 +1048,7 @@ def _materialize_bundle(
         state.positions,
         index_path,
         map_digest,
+        roles,
     )
     manifest_path = staging / MANIFEST_FILENAME
     manifest = _build_manifest(
@@ -1012,6 +1071,7 @@ def _materialize_bundle(
         state.source_positions,
         state.topology,
         state.positions,
+        roles,
     )
     return manifest
 
@@ -1103,21 +1163,24 @@ def _rewrite_pdb_closure_records(path: Path, bond_records: tuple[TopologyBondRec
 
 
 def _pdb_bond_records(
-    topology: object, closure_records: tuple[TopologyBondRecord, ...]
+    topology: object,
+    closure_records: tuple[TopologyBondRecord, ...],
+    roles: ComplexChainRoles,
 ) -> tuple[TopologyBondRecord, ...]:
     records = list(closure_records)
     recorded_pairs = {
         (min(record.atom1_index, record.atom2_index), max(record.atom1_index, record.atom2_index))
         for record in records
     }
+    receptor_ids = roles.receptor_chain_ids
     for first, second in topology.bonds():  # type: ignore[attr-defined]
         pair = (min(first.index, second.index), max(first.index, second.index))
         if (
             pair in recorded_pairs
             or first.name != "SG"
             or second.name != "SG"
-            or first.residue.chain.id not in RECEPTOR_CHAIN_IDS
-            or second.residue.chain.id not in RECEPTOR_CHAIN_IDS
+            or first.residue.chain.id not in receptor_ids
+            or second.residue.chain.id not in receptor_ids
         ):
             continue
         records.append(
@@ -1158,27 +1221,29 @@ def _verify_multichain_parity(
     return True, ""
 
 
-def _selection_groups(topology: object) -> dict[str, list[int]]:
-    groups = {name: [] for name in _GROUP_ORDER}
+def _selection_groups(topology: object, roles: ComplexChainRoles) -> dict[str, list[int]]:
+    groups = {name: [] for name in _group_order(roles)}
     for atom in topology.atoms():  # type: ignore[attr-defined]
-        if atom.residue.chain.id in RECEPTOR_CHAIN_IDS:
-            groups["receptor_ab"].append(atom.index + 1)
-        elif atom.residue.chain.id == DESIGN_CHAIN_ID:
-            groups["design_c"].append(atom.index + 1)
+        chain_id = atom.residue.chain.id
+        if chain_id == roles.design_chain_id:
+            groups["design_c" if roles.legacy else "design"].append(atom.index + 1)
+        elif chain_id in roles.receptor_chain_ids:
+            groups["receptor_ab" if roles.legacy else "receptor"].append(atom.index + 1)
         else:
-            raise ValueError(f"unexpected chain {atom.residue.chain.id!r} in index groups")
-    groups["dimer_ab"] = list(groups["receptor_ab"])
+            raise ValueError(f"unexpected chain {chain_id!r} in index groups")
+    if roles.legacy:
+        groups["dimer_ab"] = list(groups["receptor_ab"])
     for group in groups.values():
         if group != sorted(set(group)) or not group:
             raise ValueError("index group is not ascending and unique")
-    if groups["receptor_ab"] != groups["dimer_ab"]:
+    if roles.legacy and groups["receptor_ab"] != groups["dimer_ab"]:
         raise ValueError("receptor_ab and dimer_ab selections differ")
     return groups
 
 
-def _render_index(groups: dict[str, list[int]]) -> str:
+def _render_index(groups: dict[str, list[int]], order: tuple[str, ...]) -> str:
     lines: list[str] = []
-    for group_name in _GROUP_ORDER:
+    for group_name in order:
         lines.append(f"[ {group_name} ]")
         values = groups[group_name]
         lines.extend(
@@ -1221,7 +1286,7 @@ def _build_selection_map(
         for key in residue_common
     ]
     return {
-        "schema_version": PREPARATION_SCHEMA_VERSION,
+        "schema_version": state.roles.schema_version,
         "preparation_digest": preparation_digest,
         "source_pdb_sha256": source_digest,
         "prepared_artifact_sha256": dict(prepared_digests),
@@ -1246,8 +1311,8 @@ def _build_selection_map(
             _map_residue_record(source_residues[key], "source")
             for key in sorted(set(source_residues) - set(prepared_residues))
         ],
-        "selections": _selection_groups(state.topology),
-        "interface_mapping": _interface_mapping(state.topology),
+        "selections": _selection_groups(state.topology, state.roles),
+        "interface_mapping": _interface_mapping(state.topology, state.roles),
         "chain_audits": [audit.to_dict() for audit in state.chain_audits],
         "residue_audits": [audit.to_dict() for audit in state.residue_audits],
         "solvent_ion_boundaries": {"solvent": "not_staged", "ions": "not_staged"},
@@ -1341,7 +1406,7 @@ def _build_manifest(
         INDEX_FILENAME: index_digest,
     }
     manifest = {
-        "schema_version": PREPARATION_SCHEMA_VERSION,
+        "schema_version": state.roles.schema_version,
         "runner": "complex_prep",
         "output_dir": str(output_dir),
         "source_pdb": config.source_pdb,
@@ -1350,9 +1415,9 @@ def _build_manifest(
         "config_digest": config_digest,
         "preparation_digest": preparation_digest,
         "design_sequence": config.design_sequence,
-        "chain_roles": {"receptor": list(RECEPTOR_CHAIN_IDS), "design": DESIGN_CHAIN_ID},
+        "chain_roles": state.roles.manifest_chain_roles,
         "force_field": {"protein": PROTEIN_FORCE_FIELD, "water": WATER_FORCE_FIELD, "pH": 7.4},
-        "algorithm_versions": dict(ALGORITHM_VERSIONS),
+        "algorithm_versions": state.roles.algorithm_versions,
         "closure_limits": {
             "head_to_tail_angstrom": DEFAULT_MAX_HEAD_TO_TAIL_DISTANCE_A,
             "disulfide_angstrom": DEFAULT_MAX_DISULFIDE_DISTANCE_A,
@@ -1392,8 +1457,9 @@ def _verify_staging(
     source_positions: object,
     prepared_topology: object,
     prepared_positions: object,
+    roles: ComplexChainRoles,
 ) -> None:
-    _validate_manifest_shape(manifest)
+    _validate_manifest_shape(manifest, roles)
     for filename in _OUTPUT_FILENAMES:
         path = staging / filename
         if path.is_symlink() or not path.is_file() or path.stat().st_size == 0:
@@ -1408,6 +1474,7 @@ def _verify_staging(
         prepared_positions,
         staging / INDEX_FILENAME,
         _required_sha(staging / SELECTION_MAP_FILENAME),
+        roles,
     )
     _required_sha(staging / MANIFEST_FILENAME)
 
@@ -1524,6 +1591,7 @@ def _inspect_existing(
         return early_result
     if manifest is None:
         return None
+    roles = config.chain_roles
     try:
         _validate_manifest_identity(
             manifest, config, source_digest, config_digest, preparation_digest
@@ -1539,7 +1607,7 @@ def _inspect_existing(
         import openmm.app as app
 
         prepared = app.PDBFile(str(output_dir / PREPARED_PDB_FILENAME))
-        _restore_cached_disulfide_names(prepared.topology, config)
+        _restore_cached_disulfide_names(prepared.topology, config, roles)
         _validate_selection_map(
             map_data,
             source_topology,
@@ -1548,6 +1616,7 @@ def _inspect_existing(
             prepared.positions,
             output_dir / INDEX_FILENAME,
             _required_sha(output_dir / SELECTION_MAP_FILENAME),
+            roles,
         )
         if (
             manifest["chain_audits"] != map_data["chain_audits"]
@@ -1607,13 +1676,15 @@ def _validate_cached_science(
 ) -> None:
     from biolab_runners.peptide_prep import export
 
+    roles = config.chain_roles
     _validate_preserved_topologies(
         source_topology,
         source_positions,
         prepared_topology,
         prepared_positions,
+        roles,
     )
-    records = _validate_cached_bond_records(config, manifest, prepared_topology)
+    records = _validate_cached_bond_records(config, manifest, prepared_topology, roles)
     _validate_closure_geometry(prepared_topology, prepared_positions, list(records))
     system, net_charge = _build_system(prepared_topology)
     if not math.isclose(net_charge, manifest["net_charge"], rel_tol=0.0, abs_tol=1e-9):
@@ -1636,10 +1707,12 @@ def _validate_cached_science(
         raise ValueError(f"cached GROMACS parity check failed: {parity_message}")
 
 
-def _restore_cached_disulfide_names(topology: object, config: ComplexPrepConfig) -> None:
+def _restore_cached_disulfide_names(
+    topology: object, config: ComplexPrepConfig, roles: ComplexChainRoles
+) -> None:
     _, residues = design_chain.resolve_design_chain(
         topology,
-        DESIGN_CHAIN_ID,
+        roles.design_chain_id,
         expected_length=len(config.design_sequence),
     )
     residue_indices = {
@@ -1668,8 +1741,9 @@ def _validate_cached_bond_records(
     config: ComplexPrepConfig,
     manifest: dict[str, Any],
     topology: object,
+    roles: ComplexChainRoles,
 ) -> tuple[TopologyBondRecord, ...]:
-    expected = _expected_closure_records(config, topology)
+    expected = _expected_closure_records(config, topology, roles)
     actual = tuple(TopologyBondRecord(**record) for record in manifest["bond_records"])
     if sorted(_canonical_json(asdict(record)) for record in actual) != sorted(
         _canonical_json(asdict(record)) for record in expected
@@ -1686,11 +1760,11 @@ def _validate_cached_bond_records(
 
 
 def _expected_closure_records(
-    config: ComplexPrepConfig, topology: object
+    config: ComplexPrepConfig, topology: object, roles: ComplexChainRoles
 ) -> tuple[TopologyBondRecord, ...]:
     _, residues = design_chain.resolve_design_chain(
         topology,
-        DESIGN_CHAIN_ID,
+        roles.design_chain_id,
         expected_length=len(config.design_sequence),
     )
     records: list[TopologyBondRecord] = []
@@ -1745,7 +1819,7 @@ def _validate_manifest_identity(
     config_digest: str,
     preparation_digest: str,
 ) -> None:
-    _validate_manifest_shape(manifest)
+    _validate_manifest_shape(manifest, config.chain_roles)
     for key, expected in (
         ("source_pdb_sha256", source_digest),
         ("config_digest", config_digest),
@@ -1756,10 +1830,10 @@ def _validate_manifest_identity(
     _validate_manifest_request_values(manifest, config)
 
 
-def _validate_manifest_shape(manifest: dict[str, Any]) -> None:
+def _validate_manifest_shape(manifest: dict[str, Any], roles: ComplexChainRoles) -> None:
     if (
         not _strict_int(manifest.get("schema_version"))
-        or manifest.get("schema_version") != PREPARATION_SCHEMA_VERSION
+        or manifest.get("schema_version") != roles.schema_version
         or manifest.get("runner") != "complex_prep"
     ):
         raise MalformedBundleError("manifest schema is unsupported")
@@ -1767,10 +1841,11 @@ def _validate_manifest_shape(manifest: dict[str, Any]) -> None:
         raise MalformedBundleError("manifest scientific metadata digest is malformed")
     if manifest.get(MANIFEST_PAYLOAD_DIGEST_FIELD) != _manifest_payload_digest(manifest):
         raise ValueError("cached manifest scientific metadata digest does not match payload")
-    _validate_manifest_metadata_types(manifest)
+    _validate_manifest_metadata_types(manifest, roles)
 
 
 def _validate_manifest_request_values(manifest: dict[str, Any], config: ComplexPrepConfig) -> None:
+    roles = config.chain_roles
     if manifest["source_pdb"] != config.source_pdb:
         raise ValueError("cached bundle source path does not match request")
     if manifest["design_sequence"] != config.design_sequence or manifest[
@@ -1781,10 +1856,7 @@ def _validate_manifest_request_values(manifest: dict[str, Any], config: ComplexP
         raise ValueError("cached bundle D-coordinate input mode does not match request")
     if manifest["source_decoy"] != config.source_decoy.to_dict():
         raise ValueError("cached bundle source decoy identity does not match request")
-    if manifest["chain_roles"] != {
-        "receptor": list(RECEPTOR_CHAIN_IDS),
-        "design": DESIGN_CHAIN_ID,
-    }:
+    if manifest["chain_roles"] != roles.manifest_chain_roles:
         raise MalformedBundleError("manifest chain roles are malformed")
     if manifest["force_field"] != {
         "protein": PROTEIN_FORCE_FIELD,
@@ -1792,7 +1864,7 @@ def _validate_manifest_request_values(manifest: dict[str, Any], config: ComplexP
         "pH": 7.4,
     }:
         raise MalformedBundleError("manifest force-field policy is malformed")
-    if manifest["algorithm_versions"] != ALGORITHM_VERSIONS:
+    if manifest["algorithm_versions"] != roles.algorithm_versions:
         raise MalformedBundleError("manifest algorithm versions are stale")
     if manifest["closure_limits"] != {
         "head_to_tail_angstrom": DEFAULT_MAX_HEAD_TO_TAIL_DISTANCE_A,
@@ -1801,7 +1873,7 @@ def _validate_manifest_request_values(manifest: dict[str, Any], config: ComplexP
         raise MalformedBundleError("manifest closure limits are stale")
 
 
-def _validate_manifest_metadata_types(manifest: dict[str, Any]) -> None:
+def _validate_manifest_metadata_types(manifest: dict[str, Any], roles: ComplexChainRoles) -> None:
     for key in ("source_pdb_sha256", "config_digest", "preparation_digest"):
         if not _is_sha(manifest.get(key)):
             raise MalformedBundleError(f"manifest digest is malformed for {key}")
@@ -1819,7 +1891,7 @@ def _validate_manifest_metadata_types(manifest: dict[str, Any]) -> None:
         manifest.get("topology"), dict
     ):
         raise MalformedBundleError("manifest source or topology metadata is malformed")
-    _validate_manifest_policies(manifest)
+    _validate_manifest_policies(manifest, roles)
     _validate_manifest_artifact_specs(manifest.get("artifacts"))
     _validate_chain_audit_types(manifest.get("chain_audits"))
     _validate_residue_audit_types(manifest.get("residue_audits"))
@@ -1827,9 +1899,9 @@ def _validate_manifest_metadata_types(manifest: dict[str, Any]) -> None:
     _validate_chirality_report_types(manifest.get("chirality_reports"))
 
 
-def _validate_manifest_policies(manifest: dict[str, Any]) -> None:
+def _validate_manifest_policies(manifest: dict[str, Any], roles: ComplexChainRoles) -> None:
     versions = manifest.get("algorithm_versions")
-    if not isinstance(versions, dict) or set(versions) != set(ALGORITHM_VERSIONS):
+    if not isinstance(versions, dict) or set(versions) != set(roles.algorithm_versions):
         raise MalformedBundleError("manifest algorithm versions are malformed")
     if any(not isinstance(value, str) for value in versions.values()):
         raise MalformedBundleError("manifest algorithm versions are malformed")
@@ -2012,18 +2084,20 @@ def _validate_selection_map(
     prepared_positions: object,
     index_path: Path,
     map_digest: str,
+    roles: ComplexChainRoles,
 ) -> None:
-    data = _validated_selection_map_header(data)
+    data = _validated_selection_map_header(data, roles)
     if data.get("index_sha256") != _required_sha(index_path):
         raise ValueError("selection map/index digest binding is stale")
     _validate_index_groups(
         data.get("selections"),
         index_path,
         prepared_topology.getNumAtoms(),  # type: ignore[attr-defined]
+        roles,
     )
-    if data.get("selections") != _selection_groups(prepared_topology):
+    if data.get("selections") != _selection_groups(prepared_topology, roles):
         raise ValueError("selection map groups differ from prepared topology roles")
-    _validate_interface_mapping(data, prepared_topology)
+    _validate_interface_mapping(data, prepared_topology, roles)
     source_atoms = _atom_records(source_topology, source_positions)
     prepared_atoms = _atom_records(prepared_topology, prepared_positions)
     _validate_atom_mapping(data, source_atoms, prepared_atoms)
@@ -2031,11 +2105,12 @@ def _validate_selection_map(
     prepared_residues = _residue_records(prepared_topology)
     _validate_residue_mapping(data, source_residues, prepared_residues)
     if data.get("chain_audits") != [
-        audit.to_dict() for audit in _build_chain_audits(source_topology, prepared_topology)
+        audit.to_dict() for audit in _build_chain_audits(source_topology, prepared_topology, roles)
     ]:
         raise ValueError("selection map chain audits differ from topologies")
     if data.get("residue_audits") != [
-        audit.to_dict() for audit in _build_residue_audits(source_topology, prepared_topology)
+        audit.to_dict()
+        for audit in _build_residue_audits(source_topology, prepared_topology, roles)
     ]:
         raise ValueError("selection map residue audits differ from topologies")
     prepared_digests = data.get("prepared_artifact_sha256")
@@ -2054,8 +2129,8 @@ def _validate_selection_map(
         raise MalformedBundleError("selection map solvent/ion policy is malformed")
 
 
-def _validated_selection_map_header(data: object) -> dict[str, Any]:
-    if not isinstance(data, dict) or data.get("schema_version") != PREPARATION_SCHEMA_VERSION:
+def _validated_selection_map_header(data: object, roles: ComplexChainRoles) -> dict[str, Any]:
+    if not isinstance(data, dict) or data.get("schema_version") != roles.schema_version:
         raise MalformedBundleError("selection map schema is malformed")
     if data.get("index_bases") != {
         "source_pdb_atom": 1,
@@ -2344,11 +2419,17 @@ def _validate_partition_residue_indices(
             raise ValueError(f"selection map partition index is stale: {field}")
 
 
-def _validate_index_groups(groups: object, index_path: Path, atom_count: int) -> None:
-    if not isinstance(groups, dict) or set(groups) != set(_GROUP_ORDER):
+def _validate_index_groups(
+    groups: object,
+    index_path: Path,
+    atom_count: int,
+    roles: ComplexChainRoles,
+) -> None:
+    order = _group_order(roles)
+    if not isinstance(groups, dict) or set(groups) != set(order):
         raise MalformedBundleError("selection map groups are malformed")
     expected = {name: list(values) for name, values in groups.items() if isinstance(values, list)}
-    parsed = _parse_index(index_path)
+    parsed = _parse_index(index_path, order)
     if parsed != expected:
         raise ValueError("index.ndx selections do not equal selection-map selections")
     for values in parsed.values():
@@ -2356,20 +2437,29 @@ def _validate_index_groups(groups: object, index_path: Path, atom_count: int) ->
             not _valid_index(value, atom_count) for value in values
         ):
             raise ValueError("index.ndx contains duplicate or out-of-range atom indices")
-    if parsed["receptor_ab"] != parsed["dimer_ab"]:
+    if roles.legacy and parsed["receptor_ab"] != parsed["dimer_ab"]:
         raise ValueError("receptor_ab and dimer_ab selections differ")
 
 
-def _interface_mapping(topology: object) -> dict[str, list[int]]:
-    mapping = {name: [] for name in ("receptor_a", "receptor_b", "dimer_ab", "design_c")}
+def _interface_mapping(topology: object, roles: ComplexChainRoles) -> dict[str, Any]:
+    if roles.legacy:
+        return _legacy_interface_mapping(topology, roles)
+    return _role_interface_mapping(topology, roles)
+
+
+def _legacy_interface_mapping(topology: object, roles: ComplexChainRoles) -> dict[str, Any]:
+    receptor_ids = roles.receptor_chain_ids
+    if len(receptor_ids) != 2:
+        raise ValueError("legacy interface mapping requires exactly two receptor chains")
+    mapping: dict[str, list[int]] = {name: [] for name in _LEGACY_INTERFACE_GROUPS}
     for atom in topology.atoms():  # type: ignore[attr-defined]
         chain_id = atom.residue.chain.id
         atom_index = atom.index + 1
-        if chain_id == RECEPTOR_CHAIN_IDS[0]:
+        if chain_id == receptor_ids[0]:
             mapping["receptor_a"].append(atom_index)
-        elif chain_id == RECEPTOR_CHAIN_IDS[1]:
+        elif chain_id == receptor_ids[1]:
             mapping["receptor_b"].append(atom_index)
-        elif chain_id == DESIGN_CHAIN_ID:
+        elif chain_id == roles.design_chain_id:
             mapping["design_c"].append(atom_index)
         else:
             raise ValueError(f"unexpected chain {chain_id!r} in interface mapping")
@@ -2378,21 +2468,60 @@ def _interface_mapping(topology: object) -> dict[str, list[int]]:
     return mapping
 
 
-def _validate_interface_mapping(data: dict[str, Any], prepared_topology: object) -> None:
+def _role_interface_mapping(topology: object, roles: ComplexChainRoles) -> dict[str, Any]:
+    receptor_ids = roles.receptor_chain_ids
+    receptor_chains: dict[str, list[int]] = {chain_id: [] for chain_id in receptor_ids}
+    design: list[int] = []
+    for atom in topology.atoms():  # type: ignore[attr-defined]
+        chain_id = atom.residue.chain.id
+        atom_index = atom.index + 1
+        if chain_id == roles.design_chain_id:
+            design.append(atom_index)
+        elif chain_id in receptor_chains:
+            receptor_chains[chain_id].append(atom_index)
+        else:
+            raise ValueError(f"unexpected chain {chain_id!r} in interface mapping")
+    mapping: dict[str, Any] = {
+        "receptor_chains": receptor_chains,
+        "receptor": sorted(
+            atom_index for values in receptor_chains.values() for atom_index in values
+        ),
+        "design": design,
+    }
+    _validate_role_interface_mapping_values(mapping)
+    return mapping
+
+
+def _validate_interface_mapping(
+    data: dict[str, Any], prepared_topology: object, roles: ComplexChainRoles
+) -> None:
     atom_count = prepared_topology.getNumAtoms()  # type: ignore[attr-defined]
-    mapping = _normalized_interface_mapping(data.get("interface_mapping"), atom_count)
-    expected = _interface_mapping(prepared_topology)
+    if roles.legacy:
+        mapping = _normalized_interface_mapping(data.get("interface_mapping"), atom_count)
+        expected = _interface_mapping(prepared_topology, roles)
+        if mapping != expected:
+            raise ValueError("interface mapping differs from prepared topology chain roles")
+        selections = data.get("selections")
+        if not isinstance(selections, dict):
+            raise ValueError("selection map selections are malformed")
+        if mapping["dimer_ab"] != selections.get("receptor_ab") or mapping["dimer_ab"] != (
+            selections.get("dimer_ab")
+        ):
+            raise ValueError("interface mapping dimer_ab differs from receptor selections")
+        if mapping["design_c"] != selections.get("design_c"):
+            raise ValueError("interface mapping design_c differs from design selection")
+        return
+    mapping = _normalized_role_interface_mapping(data.get("interface_mapping"), atom_count)
+    expected = _role_interface_mapping(prepared_topology, roles)
     if mapping != expected:
         raise ValueError("interface mapping differs from prepared topology chain roles")
     selections = data.get("selections")
-    if not isinstance(selections, dict):
+    if not isinstance(selections, dict) or set(selections) != {"receptor", "design"}:
         raise ValueError("selection map selections are malformed")
-    if mapping["dimer_ab"] != selections.get("receptor_ab") or mapping["dimer_ab"] != (
-        selections.get("dimer_ab")
-    ):
-        raise ValueError("interface mapping dimer_ab differs from receptor selections")
-    if mapping["design_c"] != selections.get("design_c"):
-        raise ValueError("interface mapping design_c differs from design selection")
+    if mapping["receptor"] != selections.get("receptor"):
+        raise ValueError("interface mapping receptor differs from receptor selection")
+    if mapping["design"] != selections.get("design"):
+        raise ValueError("interface mapping design differs from design selection")
 
 
 def _normalized_interface_mapping(value: object, atom_count: int) -> dict[str, list[int]]:
@@ -2400,6 +2529,27 @@ def _normalized_interface_mapping(value: object, atom_count: int) -> dict[str, l
     if not isinstance(value, dict) or set(value) != set(names):
         raise ValueError("selection map interface_mapping groups are malformed")
     return {name: _validated_interface_group(value.get(name), name, atom_count) for name in names}
+
+
+def _normalized_role_interface_mapping(value: object, atom_count: int) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != set(_ROLE_INTERFACE_GROUPS):
+        raise ValueError(
+            "selection map interface_mapping must contain exactly "
+            "receptor_chains, receptor, and design"
+        )
+    chains = value.get("receptor_chains")
+    if not isinstance(chains, dict) or not chains:
+        raise ValueError("interface mapping receptor_chains must be a non-empty object")
+    if any(not isinstance(chain_id, str) or not chain_id for chain_id in chains):
+        raise ValueError("interface mapping receptor_chains has an invalid chain ID")
+    return {
+        "receptor_chains": {
+            chain_id: _validated_interface_group(atoms, chain_id, atom_count)
+            for chain_id, atoms in chains.items()
+        },
+        "receptor": _validated_interface_group(value.get("receptor"), "receptor", atom_count),
+        "design": _validated_interface_group(value.get("design"), "design", atom_count),
+    }
 
 
 def _validated_interface_group(value: object, name: str, atom_count: int) -> list[int]:
@@ -2425,12 +2575,24 @@ def _validate_interface_mapping_values(mapping: dict[str, list[int]]) -> None:
         raise ValueError("interface mapping receptor dimer overlaps design C")
 
 
-def _parse_index(path: Path) -> dict[str, list[int]]:
+def _validate_role_interface_mapping_values(mapping: dict[str, Any]) -> None:
+    receptor_chains = mapping["receptor_chains"]
+    receptor_union = mapping["receptor"]
+    design = mapping["design"]
+    if receptor_union != sorted(
+        atom_index for values in receptor_chains.values() for atom_index in values
+    ):
+        raise ValueError("interface mapping receptor is not the sorted chain union")
+    if set(receptor_union) & set(design):
+        raise ValueError("interface mapping receptor overlaps design")
+
+
+def _parse_index(path: Path, order: tuple[str, ...]) -> dict[str, list[int]]:
     groups: dict[str, list[int]] = {}
     current: str | None = None
     for line in path.read_text().splitlines():
         current = _parse_index_line(line, groups, current)
-    if tuple(groups) != _GROUP_ORDER:
+    if tuple(groups) != order:
         raise MalformedBundleError("index.ndx group order is not the fixed contract")
     return groups
 

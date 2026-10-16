@@ -22,6 +22,11 @@ from biolab_runners.complex_prep import (
     compute_complex_config_digest,
 )
 from biolab_runners.complex_prep import runner as complex_prep_runner
+from biolab_runners.complex_prep.config import (
+    LEGACY_CHAIN_ROLES,
+    MULTIROLE_PREPARATION_SCHEMA_VERSION,
+    ComplexChainRoles,
+)
 from biolab_runners.contracts import ExecutionStatus
 from biolab_runners.peptide_prep import ChiralityReport, CoordinateTransformResult
 from biolab_runners.rosetta import ChainAudit, PDBIdentity, RelaxScore, RosettaDecoyArtifact
@@ -433,6 +438,7 @@ def test_receptor_heavy_atom_identity_mismatch_fails_closed(
         source_positions=source_positions,
         topology=prepared_topology,
         positions=prepared_positions,
+        roles=LEGACY_CHAIN_ROLES,
     )
 
     with pytest.raises(ValueError, match="receptor A/B heavy-atom"):
@@ -1153,7 +1159,9 @@ def test_cache_rejects_index_base_and_role_tampering(source_pdb: Path, tmp_path:
     map_data["selections"]["design_c"].sort()
     map_path.write_text(json.dumps(map_data, indent=2, sort_keys=True) + "\n")
     (role_output / "index.ndx").write_text(
-        complex_prep_runner._render_index(map_data["selections"])
+        complex_prep_runner._render_index(
+            map_data["selections"], complex_prep_runner._LEGACY_GROUP_ORDER
+        )
     )
     _refresh_bound_artifacts(role_output, "index.ndx")
 
@@ -1257,3 +1265,258 @@ def test_source_digest_mismatch_and_callback_failure_publish_nothing(
     assert failed.provenance.executed
     assert not Path(config.output_dir).exists()
     assert not list(Path(config.output_dir).parent.glob(".callback-failure.staging-*"))
+
+
+def _multi_receptor_complex_pdb_text() -> str:
+    first = {
+        "N": (0.000, 0.000, 0.000, "N"),
+        "CA": (1.450, 0.000, 0.000, "C"),
+        "C": (2.450, 1.200, 0.000, "C"),
+        "O": (2.200, 2.350, 0.000, "O"),
+        "CB": (1.400, -1.000, -1.000, "C"),
+    }
+    second = {
+        "N": (3.550, 1.100, 0.000, "N"),
+        "CA": (4.550, 2.200, 0.000, "C"),
+        "C": (5.850, 1.400, 0.000, "C"),
+        "O": (6.900, 1.800, 0.000, "O"),
+        "CB": (4.700, 3.300, -1.000, "C"),
+        "OXT": (6.800, 1.500, 0.000, "O"),
+    }
+    chains = (
+        ("A", 10, "ALA", True, 0.0),
+        ("B", 20, "GLY", False, 10.0),
+        ("C", 40, "ALA", True, 30.0),
+        ("D", 50, "ALA", True, 45.0),
+    )
+    lines = ["HEADER    multi-receptor complex fixture"]
+    serial = 0
+    for chain_id, first_number, residue_name, include_cb, y_offset in chains:
+        for residue_number, template in (
+            (first_number, first),
+            (first_number + 1, second),
+        ):
+            for atom_name, (x, y, z, element) in template.items():
+                if atom_name == "CB" and not include_cb:
+                    continue
+                serial += 1
+                lines.append(
+                    f"ATOM  {serial:5d} {atom_name:>4s} {residue_name} "
+                    f"{chain_id}{residue_number:4d}"
+                    f"    {x:8.3f}{y + y_offset:8.3f}{z:8.3f}  1.00  0.00           {element:>2s}"
+                )
+        lines.append("TER")
+    return "\n".join([*lines, "END"]) + "\n"
+
+
+def _chain_atom_counts(text: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for line in text.splitlines():
+        if line.startswith("ATOM  "):
+            counts[line[21]] = counts.get(line[21], 0) + 1
+    return counts
+
+
+def _multi_receptor_artifact(source_pdb: Path) -> RosettaDecoyArtifact:
+    digest = hashlib.sha256(source_pdb.read_bytes()).hexdigest()
+    counts = _chain_atom_counts(source_pdb.read_text())
+    return RosettaDecoyArtifact(
+        candidate_identity="candidate-1",
+        parent_input_identity="parent-1",
+        protocol_identity="protocol-1",
+        config_identity="config-1",
+        runtime_identity="runtime-1",
+        input_pdb_identity=PDBIdentity("input", digest),
+        output_pdb_identity=PDBIdentity("output", digest),
+        chain_audits=(
+            ChainAudit("A", "receptor", 2, counts["A"]),
+            ChainAudit("B", "receptor", 2, counts["B"]),
+            ChainAudit("C", "receptor", 2, counts["C"]),
+            ChainAudit("D", "design", 2, counts["D"]),
+        ),
+        relax_score=RelaxScore(total_score=-12.5),
+        status=ExecutionStatus.SUCCEEDED,
+    )
+
+
+def _multi_receptor_fixture(tmp_path: Path) -> tuple[Path, ComplexPrepConfig, Path]:
+    source_pdb = tmp_path / "multi-receptor.pdb"
+    source_pdb.write_text(_multi_receptor_complex_pdb_text())
+    output_dir = tmp_path / "multi-receptor-out"
+    config = _config(source_pdb, output_dir, source_decoy=_multi_receptor_artifact(source_pdb))
+    return source_pdb, config, output_dir
+
+
+def test_multireceptor_roles_resolve_from_chain_audits(tmp_path: Path) -> None:
+    _, config, _ = _multi_receptor_fixture(tmp_path)
+
+    roles = config.chain_roles
+
+    assert isinstance(roles, ComplexChainRoles)
+    assert roles.receptor_chain_ids == ("A", "B", "C")
+    assert roles.design_chain_id == "D"
+    assert roles.legacy is False
+    assert roles.manifest_chain_roles == {"receptor": ["A", "B", "C"], "design": "D"}
+
+
+def test_multireceptor_preparation_emits_role_aware_selection_map(tmp_path: Path) -> None:
+    _, config, output_dir = _multi_receptor_fixture(tmp_path)
+
+    result = ComplexPrepRunner().run(config)
+
+    assert result.success, result.error
+    assert result.bundle is not None
+    data = json.loads((output_dir / SELECTION_MAP_FILENAME).read_text())
+    manifest = json.loads((output_dir / "manifest.json").read_text())
+    assert data["schema_version"] == MULTIROLE_PREPARATION_SCHEMA_VERSION
+    assert manifest["schema_version"] == MULTIROLE_PREPARATION_SCHEMA_VERSION
+    assert manifest["chain_roles"] == {"receptor": ["A", "B", "C"], "design": "D"}
+    assert manifest["algorithm_versions"]["preparation"] == "complex-preparation-v5"
+    assert [audit["role"] for audit in data["chain_audits"]] == [
+        "receptor",
+        "receptor",
+        "receptor",
+        "design",
+    ]
+    assert [audit["chain_id"] for audit in data["chain_audits"]] == ["A", "B", "C", "D"]
+
+    counts = [audit["prepared_atom_count"] for audit in data["chain_audits"]]
+    receptor_union = list(range(1, sum(counts[:3]) + 1))
+    design_binder = list(range(sum(counts[:3]) + 1, result.bundle.atom_count + 1))
+    assert data["selections"] == {"receptor": receptor_union, "design": design_binder}
+    assert data["interface_mapping"] == {
+        "receptor_chains": {
+            "A": list(range(1, counts[0] + 1)),
+            "B": list(range(counts[0] + 1, counts[0] + counts[1] + 1)),
+            "C": list(range(counts[0] + counts[1] + 1, sum(counts[:3]) + 1)),
+        },
+        "receptor": receptor_union,
+        "design": design_binder,
+    }
+    assert set(data["selections"]["receptor"]) & set(data["selections"]["design"]) == set()
+    assert sorted([*receptor_union, *design_binder]) == list(range(1, result.bundle.atom_count + 1))
+
+    parsed: dict[str, list[int]] = {}
+    current = ""
+    for line in (output_dir / "index.ndx").read_text().splitlines():
+        if line.startswith("[ "):
+            current = line[2:-2]
+            parsed[current] = []
+        elif line.strip():
+            parsed[current].extend(int(value) for value in line.split())
+    assert tuple(parsed) == ("receptor", "design")
+    assert parsed == data["selections"]
+
+
+def test_multireceptor_prepared_pdb_has_no_interchain_bonds(tmp_path: Path) -> None:
+    _, config, output_dir = _multi_receptor_fixture(tmp_path)
+
+    assert ComplexPrepRunner().run(config).success
+
+    chain_by_serial: dict[int, str] = {}
+    conect_pairs: list[tuple[int, int]] = []
+    chains: list[str] = []
+    for line in (output_dir / "prepared.pdb").read_text().splitlines():
+        if line.startswith(("ATOM  ", "HETATM")):
+            chain = line[21]
+            if chain not in chains:
+                chains.append(chain)
+            chain_by_serial[int(line[6:11])] = chain
+        elif line.startswith("CONECT"):
+            conect_pairs.append((int(line[6:11]), int(line[11:16])))
+
+    assert chains == ["A", "B", "C", "D"]
+    assert conect_pairs == [], "prepared.pdb must not introduce interchain peptide bonds"
+    assert all(chain_by_serial[first] == chain_by_serial[second] for first, second in conect_pairs)
+
+
+def test_multireceptor_cache_round_trip_reuses_role_aware_bundle(tmp_path: Path) -> None:
+    _, config, _ = _multi_receptor_fixture(tmp_path)
+    first = ComplexPrepRunner().run(config)
+
+    second = ComplexPrepRunner().run(config)
+
+    assert first.status is ExecutionStatus.SUCCEEDED
+    assert second.status is ExecutionStatus.CACHED
+    assert second.preparation_digest == first.preparation_digest
+
+
+def test_multireceptor_second_design_role_is_rejected(tmp_path: Path) -> None:
+    source_pdb = tmp_path / "multi-receptor.pdb"
+    source_pdb.write_text(_multi_receptor_complex_pdb_text())
+    artifact = _multi_receptor_artifact(source_pdb)
+    object.__setattr__(
+        artifact,
+        "chain_audits",
+        (
+            *artifact.chain_audits[:3],
+            ChainAudit("D", "design", 2, 1),
+            ChainAudit("E", "design", 2, 1),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="exactly one role='design'"):
+        _config(source_pdb, tmp_path / "out", source_decoy=artifact)
+
+
+def test_multireceptor_unknown_role_is_rejected(tmp_path: Path) -> None:
+    source_pdb = tmp_path / "multi-receptor.pdb"
+    source_pdb.write_text(_multi_receptor_complex_pdb_text())
+    artifact = _multi_receptor_artifact(source_pdb)
+    audits = (*artifact.chain_audits[:3], ChainAudit("D", "linker", 2, 1))
+    object.__setattr__(artifact, "chain_audits", audits)
+
+    with pytest.raises(ValueError, match="unsupported roles"):
+        _config(source_pdb, tmp_path / "out-unknown", source_decoy=artifact)
+
+
+def test_multireceptor_source_chain_mismatch_fails_closed(source_pdb: Path, tmp_path: Path) -> None:
+    digest = hashlib.sha256(source_pdb.read_bytes()).hexdigest()
+    artifact = RosettaDecoyArtifact(
+        candidate_identity="candidate-1",
+        parent_input_identity="parent-1",
+        protocol_identity="protocol-1",
+        config_identity="config-1",
+        runtime_identity="runtime-1",
+        input_pdb_identity=PDBIdentity("input", digest),
+        output_pdb_identity=PDBIdentity("output", digest),
+        chain_audits=(
+            ChainAudit("A", "receptor", 2, 11),
+            ChainAudit("B", "receptor", 2, 9),
+            ChainAudit("C", "receptor", 2, 10),
+            ChainAudit("D", "design", 2, 10),
+        ),
+        relax_score=RelaxScore(total_score=-12.5),
+        status=ExecutionStatus.SUCCEEDED,
+    )
+
+    result = ComplexPrepRunner().run(
+        _config(source_pdb, tmp_path / "out-mismatch", source_decoy=artifact)
+    )
+
+    assert result.status is ExecutionStatus.FAILED
+    assert "decoy chain roles" in result.error
+
+
+def test_legacy_artifact_still_emits_schema_one_selection_map(
+    source_pdb: Path, tmp_path: Path
+) -> None:
+    output_dir = tmp_path / "legacy-out"
+
+    result = ComplexPrepRunner().run(_config(source_pdb, output_dir))
+
+    assert result.success, result.error
+    data = json.loads((output_dir / SELECTION_MAP_FILENAME).read_text())
+    assert data["schema_version"] == 1
+    assert set(data["selections"]) == {"receptor_ab", "design_c", "dimer_ab"}
+    assert set(data["interface_mapping"]) == {"receptor_a", "receptor_b", "dimer_ab", "design_c"}
+    parsed: dict[str, list[int]] = {}
+    current = ""
+    for line in (output_dir / "index.ndx").read_text().splitlines():
+        if line.startswith("[ "):
+            current = line[2:-2]
+            parsed[current] = []
+        elif line.strip():
+            parsed[current].extend(int(value) for value in line.split())
+    assert tuple(parsed) == ("receptor_ab", "design_c", "dimer_ab")
+    assert parsed == data["selections"]
