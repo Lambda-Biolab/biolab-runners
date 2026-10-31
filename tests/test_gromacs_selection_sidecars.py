@@ -1283,6 +1283,141 @@ def _write_role_bundle(tmp_path: Path) -> dict[str, Path]:
     }
 
 
+def _write_role_bundle_with_multi_atom_residue(tmp_path: Path) -> dict[str, Path]:
+    """Role-aware bundle whose receptor chain A holds two atoms in one residue."""
+    tmp_path.mkdir(parents=True)
+    prepared_pdb = tmp_path / "prepared.pdb"
+    prepared_top = tmp_path / "prepared.top"
+    prepared_gro = tmp_path / "prepared.gro"
+    index = tmp_path / "index.ndx"
+    selection_map = tmp_path / "selection-map.json"
+    manifest = tmp_path / "manifest.json"
+
+    prepared_pdb.write_text(
+        "ATOM      1  N   ALA A   1\n"
+        "ATOM      2  CA  ALA A   1\n"
+        "ATOM      3  CA  GLY B   1\n"
+        "ATOM      4  CA  GLY C   1\n"
+        "ATOM      5  CA  GLY D   1\n"
+        "END\n"
+    )
+    prepared_top.write_text("; prepared topology\n")
+    _write_gro(
+        prepared_gro,
+        [
+            (1, "ALA", "N", 1),
+            (1, "ALA", "CA", 2),
+            (1, "GLY", "CA", 3),
+            (1, "GLY", "CA", 4),
+            (1, "GLY", "CA", 5),
+        ],
+    )
+    index.write_text("[ receptor ]\n1 2 3 4\n[ design ]\n5\n")
+
+    index_digest = _sha256(index)
+    prepared_digests = {
+        "prepared.pdb": _sha256(prepared_pdb),
+        "prepared.top": _sha256(prepared_top),
+        "prepared.gro": _sha256(prepared_gro),
+    }
+
+    def audit(chain_id: str, role: str, atoms: int) -> dict[str, Any]:
+        return {
+            "chain_id": chain_id,
+            "role": role,
+            "source_residue_count": 1,
+            "prepared_residue_count": 1,
+            "source_atom_count": atoms,
+            "prepared_atom_count": atoms,
+        }
+
+    map_payload: dict[str, Any] = {
+        "schema_version": 3,
+        "preparation_digest": "a" * 64,
+        "source_pdb_sha256": "b" * 64,
+        "prepared_artifact_sha256": prepared_digests,
+        "index_sha256": index_digest,
+        "index_bases": {
+            "source_pdb_atom": 1,
+            "source_pdb_residue": 1,
+            "prepared_pdb_atom": 1,
+            "prepared_pdb_residue": 1,
+            "prepared_topology_atom": 1,
+            "prepared_topology_residue": 1,
+        },
+        "source_to_prepared_atoms": [
+            _role_atom_record("A", 1, "N", "N"),
+            _role_atom_record("A", 2, "CA", "C"),
+            _role_atom_record("B", 3, "CA", "C"),
+            _role_atom_record("C", 4, "CA", "C"),
+            _role_atom_record("D", 5, "CA", "C"),
+        ],
+        "added_atoms": [],
+        "dropped_atoms": [],
+        "source_to_prepared_residues": [],
+        "added_residues": [],
+        "dropped_residues": [],
+        "selections": {"receptor": [1, 2, 3, 4], "design": [5]},
+        "interface_mapping": {
+            "receptor_chains": {"A": [1, 2], "B": [3], "C": [4]},
+            "receptor": [1, 2, 3, 4],
+            "design": [5],
+        },
+        "chain_audits": [
+            audit("A", "receptor", 2),
+            audit("B", "receptor", 1),
+            audit("C", "receptor", 1),
+            audit("D", "design", 1),
+        ],
+        "residue_audits": [],
+        "solvent_ion_boundaries": {"solvent": "not_staged", "ions": "not_staged"},
+    }
+    selection_map.write_text(json.dumps(map_payload, indent=2, sort_keys=True))
+
+    artifacts = {
+        **prepared_digests,
+        "selection-map.json": _sha256(selection_map),
+        "index.ndx": index_digest,
+    }
+    manifest_payload: dict[str, Any] = {
+        "schema_version": 3,
+        "runner": "complex_prep",
+        "preparation_digest": map_payload["preparation_digest"],
+        "source_pdb_sha256": map_payload["source_pdb_sha256"],
+        "chain_roles": {"receptor": ["A", "B", "C"], "design": "D"},
+        "chain_audits": map_payload["chain_audits"],
+        "residue_audits": map_payload["residue_audits"],
+        "artifacts": {
+            name: {"path": str(tmp_path / name), "sha256": digest}
+            for name, digest in artifacts.items()
+        },
+        "atom_count": 5,
+    }
+    manifest_payload["scientific_metadata_sha256"] = _canonical_digest(
+        manifest_payload, excluded="scientific_metadata_sha256"
+    )
+    manifest.write_text(json.dumps(manifest_payload, indent=2, sort_keys=True))
+    return {
+        "pdb": prepared_pdb,
+        "top": prepared_top,
+        "gro": prepared_gro,
+        "map": selection_map,
+        "index": index,
+        "manifest": manifest,
+    }
+
+
+def test_stage_role_aware_sidecars_counts_chain_residues_not_atoms(tmp_path: Path) -> None:
+    from biolab_runners.gromacs.selection_sidecars import stage_selection_sidecars
+
+    bundle = _write_role_bundle_with_multi_atom_residue(tmp_path / "bundle")
+
+    identity = stage_selection_sidecars(_strict_config(tmp_path, bundle), tmp_path / "work")
+
+    assert identity["preparation_digest"] == "a" * 64
+    assert identity["selection_map_sha256"] == _sha256(tmp_path / "work" / "selection-map.json")
+
+
 def test_stage_role_aware_sidecars_accepts_generic_receptor_selection(tmp_path: Path) -> None:
     from biolab_runners.gromacs.selection_sidecars import stage_selection_sidecars
 
