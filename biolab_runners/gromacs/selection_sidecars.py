@@ -466,7 +466,7 @@ def _validate_interface_mapping(
     mapping = _normalized_role_interface_mapping(selection_map.get("interface_mapping"), atom_count)
     _validate_role_interface_partition(mapping, pdb_chains, atom_count)
     _validate_role_interface_selections(mapping, selection_map)
-    _validate_role_chain_audits(selection_map, pdb_chains)
+    _validate_role_chain_audits(selection_map, pdb_atoms)
 
 
 def _normalized_interface_mapping(value: object, atom_count: int) -> dict[str, list[int]]:
@@ -574,11 +574,12 @@ def _validate_role_interface_selections(
 
 def _validate_role_chain_audits(
     selection_map: dict[str, Any],
-    pdb_chains: dict[str, list[int]],
+    pdb_atoms: list[_PdbAtom],
 ) -> None:
     audits = selection_map.get("chain_audits")
     if not isinstance(audits, list) or not audits:
         raise ValueError("selection map chain_audits are malformed")
+    pdb_chains = _pdb_chain_groups(pdb_atoms)
     chain_ids: list[str] = []
     roles: list[str] = []
     validated: list[dict[str, Any]] = []
@@ -594,7 +595,8 @@ def _validate_role_chain_audits(
     if roles.count(_DESIGN_ROLE) != 1 or roles.count(_RECEPTOR_ROLE) < 1:
         raise ValueError("selection map chain_audits must describe one design and a receptor set")
     for audit in validated:
-        _validate_chain_audit_counts(audit, pdb_chains[audit["chain_id"]], selection_map)
+        chain_atoms = [atom for atom in pdb_atoms if atom.chain_id == audit["chain_id"]]
+        _validate_chain_audit_counts(audit, chain_atoms, selection_map)
 
 
 def _validate_interface_chain_bindings(
@@ -653,7 +655,7 @@ def _validate_chain_audit_fields(
 
 def _validate_chain_audit_counts(
     audit: dict[str, Any],
-    chain_atoms: Sequence[Any],
+    chain_atoms: Sequence[_PdbAtom],
     selection_map: dict[str, Any],
 ) -> None:
     chain_id = audit["chain_id"]
