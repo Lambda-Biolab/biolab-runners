@@ -289,6 +289,138 @@ def test_gromacs_protocol_runner_real_minimization_when_gmx_present(
         assert (work_dir / "min.edr").is_file(), "min.edr missing after successful protocol"
 
 
+# A single alanine with ideal heavy-atom geometry. ``pdb2gmx`` adds the
+# hydrogens and termini, so the protocol reaches real ``.edr`` output in a
+# few seconds. The coordinates are test scaffolding, not a scientific claim.
+_MINIMAL_ALANINE_PDB = """\
+ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00           N
+ATOM      2  CA  ALA A   1       0.145   0.000   0.000  1.00  0.00           C
+ATOM      3  C   ALA A   1       0.200   0.140   0.000  1.00  0.00           C
+ATOM      4  O   ALA A   1       0.150   0.250   0.000  1.00  0.00           O
+ATOM      5  CB  ALA A   1      -0.070   0.100   0.100  1.00  0.00           C
+TER
+END
+"""
+
+
+def _gromacs_top_directory() -> Path | None:
+    """Return the installed GROMACS ``top`` directory, or None."""
+    import subprocess
+
+    binary = os.environ.get("GROMACS_BIN", "gmx")
+    candidates: list[Path] = []
+    try:
+        completed = subprocess.run(
+            [binary, "--version"], capture_output=True, text=True, check=False, timeout=60
+        )
+    except (OSError, subprocess.SubprocessError):
+        completed = None
+    if completed is not None:
+        for line in completed.stdout.splitlines():
+            if line.startswith("Data prefix:"):
+                prefix = Path(line.split(":", 1)[1].strip())
+                candidates.extend([prefix / "share" / "gromacs" / "top", prefix / "top"])
+    if data_root := os.environ.get("GMXDATA"):
+        candidates.extend([Path(data_root) / "top", Path(data_root)])
+    return next((candidate for candidate in candidates if candidate.is_dir()), None)
+
+
+def _available_protein_force_field() -> str | None:
+    """Return an installed ``pdb2gmx`` force field name, or None.
+
+    ``charmm36m`` is the protocol default but is not bundled with every
+    GROMACS install, so the test prefers it and otherwise uses whatever
+    all-atom force field the local data directory provides. The
+    observation assertions below verify extraction, identity, and units
+    only, so the force field choice cannot weaken or strengthen them.
+    """
+    top = _gromacs_top_directory()
+    if top is None:
+        return None
+    for preferred in ("charmm36m", "charmm27"):
+        if (top / f"{preferred}.ff").is_dir():
+            return preferred
+    installed = sorted(path.stem for path in top.glob("*.ff"))
+    return installed[0] if installed else None
+
+
+def test_gromacs_protocol_runner_reports_real_edr_observations(tmp_path: Path) -> None:
+    """Real ``.edr`` observations for NVT, NPT, and production.
+
+    Runs the protocol on a minimal alanine peptide and reads temperature
+    and pressure out of the three dynamic stage ``.edr`` files with the
+    local ``gmx energy``.
+
+    This asserts extraction, identity, and units only:
+
+    - NVT, NPT, and production stay separate records, in that order;
+    - each record names its own stage ``.edr`` and that file's SHA-256;
+    - temperature is reported in K, pressure in bar, and time in ps;
+    - samples are timestamped and non-empty.
+
+    It deliberately asserts nothing about thermal stability, an
+    equilibration verdict, or a plausible temperature/pressure window:
+    the observation surface reports measurements, not conclusions.
+
+    Skips when ``gmx`` or a ``pdb2gmx`` force field is unavailable.
+    """
+    import hashlib
+
+    from biolab_runners.gromacs import (
+        GromacsObservationStatus,
+        GromacsProtocolConfig,
+        GromacsProtocolRunner,
+        gromacs_available,
+    )
+
+    if not gromacs_available():
+        pytest.skip(
+            "gmx binary not on PATH (set GROMACS_BIN or install gromacs); "
+            "real-GROMACS observation test guarded by availability"
+        )
+    force_field = _available_protein_force_field()
+    if force_field is None:
+        pytest.skip("no pdb2gmx force field installed in the GROMACS data directory")
+
+    input_pdb = tmp_path / "alanine.pdb"
+    input_pdb.write_text(_MINIMAL_ALANINE_PDB)
+    config = GromacsProtocolConfig(
+        name="gmx-observations",
+        input_pdb=str(input_pdb),
+        output_root=str(tmp_path),
+        force_field=force_field,
+        nvt_ps=1,
+        npt_ps=1,
+        production_ns=0.02,
+        minimization_max_iterations=200,
+        nt_threads=2,
+        timeout_seconds=600,
+    )
+
+    result = GromacsProtocolRunner().run_protocol(config)
+
+    assert result.exit_code == 0, result.error
+    assert [observation.stage for observation in result.observations] == [
+        "equil_nvt",
+        "equil_npt",
+        "production",
+    ]
+    for observation in result.observations:
+        edr = Path(observation.source_edr)
+        assert edr.is_file(), f"missing stage EDR {edr}"
+        assert observation.source_edr_sha256 == hashlib.sha256(edr.read_bytes()).hexdigest()
+        assert observation.status == GromacsObservationStatus.AVAILABLE, observation.error
+        for series, unit in ((observation.temperature, "K"), (observation.pressure, "bar")):
+            assert series is not None
+            assert series.status == GromacsObservationStatus.AVAILABLE, series.error
+            assert series.unit == unit
+            assert series.time_unit == "ps"
+            assert len(series.samples) >= 2, f"{observation.stage} {series.quantity} samples"
+            times = [sample.time for sample in series.samples]
+            assert times == sorted(times)
+            assert times[-1] > 0.0
+
+
 # ---------------------------------------------------------------------------
 # OpenMM — physics smoke test (skips if openmm missing)
 # ---------------------------------------------------------------------------

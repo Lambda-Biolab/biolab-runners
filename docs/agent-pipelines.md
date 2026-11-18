@@ -115,6 +115,14 @@ For a complete GROMACS protocol, import `GromacsProtocolConfig` and
 `succeeded`, `skipped`, `failed`, `interrupted`, and `validated`, plus a
 normalized `status` property and artifact/provenance accessors.
 
+Its `observations` tuple carries one record per `equil_nvt`, `equil_npt`, and
+`production` stage: the stage `.edr` path and SHA-256, timestamped temperature
+samples in K and pressure samples in bar with the time unit the energy file
+declares, and explicit unavailable, partial, or error states when GROMACS
+output is absent or unreadable. The records are measurements only: they carry
+no threshold, no aggregation across stages or replicas, and no stability
+verdict.
+
 The protocol runs topology, box, solvation, ions, minimization, NVT, NPT,
 and production stages. Stages recorded as completed in the manifest are
 skipped. An MD stage with a `.cpt` resumes with GROMACS checkpoint flags; a
