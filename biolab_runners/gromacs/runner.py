@@ -45,6 +45,10 @@ from biolab_runners.contracts import (
     MalformedOutputError,
     RunnerTimeoutError,
 )
+from biolab_runners.gromacs.observations import (
+    GromacsStageObservation,
+    extract_protocol_observations,
+)
 from biolab_runners.gromacs.protocol import (
     GENION_INPUT,
     ProtocolStage,
@@ -187,6 +191,14 @@ class GromacsProtocolResult:
       ``dry_run=True``. When True, every stage counts as
       ``validated`` (or ``failed`` for stages that could not
       emit a .mdp).
+    - ``observations``: per-stage records read from the real
+      ``equil_nvt`` / ``equil_npt`` / ``production`` ``.edr``
+      files, each bound to its stage EDR digest. The records carry
+      timestamped temperature and pressure samples with the units
+      declared by the energy file. They are evidence, not a verdict:
+      no threshold, aggregation, or stability claim is derived from
+      them, and an unreadable or absent stage stays an explicit
+      unavailable/partial/error state.
     """
 
     name: str
@@ -210,6 +222,7 @@ class GromacsProtocolResult:
     executed: bool = False
     cache_hit: bool = False
     command: tuple[str, ...] = ()
+    observations: tuple[GromacsStageObservation, ...] = ()
 
     @property
     def status(self) -> ExecutionStatus:
@@ -284,6 +297,7 @@ class GromacsProtocolResult:
             "status": self.status,
             "execution_mode": self.execution_mode,
             "artifacts": [artifact.to_dict() for artifact in self.artifacts],
+            "observations": [observation.to_dict() for observation in self.observations],
             "provenance": self.provenance.to_dict(),
         }
 
@@ -964,6 +978,17 @@ def _protocol_source_digest(config: GromacsProtocolConfig) -> str | None:
     return compute_file_digest(Path(config.input_pdb))
 
 
+def _observations_for_result(
+    dry_run: bool,
+    work_dir: Path,
+    executable: tuple[str, ...] | None,
+) -> tuple[GromacsStageObservation, ...]:
+    """Read stage EDR observations for a finished protocol invocation."""
+    if dry_run or not executable:
+        return ()
+    return extract_protocol_observations(work_dir, executable)
+
+
 def _stage_prebuilt_files(
     config: GromacsProtocolConfig,
     work_dir: Path,
@@ -1205,6 +1230,9 @@ class GromacsProtocolRunner:
                 break
 
         did_work = bool(succeeded or failed or interrupted)
+        observations = _observations_for_result(
+            self._dry_run, work_dir, self._resolved_binary_prefix
+        )
         return GromacsProtocolResult(
             name=config.name,
             output_dir=str(work_dir),
@@ -1231,6 +1259,7 @@ class GromacsProtocolRunner:
             executed=not self._dry_run and did_work,
             cache_hit=not self._dry_run and not did_work and skipped > 0,
             command=self._last_command,
+            observations=observations,
         )
 
     def _run_single_stage(

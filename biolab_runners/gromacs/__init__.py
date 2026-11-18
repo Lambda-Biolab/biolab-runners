@@ -32,6 +32,12 @@ force-field and topology files are configured by the operator.
 from __future__ import annotations
 
 from biolab_runners.gromacs.config import GromacsConfig, GromacsProtocolConfig
+from biolab_runners.gromacs.observations import (
+    GromacsObservationStatus,
+    GromacsStageObservation,
+    GromacsThermodynamicSample,
+    GromacsThermodynamicSeries,
+)
 from biolab_runners.gromacs.protocol import GENION_INPUT
 from biolab_runners.gromacs.runner import (
     GromacsProtocolResult,
@@ -50,6 +56,7 @@ from biolab_runners.gromacs.utils import (
 __all__ = [
     "GENION_INPUT",
     "GromacsConfig",
+    "GromacsObservationStatus",
     "GromacsProtocolConfig",
     "GromacsProtocolResult",
     "GromacsProtocolRunner",
@@ -57,6 +64,9 @@ __all__ = [
     "GromacsRecordStatus",
     "GromacsResult",
     "GromacsRunner",
+    "GromacsStageObservation",
+    "GromacsThermodynamicSample",
+    "GromacsThermodynamicSeries",
     "StageStatus",
     "gromacs_available",
     "parse_nthcol_energy",

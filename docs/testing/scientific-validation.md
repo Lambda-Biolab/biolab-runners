@@ -43,6 +43,7 @@ exercises the following available checks:
 | `test_gromacs_parse_nthcol_handles_comment_lines` | GROMACS | fixture `.xvg` | Parser skips `@` / `#` comment lines |
 | `test_gromacs_protocol_runner_dry_run_emits_deterministic_mdps` | GROMACS protocol | `ala5_peptide.pdb` | Dry-run emits deterministic stage `.mdp` files without writing a terminal manifest |
 | `test_gromacs_protocol_runner_real_minimization_when_gmx_present` | GROMACS protocol | `ala5_peptide.pdb` | When `gmx` is available, minimisation produces the required `.tpr`, `.gro`, `.edr`, and `.log` outputs |
+| `test_gromacs_protocol_runner_reports_real_edr_observations` | GROMACS protocol | minimal alanine peptide | When `gmx` and a `pdb2gmx` force field are available, NVT/NPT/production observations report timestamped temperature (K) and pressure (bar) from the real stage `.edr` files, each bound to its file SHA-256; extraction and units only, no stability verdict |
 | `test_proteinmpnn_parse_fasta_returns_both_records_with_protein_alpha` | ProteinMPNN | fixture `.fa` | `parse_fasta_sequences` returns both design records with canonical amino-acid sequences |
 | `test_rfdiffusion_runner_availablity_check_works` | RFdiffusion | environment probe | `rfdiffusion_available()` checks the package adapter or `${RFDIFFUSION_BIN}` and its `--help` result |
 | `test_rfdiffusion_wrapper_accepts_design_startnum_and_two_seeds_differ` | RFdiffusion adapter | fake upstream script | Adapter accepts the runner contract and forwards deterministic design-start values |
