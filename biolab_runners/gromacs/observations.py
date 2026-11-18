@@ -265,7 +265,11 @@ def _extract_series(
     term: str,
 ) -> GromacsThermodynamicSeries:
     """Read one quantity from a stage EDR, recording any failure as a state."""
-    with tempfile.TemporaryDirectory(prefix="gromacs-observation-") as tmp_dir:
+    try:
+        temporary = tempfile.TemporaryDirectory(prefix="gromacs-observation-")
+    except OSError as exc:
+        return _error_series(quantity, f"gmx energy output directory is not available: {exc}")
+    with temporary as tmp_dir:
         destination = Path(tmp_dir) / f"{quantity}.xvg"
         try:
             returncode, stderr = _run_energy_selection(
@@ -335,7 +339,15 @@ def _observe_stage(
             status=GromacsObservationStatus.UNAVAILABLE,
             error=f"stage energy file not present: {edr.name}",
         )
-    digest = compute_file_digest(edr) or ""
+    try:
+        digest = compute_file_digest(edr) or ""
+    except OSError as exc:
+        return GromacsStageObservation(
+            stage=stage.kind.value,
+            status=GromacsObservationStatus.ERROR,
+            source_edr=str(edr),
+            error=f"stage energy file could not be hashed: {edr.name}: {exc}",
+        )
     if not digest:
         return GromacsStageObservation(
             stage=stage.kind.value,

@@ -260,6 +260,30 @@ class TestStageObservations:
             GromacsObservationStatus.UNAVAILABLE
         ] * 2
 
+    def test_unreadable_stage_edr_marks_stage_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        work_dir = tmp_path / "run"
+        work_dir.mkdir()
+        edr = work_dir / "nvt.edr"
+        edr.write_bytes(b"stage-energy-bytes")
+
+        def unreadable(_: Path) -> str | None:
+            raise PermissionError("permission denied")
+
+        monkeypatch.setattr("biolab_runners.gromacs.observations.compute_file_digest", unreadable)
+
+        nvt = extract_protocol_observations(work_dir, ("gmx",))[0]
+
+        assert nvt.stage == StageKind.EQUIL_NVT.value
+        assert nvt.status == GromacsObservationStatus.ERROR
+        assert nvt.source_edr == str(edr)
+        assert nvt.source_edr_sha256 == ""
+        assert nvt.temperature is None
+        assert nvt.pressure is None
+        assert "could not be hashed" in nvt.error
+        assert "permission denied" in nvt.error
+
     def test_binds_each_observation_to_its_stage_edr_digest(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -351,6 +375,27 @@ class TestStageObservations:
         assert observation.temperature.samples == ()
         assert observation.pressure is not None
         assert observation.pressure.status == GromacsObservationStatus.AVAILABLE
+
+    def test_temporary_output_failure_marks_series_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _seed_stage_edrs(tmp_path)
+
+        def failing(*_: Any, **__: Any) -> Any:
+            raise OSError("no space left on device")
+
+        monkeypatch.setattr(
+            "biolab_runners.gromacs.observations.tempfile.TemporaryDirectory", failing
+        )
+
+        observation = extract_protocol_observations(tmp_path, ("gmx",))[0]
+
+        assert observation.status == GromacsObservationStatus.ERROR
+        assert observation.temperature is not None
+        assert observation.temperature.status == GromacsObservationStatus.ERROR
+        assert "not available" in observation.temperature.error
+        assert observation.pressure is not None
+        assert observation.pressure.status == GromacsObservationStatus.ERROR
 
     def test_extractor_failure_marks_stage_error_not_zero(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
