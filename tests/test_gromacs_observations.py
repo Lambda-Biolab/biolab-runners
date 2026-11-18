@@ -231,6 +231,35 @@ class TestStageObservations:
             assert observation.pressure is None
             assert "not present" in observation.error
 
+    def test_symlinked_edr_is_refused_without_extraction(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        work_dir = tmp_path / "run"
+        work_dir.mkdir()
+        outside = tmp_path / "outside.edr"
+        outside.write_bytes(b"outside-stage-energy-bytes")
+        outside.chmod(0o000)
+        (work_dir / "nvt.edr").symlink_to(outside)
+
+        def unexpected(**_: Any) -> tuple[int, str]:
+            raise AssertionError("gmx energy must not run for a symlinked EDR")
+
+        monkeypatch.setattr("biolab_runners.gromacs.observations._run_energy_selection", unexpected)
+
+        observations = extract_protocol_observations(work_dir, ("gmx",))
+        nvt = observations[0]
+
+        assert nvt.stage == StageKind.EQUIL_NVT.value
+        assert nvt.status == GromacsObservationStatus.ERROR
+        assert "symlink" in nvt.error
+        assert nvt.source_edr == ""
+        assert nvt.source_edr_sha256 == ""
+        assert nvt.temperature is None
+        assert nvt.pressure is None
+        assert [observation.status for observation in observations[1:]] == [
+            GromacsObservationStatus.UNAVAILABLE
+        ] * 2
+
     def test_binds_each_observation_to_its_stage_edr_digest(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

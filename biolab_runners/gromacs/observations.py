@@ -323,6 +323,12 @@ def _observe_stage(
     executable: tuple[str, ...],
 ) -> GromacsStageObservation:
     edr = work_dir / f"{stage.prefix}.edr"
+    if edr.is_symlink():
+        return GromacsStageObservation(
+            stage=stage.kind.value,
+            status=GromacsObservationStatus.ERROR,
+            error=f"stage energy file symlink is outside the output boundary: {edr.name}",
+        )
     if not edr.is_file():
         return GromacsStageObservation(
             stage=stage.kind.value,
