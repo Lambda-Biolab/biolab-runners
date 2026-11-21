@@ -48,6 +48,7 @@ surfaced.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -200,15 +201,29 @@ class PeptidePrepConfig:
             (canonical for unsolvated peptide preparation).
         restraint_force_k_kjmol_nm2: Strength of the backbone
             N/CA/C positional restraint during minimization.
-            Default 1 000 kJ/mol/nm² — strong enough to hold the
-            backbone near the threaded coordinates while side-chain
-            clashes relax. The restraint is REMOVED after
-            minimization (not retained in the exported system).
+            Default 1 000 kJ/mol/nm². The restraint is a finite
+            harmonic well, so it biases the backbone toward the
+            threaded coordinates rather than fixing it: actual
+            drift is reported as atom-wise evidence (see
+            ``max_backbone_displacement_angstrom``). The restraint
+            is REMOVED after minimization (not retained in the
+            exported system).
         minimization_tolerance_kjmol_nm: Convergence tolerance for
             the minimization (passed to ``app.LocalEnergyMinimizer``
             via ``simulation.minimizeEnergy(tolerance=...)``).
             Default 10 kJ/mol/nm — the canonical unsolvated
             peptide value.
+        max_backbone_displacement_angstrom: Optional, caller-supplied
+            fail-closed gate on how far any N / CA / C / O backbone
+            atom may move during the restrained minimization,
+            measured from the post-threading (pre-minimization)
+            coordinates. Must be positive and finite when set.
+            ``None`` (the default) records the atom-wise evidence
+            without gating. The value is scientific policy, not a
+            runner default: no tolerance is inferred here. Note that
+            intended closure geometry (head-to-tail, disulfide) also
+            moves backbone atoms, so an approved criterion must
+            account for it.
         max_disulfide_distance_angstrom: Post-minimization maximum
             SG-SG distance (Å) for a closure to count as covalent.
             Default 2.5 Å (S-S equilibrium ~2.05 Å). A 7.6 Å
@@ -290,6 +305,7 @@ class PeptidePrepConfig:
         DEFAULT_GROMACS_POSITION_RESTRAINT_FORCE_K_KJMOL_NM2
     )
     minimization_tolerance_kjmol_nm: float = 10.0
+    max_backbone_displacement_angstrom: float | None = None
 
     # Closure bond-length limits (H5)
     max_disulfide_distance_angstrom: float = DEFAULT_MAX_DISULFIDE_DISTANCE_A
@@ -372,6 +388,14 @@ class PeptidePrepConfig:
             raise ValueError(
                 f"minimization_tolerance_kjmol_nm must be positive; "
                 f"got {self.minimization_tolerance_kjmol_nm}"
+            )
+        if self.max_backbone_displacement_angstrom is not None and (
+            not math.isfinite(self.max_backbone_displacement_angstrom)
+            or self.max_backbone_displacement_angstrom <= 0
+        ):
+            raise ValueError(
+                "max_backbone_displacement_angstrom must be a positive finite "
+                f"number when set; got {self.max_backbone_displacement_angstrom}"
             )
 
     def _validate_closure_limits(self) -> None:

@@ -116,6 +116,11 @@ class PreparationArtifacts:
             head-to-tail C-N and S-S bonds BEFORE minimization.
         energy_before_kjmol: Total potential energy of the
             restrained system BEFORE minimization (kJ/mol).
+        backbone_displacement: Atom-wise N/CA/C/O before/after
+            coordinates and displacement (Å) measured after the
+            restrained minimization.
+        max_backbone_displacement_angstrom: Largest observed
+            displacement in ``backbone_displacement`` (Å).
     """
 
     topology: object
@@ -128,6 +133,8 @@ class PreparationArtifacts:
     bond_graph: list[Any] = field(default_factory=list)
     closure_distances_before: dict[str, float] = field(default_factory=dict)
     energy_before_kjmol: float = 0.0
+    backbone_displacement: tuple[Any, ...] = ()
+    max_backbone_displacement_angstrom: float = 0.0
 
 
 def build_modeller(
