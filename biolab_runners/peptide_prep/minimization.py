@@ -52,7 +52,10 @@ Energy convention:
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from biolab_runners.peptide_prep.utils import BackboneDisplacementRecord
 
 logger = logging.getLogger(__name__)
 
@@ -64,8 +67,23 @@ _CHIRALITY_RESTRAINT_EXPRESSION = (
     "+(z1-z2)*((x3-x2)*(y4-y2)-(y3-y2)*(x4-x2))"
 )
 
+# Atoms the backbone restraint actually anchors. Single source of
+# truth for both ``restrain_backbone`` and the displacement report so
+# the measured set cannot silently drift from the restrained set.
+RESTRAINED_BACKBONE_ATOM_NAMES = ("N", "CA", "C")
+
+# Backbone heavy atoms reported as raw displacement evidence. The
+# carbonyl O is included although it is NOT restrained: reporting it
+# keeps unrestrained backbone drift visible instead of implied away.
+# Derived from the restrained set so the reported N/CA/C atoms cannot
+# silently drift from the atoms the restraint actually anchors.
+MEASURED_BACKBONE_ATOM_NAMES = (*RESTRAINED_BACKBONE_ATOM_NAMES, "O")
+
 __all__ = [
+    "MEASURED_BACKBONE_ATOM_NAMES",
+    "RESTRAINED_BACKBONE_ATOM_NAMES",
     "build_closed_system",
+    "measure_backbone_displacement",
     "read_potential_energy",
     "restrain_backbone",
     "restrain_chirality",
@@ -113,7 +131,7 @@ def restrain_backbone(
     restraint.addPerParticleParameter("z0")
 
     for atom in topology.atoms():
-        if atom.name not in {"N", "CA", "C"}:
+        if atom.name not in RESTRAINED_BACKBONE_ATOM_NAMES:
             continue
         pos = positions[atom.index]  # type: ignore[index]
         restraint.addParticle(
@@ -182,6 +200,84 @@ def _signed_chiral_volume(p1: object, p2: object, p3: object, p4: object) -> flo
     return float(
         np.dot(np.cross(points[0] - points[1], points[2] - points[1]), points[3] - points[1])
     )
+
+
+def measure_backbone_displacement(
+    topology: object,
+    positions_before: object,
+    positions_after: object,
+    *,
+    atom_names: tuple[str, ...] = MEASURED_BACKBONE_ATOM_NAMES,
+) -> tuple[BackboneDisplacementRecord, ...]:
+    """Report raw per-atom backbone displacement across a minimization.
+
+    The force-based restraint is finite, so minimization can move the
+    atoms it restrains, and it does not restrain the carbonyl O at
+    all. This function measures what actually happened instead of
+    asserting that the backbone did not move: one record per matching
+    atom with the pre- and post-minimization coordinates in Å and the
+    Euclidean displacement between them.
+
+    The returned evidence carries no tolerance and no verdict. A
+    caller that must hold a fixed atom set to an approved tolerance
+    supplies both and decides from these records.
+
+    Args:
+        topology: The OpenMM ``app.Topology`` shared by both position
+            sets.
+        positions_before: Pre-minimization positions, one per atom
+            (the restraint anchors / threaded design coordinates).
+        positions_after: Post-minimization positions, same length.
+        atom_names: Backbone atom names to report. Defaults to
+            :data:`MEASURED_BACKBONE_ATOM_NAMES`.
+
+    Returns:
+        One :class:`BackboneDisplacementRecord` per matching atom, in
+        topology order.
+    """
+    from biolab_runners.peptide_prep.utils import BackboneDisplacementRecord, distance
+
+    chain_local_indices = _chain_local_residue_indices(topology)
+    records: list[BackboneDisplacementRecord] = []
+    for atom in topology.atoms():
+        if atom.name not in atom_names:
+            continue
+        before = _position_angstrom(positions_before[atom.index])  # type: ignore[index]
+        after = _position_angstrom(positions_after[atom.index])  # type: ignore[index]
+        records.append(
+            BackboneDisplacementRecord(
+                chain_id=str(atom.residue.chain.id),
+                residue_index=chain_local_indices[atom.residue.index],
+                residue_name=atom.residue.name,
+                atom_name=atom.name,
+                before_angstrom=before,
+                after_angstrom=after,
+                displacement_angstrom=distance(before, after),
+            )
+        )
+    return tuple(records)
+
+
+def _chain_local_residue_indices(topology: object) -> dict[int, int]:
+    """Map each residue's topology index to its 0-indexed chain position."""
+    indices: dict[int, int] = {}
+    for chain in topology.chains():  # type: ignore[attr-defined]
+        for local_index, residue in enumerate(chain.residues()):
+            indices[residue.index] = local_index
+    return indices
+
+
+def _position_angstrom(position: object) -> tuple[float, float, float]:
+    """Convert one OpenMM position (nm unless unit-tagged) to Å."""
+    import openmm.unit as unit
+
+    converted: list[float] = []
+    for component in position:  # type: ignore[union-attr]
+        if hasattr(component, "value_in_unit"):
+            converted.append(float(component.value_in_unit(unit.angstrom)))  # type: ignore[attr-defined]
+        else:
+            converted.append(float(component) * 10.0)  # type: ignore[arg-type]
+    return converted[0], converted[1], converted[2]
 
 
 def build_closed_system(

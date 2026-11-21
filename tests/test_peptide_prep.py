@@ -44,6 +44,7 @@ from __future__ import annotations
 import importlib
 import importlib.abc
 import json
+import math
 import shutil
 import subprocess
 from pathlib import Path
@@ -455,6 +456,18 @@ class TestPeptidePrepConfig:
                 str(tmp_path / "out"),
                 minimization_max_iterations=0,
             )
+
+    def test_rejects_nonpositive_backbone_displacement_gate(self, tmp_path: Path) -> None:
+        """A set gate must be a positive finite distance; None means record-only."""
+        for gate in (0.0, -0.5, float("nan"), float("inf"), float("-inf")):
+            with pytest.raises(ValueError, match="max_backbone_displacement_angstrom"):
+                _make_linear_config(
+                    str(tmp_path / "out"),
+                    max_backbone_displacement_angstrom=gate,
+                )
+
+        cfg = _make_linear_config(str(tmp_path / "out"))
+        assert cfg.max_backbone_displacement_angstrom is None
 
     def test_rejects_invalid_chirality_restraint_parameters(self, tmp_path: Path) -> None:
         for force_constant in (-1.0, 0.0):
@@ -1836,6 +1849,300 @@ class TestPeptidePrepRestraint:
 
 
 # ---------------------------------------------------------------------------
+# Backbone preservation evidence + explicit gate
+# ---------------------------------------------------------------------------
+
+# Values used ONLY to exercise the fail-closed mechanics. Neither is a
+# chemistry threshold: an impossible gate must fail on any real minimization,
+# and a loose gate must pass. The production/scientific tolerance is supplied
+# by the caller and has no default in the config.
+_IMPOSSIBLE_GATE_A = 1e-6
+_LOOSE_TEST_GATE_A = 5.0
+
+
+def _pdb_chain_order_coordinates(
+    path: Path, chain_id: str
+) -> dict[tuple[int, str], tuple[float, float, float]]:
+    """Map ``(chain-local residue index, atom name)`` to Å coordinates."""
+    residue_order: dict[str, int] = {}
+    coordinates: dict[tuple[int, str], tuple[float, float, float]] = {}
+    for line in path.read_text().splitlines():
+        if not line.startswith("ATOM") or line[21] != chain_id:
+            continue
+        residue_id = line[22:26].strip()
+        if residue_id not in residue_order:
+            residue_order[residue_id] = len(residue_order)
+        coordinates[(residue_order[residue_id], line[12:16].strip())] = (
+            float(line[30:38]),
+            float(line[38:46]),
+            float(line[46:54]),
+        )
+    return coordinates
+
+
+class TestPeptidePrepBackbonePreservation:
+    """Atom-wise N/CA/C/O displacement evidence and the caller-supplied gate."""
+
+    def test_measure_backbone_displacement_reports_only_backbone_atoms(self) -> None:
+        from biolab_runners.peptide_prep.minimization import (
+            MEASURED_BACKBONE_ATOM_NAMES,
+            RESTRAINED_BACKBONE_ATOM_NAMES,
+            measure_backbone_displacement,
+        )
+
+        assert MEASURED_BACKBONE_ATOM_NAMES[:-1] == RESTRAINED_BACKBONE_ATOM_NAMES
+        assert MEASURED_BACKBONE_ATOM_NAMES[-1] == "O"
+
+        topology = app.Topology()
+        chain = topology.addChain("A")
+        residue = topology.addResidue("ALA", chain, "1")
+        elements = {
+            "N": app.element.nitrogen,
+            "O": app.element.oxygen,
+            "CA": app.element.carbon,
+            "C": app.element.carbon,
+            "CB": app.element.carbon,
+        }
+        for name in ("N", "CA", "C", "O", "CB"):
+            topology.addAtom(name, elements[name], residue)
+
+        before_nm = [(0.0, 0.0, 0.0)] * 5
+        after_nm = [
+            (0.0, 0.0, 0.0),  # N unchanged
+            (0.1, 0.0, 0.0),  # CA moved 1.0 A
+            (0.0, 0.0, 0.0),  # C unchanged
+            (0.0, 0.2, 0.0),  # O moved 2.0 A
+            (3.0, 0.0, 0.0),  # CB moved 30 A but is not a backbone atom
+        ]
+
+        records = measure_backbone_displacement(
+            topology,
+            openmm.unit.Quantity([openmm.Vec3(*xyz) for xyz in before_nm], openmm.unit.nanometer),
+            openmm.unit.Quantity([openmm.Vec3(*xyz) for xyz in after_nm], openmm.unit.nanometer),
+        )
+
+        measured = {
+            (record.chain_id, record.residue_index, record.atom_name): record for record in records
+        }
+        assert set(measured) == {
+            ("A", 0, "N"),
+            ("A", 0, "CA"),
+            ("A", 0, "C"),
+            ("A", 0, "O"),
+        }
+        assert measured[("A", 0, "N")].displacement_angstrom == pytest.approx(0.0, abs=1e-12)
+        assert measured[("A", 0, "C")].displacement_angstrom == pytest.approx(0.0, abs=1e-12)
+        assert measured[("A", 0, "CA")].displacement_angstrom == pytest.approx(1.0, abs=1e-9)
+        assert measured[("A", 0, "O")].displacement_angstrom == pytest.approx(2.0, abs=1e-9)
+        assert measured[("A", 0, "O")].before_angstrom == pytest.approx((0.0, 0.0, 0.0))
+        assert measured[("A", 0, "O")].after_angstrom == pytest.approx((0.0, 2.0, 0.0))
+
+    def test_linear_run_records_atom_wise_displacement_evidence(self, tmp_output_dir: Path) -> None:
+        """The engine run records raw per-atom before/after coordinates for N/CA/C/O."""
+        cfg = _make_linear_config(
+            str(tmp_output_dir),
+            name="preservation_evidence",
+            restraint_force_k_kjmol_nm2=1000.0,
+            minimization_max_iterations=200,
+        )
+        result = PeptidePrepRunner().run(cfg)
+
+        assert result.success, f"prep failed: {result.error}"
+        records = result.backbone_displacement
+        assert records, "engine run recorded no backbone displacement evidence"
+
+        measured = {(record.chain_id, record.residue_index, record.atom_name) for record in records}
+        expected = {
+            (cfg.chain_id, index, name) for index in range(5) for name in ("N", "CA", "C", "O")
+        }
+        assert expected <= measured, f"missing backbone atoms: {sorted(expected - measured)}"
+
+        for record in records:
+            recomputed = math.dist(record.before_angstrom, record.after_angstrom)
+            assert record.displacement_angstrom == pytest.approx(recomputed, abs=1e-9)
+
+        assert result.max_backbone_displacement_angstrom == pytest.approx(
+            max(record.displacement_angstrom for record in records), abs=1e-12
+        )
+        assert result.max_backbone_displacement_angstrom > 0.0
+        assert result.configured_max_backbone_displacement_angstrom is None
+
+        source_coordinates = _pdb_chain_order_coordinates(Path(cfg.backbone_pdb), cfg.chain_id)
+        prepared_coordinates = _pdb_chain_order_coordinates(Path(result.prepared_pdb), cfg.chain_id)
+        for record in records:
+            key = (record.residue_index, record.atom_name)
+            if record.atom_name != "O":  # the source fixture carries no carbonyl O
+                assert record.before_angstrom == pytest.approx(source_coordinates[key], abs=2e-3), (
+                    "reported 'before' must be the pre-minimization threaded coordinate"
+                )
+            assert record.after_angstrom == pytest.approx(prepared_coordinates[key], abs=2e-3), (
+                "reported 'after' must be the exported minimized coordinate"
+            )
+
+        manifest = json.loads(Path(result.manifest_path).read_text())
+        assert len(manifest["backbone_displacement"]) == len(records)
+        assert manifest["max_backbone_displacement_angstrom"] == pytest.approx(
+            result.max_backbone_displacement_angstrom, abs=1e-12
+        )
+        assert manifest["backbone_displacement_atom_names"] == ["N", "CA", "C", "O"]
+        assert manifest["configured_max_backbone_displacement_angstrom"] is None
+
+    def test_explicit_gate_fails_closed_with_measured_evidence(self, tmp_output_dir: Path) -> None:
+        """A caller-supplied tolerance below the measured drift fails before writing outputs."""
+        cfg = _make_linear_config(
+            str(tmp_output_dir),
+            name="preservation_gate",
+            restraint_force_k_kjmol_nm2=1000.0,
+            minimization_max_iterations=200,
+            max_backbone_displacement_angstrom=_IMPOSSIBLE_GATE_A,
+        )
+        result = PeptidePrepRunner().run(cfg)
+
+        assert result.success is False
+        assert "backbone preservation" in result.error
+        assert f"max_backbone_displacement_angstrom={_IMPOSSIBLE_GATE_A}" in result.error
+        assert result.configured_max_backbone_displacement_angstrom == _IMPOSSIBLE_GATE_A
+        assert result.backbone_displacement, "gate failure recorded no atom-wise evidence"
+        assert result.max_backbone_displacement_angstrom > _IMPOSSIBLE_GATE_A
+        worst = max(result.backbone_displacement, key=lambda record: record.displacement_angstrom)
+        assert (
+            f"{worst.atom_name} of chain {worst.chain_id} residue index "
+            f"{worst.residue_index} (0-based)"
+        ) in result.error
+        assert not (Path(cfg.output_root) / cfg.name / "prepared.pdb").exists()
+
+        manifest = json.loads(Path(result.manifest_path).read_text())
+        assert manifest["max_backbone_displacement_angstrom"] == pytest.approx(
+            result.max_backbone_displacement_angstrom, abs=1e-12
+        )
+        assert manifest["configured_max_backbone_displacement_angstrom"] == pytest.approx(
+            _IMPOSSIBLE_GATE_A
+        )
+        assert len(manifest["backbone_displacement"]) == len(result.backbone_displacement)
+
+    def test_gate_is_bound_into_the_cache_digest(self, tmp_output_dir: Path) -> None:
+        """A loose-gate success is never reused when a stricter gate is requested."""
+        loose = _make_linear_config(
+            str(tmp_output_dir),
+            name="preservation_cache",
+            restraint_force_k_kjmol_nm2=1000.0,
+            minimization_max_iterations=50,
+            max_backbone_displacement_angstrom=_LOOSE_TEST_GATE_A,
+        )
+        first = PeptidePrepRunner().run(loose)
+        assert first.success, first.error
+        assert first.reused is False
+
+        cached = PeptidePrepRunner().run(loose)
+        assert cached.reused is True
+        assert cached.configured_max_backbone_displacement_angstrom == _LOOSE_TEST_GATE_A
+
+        strict = _make_linear_config(
+            str(tmp_output_dir),
+            name="preservation_cache",
+            restraint_force_k_kjmol_nm2=1000.0,
+            minimization_max_iterations=50,
+            max_backbone_displacement_angstrom=_IMPOSSIBLE_GATE_A,
+        )
+        gated = PeptidePrepRunner().run(strict)
+        assert gated.reused is False
+        assert gated.success is False
+        assert gated.configured_max_backbone_displacement_angstrom == _IMPOSSIBLE_GATE_A
+        assert "backbone preservation" in gated.error
+
+    def test_cache_hit_preserves_typed_displacement_records(self, tmp_output_dir: Path) -> None:
+        """A reused result must expose the same typed records as a fresh run."""
+        cfg = _make_linear_config(
+            str(tmp_output_dir),
+            name="preservation_reuse",
+            restraint_force_k_kjmol_nm2=1000.0,
+            minimization_max_iterations=20,
+        )
+        runner = PeptidePrepRunner()
+        first = runner.run(cfg)
+        assert first.success, first.error
+        assert first.reused is False
+
+        cached = runner.run(cfg)
+        assert cached.success
+        assert cached.reused is True
+        assert len(cached.backbone_displacement) == len(first.backbone_displacement)
+        for fresh, reused in zip(
+            first.backbone_displacement, cached.backbone_displacement, strict=True
+        ):
+            assert isinstance(reused.before_angstrom, tuple)
+            assert isinstance(reused.after_angstrom, tuple)
+            assert reused == fresh
+
+    def test_manifest_with_a_different_measured_atom_set_is_not_reused(
+        self, tmp_output_dir: Path
+    ) -> None:
+        """Cached evidence from a different atom set must not answer the current run."""
+        cfg = _make_linear_config(
+            str(tmp_output_dir),
+            name="preservation_atom_set",
+            restraint_force_k_kjmol_nm2=1000.0,
+            minimization_max_iterations=20,
+        )
+        runner = PeptidePrepRunner()
+        first = runner.run(cfg)
+        assert first.success, first.error
+        cached = runner.run(cfg)
+        assert cached.reused is True
+
+        manifest_path = Path(first.manifest_path)
+        manifest = json.loads(manifest_path.read_text())
+        manifest["backbone_displacement_atom_names"] = ["N", "CA", "C"]
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+
+        current = runner.run(cfg)
+        assert current.reused is False, (
+            "a cached manifest recorded a different measured atom set; "
+            "reusing it would serve stale preservation evidence"
+        )
+        assert current.success
+        assert json.loads(manifest_path.read_text())["backbone_displacement_atom_names"] == [
+            "N",
+            "CA",
+            "C",
+            "O",
+        ]
+
+    def test_post_minimization_closure_failure_keeps_displacement_evidence(
+        self, tmp_output_dir: Path, two_cys_pdb: Path
+    ) -> None:
+        """A failure after minimization still reports the drift already measured."""
+        cfg = _make_linear_config(
+            str(tmp_output_dir),
+            name="preservation_closure_evidence",
+            backbone_pdb=str(two_cys_pdb),
+            sequence="ACAC",
+            topology=PeptideTopologyDescriptor(
+                disulfides=(_FakeDisulfide(2, 4),),
+            ),
+            minimization_max_iterations=100,
+            # A deliberately impossible limit makes the closure failure
+            # deterministic; the physical S-S distance is ~2 A.
+            max_disulfide_distance_angstrom=0.001,
+        )
+        result = PeptidePrepRunner().run(cfg)
+
+        assert result.success is False
+        assert "closure-integrity" in result.error.lower()
+        assert result.backbone_displacement, (
+            "a post-minimization closure failure must keep the displacement evidence "
+            "it already measured"
+        )
+        assert result.max_backbone_displacement_angstrom > 0.0
+        manifest = json.loads(Path(result.manifest_path).read_text())
+        assert len(manifest["backbone_displacement"]) == len(result.backbone_displacement)
+        assert manifest["max_backbone_displacement_angstrom"] == pytest.approx(
+            result.max_backbone_displacement_angstrom, abs=1e-12
+        )
+        assert manifest["configured_max_backbone_displacement_angstrom"] is None
+
+
+# ---------------------------------------------------------------------------
 # Closure integrity (H5)
 # ---------------------------------------------------------------------------
 
@@ -1982,6 +2289,9 @@ class TestPeptidePrepDSubs:
         )
         assert result.success is False
         assert "chirality" in result.error.lower()
+        assert result.backbone_displacement, (
+            "a post-minimization chirality failure must keep the displacement evidence"
+        )
 
     def test_identity_transformer_and_valid_validator_succeed(self, tmp_output_dir: Path) -> None:
         cfg = _make_linear_config(

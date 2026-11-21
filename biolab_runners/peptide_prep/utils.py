@@ -238,3 +238,41 @@ class TopologyBondRecord:
     atom2_name: str = ""
     residue1_index: int = -1
     residue2_index: int = -1
+
+
+@dataclass(frozen=True)
+class BackboneDisplacementRecord:
+    """One backbone atom's displacement across restrained minimization.
+
+    This is raw evidence, not a verdict: it records where the atom
+    started (the restraint anchor / threaded design position) and
+    where it ended (post-minimization), in Å, so a caller can decide
+    whether its own approved atom set and tolerance are satisfied.
+    The carbonyl O is measured even though the backbone restraint
+    does not anchor it, so unrestrained backbone drift is visible
+    rather than assumed away.
+
+    Attributes:
+        chain_id: Chain identifier of the atom's residue.
+        residue_index: 0-indexed position of the residue within its
+            chain (same convention as :class:`ChiralityReport`).
+        residue_name: 3-letter residue name at measurement time.
+        atom_name: Backbone atom name (``"N"``, ``"CA"``, ``"C"``,
+            ``"O"``).
+        before_angstrom: Pre-minimization ``(x, y, z)`` in Å.
+        after_angstrom: Post-minimization ``(x, y, z)`` in Å.
+        displacement_angstrom: Euclidean distance between the two.
+    """
+
+    chain_id: str
+    residue_index: int
+    residue_name: str
+    atom_name: str
+    before_angstrom: tuple[float, float, float]
+    after_angstrom: tuple[float, float, float]
+    displacement_angstrom: float
+
+    def __post_init__(self) -> None:
+        """Normalize manifest-decoded coordinate lists back to tuples."""
+        object.__setattr__(self, "before_angstrom", tuple(self.before_angstrom))
+        object.__setattr__(self, "after_angstrom", tuple(self.after_angstrom))
