@@ -128,6 +128,8 @@ class PreparationArtifacts:
     bond_graph: list[Any] = field(default_factory=list)
     closure_distances_before: dict[str, float] = field(default_factory=dict)
     energy_before_kjmol: float = 0.0
+    backbone_displacement: tuple[Any, ...] = ()
+    max_backbone_displacement_angstrom: float = 0.0
 
 
 def build_modeller(
