@@ -48,6 +48,7 @@ surfaced.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -216,12 +217,13 @@ class PeptidePrepConfig:
             fail-closed gate on how far any N / CA / C / O backbone
             atom may move during the restrained minimization,
             measured from the post-threading (pre-minimization)
-            coordinates. ``None`` (the default) records the atom-wise
-            evidence without gating. The value is scientific policy,
-            not a runner default: no tolerance is inferred here.
-            Note that intended closure geometry (head-to-tail,
-            disulfide) also moves backbone atoms, so an approved
-            criterion must account for it.
+            coordinates. Must be positive and finite when set.
+            ``None`` (the default) records the atom-wise evidence
+            without gating. The value is scientific policy, not a
+            runner default: no tolerance is inferred here. Note that
+            intended closure geometry (head-to-tail, disulfide) also
+            moves backbone atoms, so an approved criterion must
+            account for it.
         max_disulfide_distance_angstrom: Post-minimization maximum
             SG-SG distance (Å) for a closure to count as covalent.
             Default 2.5 Å (S-S equilibrium ~2.05 Å). A 7.6 Å
@@ -388,11 +390,12 @@ class PeptidePrepConfig:
                 f"got {self.minimization_tolerance_kjmol_nm}"
             )
         if self.max_backbone_displacement_angstrom is not None and (
-            self.max_backbone_displacement_angstrom <= 0
+            not math.isfinite(self.max_backbone_displacement_angstrom)
+            or self.max_backbone_displacement_angstrom <= 0
         ):
             raise ValueError(
-                "max_backbone_displacement_angstrom must be positive when set; "
-                f"got {self.max_backbone_displacement_angstrom}"
+                "max_backbone_displacement_angstrom must be a positive finite "
+                f"number when set; got {self.max_backbone_displacement_angstrom}"
             )
 
     def _validate_closure_limits(self) -> None:

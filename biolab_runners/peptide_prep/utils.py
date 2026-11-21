@@ -271,3 +271,8 @@ class BackboneDisplacementRecord:
     before_angstrom: tuple[float, float, float]
     after_angstrom: tuple[float, float, float]
     displacement_angstrom: float
+
+    def __post_init__(self) -> None:
+        """Normalize manifest-decoded coordinate lists back to tuples."""
+        object.__setattr__(self, "before_angstrom", tuple(self.before_angstrom))
+        object.__setattr__(self, "after_angstrom", tuple(self.after_angstrom))

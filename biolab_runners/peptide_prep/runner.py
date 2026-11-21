@@ -176,6 +176,17 @@ class PeptidePrepResult:
             at this read; B2).
         no_nan: ``True`` iff every position + energy value the
             runner saw was finite (no NaN, no inf).
+        backbone_displacement: Raw atom-wise N/CA/C/O before/after
+            coordinates and Euclidean displacement (Å) from the
+            restrained minimization; empty when minimization did not
+            run.
+        max_backbone_displacement_angstrom: Largest observed
+            displacement in ``backbone_displacement`` (Å); ``0.0``
+            when no evidence was measured.
+        configured_max_backbone_displacement_angstrom: The
+            caller-supplied fail-closed gate that was applied, or
+            ``None`` for record-only mode. Distinct from the observed
+            maximum above.
     """
 
     name: str
@@ -214,6 +225,7 @@ class PeptidePrepResult:
 
     backbone_displacement: tuple[Any, ...] = ()
     max_backbone_displacement_angstrom: float = 0.0
+    configured_max_backbone_displacement_angstrom: float | None = None
 
     @property
     def status(self) -> ExecutionStatus:
@@ -295,6 +307,9 @@ class PeptidePrepResult:
             "no_nan": self.no_nan,
             "backbone_displacement": [dataclasses.asdict(r) for r in self.backbone_displacement],
             "max_backbone_displacement_angstrom": self.max_backbone_displacement_angstrom,
+            "configured_max_backbone_displacement_angstrom": (
+                self.configured_max_backbone_displacement_angstrom
+            ),
             "status": self.status,
             "execution_mode": self.execution_mode,
             "artifacts": [artifact.to_dict() for artifact in self.artifacts],
@@ -589,6 +604,19 @@ class PeptidePrepRunner:
         if expected_source != source_digest or expected_config != config_digest:
             return None
 
+        # The measured atom set is part of the evidence contract but
+        # not of the config digest (it is code, not caller input).
+        # Reusing a manifest recorded with a different set would serve
+        # stale preservation evidence for the current algorithm.
+        expected_atom_names = list(_measured_backbone_atom_names())
+        if manifest.get("backbone_displacement_atom_names") != expected_atom_names:
+            logger.info(
+                "manifest backbone displacement atom names=%r != current %r; not reusing",
+                manifest.get("backbone_displacement_atom_names"),
+                expected_atom_names,
+            )
+            return None
+
         outputs = manifest["outputs"]
         prepared_pdb_sha = outputs.get("prepared_pdb_sha256") or ""
         gromacs_top_sha = outputs.get("gromacs_top_sha256") or ""
@@ -645,6 +673,10 @@ class PeptidePrepRunner:
             ),
             max_backbone_displacement_angstrom=float(
                 manifest.get("max_backbone_displacement_angstrom", 0.0)
+            ),
+            configured_max_backbone_displacement_angstrom=manifest.get(
+                "configured_max_backbone_displacement_angstrom",
+                config.max_backbone_displacement_angstrom,
             ),
         )
 
@@ -1228,7 +1260,7 @@ class PeptidePrepRunner:
             manifest_path,
             error=(
                 f"backbone preservation gate: {worst.atom_name} of chain "
-                f"{worst.chain_id} residue {worst.residue_index} "
+                f"{worst.chain_id} residue index {worst.residue_index} (0-based) "
                 f"({worst.residue_name}) moved "
                 f"{worst.displacement_angstrom:.4f} A during restrained "
                 f"minimization; exceeds "
@@ -1287,6 +1319,8 @@ class PeptidePrepRunner:
                 chirality_reports_before=pre_chirality,
                 potential_energy_before_kjmol=artifacts.energy_before_kjmol,
                 potential_energy_after_kjmol=energy_after,
+                backbone_displacement=artifacts.backbone_displacement,
+                max_backbone_displacement_angstrom=artifacts.max_backbone_displacement_angstrom,
             )
 
     def _stage_write_pdb(
@@ -1324,6 +1358,8 @@ class PeptidePrepRunner:
                 chirality_reports_after=post_chirality,
                 potential_energy_before_kjmol=artifacts.energy_before_kjmol,
                 potential_energy_after_kjmol=energy_after,
+                backbone_displacement=artifacts.backbone_displacement,
+                max_backbone_displacement_angstrom=artifacts.max_backbone_displacement_angstrom,
             )
 
     def _stage_export_gromacs(
@@ -1372,6 +1408,8 @@ class PeptidePrepRunner:
                 chirality_reports_after=post_chirality,
                 potential_energy_before_kjmol=artifacts.energy_before_kjmol,
                 potential_energy_after_kjmol=energy_after,
+                backbone_displacement=artifacts.backbone_displacement,
+                max_backbone_displacement_angstrom=artifacts.max_backbone_displacement_angstrom,
             )
         top_path = Path(gromacs_artifacts["top_path"])
         gro_path = Path(gromacs_artifacts["gro_path"])
@@ -1424,6 +1462,8 @@ class PeptidePrepRunner:
                 chirality_reports_after=post_chirality,
                 potential_energy_before_kjmol=artifacts.energy_before_kjmol,
                 potential_energy_after_kjmol=energy_after,
+                backbone_displacement=artifacts.backbone_displacement,
+                max_backbone_displacement_angstrom=artifacts.max_backbone_displacement_angstrom,
             )
         if not parity_ok:
             return self._fail(
@@ -1439,6 +1479,8 @@ class PeptidePrepRunner:
                 chirality_reports_after=post_chirality,
                 potential_energy_before_kjmol=artifacts.energy_before_kjmol,
                 potential_energy_after_kjmol=energy_after,
+                backbone_displacement=artifacts.backbone_displacement,
+                max_backbone_displacement_angstrom=artifacts.max_backbone_displacement_angstrom,
             )
 
         # Optional gmx grompp -pp round-trip (skipped when gmx
@@ -1462,6 +1504,8 @@ class PeptidePrepRunner:
                 chirality_reports_after=post_chirality,
                 potential_energy_before_kjmol=artifacts.energy_before_kjmol,
                 potential_energy_after_kjmol=energy_after,
+                backbone_displacement=artifacts.backbone_displacement,
+                max_backbone_displacement_angstrom=artifacts.max_backbone_displacement_angstrom,
             )
         return True, ""
 
@@ -1539,6 +1583,9 @@ class PeptidePrepRunner:
             no_nan=no_nan,
             backbone_displacement=artifacts.backbone_displacement,
             max_backbone_displacement_angstrom=artifacts.max_backbone_displacement_angstrom,
+            configured_max_backbone_displacement_angstrom=(
+                config.max_backbone_displacement_angstrom
+            ),
             executed=executed,
         )
 
@@ -1723,6 +1770,8 @@ class PeptidePrepRunner:
                     closure_distances_after=closure_distances_after,
                     potential_energy_before_kjmol=artifacts.energy_before_kjmol,
                     potential_energy_after_kjmol=energy_after,
+                    backbone_displacement=artifacts.backbone_displacement,
+                    max_backbone_displacement_angstrom=artifacts.max_backbone_displacement_angstrom,
                 )
             if bond_type == "head_to_tail" and distance > config.max_head_to_tail_distance_angstrom:
                 return self._fail(
@@ -1745,6 +1794,8 @@ class PeptidePrepRunner:
                     closure_distances_after=closure_distances_after,
                     potential_energy_before_kjmol=artifacts.energy_before_kjmol,
                     potential_energy_after_kjmol=energy_after,
+                    backbone_displacement=artifacts.backbone_displacement,
+                    max_backbone_displacement_angstrom=artifacts.max_backbone_displacement_angstrom,
                 )
         return None
 
@@ -1786,6 +1837,8 @@ class PeptidePrepRunner:
             chirality_reports_after=post_chirality,
             potential_energy_before_kjmol=artifacts.energy_before_kjmol,
             potential_energy_after_kjmol=energy_after,
+            backbone_displacement=artifacts.backbone_displacement,
+            max_backbone_displacement_angstrom=artifacts.max_backbone_displacement_angstrom,
         )
 
     def _write_prepared_pdb(
@@ -1885,6 +1938,9 @@ class PeptidePrepRunner:
             "backbone_displacement": [dataclasses.asdict(r) for r in backbone_displacement],
             "backbone_displacement_atom_names": list(_measured_backbone_atom_names()),
             "max_backbone_displacement_angstrom": max_backbone_displacement_angstrom,
+            "configured_max_backbone_displacement_angstrom": (
+                config.max_backbone_displacement_angstrom
+            ),
             "openmm_platform": self._effective_platform(config),
             "minimization_max_iterations": config.minimization_max_iterations,
             "restraint_force_k_kjmol_nm2": config.restraint_force_k_kjmol_nm2,
@@ -1943,6 +1999,9 @@ class PeptidePrepRunner:
             "backbone_displacement": [dataclasses.asdict(r) for r in backbone_displacement],
             "backbone_displacement_atom_names": list(_measured_backbone_atom_names()),
             "max_backbone_displacement_angstrom": max_backbone_displacement_angstrom,
+            "configured_max_backbone_displacement_angstrom": (
+                config.max_backbone_displacement_angstrom
+            ),
             "coordinate_transformer_identity": config.coordinate_transformer_identity,
             "chirality_validator_identity": config.chirality_validator_identity,
         }
@@ -1966,6 +2025,9 @@ class PeptidePrepRunner:
             potential_energy_after_kjmol=float(potential_energy_after_kjmol),  # type: ignore[arg-type]
             backbone_displacement=backbone_displacement,
             max_backbone_displacement_angstrom=max_backbone_displacement_angstrom,
+            configured_max_backbone_displacement_angstrom=(
+                config.max_backbone_displacement_angstrom
+            ),
             executed=self._execution_started,
         )
 

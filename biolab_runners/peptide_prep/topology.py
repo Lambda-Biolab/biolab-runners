@@ -116,6 +116,11 @@ class PreparationArtifacts:
             head-to-tail C-N and S-S bonds BEFORE minimization.
         energy_before_kjmol: Total potential energy of the
             restrained system BEFORE minimization (kJ/mol).
+        backbone_displacement: Atom-wise N/CA/C/O before/after
+            coordinates and displacement (Å) measured after the
+            restrained minimization.
+        max_backbone_displacement_angstrom: Largest observed
+            displacement in ``backbone_displacement`` (Å).
     """
 
     topology: object

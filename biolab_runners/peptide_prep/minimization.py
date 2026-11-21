@@ -75,7 +75,9 @@ RESTRAINED_BACKBONE_ATOM_NAMES = ("N", "CA", "C")
 # Backbone heavy atoms reported as raw displacement evidence. The
 # carbonyl O is included although it is NOT restrained: reporting it
 # keeps unrestrained backbone drift visible instead of implied away.
-MEASURED_BACKBONE_ATOM_NAMES = ("N", "CA", "C", "O")
+# Derived from the restrained set so the reported N/CA/C atoms cannot
+# silently drift from the atoms the restraint actually anchors.
+MEASURED_BACKBONE_ATOM_NAMES = (*RESTRAINED_BACKBONE_ATOM_NAMES, "O")
 
 __all__ = [
     "MEASURED_BACKBONE_ATOM_NAMES",
