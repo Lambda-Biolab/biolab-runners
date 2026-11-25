@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import itertools
 import logging
 import os
 import signal
@@ -63,6 +64,14 @@ from biolab_runners.gromacs.protocol import (
     stage_minimum_outputs,
     stage_outputs_for,
     stage_prebuilt_topology,
+)
+from biolab_runners.gromacs.segment import (
+    SEGMENT_STATUS,
+    parse_checkpoint_step,
+    read_cumulative_steps,
+    read_production_state,
+    validate_segment_cumulative,
+    validate_segment_duration,
 )
 from biolab_runners.gromacs.selection_sidecars import (
     bind_checkpoint_identity,
@@ -223,6 +232,9 @@ class GromacsProtocolResult:
     cache_hit: bool = False
     command: tuple[str, ...] = ()
     observations: tuple[GromacsStageObservation, ...] = ()
+    production_complete: bool = False
+    production_steps: int = 0
+    production_target_steps: int = 0
 
     @property
     def status(self) -> ExecutionStatus:
@@ -298,6 +310,9 @@ class GromacsProtocolResult:
             "execution_mode": self.execution_mode,
             "artifacts": [artifact.to_dict() for artifact in self.artifacts],
             "observations": [observation.to_dict() for observation in self.observations],
+            "production_complete": self.production_complete,
+            "production_steps": self.production_steps,
+            "production_target_steps": self.production_target_steps,
             "provenance": self.provenance.to_dict(),
         }
 
@@ -310,6 +325,10 @@ class GromacsProtocolResult:
 # ``succeeded`` / ``skipped`` so callers can distinguish a
 # dry-run validation from a real run.
 _DRY_RUN_STATUS = "validated"
+
+# ``gmx dump -cp`` prints ``step = N`` in the checkpoint header, well within
+# the first dozen lines. The cap bounds the read for a large checkpoint.
+_CHECKPOINT_STEP_LINES = 200
 
 
 def _mdp_content_for(stage: ProtocolStage, config: GromacsProtocolConfig) -> str | None:
@@ -1137,8 +1156,16 @@ class GromacsProtocolRunner:
     def run_protocol(
         self,
         config: GromacsProtocolConfig,
+        *,
+        segment_ns: float | None = None,
     ) -> GromacsProtocolResult:
         """Execute the full protocol and return a per-stage result.
+
+        With ``segment_ns=None`` (the default) this is the unchanged full-target
+        run. With a positive value, production is advanced by one bounded
+        segment of the same full-target protocol: setup and equilibration are
+        skipped as usual, ``prod.tpr`` keeps the approved full ``nsteps``, and
+        the production stage stays resumable until cumulative steps reach it.
 
         See the class docstring for the skip-vs-resume-vs-fresh
         decision tree. The method is the only public entry point
@@ -1180,6 +1207,8 @@ class GromacsProtocolRunner:
         exit_code = 0
         error = ""
 
+        segment_steps = _segment_step_count(segment_ns, config)
+
         # Prebuilt stage (no subprocess — file copy only).
         prebuilt_failure = self._stage_prebuilt(work_dir, config, started, execution_mode)
         if prebuilt_failure is not None:
@@ -1187,7 +1216,9 @@ class GromacsProtocolRunner:
 
         for stage in build_stage_plan():
             try:
-                status, rc, was_skipped = self._run_single_stage(work_dir, stage, config)
+                status, rc, was_skipped = self._dispatch_stage(
+                    work_dir, stage, config, segment_steps
+                )
             except _SelectionSidecarRefusalError as exc:
                 _record_protocol_stage_status(
                     work_dir,
@@ -1203,7 +1234,7 @@ class GromacsProtocolRunner:
                 error = f"stage {stage.kind.value} selection sidecar refusal: {exc}"
                 break
             stage_statuses[stage.kind.value] = status
-            if status == StageStatus.COMPLETED:
+            if status in (StageStatus.COMPLETED, SEGMENT_STATUS):
                 if was_skipped:
                     skipped += 1
                 else:
@@ -1233,6 +1264,7 @@ class GromacsProtocolRunner:
         observations = _observations_for_result(
             self._dry_run, work_dir, self._resolved_binary_prefix
         )
+        production_state = read_production_state(work_dir, config)
         return GromacsProtocolResult(
             name=config.name,
             output_dir=str(work_dir),
@@ -1260,7 +1292,211 @@ class GromacsProtocolRunner:
             cache_hit=not self._dry_run and not did_work and skipped > 0,
             command=self._last_command,
             observations=observations,
+            production_complete=production_state.complete,
+            production_steps=production_state.steps,
+            production_target_steps=production_state.target_steps,
         )
+
+    def _dispatch_stage(
+        self,
+        work_dir: Path,
+        stage: ProtocolStage,
+        config: GromacsProtocolConfig,
+        segment_steps: int | None,
+    ) -> tuple[str, int, bool]:
+        """Route production through the bounded path when a segment is requested."""
+        if segment_steps is not None and stage.kind == StageKind.PRODUCTION:
+            return self._run_production_segment(work_dir, stage, config, segment_steps)
+        return self._run_single_stage(work_dir, stage, config)
+
+    def _run_production_segment(
+        self,
+        work_dir: Path,
+        stage: ProtocolStage,
+        config: GromacsProtocolConfig,
+        segment_steps: int,
+    ) -> tuple[str, int, bool]:
+        """Advance production by one bounded segment of the full target.
+
+        A fresh segment compiles ``prod.tpr`` from the unchanged full-target
+        mdp (so the approved target and its identity stay stable). A resumed
+        segment reuses that exact tpr: ``gmx mdrun -cpi -append`` reads all
+        evolution state from ``prod.cpt``, so re-running grompp would only
+        rewrite the tpr with segment-specific state. GROMACS 2026.1 interprets
+        ``-nsteps`` relative to the checkpoint step, so the flag carries the
+        steps remaining to this segment's boundary, read from the checkpoint
+        itself. That keeps a retry after an unrecorded or interrupted segment
+        from advancing past the approved target.
+        """
+        if _stage_identity_changed(work_dir, stage, config):
+            logger.info("production identity changed; prod.cpt quarantined and steps reset")
+        cumulative = read_cumulative_steps(work_dir)
+        state = read_production_state(work_dir, config)
+        if state.complete or cumulative >= state.target_steps:
+            return self._run_single_stage(work_dir, stage, config)
+        target_steps = state.target_steps
+
+        validate_segment_cumulative(segment_steps, cumulative, target_steps)
+        _require_staged_selection_sidecars(work_dir, config)
+        checkpoint_path = _checkpoint_for(work_dir, stage)
+        _require_checkpoint_identity(work_dir, stage, config, checkpoint_path)
+        _emit_mdp(work_dir, stage, config)
+        started_at = now_utc_iso()
+
+        start_step, boundary_steps, settled = self._resolve_segment_start(
+            work_dir,
+            stage,
+            config,
+            checkpoint_path,
+            cumulative_steps=cumulative,
+            segment_steps=segment_steps,
+            target_steps=target_steps,
+        )
+        if settled is not None:
+            return settled
+
+        commands = build_commands(stage, checkpoint_path=checkpoint_path, config=config)
+        if checkpoint_path:
+            commands = [commands[-1]]
+        commands[-1] = [*commands[-1], "-nsteps", str(boundary_steps - start_step)]
+        prefix = self._resolved_binary_prefix or resolve_binary_prefix(self._binary_prefix)
+        resolved = [_resolve_protocol_command(command, prefix) for command in commands]
+        self._last_command = tuple(resolved[-1])
+        if self._dry_run:
+            return _DRY_RUN_STATUS, 0, False
+
+        command = " ".join(resolved[0])
+        _record_protocol_stage_status(
+            work_dir,
+            stage,
+            config,
+            StageStatus.RUNNING,
+            command=command,
+            started_at=started_at,
+        )
+        rc = 0
+        for cmd in resolved:
+            self._last_command = tuple(cmd)
+            rc = self._run_subprocess(cmd, work_dir, config.timeout_seconds)
+            if rc != 0:
+                break
+        completed_at = now_utc_iso()
+
+        if rc == _INTERRUPTED_RC:
+            _bind_stage_checkpoint(work_dir, stage, config)
+            _record_protocol_stage_status(
+                work_dir,
+                stage,
+                config,
+                StageStatus.RUNNING,
+                outputs=stage_minimum_outputs(stage.kind, stage.prefix),
+                command=command,
+                started_at=started_at,
+                completed_at=completed_at,
+                error="interrupted by SIGTERM; resumable on next invocation",
+            )
+            return "interrupted", _INTERRUPTED_RC, False
+        if rc != 0:
+            _bind_stage_checkpoint(work_dir, stage, config)
+            _record_protocol_stage_status(
+                work_dir,
+                stage,
+                config,
+                StageStatus.FAILED,
+                outputs=stage_minimum_outputs(stage.kind, stage.prefix),
+                command=command,
+                started_at=started_at,
+                completed_at=completed_at,
+                error=f"rc={rc}",
+            )
+            return StageStatus.FAILED, rc, False
+
+        complete = boundary_steps >= target_steps
+        _refresh_selection_sidecars_after_stage(work_dir, stage, config)
+        _preserve_segment_checkpoint(work_dir, stage)
+        _record_segment_progress(
+            work_dir,
+            stage,
+            config,
+            steps=boundary_steps,
+            target_steps=target_steps,
+            complete=complete,
+            started_at=started_at,
+            completed_at=completed_at,
+            command=command,
+        )
+        return (StageStatus.COMPLETED if complete else SEGMENT_STATUS), rc, False
+
+    def _read_checkpoint_step(self, checkpoint: Path) -> int | None:
+        """Return the absolute integration step stored in a GROMACS checkpoint.
+
+        ``gmx dump -cp`` prints ``step = N`` in the first header lines; only
+        those lines are read, then the dump is terminated so a large checkpoint
+        is not serialised in full.
+        """
+        checkpoint = checkpoint.resolve()
+        prefix = self._resolved_binary_prefix or resolve_binary_prefix(self._binary_prefix)
+        try:
+            process = subprocess.Popen(
+                [*prefix, "dump", "-cp", str(checkpoint)],
+                cwd=str(checkpoint.parent),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+        except OSError:
+            logger.warning("cannot start gmx dump for %s", checkpoint)
+            return None
+        try:
+            if process.stdout is None:
+                return None
+            return parse_checkpoint_step(itertools.islice(process.stdout, _CHECKPOINT_STEP_LINES))
+        finally:
+            with contextlib.suppress(OSError):
+                process.kill()
+            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                process.wait(timeout=5)
+
+    def _resolve_segment_start(
+        self,
+        work_dir: Path,
+        stage: ProtocolStage,
+        config: GromacsProtocolConfig,
+        checkpoint_path: str | None,
+        *,
+        cumulative_steps: int,
+        segment_steps: int,
+        target_steps: int,
+    ) -> tuple[int, int, tuple[str, int, bool] | None]:
+        """Resolve this segment's start, boundary, and any already-satisfied outcome.
+
+        The boundary is anchored on the recorded cumulative when the checkpoint
+        advanced past it (a segment ran without its progress write), so a retry
+        reconciles instead of running another segment. A checkpoint at or behind
+        the record anchors the boundary on its actual step, keeping the run
+        bounded when the checkpoint was pruned or restored from a copy.
+        """
+        if checkpoint_path is None or self._dry_run:
+            start_step = 0
+        else:
+            start_step = self._read_checkpoint_step(Path(checkpoint_path))
+            if start_step is None:
+                error = f"cannot read the integration step from {Path(checkpoint_path).name}"
+                _record_protocol_stage_status(
+                    work_dir, stage, config, StageStatus.FAILED, error=error
+                )
+                return 0, 0, (StageStatus.FAILED, 2, False)
+        anchor = cumulative_steps if start_step > cumulative_steps else start_step
+        boundary_steps = min(anchor + segment_steps, target_steps)
+        if start_step >= boundary_steps:
+            return (
+                start_step,
+                boundary_steps,
+                _reconcile_segment(
+                    work_dir, stage, config, start_step, boundary_steps, target_steps
+                ),
+            )
+        return start_step, boundary_steps, None
 
     def _run_single_stage(
         self,
@@ -1640,7 +1876,11 @@ def _invalidate_stages_from(
         kind = stage.kind.value
         record = stages_section.get(kind)
         _move_outputs_to_stale(work_dir, _stage_record_outputs(record, stage), stale_dir)
-        updated = dict(record) if isinstance(record, dict) else {}
+        updated = {
+            key: value
+            for key, value in (record.items() if isinstance(record, dict) else ())
+            if not key.startswith("production_")
+        }
         updated["status"] = StageStatus.PENDING
         updated[f"invalidated_by_{reason}"] = True
         stages_section[kind] = updated
@@ -1732,7 +1972,104 @@ def _record_protocol_stage_status(
     manifest = load_stage_manifest(work_dir)
     record = manifest["stages"].setdefault(stage.kind.value, {})
     record["protocol_identity"] = _protocol_stage_identity(stage, config)
+    if stage.kind == StageKind.PRODUCTION and status == StageStatus.COMPLETED:
+        # A full-target completion (segment_ns=None, a cache hit, or the last
+        # bounded segment) must overwrite any stale partial progress so the
+        # manifest never reports COMPLETED with an incomplete step count.
+        target_steps = read_production_state(work_dir, config).target_steps
+        record["production_steps"] = target_steps
+        record["production_target_steps"] = target_steps
+        record["production_complete"] = True
+    elif stage.kind == StageKind.PRODUCTION:
+        record["production_complete"] = False
     save_stage_manifest(work_dir, manifest)
+
+
+def _segment_step_count(segment_ns: float | None, config: GromacsProtocolConfig) -> int | None:
+    """Translate an optional segment duration into a bounded step count."""
+    if segment_ns is None:
+        return None
+    return validate_segment_duration(segment_ns, config)
+
+
+def _record_segment_progress(
+    work_dir: Path,
+    stage: ProtocolStage,
+    config: GromacsProtocolConfig,
+    *,
+    steps: int,
+    target_steps: int,
+    complete: bool,
+    started_at: str,
+    completed_at: str,
+    command: str,
+) -> None:
+    """Persist cumulative progress; only a completed target is marked COMPLETED."""
+    _record_protocol_stage_status(
+        work_dir,
+        stage,
+        config,
+        StageStatus.COMPLETED if complete else StageStatus.RUNNING,
+        outputs=stage_minimum_outputs(stage.kind, stage.prefix),
+        command=command,
+        started_at=started_at,
+        completed_at=completed_at,
+    )
+    manifest = load_stage_manifest(work_dir)
+    record = manifest["stages"][stage.kind.value]
+    record["production_steps"] = steps
+    record["production_target_steps"] = target_steps
+    record["production_complete"] = complete
+    save_stage_manifest(work_dir, manifest)
+
+
+def _reconcile_segment(
+    work_dir: Path,
+    stage: ProtocolStage,
+    config: GromacsProtocolConfig,
+    start_step: int,
+    boundary_steps: int,
+    target_steps: int,
+) -> tuple[str, int, bool]:
+    """Record a segment whose boundary is already on disk.
+
+    A segment that exited 0 but whose progress write was lost leaves the
+    checkpoint at or past this segment's boundary. Re-running it would advance
+    the simulation by another relative ``-nsteps`` count, so reconcile the
+    manifest with the checkpoint instead of executing anything.
+    """
+    complete = start_step >= target_steps
+    if complete and start_step > target_steps:
+        logger.warning(
+            "production checkpoint is at step %d, past the target %d; no further steps",
+            start_step,
+            target_steps,
+        )
+    steps = target_steps if complete else max(boundary_steps, start_step)
+    timestamp = now_utc_iso()
+    _record_segment_progress(
+        work_dir,
+        stage,
+        config,
+        steps=steps,
+        target_steps=target_steps,
+        complete=complete,
+        started_at=timestamp,
+        completed_at=timestamp,
+        command="",
+    )
+    return (StageStatus.COMPLETED if complete else SEGMENT_STATUS), 0, True
+
+
+def _preserve_segment_checkpoint(work_dir: Path, stage: ProtocolStage) -> None:
+    """Keep a stable copy of the boundary checkpoint for the next segment."""
+    import shutil
+
+    from biolab_runners.gromacs.paths import GromacsFiles
+
+    checkpoint = work_dir / GromacsFiles.checkpoint(stage.prefix)
+    if checkpoint.is_file():
+        shutil.copy2(checkpoint, work_dir / f"{stage.prefix}.segment.cpt")
 
 
 def _prebuilt_stale_dir(work_dir: Path) -> Path:
