@@ -5,7 +5,8 @@ Two segments whose sum is the full production target are run with the local
 ``-nsteps`` semantics (relative to the checkpoint step) and asserts that the
 full-target ``prod.tpr`` does not change, cumulative steps reach the target,
 the appended trajectory has no duplicated boundary frame, and the reported
-completion moves from False to True.
+completion moves from False to True. A retry of the first segment after its
+progress record was lost must leave the checkpoint at the same step.
 
 Skips when no GROMACS binary or no ``pdb2gmx`` force field is available. Set
 ``GROMACS_BIN`` to the binary under test (the consumer's CI uses the installed
@@ -123,6 +124,22 @@ def test_two_segments_complete_one_full_target_without_duplicate_frames(tmp_path
     assert first.production_complete is False
     assert first.production_steps == _STEPS_PER_SEGMENT
     assert first.production_target_steps == _TARGET_STEPS
+    assert _checkpoint_step(gmx, work_dir / "prod.cpt") == _STEPS_PER_SEGMENT
+
+    # A retry of the same segment after its progress write was lost must not
+    # advance the checkpoint: -nsteps is relative to the checkpoint step.
+    manifest_path = work_dir / "gromacs_stages.json"
+    manifest = json.loads(manifest_path.read_text())
+    record = manifest["stages"]["production"]
+    record["status"] = "running"
+    for key in ("production_steps", "production_target_steps", "production_complete"):
+        record.pop(key, None)
+    manifest_path.write_text(json.dumps(manifest))
+
+    retry = runner.run_protocol(config, segment_ns=_SEGMENT_NS)
+    assert retry.exit_code == 0, f"segment retry failed: {retry.error}"
+    assert retry.production_complete is False
+    assert retry.production_steps == _STEPS_PER_SEGMENT
     assert _checkpoint_step(gmx, work_dir / "prod.cpt") == _STEPS_PER_SEGMENT
 
     second = runner.run_protocol(config, segment_ns=_SEGMENT_NS)

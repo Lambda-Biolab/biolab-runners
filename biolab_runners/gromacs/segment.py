@@ -7,14 +7,21 @@ integration steps and records cumulative progress in the stage manifest.
 
 GROMACS 2026.1 treats ``gmx mdrun -nsteps N`` as RELATIVE to the step stored
 in the resume checkpoint: resuming at step 100 with ``-nsteps 200`` finishes
-at step 300. The runner therefore passes the number of steps for *this*
-segment, not an absolute final step. The full-target step count comes from
-the mdp's ``nsteps`` (``_ns_to_steps`` in :mod:`protocol`), so segment and
-target always share the same 2 fs tick.
+at step 300. The runner therefore passes the steps remaining to this segment's
+boundary, derived from the checkpoint's own absolute step, so a retry after an
+interrupted or unrecorded segment cannot advance past the approved target. The
+full-target step count comes from the mdp's ``nsteps`` (``_ns_to_steps`` in
+:mod:`protocol`), so segment and target always share the same 2 fs tick.
+
+GROMACS 2026.1 deprecates the command-line ``-nsteps`` flag in favour of
+``gmx convert-tpr``, but still honours the relative count. The CPU
+integration test pins that behaviour; a GROMACS that removes the flag would
+need a converted per-segment tpr, never a change to the approved ``prod.tpr``.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -22,6 +29,7 @@ from biolab_runners.gromacs.protocol import StageKind, _ns_to_steps
 from biolab_runners.gromacs.utils import StageStatus, load_stage_manifest
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from pathlib import Path
 
     from biolab_runners.gromacs.config import GromacsProtocolConfig
@@ -29,11 +37,14 @@ if TYPE_CHECKING:
 __all__ = [
     "SEGMENT_STATUS",
     "ProductionState",
+    "parse_checkpoint_step",
     "read_cumulative_steps",
     "read_production_state",
     "validate_segment_cumulative",
     "validate_segment_duration",
 ]
+
+_CHECKPOINT_STEP_LINE = re.compile(r"^step\s*=\s*(\d+)\s*$")
 
 # Per-invocation stage status for a bounded stop that has NOT reached the
 # full target. It counts as successful work for the calling runner but is
@@ -62,21 +73,32 @@ def read_cumulative_steps(work_dir: Path) -> int:
     return steps if isinstance(steps, int) and steps > 0 else 0
 
 
+def parse_checkpoint_step(lines: Iterable[str]) -> int | None:
+    """Return the absolute ``step = N`` from a ``gmx dump -cp`` header."""
+    for line in lines:
+        match = _CHECKPOINT_STEP_LINE.match(line.strip())
+        if match:
+            return int(match.group(1))
+    return None
+
+
 def read_production_state(work_dir: Path, config: GromacsProtocolConfig) -> ProductionState:
-    """Read truthful completion/steps from the manifest for the caller's result."""
+    """Read truthful completion/steps from the manifest for the caller's result.
+
+    The stage status is the authority: production is COMPLETED only when the
+    full target was reached, or when a pre-segment full run finished. A bounded
+    stop is recorded as RUNNING and must never read as complete, and a
+    completion recorded for a different target is stale.
+    """
     target_steps = _ns_to_steps(config.effective_production_ns())
     record = _production_record(work_dir)
     steps = record.get("production_steps")
     cumulative = steps if isinstance(steps, int) and steps > 0 else 0
-    recorded_complete = record.get("production_complete")
-    complete = (
-        recorded_complete
-        if isinstance(recorded_complete, bool)
-        else record.get("status") == StageStatus.COMPLETED
-    )
-    if complete and cumulative == 0:
-        # A pre-segment full run completed without a step counter.
-        cumulative = target_steps
+    recorded_target = record.get("production_target_steps")
+    target_matches = not isinstance(recorded_target, int) or recorded_target == target_steps
+    complete = record.get("status") == StageStatus.COMPLETED and target_matches
+    if complete:
+        cumulative = max(cumulative, target_steps)
     return ProductionState(complete=complete, steps=cumulative, target_steps=target_steps)
 
 
