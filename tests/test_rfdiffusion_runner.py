@@ -37,6 +37,7 @@ from biolab_runners.rfdiffusion.runner import (
     _executed_digest,
     _execution_payload,
     _parse_output_dir,
+    logical_design_seeds,
 )
 from biolab_runners.rfdiffusion.utils import (
     InvokeResult,
@@ -2067,3 +2068,28 @@ def test_runner_validates_malformed_image_digest(
     runner = RFdiffusionRunner(output_root=output_root)
     with pytest.raises(ValueError, match="image_digest must be"):
         runner.run(RFdiffusionConfig(name="bad"), image_digest="not-a-digest")
+
+
+# --- VS23: reproducible logical per-design seed identity -------------------
+
+
+def test_logical_design_seeds_follow_design_startnum() -> None:
+    # ARRANGE / ACT
+    seeds = logical_design_seeds(100, 4)
+    # ASSERT: upstream seeds design i_des with design_startnum + i_des
+    assert seeds == (100, 101, 102, 103)
+
+
+def test_logical_design_seeds_are_stable_across_batches() -> None:
+    # ARRANGE / ACT: an 8-design request partitioned two ways
+    whole = logical_design_seeds(10, 8)
+    batches = logical_design_seeds(10, 8)[:3] + logical_design_seeds(10, 8)[3:]
+    # ASSERT: batch partition does not change any logical design seed
+    assert whole == tuple(range(10, 18))
+    assert batches == whole
+
+
+@pytest.mark.parametrize("base,count", [(-1, 4), (0, 0), (0, -1)])
+def test_logical_design_seeds_reject_invalid_inputs(base: int, count: int) -> None:
+    with pytest.raises(ValueError):
+        logical_design_seeds(base, count)

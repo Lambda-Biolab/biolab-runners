@@ -18,6 +18,8 @@ from biolab_runners.proteinmpnn.runner import (
     EXCLUDED_FROM_EXECUTED_DIGEST,
     ProteinMPNNRunner,
     _config_to_cli,
+    logical_sequence_seeds,
+    summarize_sampling,
 )
 from biolab_runners.proteinmpnn.utils import (
     InvokeResult,
@@ -1466,3 +1468,65 @@ def test_runner_validates_malformed_image_digest(
     runner = ProteinMPNNRunner(output_root=output_root, config=ProteinMPNNConfig())
     with pytest.raises(ValueError, match="image_digest must be"):
         runner.run(pdb_input, image_digest="not-a-digest")
+
+
+# --- VS23: reproducible logical identity + truthful distinctness -----------
+
+
+def test_logical_sequence_seeds_are_base_plus_index() -> None:
+    # ARRANGE / ACT
+    seeds = logical_sequence_seeds(7, 4)
+    # ASSERT
+    assert seeds == (7, 8, 9, 10)
+
+
+def test_logical_sequence_seeds_are_stable_across_batches() -> None:
+    # ARRANGE: one logical request of 10, executed as two different batch sizes
+    expected = tuple(range(20, 30))
+    # ACT: batch size is not an input to the logical seed mapping
+    ten_at_once = logical_sequence_seeds(20, 10)
+    two_batches = logical_sequence_seeds(20, 5) + logical_sequence_seeds(25, 5)
+    # ASSERT: logical identity does not depend on the batch partition
+    assert ten_at_once == expected
+    assert two_batches == expected
+
+
+@pytest.mark.parametrize("base,count", [(-1, 4), (0, 0), (0, -2)])
+def test_logical_sequence_seeds_reject_invalid_inputs(base: int, count: int) -> None:
+    with pytest.raises(ValueError):
+        logical_sequence_seeds(base, count)
+
+
+def test_summarize_sampling_counts_four_distinct_sequences() -> None:
+    # ARRANGE
+    samples = ["ACDE", "ACDF", "ACDG", "ACDH"]
+    # ACT
+    summary = summarize_sampling(4, samples)
+    # ASSERT
+    assert summary.distinct == 4
+    assert summary.sampled == 4
+    assert summary.shortfall == 0
+    assert summary.fulfilled is True
+
+
+def test_summarize_sampling_reports_duplicate_shortfall() -> None:
+    # ARRANGE: four successful samples, only two unique sequences
+    samples = ["ACDE", "ACDE", "ACDE", "ACDG"]
+    # ACT
+    summary = summarize_sampling(4, samples)
+    # ASSERT: duplicates never fulfil a distinctness request
+    assert summary.sampled == 4
+    assert summary.distinct == 2
+    assert summary.shortfall == 2
+    assert summary.fulfilled is False
+
+
+def test_summarize_sampling_keeps_raw_samples_auditable() -> None:
+    # ARRANGE / ACT: empty sequences are not counted as distinct designs
+    summary = summarize_sampling(2, ["ACDE", "", "ACDE"])
+    # ASSERT
+    assert summary.sampled == 3
+    assert summary.distinct == 1
+    assert summary.shortfall == 1
+    assert summary.fulfilled is False
+    assert summary.to_dict()["distinct"] == 1
