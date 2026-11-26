@@ -2081,9 +2081,10 @@ def test_logical_design_seeds_follow_design_startnum() -> None:
 
 
 def test_logical_design_seeds_are_stable_across_batches() -> None:
-    # ARRANGE / ACT: an 8-design request partitioned two ways
+    # ARRANGE / ACT: an 8-design request executed as two batches whose
+    # second invocation starts at the next design_startnum.
     whole = logical_design_seeds(10, 8)
-    batches = logical_design_seeds(10, 8)[:3] + logical_design_seeds(10, 8)[3:]
+    batches = logical_design_seeds(10, 3) + logical_design_seeds(13, 5)
     # ASSERT: batch partition does not change any logical design seed
     assert whole == tuple(range(10, 18))
     assert batches == whole
