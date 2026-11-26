@@ -38,7 +38,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["ProteinMPNNResult", "ProteinMPNNRunner"]
+__all__ = [
+    "ProteinMPNNResult",
+    "ProteinMPNNRunner",
+    "SamplingSummary",
+    "logical_sequence_seeds",
+    "summarize_sampling",
+]
 
 
 #: Field names excluded from the *executed* config digest for ProteinMPNN.
@@ -71,6 +77,67 @@ _RESERVED_EXTRA_KEYS = frozenset(
         "omit_AAs",
     }
 )
+
+
+@dataclass(frozen=True)
+class SamplingSummary:
+    """Truthful accounting of one ProteinMPNN sampling request.
+
+    ``sampled`` is the raw count of returned sequences, including any
+    duplicates. ``distinct`` counts unique non-empty sequences. A
+    duplicate never satisfies a distinctness request: ``fulfilled`` is
+    true only when ``distinct >= requested`` and ``shortfall`` is the
+    positive gap between the two. The raw sequences remain available to
+    the caller as the :class:`ProteinMPNNResult.records` audit trail.
+    """
+
+    requested: int
+    sampled: int
+    distinct: int
+    shortfall: int
+    fulfilled: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize into a JSON-safe dictionary."""
+        return {
+            "requested": self.requested,
+            "sampled": self.sampled,
+            "distinct": self.distinct,
+            "shortfall": self.shortfall,
+            "fulfilled": self.fulfilled,
+        }
+
+
+def logical_sequence_seeds(base_seed: int, count: int) -> tuple[int, ...]:
+    """Deterministic logical seed labels for a requested ``count``.
+
+    ProteinMPNN forwards a single ``--seed`` to upstream (the runner
+    records ``RNG_INTENT_SINGLE_STREAM``), so these labels are stable
+    per-sequence audit identities, not independent upstream RNG seeds.
+    The labels depend only on ``base_seed`` and ``count``; an
+    execution-level ``--batch_size`` never appears here, so changing
+    batch size cannot alter a logical seed label.
+    """
+    if base_seed < 0:
+        raise ValueError(f"base_seed must be >= 0; got {base_seed}")
+    if count < 1:
+        raise ValueError(f"count must be >= 1; got {count}")
+    return tuple(base_seed + index for index in range(count))
+
+
+def summarize_sampling(requested: int, sequences: Iterable[str]) -> SamplingSummary:
+    """Count distinct sequences without treating duplicates as fulfilled."""
+    if requested < 0:
+        raise ValueError(f"requested must be >= 0; got {requested}")
+    raw = tuple(sequences)
+    distinct = len({sequence for sequence in raw if sequence})
+    return SamplingSummary(
+        requested=requested,
+        sampled=len(raw),
+        distinct=distinct,
+        shortfall=max(0, requested - distinct),
+        fulfilled=distinct >= requested,
+    )
 
 
 @dataclass(frozen=True)

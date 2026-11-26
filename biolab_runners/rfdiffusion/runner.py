@@ -211,7 +211,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["RFdiffusionResult", "RFdiffusionRunner"]
+__all__ = ["RFdiffusionResult", "RFdiffusionRunner", "logical_design_seeds"]
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +313,23 @@ def _executed_digest(config: RFdiffusionConfig) -> str:
     mapping omits the seed when ``deterministic=False``.
     """
     return compute_config_digest(_execution_payload(config))
+
+
+def logical_design_seeds(base_seed: int, task_count: int) -> tuple[int, ...]:
+    """Deterministic per-design seeds for a requested ``task_count``.
+
+    Mirrors upstream's ``for i_des in range(design_startnum,
+    design_startnum + num_designs): make_deterministic(i_des)``. The
+    seeds depend only on the base seed and the count; an execution-level
+    batch size never appears here, so changing batch size cannot alter a
+    logical design seed. ``design_startnum`` is the supported external
+    base forwarded in deterministic mode.
+    """
+    if base_seed < 0:
+        raise ValueError(f"base_seed must be >= 0; got {base_seed}")
+    if task_count < 1:
+        raise ValueError(f"task_count must be >= 1; got {task_count}")
+    return tuple(base_seed + index for index in range(task_count))
 
 
 @dataclass(frozen=True)
