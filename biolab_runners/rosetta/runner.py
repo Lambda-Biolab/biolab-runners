@@ -13,6 +13,7 @@ from biolab_runners.contracts import (
     ExecutionStatus,
     RunnerTimeoutError,
 )
+from biolab_runners.peptide_prep.minimization import check_backbone_invariance
 from biolab_runners.provenance import (
     EMPTY_PROVENANCE,
     ProvenanceMetadata,
@@ -33,7 +34,12 @@ from biolab_runners.rosetta.utils import (
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    from biolab_runners.rosetta.config import ConstrainedRelaxOptions, RosettaConfig
+    from biolab_runners.peptide_prep.minimization import BackboneInvarianceResult
+    from biolab_runners.rosetta.config import (
+        ConstrainedRelaxOptions,
+        RosettaConfig,
+        SidechainOnlyRelaxOptions,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +62,15 @@ class RosettaResult:
     status: ExecutionStatus = ExecutionStatus.INCOMPLETE
     artifacts: tuple[ArtifactReference, ...] = ()
     execution_mode: ExecutionMode = ExecutionMode.SUBPROCESS
+    # Versioned sidechain-only relaxation evidence. Empty version means
+    # the legacy constrained-relax protocol (old bundles keep their
+    # original provenance). ``relaxation_status`` is one of
+    # not_requested / unavailable / failed / passed. An unavailable
+    # result never asserts backbone invariance.
+    relaxation_protocol_version: str = ""
+    relaxation_method_identity: str = ""
+    relaxation_status: str = "not_requested"
+    backbone_invariance: BackboneInvarianceResult | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the result into a JSON-safe dictionary."""
@@ -72,6 +87,12 @@ class RosettaResult:
             "status": self.status,
             "artifacts": [artifact.to_dict() for artifact in self.artifacts],
             "execution_mode": self.execution_mode,
+            "relaxation_protocol_version": self.relaxation_protocol_version,
+            "relaxation_method_identity": self.relaxation_method_identity,
+            "relaxation_status": self.relaxation_status,
+            "backbone_invariance": (
+                self.backbone_invariance.to_dict() if self.backbone_invariance is not None else None
+            ),
         }
 
 
@@ -116,6 +137,10 @@ class RosettaRunner:
         if cfg is None:
             raise ValueError("RosettaConfig is required: pass it to run() or the runner")
         image_digest = validate_image_digest(image_digest)
+
+        sidechain = cfg.sidechain_only_relax
+        if sidechain is not None:
+            return self._sidechain_unavailable_result(cfg, sidechain, image_digest)
 
         config_dict = _config_to_cli(cfg)
         output_dir = self._effective_output_dir(cfg, config_dict)
@@ -245,6 +270,59 @@ class RosettaRunner:
         cli_config = config_dict if config_dict is not None else _config_to_cli(config)
         output_dir = cli_config.get("out:path:all")
         return Path(str(output_dir)) if output_dir else self._design_dir(config)
+
+    def _sidechain_unavailable_result(
+        self,
+        config: RosettaConfig,
+        options: SidechainOnlyRelaxOptions,
+        image_digest: str | None,
+    ) -> RosettaResult:
+        """Report an honest unavailable state; never invoke the binary or fabricate a pass."""
+        detail = (
+            "no licensed/registered sidechain-only relaxation method is available "
+            "in this environment (SG02 open)"
+        )
+        invariance = check_backbone_invariance(
+            topology=None,
+            positions_before=None,
+            positions_after=None,
+            tolerance_angstrom=options.tolerance_angstrom,
+            method_available=False,
+            method_detail=detail,
+            protocol_version=options.protocol_version,
+            fixed_atom_names=options.fixed_backbone_atoms,
+        )
+        status = ExecutionStatus.UNSUPPORTED
+        command = build_invocation_command(
+            config=_config_to_cli(config),
+            binary_prefix=self._binary_prefix,
+        )
+        return RosettaResult(
+            name=config.name,
+            output_dir=str(self._effective_output_dir(config)),
+            records=(),
+            succeeded=0,
+            failed=0,
+            skipped=0,
+            exit_code=0,
+            duration_seconds=0.0,
+            provenance=_provenance(
+                status,
+                0,
+                (),
+                image_digest,
+                _execution_mode(command),
+                command=command,
+                requested_config_digest=compute_config_digest(config),
+                source_backbone_digest=compute_file_digest(Path(config.input_pdb)),
+            ),
+            status=status,
+            execution_mode=_execution_mode(command),
+            relaxation_protocol_version=options.protocol_version,
+            relaxation_method_identity=options.method_identity,
+            relaxation_status="unavailable",
+            backbone_invariance=invariance,
+        )
 
 
 def _artifacts_for_output(output_dir: Path) -> tuple[ArtifactReference, ...]:
@@ -449,7 +527,27 @@ def _structured_script_vars(config: RosettaConfig) -> tuple[str, ...]:
         tokens.append(f"prep_mode={config.preparation_mode}")
     if config.constrained_relax is not None:
         tokens.extend(_constrained_relax_vars(config.constrained_relax))
+    if config.sidechain_only_relax is not None:
+        tokens.extend(_sidechain_only_vars(config.sidechain_only_relax))
     return tuple(tokens)
+
+
+def _sidechain_only_vars(opts: SidechainOnlyRelaxOptions) -> tuple[str, ...]:
+    """Express the sidechain-only mover contract as ``key=value`` tokens.
+
+    Backbone and jump movement are disabled explicitly; a finite
+    coordinate restraint is not used as a substitute. The method identity
+    and receptor scope are forwarded verbatim (SG02 keeps them open).
+    """
+    return (
+        f"relaxation_protocol={opts.protocol_version}",
+        f"fixed_backbone_atoms={','.join(opts.fixed_backbone_atoms)}",
+        f"bb_tolerance_angstrom={opts.tolerance_angstrom}",
+        "move_backbone=0",
+        "move_jumps=0",
+        "move_sidechains=1",
+        f"receptor_scope={opts.receptor_scope}",
+    )
 
 
 def _constrained_relax_vars(opts: ConstrainedRelaxOptions) -> tuple[str, ...]:

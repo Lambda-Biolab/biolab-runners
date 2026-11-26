@@ -2,14 +2,25 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
+
+from biolab_runners.peptide_prep.minimization import (
+    FIXED_BACKBONE_ATOM_NAMES,
+    SIDECHAIN_ONLY_RELAXATION_PROTOCOL_VERSION,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from typing import Any
 
-__all__ = ["ConstrainedRelaxOptions", "PreparationMode", "RosettaConfig"]
+__all__ = [
+    "ConstrainedRelaxOptions",
+    "PreparationMode",
+    "RosettaConfig",
+    "SidechainOnlyRelaxOptions",
+]
 
 # ``preparation_mode`` mirrors the upstream ``rosetta_scripts`` protocol
 # variable convention: the protocol XML gates behaviour on
@@ -46,6 +57,47 @@ class ConstrainedRelaxOptions:
 
 
 @dataclass(frozen=True)
+class SidechainOnlyRelaxOptions:
+    """Explicit, versioned adoption of sidechain-only relaxation.
+
+    Unlike :class:`ConstrainedRelaxOptions` (finite coordinate restraints,
+    kept unchanged for old bundles), this selector declares that the
+    backbone and all jumps are held fixed while sidechains move. It is
+    translated into ``-parser:script_vars`` tokens that disable backbone
+    and jump movement; a harmonic restraint is deliberately not a
+    substitute.
+
+    SG02 keeps the licensed method/version, receptor scope, fixed-atom
+    list, and numeric tolerance open. Callers supply them explicitly and
+    they are recorded verbatim: an empty ``method_identity`` means the
+    method is unqualified and the runner reports the protocol as
+    unavailable rather than fabricating a validated result.
+    """
+
+    tolerance_angstrom: float
+    protocol_version: str = SIDECHAIN_ONLY_RELAXATION_PROTOCOL_VERSION
+    fixed_backbone_atoms: tuple[str, ...] = FIXED_BACKBONE_ATOM_NAMES
+    method_identity: str = ""
+    receptor_scope: str = "unspecified"
+
+    def __post_init__(self) -> None:
+        """Validate tolerance and the fixed heavy-backbone atom set."""
+        if not math.isfinite(self.tolerance_angstrom) or self.tolerance_angstrom <= 0:
+            raise ValueError(
+                "SidechainOnlyRelaxOptions.tolerance_angstrom must be a positive "
+                f"finite number; got {self.tolerance_angstrom}"
+            )
+        if not self.protocol_version:
+            raise ValueError("SidechainOnlyRelaxOptions.protocol_version is required")
+        missing = set(FIXED_BACKBONE_ATOM_NAMES) - set(self.fixed_backbone_atoms)
+        if missing:
+            raise ValueError(
+                "fixed_backbone_atoms must include every heavy backbone atom "
+                f"{sorted(FIXED_BACKBONE_ATOM_NAMES)}; missing {sorted(missing)}"
+            )
+
+
+@dataclass(frozen=True)
 class RosettaConfig:
     """Per-invocation configuration for the Rosetta runner.
 
@@ -69,6 +121,7 @@ class RosettaConfig:
     nstruct: int = 1
     preparation_mode: PreparationMode | None = None
     constrained_relax: ConstrainedRelaxOptions | None = None
+    sidechain_only_relax: SidechainOnlyRelaxOptions | None = None
     extra_flags: tuple[str, ...] = field(default_factory=_empty_str_tuple)
     extra: Mapping[str, Any] = field(default_factory=lambda: {})
     license_acknowledged: bool = False

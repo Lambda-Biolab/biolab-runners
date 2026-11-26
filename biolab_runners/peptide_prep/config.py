@@ -52,6 +52,11 @@ import math
 from dataclasses import dataclass, field
 from typing import Any
 
+from biolab_runners.peptide_prep.minimization import (
+    FIXED_BACKBONE_ATOM_NAMES,
+    SIDECHAIN_ONLY_RELAXATION_PROTOCOL_VERSION,
+)
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -64,8 +69,10 @@ __all__ = [
     "GROMACS_INCLUDE_FAMILY_AMBER99SB_ILDN_TIP3P",
     "GROMACS_POSITION_RESTRAINT_ALGORITHM_VERSION",
     "GROMACS_TOPOLOGY_MATERIALIZER_VERSION",
+    "SIDECHAIN_ONLY_RELAXATION_PROTOCOL_VERSION",
     "PeptidePrepConfig",
     "PeptideTopologyDescriptor",
+    "SidechainOnlyRelaxation",
     "resolve_gromacs_include_family",
 ]
 
@@ -141,6 +148,47 @@ class PeptideTopologyDescriptor:
     def has_any_modification(self) -> bool:
         """Return True iff the descriptor specifies any non-trivial modification."""
         return bool(self.d_substitutions) or self.head_to_tail is not None or bool(self.disulfides)
+
+
+# ---------------------------------------------------------------------------
+# Sidechain-only relaxation (explicit opt-in, versioned)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SidechainOnlyRelaxation:
+    """Explicit, versioned adoption of the sidechain-only relaxation protocol.
+
+    SG02 leaves the licensed method/version, the receptor scope and the
+    numeric tolerance open. Those are carried as caller-supplied policy and
+    recorded verbatim; nothing here validates a protocol as qualified,
+    invents a tolerance, or relabels the finite harmonic minimization as
+    fixed-backbone relaxation. Absence of this selector (the default)
+    preserves the original constrained-minimization semantics.
+    """
+
+    tolerance_angstrom: float
+    protocol_version: str = SIDECHAIN_ONLY_RELAXATION_PROTOCOL_VERSION
+    fixed_backbone_atoms: tuple[str, ...] = FIXED_BACKBONE_ATOM_NAMES
+    method_identity: str = ""
+    receptor_scope: str = "unspecified"
+
+    def __post_init__(self) -> None:
+        """Validate the caller-supplied tolerance and fixed-atom set."""
+        if not math.isfinite(self.tolerance_angstrom) or self.tolerance_angstrom <= 0:
+            raise ValueError(
+                "SidechainOnlyRelaxation.tolerance_angstrom must be a positive "
+                f"finite number; got {self.tolerance_angstrom}"
+            )
+        if not self.protocol_version:
+            raise ValueError("SidechainOnlyRelaxation.protocol_version is required")
+        required = set(FIXED_BACKBONE_ATOM_NAMES)
+        missing = required - set(self.fixed_backbone_atoms)
+        if missing:
+            raise ValueError(
+                "fixed_backbone_atoms must include every heavy backbone atom "
+                f"{sorted(required)}; missing {sorted(missing)}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +319,13 @@ class PeptidePrepConfig:
             digest — and never reuses or overwrites a production
             manifest (a dry-run after a real run leaves the
             production binding intact).
+        sidechain_only_relaxation: Optional, explicitly versioned adoption
+            of the sidechain-only relaxation protocol. ``None`` (the
+            default) keeps the original finite-restraint minimization and
+            its original provenance. When set, the caller supplies the
+            tolerance and method identity (SG02); nothing is inferred.
+            This is an adoption marker only: the registered relaxation
+            boundary is the Rosetta runner, not OpenMM.
 
     Side-channels the runner DOES NOT touch:
 
@@ -321,6 +376,9 @@ class PeptidePrepConfig:
     # Idempotency
     force: bool = False
     dry_run: bool = False
+
+    # Explicit, versioned sidechain-only relaxation adoption (opt-in)
+    sidechain_only_relaxation: SidechainOnlyRelaxation | None = None
 
     def __post_init__(self) -> None:
         """Validate required paths, sequence alphabet/length, and topology positions."""
