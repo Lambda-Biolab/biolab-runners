@@ -1211,3 +1211,85 @@ def test_parse_score_files_handles_missing_file(tmp_path: Path) -> None:
     assert records[0].status == RelaxRecordStatus.FAILED
     assert records[0].score == RelaxScore()
     assert records[0].error
+
+
+# ---------------------------------------------------------------------------
+# VS08 — sidechain-only relaxation (explicit, versioned, honest unavailable)
+# ---------------------------------------------------------------------------
+
+
+def test_config_default_sidechain_only_relax_is_none() -> None:
+    cfg = _valid_config()
+
+    assert cfg.sidechain_only_relax is None
+    result = RosettaRunner(output_root=Path("/tmp/opencode/vs08-default")).run(cfg, dry_run=True)
+    assert result.relaxation_protocol_version == ""
+    assert result.relaxation_status == "not_requested"
+    assert result.backbone_invariance is None
+
+
+def test_config_to_cli_translates_sidechain_only_contract() -> None:
+    from biolab_runners.rosetta.config import SidechainOnlyRelaxOptions
+
+    opts = SidechainOnlyRelaxOptions(tolerance_angstrom=0.2, method_identity="mover/v1")
+    cfg = _valid_config(sidechain_only_relax=opts)
+
+    cli = _config_to_cli(cfg)
+    assert cli["parser:script_vars"] == [
+        "relaxation_protocol=sidechain-only-relax-v1",
+        "fixed_backbone_atoms=N,CA,C,O",
+        "bb_tolerance_angstrom=0.2",
+        "move_backbone=0",
+        "move_jumps=0",
+        "move_sidechains=1",
+        "receptor_scope=unspecified",
+    ]
+    assert "constrain_to_start_coords" not in str(cli["parser:script_vars"])
+
+
+def test_config_to_cli_preserves_legacy_constrained_relax() -> None:
+    cfg = _valid_config(constrained_relax=ConstrainedRelaxOptions(relax_cycles=3))
+
+    assert cfg.sidechain_only_relax is None
+    assert _config_to_cli(cfg)["parser:script_vars"] == ["relax_cycles=3"]
+
+
+def test_sidechain_options_validation() -> None:
+    from biolab_runners.rosetta.config import SidechainOnlyRelaxOptions
+
+    assert SidechainOnlyRelaxOptions(tolerance_angstrom=0.2).protocol_version == (
+        "sidechain-only-relax-v1"
+    )
+    with pytest.raises(ValueError, match="tolerance_angstrom"):
+        SidechainOnlyRelaxOptions(tolerance_angstrom=0.0)
+    with pytest.raises(ValueError, match="missing"):
+        SidechainOnlyRelaxOptions(tolerance_angstrom=0.2, fixed_backbone_atoms=("N", "CA", "C"))
+
+
+def test_runner_reports_unavailable_without_invoking_binary(tmp_path: Path) -> None:
+    from biolab_runners.rosetta.config import SidechainOnlyRelaxOptions
+
+    opts = SidechainOnlyRelaxOptions(tolerance_angstrom=0.2, method_identity="mover/v1")
+    cfg = _valid_config(
+        sidechain_only_relax=opts,
+        input_pdb=str(tmp_path / "missing.pdb"),
+        output_dir=str(tmp_path / "out"),
+    )
+    runner = RosettaRunner(
+        binary_prefix=["/nonexistent/rosetta_scripts"],
+        output_root=tmp_path / "runner-out",
+    )
+
+    result = runner.run(cfg)
+
+    assert result.status == "unsupported"
+    assert result.relaxation_status == "unavailable"
+    assert result.relaxation_protocol_version == "sidechain-only-relax-v1"
+    assert result.relaxation_method_identity == "mover/v1"
+    assert result.records == ()
+    assert result.backbone_invariance is not None
+    assert result.backbone_invariance.unavailable is True
+    assert result.backbone_invariance.passed is False
+    assert "SG02" in result.backbone_invariance.reason
+    assert result.to_dict()["backbone_invariance"]["reason"] == (result.backbone_invariance.reason)
+    assert not (tmp_path / "out").exists(), "unavailable path must not invoke the binary"

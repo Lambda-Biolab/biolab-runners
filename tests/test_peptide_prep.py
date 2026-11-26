@@ -5633,3 +5633,195 @@ class TestVS07ClosureGate:
         assert payload["closure_checks_after"][0]["limit_angstrom"] == 2.0
         assert payload["closure_checks_after"][0]["status"] == "pass"
         assert check.bond_type == "head_to_tail"
+
+
+class TestSidechainOnlyBackboneInvariance:
+    """VS08: explicit sidechain-only protocol contract and fail-closed checks."""
+
+    @staticmethod
+    def _topology_and_positions(*, include_o: bool = True):
+        elements = {
+            "N": app.element.nitrogen,
+            "CA": app.element.carbon,
+            "C": app.element.carbon,
+            "O": app.element.oxygen,
+            "CB": app.element.carbon,
+        }
+        names = ("N", "CA", "C", "O", "CB") if include_o else ("N", "CA", "C", "CB")
+        topology = app.Topology()
+        chain = topology.addChain("A")
+        for residue_index in (0, 1):
+            residue = topology.addResidue("ALA", chain, str(residue_index + 1))
+            for name in names:
+                topology.addAtom(name, elements[name], residue)
+        atoms = tuple(topology.atoms())
+        before = [(0.0, 0.0, 0.0)] * len(atoms)
+        after = list(before)
+        return topology, atoms, before, after
+
+    def test_sidechain_moves_with_invariant_backbone_passes(self) -> None:
+        from biolab_runners.peptide_prep.minimization import check_backbone_invariance
+
+        topology, atoms, before, after = self._topology_and_positions()
+        sidechain_index = next(index for index, atom in enumerate(atoms) if atom.name == "CB")
+        after[sidechain_index] = (0.3, 0.0, 0.0)
+
+        verdict = check_backbone_invariance(
+            topology=topology,
+            positions_before=before,
+            positions_after=after,
+            tolerance_angstrom=0.2,
+            method_available=True,
+        )
+
+        assert verdict.passed is True
+        assert verdict.unavailable is False
+        assert verdict.protocol_version == "sidechain-only-relax-v1"
+        assert set(verdict.fixed_atom_names) == {"N", "CA", "C", "O"}
+        assert {(r.residue_index, r.atom_name) for r in verdict.records} == {
+            (residue, atom) for residue in (0, 1) for atom in ("N", "CA", "C", "O")
+        }
+        assert all(record.displacement_angstrom == pytest.approx(0.0) for record in verdict.records)
+
+    def test_backbone_drift_blocks_with_concise_reason(self) -> None:
+        from biolab_runners.peptide_prep.minimization import check_backbone_invariance
+
+        topology, atoms, before, after = self._topology_and_positions()
+        oxygen_index = next(
+            index
+            for index, atom in enumerate(atoms)
+            if atom.name == "O" and atom.residue.index == 0
+        )
+        after[oxygen_index] = (0.05, 0.0, 0.0)  # 0.5 A drift, tolerance 0.2 A
+
+        verdict = check_backbone_invariance(
+            topology=topology,
+            positions_before=before,
+            positions_after=after,
+            tolerance_angstrom=0.2,
+            method_available=True,
+        )
+
+        assert verdict.passed is False
+        assert verdict.unavailable is False
+        assert "backbone drift" in verdict.reason
+        assert "O" in verdict.reason
+        assert "exceeds tolerance 0.2 A" in verdict.reason
+
+    def test_missing_backbone_atom_identity_blocks(self) -> None:
+        from biolab_runners.peptide_prep.minimization import check_backbone_invariance
+
+        topology, _, before, after = self._topology_and_positions(include_o=False)
+
+        verdict = check_backbone_invariance(
+            topology=topology,
+            positions_before=before,
+            positions_after=after,
+            tolerance_angstrom=0.2,
+            method_available=True,
+        )
+
+        assert verdict.passed is False
+        assert "missing O" in verdict.reason
+
+    def test_non_finite_backbone_coordinate_blocks(self) -> None:
+        from biolab_runners.peptide_prep.minimization import check_backbone_invariance
+
+        topology, atoms, before, after = self._topology_and_positions()
+        ca_index = next(index for index, atom in enumerate(atoms) if atom.name == "CA")
+        after[ca_index] = (math.nan, 0.0, 0.0)
+
+        verdict = check_backbone_invariance(
+            topology=topology,
+            positions_before=before,
+            positions_after=after,
+            tolerance_angstrom=0.2,
+            method_available=True,
+        )
+
+        assert verdict.passed is False
+        assert "non-finite" in verdict.reason
+
+    def test_invalid_chirality_blocks_even_with_invariant_backbone(self) -> None:
+        from biolab_runners.peptide_prep.minimization import check_backbone_invariance
+
+        topology, _, before, after = self._topology_and_positions()
+
+        verdict = check_backbone_invariance(
+            topology=topology,
+            positions_before=before,
+            positions_after=after,
+            tolerance_angstrom=0.2,
+            method_available=True,
+            chirality_valid=False,
+        )
+
+        assert verdict.passed is False
+        assert "invalid residue chirality" in verdict.reason
+
+    def test_damaged_closure_reports_fixed_backbone_incompatibility(self) -> None:
+        from biolab_runners.peptide_prep.minimization import check_backbone_invariance
+
+        topology, _, before, after = self._topology_and_positions()
+
+        verdict = check_backbone_invariance(
+            topology=topology,
+            positions_before=before,
+            positions_after=after,
+            tolerance_angstrom=0.2,
+            method_available=True,
+            closure_intact=False,
+        )
+
+        assert verdict.passed is False
+        assert "requires moving a fixed backbone atom" in verdict.reason
+
+    def test_unavailable_method_never_claims_invariance(self) -> None:
+        from biolab_runners.peptide_prep.minimization import check_backbone_invariance
+
+        topology, _, before, after = self._topology_and_positions()
+
+        verdict = check_backbone_invariance(
+            topology=topology,
+            positions_before=before,
+            positions_after=after,
+            tolerance_angstrom=0.2,
+            method_available=False,
+            method_detail="no licensed engine registered",
+        )
+
+        assert verdict.unavailable is True
+        assert verdict.passed is False
+        assert verdict.records == ()
+        assert "no licensed engine registered" in verdict.reason
+
+    def test_movement_contract_disables_backbone_and_jumps(self) -> None:
+        from biolab_runners.peptide_prep.minimization import sidechain_only_movement_contract
+
+        contract = sidechain_only_movement_contract()
+
+        assert contract["move_backbone"] is False
+        assert contract["move_jumps"] is False
+        assert contract["move_sidechains"] is True
+        assert contract["harmonic_restraint_only"] is False
+        assert contract["fixed_backbone_atoms"] == ["N", "CA", "C", "O"]
+
+    def test_opt_in_config_defaults_and_validation(self, tmp_path: Path) -> None:
+        from biolab_runners.peptide_prep.config import SidechainOnlyRelaxation
+
+        assert _make_linear_config(str(tmp_path)).sidechain_only_relaxation is None
+
+        opts = SidechainOnlyRelaxation(tolerance_angstrom=0.2)
+        assert opts.protocol_version == "sidechain-only-relax-v1"
+        assert set(opts.fixed_backbone_atoms) == {"N", "CA", "C", "O"}
+        assert opts.method_identity == ""
+
+        with pytest.raises(ValueError, match="tolerance_angstrom"):
+            SidechainOnlyRelaxation(tolerance_angstrom=0.0)
+        with pytest.raises(ValueError, match="missing"):
+            SidechainOnlyRelaxation(tolerance_angstrom=0.2, fixed_backbone_atoms=("N", "CA", "C"))
+
+        adopted = _make_linear_config(
+            str(tmp_path), sidechain_only_relaxation=SidechainOnlyRelaxation(tolerance_angstrom=0.2)
+        )
+        assert adopted.sidechain_only_relaxation is not None

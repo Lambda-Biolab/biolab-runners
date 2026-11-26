@@ -51,7 +51,10 @@ Energy convention:
 
 from __future__ import annotations
 
+import dataclasses
 import logging
+import math
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -79,15 +82,32 @@ RESTRAINED_BACKBONE_ATOM_NAMES = ("N", "CA", "C")
 # silently drift from the atoms the restraint actually anchors.
 MEASURED_BACKBONE_ATOM_NAMES = (*RESTRAINED_BACKBONE_ATOM_NAMES, "O")
 
+# Versioned identity of the explicit sidechain-only relaxation protocol.
+# This is OUR protocol identity, NOT a claim about a licensed Rosetta
+# method (SG02 keeps method/version open). Older prepared bundles record
+# no protocol version and retain their original constrained-minimization
+# semantics.
+SIDECHAIN_ONLY_RELAXATION_PROTOCOL_VERSION = "sidechain-only-relax-v1"
+
+# Heavy backbone atoms held fixed by the sidechain-only protocol. O is
+# included: the fixed set must cover every heavy backbone atom, and a
+# finite harmonic restraint on N/CA/C alone is not a fixed backbone.
+FIXED_BACKBONE_ATOM_NAMES: tuple[str, ...] = MEASURED_BACKBONE_ATOM_NAMES
+
 __all__ = [
+    "FIXED_BACKBONE_ATOM_NAMES",
     "MEASURED_BACKBONE_ATOM_NAMES",
     "RESTRAINED_BACKBONE_ATOM_NAMES",
+    "SIDECHAIN_ONLY_RELAXATION_PROTOCOL_VERSION",
+    "BackboneInvarianceResult",
     "build_closed_system",
+    "check_backbone_invariance",
     "measure_backbone_displacement",
     "read_potential_energy",
     "restrain_backbone",
     "restrain_chirality",
     "run_minimization",
+    "sidechain_only_movement_contract",
 ]
 
 
@@ -528,9 +548,201 @@ def _component_to_nm(component: object) -> float:
 
 def _finite_number(value: object) -> bool:
     """Return True iff ``value`` is a finite float."""
-    import math
-
     try:
         return math.isfinite(float(value))  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return False
+
+
+@dataclass(frozen=True)
+class BackboneInvarianceResult:
+    """Verdict of a pre/post heavy-backbone coordinate invariance check.
+
+    ``unavailable`` is a distinct state from ``passed=False``: it records
+    that no licensed/registered relaxation method actually ran, so no
+    backbone-preservation claim can be made. A pass is never inferred from
+    an unavailable engine or from a harmonic restraint.
+    """
+
+    protocol_version: str
+    fixed_atom_names: tuple[str, ...]
+    tolerance_angstrom: float
+    passed: bool
+    unavailable: bool
+    reason: str
+    records: tuple[BackboneDisplacementRecord, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the verdict into a JSON-safe dictionary."""
+        return {
+            "protocol_version": self.protocol_version,
+            "fixed_atom_names": list(self.fixed_atom_names),
+            "tolerance_angstrom": self.tolerance_angstrom,
+            "passed": self.passed,
+            "unavailable": self.unavailable,
+            "reason": self.reason,
+            "records": [dataclasses.asdict(record) for record in self.records],
+        }
+
+
+def sidechain_only_movement_contract() -> dict[str, Any]:
+    """Declare the mover contract forwarded to the registered boundary.
+
+    Sidechains move; the heavy backbone and all jumps are held fixed. A
+    harmonic coordinate restraint is explicitly NOT the mechanism. This
+    is a declarative contract only: it is not a claim that any protocol
+    has been validated against a licensed engine (SG02 stays open).
+    """
+    return {
+        "protocol_version": SIDECHAIN_ONLY_RELAXATION_PROTOCOL_VERSION,
+        "fixed_backbone_atoms": list(FIXED_BACKBONE_ATOM_NAMES),
+        "move_backbone": False,
+        "move_jumps": False,
+        "move_sidechains": True,
+        "harmonic_restraint_only": False,
+    }
+
+
+def check_backbone_invariance(
+    *,
+    topology: object,
+    positions_before: object,
+    positions_after: object,
+    tolerance_angstrom: float,
+    method_available: bool,
+    method_detail: str = "",
+    chirality_valid: bool = True,
+    closure_intact: bool = True,
+    protocol_version: str = SIDECHAIN_ONLY_RELAXATION_PROTOCOL_VERSION,
+    fixed_atom_names: tuple[str, ...] = FIXED_BACKBONE_ATOM_NAMES,
+) -> BackboneInvarianceResult:
+    """Verify a sidechain-only relaxation kept every fixed backbone atom.
+
+    Fail closed, in precedence order: unavailable method, missing or
+    non-finite atom identity, invalid chirality, damaged closure, drift
+    beyond ``tolerance_angstrom``, then pass. ``tolerance_angstrom`` and
+    ``method_available`` are caller-supplied policy (SG02); this function
+    never invents, relaxes, or fabricates either. A damaged closure that
+    needs a fixed atom to move is reported as an incompatibility rather
+    than silently accepting a moved backbone.
+    """
+    base: dict[str, Any] = {
+        "protocol_version": protocol_version,
+        "fixed_atom_names": tuple(fixed_atom_names),
+        "tolerance_angstrom": float(tolerance_angstrom),
+    }
+    if not method_available:
+        detail = method_detail or "no licensed/registered relaxation method available"
+        return BackboneInvarianceResult(
+            unavailable=True,
+            passed=False,
+            reason=f"sidechain-only relaxation unavailable: {detail}",
+            records=(),
+            **base,
+        )
+
+    identity_issue = _fixed_backbone_identity_issue(
+        topology, positions_before, positions_after, fixed_atom_names
+    )
+    if identity_issue:
+        return BackboneInvarianceResult(
+            unavailable=False,
+            passed=False,
+            reason=f"missing or non-finite fixed backbone atom identity: {identity_issue}",
+            records=(),
+            **base,
+        )
+
+    records = measure_backbone_displacement(
+        topology,
+        positions_before,
+        positions_after,
+        atom_names=fixed_atom_names,
+    )
+    if not chirality_valid:
+        return BackboneInvarianceResult(
+            unavailable=False,
+            passed=False,
+            reason="invalid residue chirality after sidechain-only relaxation",
+            records=records,
+            **base,
+        )
+    if not closure_intact:
+        return BackboneInvarianceResult(
+            unavailable=False,
+            passed=False,
+            reason=(
+                "damaged macrocycle closure: valid closure requires moving a "
+                "fixed backbone atom; sidechain-only relaxation is incompatible "
+                "with this topology"
+            ),
+            records=records,
+            **base,
+        )
+    worst = max(records, key=lambda record: record.displacement_angstrom, default=None)
+    if worst is None:
+        return BackboneInvarianceResult(
+            unavailable=False,
+            passed=False,
+            reason="no fixed backbone atoms were measured; refusing to claim invariance",
+            records=(),
+            **base,
+        )
+    if worst.displacement_angstrom > float(tolerance_angstrom):
+        return BackboneInvarianceResult(
+            unavailable=False,
+            passed=False,
+            reason=(
+                f"backbone drift {worst.displacement_angstrom:.4f} A at chain "
+                f"{worst.chain_id} residue {worst.residue_index} atom "
+                f"{worst.atom_name} exceeds tolerance {float(tolerance_angstrom)} A"
+            ),
+            records=records,
+            **base,
+        )
+    return BackboneInvarianceResult(
+        unavailable=False,
+        passed=True,
+        reason="fixed backbone invariant within tolerance",
+        records=records,
+        **base,
+    )
+
+
+def _fixed_backbone_identity_issue(
+    topology: object,
+    positions_before: object,
+    positions_after: object,
+    fixed_atom_names: tuple[str, ...],
+) -> str:
+    """Return a concise identity/finite reason, or an empty string when clean."""
+    expected = set(fixed_atom_names)
+    per_residue: dict[tuple[str, int], set[str]] = {}
+    for atom in topology.atoms():  # type: ignore[attr-defined]
+        if atom.name not in expected:
+            continue
+        key = (str(atom.residue.chain.id), int(atom.residue.index))
+        per_residue.setdefault(key, set()).add(atom.name)
+        for label, positions in (("before", positions_before), ("after", positions_after)):
+            issue = _non_finite_position(positions, atom.index, atom.name, label)
+            if issue:
+                return issue
+    if not per_residue:
+        return "no fixed backbone atoms found in topology"
+    for (chain_id, residue_index), present in sorted(per_residue.items()):
+        absent = expected - present
+        if absent:
+            return f"chain {chain_id} residue {residue_index} missing {','.join(sorted(absent))}"
+    return ""
+
+
+def _non_finite_position(positions: object, index: object, atom_name: str, label: str) -> str:
+    """Return a reason if one atom's position is absent or non-finite."""
+    try:
+        point = positions[index]  # type: ignore[index]
+    except (IndexError, KeyError, TypeError):
+        return f"{atom_name} missing from {label} position set"
+    coords = _position_angstrom(point)
+    if not all(math.isfinite(component) for component in coords):
+        return f"{atom_name} has non-finite coordinates in {label} position set"
+    return ""
