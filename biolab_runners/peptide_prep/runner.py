@@ -76,6 +76,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "ClosureBondCheck",
     "PeptidePrepResult",
     "PeptidePrepRunner",
 ]
@@ -127,6 +128,28 @@ def _empty_float_dict() -> dict[str, float]:
 
 
 @dataclass(frozen=True)
+class ClosureBondCheck:
+    """Typed closure evidence for one bond at one pipeline stage.
+
+    ``bond_type`` is the typed identity carried by the
+    :class:`TopologyBondRecord`, never a token recovered from a
+    distance-map label. ``status`` is one of ``pass``, ``fail``,
+    ``missing``, ``nonfinite`` or ``unsupported``; the last three are
+    fail-closed states distinct from a measured zero distance.
+    """
+
+    bond_type: str
+    bond_label: str
+    residue1_index: int
+    residue2_index: int
+    distance_angstrom: float | None
+    limit_angstrom: float | None
+    units: str = "angstrom"
+    status: str = "missing"
+    reason: str = ""
+
+
+@dataclass(frozen=True)
 class PeptidePrepResult:
     """Outcome of one peptide-prep invocation.
 
@@ -169,6 +192,11 @@ class PeptidePrepResult:
             Å-scale distances of closure pairs BEFORE minimization.
         closure_distances_after: Å-scale distances AFTER
             minimization. None when the run was a cache hit.
+        closure_checks_before: Typed pre-relax closure evidence
+            (bond identity, distance, units, configured limit and
+            pass/fail/missing status) recorded before minimization.
+        closure_checks_after: Typed post-relax closure evidence with
+            the same fields, used by the covalent closure verdict.
         potential_energy_before_kjmol: Restrained-system energy
             before minimization.
         potential_energy_after_kjmol: Restrained-system energy
@@ -216,6 +244,8 @@ class PeptidePrepResult:
 
     closure_distances_before: dict[str, float] = field(default_factory=_empty_float_dict)
     closure_distances_after: dict[str, float] = field(default_factory=_empty_float_dict)
+    closure_checks_before: tuple[ClosureBondCheck, ...] = ()
+    closure_checks_after: tuple[ClosureBondCheck, ...] = ()
 
     potential_energy_before_kjmol: float = 0.0
     potential_energy_after_kjmol: float = 0.0
@@ -302,6 +332,12 @@ class PeptidePrepResult:
             ],
             "closure_distances_before": dict(self.closure_distances_before),
             "closure_distances_after": dict(self.closure_distances_after),
+            "closure_checks_before": [
+                dataclasses.asdict(check) for check in self.closure_checks_before
+            ],
+            "closure_checks_after": [
+                dataclasses.asdict(check) for check in self.closure_checks_after
+            ],
             "potential_energy_before_kjmol": self.potential_energy_before_kjmol,
             "potential_energy_after_kjmol": self.potential_energy_after_kjmol,
             "no_nan": self.no_nan,
@@ -665,6 +701,14 @@ class PeptidePrepRunner:
             ),
             closure_distances_before=dict(manifest.get("closure_distances_before", {})),
             closure_distances_after=dict(manifest.get("closure_distances_after", {})),
+            closure_checks_before=tuple(
+                _closure_check_from_manifest(entry)
+                for entry in manifest.get("closure_checks_before", [])
+            ),
+            closure_checks_after=tuple(
+                _closure_check_from_manifest(entry)
+                for entry in manifest.get("closure_checks_after", [])
+            ),
             potential_energy_before_kjmol=float(manifest.get("potential_energy_before_kjmol", 0.0)),
             potential_energy_after_kjmol=float(manifest.get("potential_energy_after_kjmol", 0.0)),
             no_nan=manifest.get("no_nan", True),
@@ -746,6 +790,7 @@ class PeptidePrepRunner:
         if not success:
             return artifacts_or_failure  # type: ignore[return-value]
         artifacts = artifacts_or_failure
+        closure_checks_before = getattr(artifacts, "closure_checks_before", ())
 
         # Stage 2 — chirality validation on the hydrogenated but
         # NOT-D-transformed structure (blocker #5). This catches
@@ -838,6 +883,9 @@ class PeptidePrepRunner:
 
         # Stage 7 — closure-integrity check (H5).
         closure_distances_after = self._closure_distances(positions_after, artifacts.bond_graph)
+        closure_checks_after = _evaluate_closure_bonds(
+            config, artifacts.bond_graph, closure_distances_after, require_covalent=True
+        )
         integrity_failure = self._check_closure_integrity(
             config,
             work_dir,
@@ -849,6 +897,7 @@ class PeptidePrepRunner:
             post_chirality,
             energy_after,
             closure_distances_after,
+            closure_checks=closure_checks_after,
         )
         if integrity_failure is not None:
             return integrity_failure
@@ -939,6 +988,8 @@ class PeptidePrepRunner:
             post_h_chirality=post_h_chirality,
             post_chirality=post_chirality,
             closure_distances_after=closure_distances_after,
+            closure_checks_before=closure_checks_before,
+            closure_checks_after=closure_checks_after,
             energy_after=energy_after,
             no_nan=no_nan,
             executed=True,
@@ -954,7 +1005,7 @@ class PeptidePrepRunner:
         source_digest: str,
         config_digest: str,
     ) -> tuple[bool, object | PeptidePrepResult]:
-        """Stage 1 — build the prepared topology + restrained system."""
+        """Stage 1 — build topology and apply the bounded pre-relax gate."""
         from biolab_runners.peptide_prep import topology
 
         try:
@@ -971,6 +1022,12 @@ class PeptidePrepRunner:
                 source_digest=source_digest,
                 config_digest=config_digest,
             )
+        pre_closure_failure, closure_checks = self._check_pre_relax_closure(
+            config, work_dir, manifest_path, source_digest, config_digest, artifacts
+        )
+        if pre_closure_failure is not None:
+            return False, pre_closure_failure
+        artifacts.closure_checks_before = closure_checks
         return True, artifacts
 
     def _stage_d_transform(
@@ -1527,8 +1584,10 @@ class PeptidePrepRunner:
         post_h_chirality: tuple[Any, ...],
         post_chirality: tuple[Any, ...],
         closure_distances_after: dict[str, float],
-        energy_after: object,
-        no_nan: bool,
+        closure_checks_before: tuple[ClosureBondCheck, ...] = (),
+        closure_checks_after: tuple[ClosureBondCheck, ...] = (),
+        energy_after: object = 0.0,
+        no_nan: bool = True,
         executed: bool = True,
     ) -> PeptidePrepResult:
         """Stage 12 — write the manifest and return the success result."""
@@ -1551,6 +1610,8 @@ class PeptidePrepRunner:
             chirality_reports_after=post_chirality,
             closure_distances_before=artifacts.closure_distances_before,
             closure_distances_after=closure_distances_after,
+            closure_checks_before=closure_checks_before,
+            closure_checks_after=closure_checks_after,
             potential_energy_before_kjmol=artifacts.energy_before_kjmol,
             potential_energy_after_kjmol=energy_after,
             no_nan=no_nan,
@@ -1578,6 +1639,8 @@ class PeptidePrepRunner:
             chirality_reports_after=post_chirality,
             closure_distances_before=artifacts.closure_distances_before,
             closure_distances_after=closure_distances_after,
+            closure_checks_before=closure_checks_before,
+            closure_checks_after=closure_checks_after,
             potential_energy_before_kjmol=artifacts.energy_before_kjmol,
             potential_energy_after_kjmol=float(energy_after),  # type: ignore[arg-type]
             no_nan=no_nan,
@@ -1720,8 +1783,69 @@ class PeptidePrepRunner:
             dy = _to_nm(pi[1]) - _to_nm(pj[1])
             dz = _to_nm(pi[2]) - _to_nm(pj[2])
             d_nm = sqrt(dx * dx + dy * dy + dz * dz)
-            distances[f"{rec.bond_type}_{rec.residue1_index}_{rec.residue2_index}"] = d_nm * 10.0
+            distances[_closure_bond_label(rec)] = d_nm * 10.0
         return distances
+
+    def _check_pre_relax_closure(
+        self,
+        config: PeptidePrepConfig,
+        work_dir: Path,
+        manifest_path: Path,
+        source_digest: str,
+        config_digest: str,
+        artifacts: object,
+    ) -> tuple[PeptidePrepResult | None, tuple[ClosureBondCheck, ...]]:
+        """Bounded pre-minimization closure gate.
+
+        A freshly created macrocycle is intentionally not covalent yet,
+        so this gate does not apply the covalent distance limit. It does
+        refuse to minimize when topology is missing, when the configured
+        closure bonds are absent from the bond graph, or when any typed
+        bond has missing / non-finite / unsupported distance evidence.
+        The typed checks are retained as pre-relax evidence.
+        """
+        bond_graph = list(getattr(artifacts, "bond_graph", None) or [])
+        distances = dict(getattr(artifacts, "closure_distances_before", None) or {})
+        checks = _evaluate_closure_bonds(config, bond_graph, distances, require_covalent=False)
+
+        def fail(error: str) -> PeptidePrepResult:
+            return self._fail(
+                config,
+                work_dir,
+                manifest_path,
+                error=error,
+                source_digest=source_digest,
+                config_digest=config_digest,
+                bond_graph=bond_graph,
+                net_charge=float(getattr(artifacts, "net_charge", 0.0) or 0.0),
+                closure_distances_before=distances,
+                potential_energy_before_kjmol=getattr(artifacts, "energy_before_kjmol", 0.0),
+                closure_checks_before=checks,
+            )
+
+        if getattr(artifacts, "topology", None) is None:
+            return (
+                fail(
+                    "pre-relax closure: topology is missing before minimization; "
+                    "refusing to minimize"
+                ),
+                checks,
+            )
+        expected = _expected_closure_bond_count(config)
+        if len(bond_graph) < expected:
+            return (
+                fail(
+                    f"pre-relax closure: missing closure bond evidence "
+                    f"(expected {expected} typed bond(s), found {len(bond_graph)}); "
+                    "refusing to minimize"
+                ),
+                checks,
+            )
+        bad = [check for check in checks if check.status in {"missing", "nonfinite", "unsupported"}]
+        if bad:
+            reasons = "; ".join(check.reason for check in bad)
+            return (fail(f"pre-relax closure: {reasons}; refusing to minimize"), checks)
+        return None, checks
 
     def _check_closure_integrity(
         self,
@@ -1735,69 +1859,52 @@ class PeptidePrepRunner:
         post_chirality: tuple[Any, ...],
         energy_after: object,
         closure_distances_after: dict[str, float],
+        closure_checks: tuple[ClosureBondCheck, ...] | None = None,
     ) -> PeptidePrepResult | None:
         """H5 — fail closed if any post-minimization closure is not covalent.
 
-        The disulfide S-S equilibrium is ~2.05 Å; anything > the
-        configured ``max_disulfide_distance_angstrom`` (default
-        2.5 Å) means the two SG atoms are NOT covalently bound and
-        the runner refuses to write outputs. Same for head-to-tail
-        C-N (equilibrium ~1.33 Å; default limit 2.0 Å).
-
-        Returns a :class:`PeptidePrepResult` failure on bad
-        distances, ``None`` otherwise.
+        Uses the typed ``bond_type`` carried by each
+        :class:`TopologyBondRecord` rather than splitting a distance-map
+        label, so the ``head_to_tail`` branch is reachable. Missing,
+        non-finite and unsupported evidence also fail closed.
         """
-        for label, distance in closure_distances_after.items():
-            bond_type = label.split("_")[0]
-            if bond_type == "disulfide" and distance > config.max_disulfide_distance_angstrom:
-                return self._fail(
-                    config,
-                    work_dir,
-                    manifest_path,
-                    error=(
-                        f"closure-integrity: disulfide {label} is {distance:.3f} Å "
-                        f"after minimization; exceeds max_disulfide_distance_angstrom "
-                        f"({config.max_disulfide_distance_angstrom:.3f} Å). The S-S "
-                        f"bond is not covalent — refusing to write outputs."
-                    ),
-                    source_digest=source_digest,
-                    config_digest=config_digest,
-                    bond_graph=artifacts.bond_graph,
-                    net_charge=artifacts.net_charge,
-                    chirality_reports_before=pre_chirality,
-                    chirality_reports_after=post_chirality,
-                    closure_distances_before=artifacts.closure_distances_before,
-                    closure_distances_after=closure_distances_after,
-                    potential_energy_before_kjmol=artifacts.energy_before_kjmol,
-                    potential_energy_after_kjmol=energy_after,
-                    backbone_displacement=artifacts.backbone_displacement,
-                    max_backbone_displacement_angstrom=artifacts.max_backbone_displacement_angstrom,
-                )
-            if bond_type == "head_to_tail" and distance > config.max_head_to_tail_distance_angstrom:
-                return self._fail(
-                    config,
-                    work_dir,
-                    manifest_path,
-                    error=(
-                        f"closure-integrity: head_to_tail {label} is {distance:.3f} Å "
-                        f"after minimization; exceeds max_head_to_tail_distance_angstrom "
-                        f"({config.max_head_to_tail_distance_angstrom:.3f} Å). The C-N "
-                        f"closure is not covalent — refusing to write outputs."
-                    ),
-                    source_digest=source_digest,
-                    config_digest=config_digest,
-                    bond_graph=artifacts.bond_graph,
-                    net_charge=artifacts.net_charge,
-                    chirality_reports_before=pre_chirality,
-                    chirality_reports_after=post_chirality,
-                    closure_distances_before=artifacts.closure_distances_before,
-                    closure_distances_after=closure_distances_after,
-                    potential_energy_before_kjmol=artifacts.energy_before_kjmol,
-                    potential_energy_after_kjmol=energy_after,
-                    backbone_displacement=artifacts.backbone_displacement,
-                    max_backbone_displacement_angstrom=artifacts.max_backbone_displacement_angstrom,
-                )
-        return None
+        checks = (
+            closure_checks
+            if closure_checks is not None
+            else _evaluate_closure_bonds(
+                config,
+                list(getattr(artifacts, "bond_graph", None) or []),
+                closure_distances_after,
+                require_covalent=True,
+            )
+        )
+        bad = [
+            check
+            for check in checks
+            if check.status in {"fail", "missing", "nonfinite", "unsupported"}
+        ]
+        if not bad:
+            return None
+        reason = "; ".join(check.reason for check in bad)
+        return self._fail(
+            config,
+            work_dir,
+            manifest_path,
+            error=f"closure-integrity: {reason}; refusing to write outputs.",
+            source_digest=source_digest,
+            config_digest=config_digest,
+            bond_graph=artifacts.bond_graph,
+            net_charge=artifacts.net_charge,
+            chirality_reports_before=pre_chirality,
+            chirality_reports_after=post_chirality,
+            closure_distances_before=artifacts.closure_distances_before,
+            closure_distances_after=closure_distances_after,
+            potential_energy_before_kjmol=artifacts.energy_before_kjmol,
+            potential_energy_after_kjmol=energy_after,
+            backbone_displacement=artifacts.backbone_displacement,
+            max_backbone_displacement_angstrom=artifacts.max_backbone_displacement_angstrom,
+            closure_checks_after=checks,
+        )
 
     def _check_chirality_failure(
         self,
@@ -1883,11 +1990,13 @@ class PeptidePrepRunner:
         chirality_reports_after: tuple[Any, ...],
         closure_distances_before: dict[str, float],
         closure_distances_after: dict[str, float],
-        potential_energy_before_kjmol: object,
-        potential_energy_after_kjmol: object,
-        no_nan: bool,
-        backbone_displacement: tuple[Any, ...],
-        max_backbone_displacement_angstrom: float,
+        closure_checks_before: tuple[ClosureBondCheck, ...] = (),
+        closure_checks_after: tuple[ClosureBondCheck, ...] = (),
+        potential_energy_before_kjmol: object = 0.0,
+        potential_energy_after_kjmol: object = 0.0,
+        no_nan: bool = True,
+        backbone_displacement: tuple[Any, ...] = (),
+        max_backbone_displacement_angstrom: float = 0.0,
     ) -> dict[str, Any]:
         """Build the manifest payload."""
         from biolab_runners.peptide_prep.config import (
@@ -1932,6 +2041,8 @@ class PeptidePrepRunner:
             "chirality_reports_after": [dataclasses.asdict(r) for r in chirality_reports_after],
             "closure_distances_before": closure_distances_before,
             "closure_distances_after": closure_distances_after,
+            "closure_checks_before": [dataclasses.asdict(c) for c in closure_checks_before],
+            "closure_checks_after": [dataclasses.asdict(c) for c in closure_checks_after],
             "potential_energy_before_kjmol": potential_energy_before_kjmol,
             "potential_energy_after_kjmol": potential_energy_after_kjmol,
             "no_nan": no_nan,
@@ -1964,6 +2075,8 @@ class PeptidePrepRunner:
         chirality_reports_after: tuple[Any, ...] = (),
         closure_distances_before: dict[str, float] | None = None,
         closure_distances_after: dict[str, float] | None = None,
+        closure_checks_before: tuple[ClosureBondCheck, ...] = (),
+        closure_checks_after: tuple[ClosureBondCheck, ...] = (),
         potential_energy_before_kjmol: object = 0.0,
         potential_energy_after_kjmol: object = 0.0,
         backbone_displacement: tuple[Any, ...] = (),
@@ -1994,6 +2107,8 @@ class PeptidePrepRunner:
             "chirality_reports_after": [dataclasses.asdict(r) for r in chirality_reports_after],
             "closure_distances_before": dict(closure_distances_before),
             "closure_distances_after": dict(closure_distances_after),
+            "closure_checks_before": [dataclasses.asdict(c) for c in closure_checks_before],
+            "closure_checks_after": [dataclasses.asdict(c) for c in closure_checks_after],
             "potential_energy_before_kjmol": potential_energy_before_kjmol,
             "potential_energy_after_kjmol": potential_energy_after_kjmol,
             "backbone_displacement": [dataclasses.asdict(r) for r in backbone_displacement],
@@ -2021,6 +2136,8 @@ class PeptidePrepRunner:
             chirality_reports_after=chirality_reports_after,
             closure_distances_before=closure_distances_before,
             closure_distances_after=closure_distances_after,
+            closure_checks_before=closure_checks_before,
+            closure_checks_after=closure_checks_after,
             potential_energy_before_kjmol=float(potential_energy_before_kjmol),  # type: ignore[arg-type]
             potential_energy_after_kjmol=float(potential_energy_after_kjmol),  # type: ignore[arg-type]
             backbone_displacement=backbone_displacement,
@@ -2049,6 +2166,90 @@ _D_BACKBONE_INVARIANT_ATOMS = ("N", "CA", "C")
 # re-projection. A transform that moves CA by 1e-3 Å or more is a
 # broken mirror, not a rounding artifact.
 _D_TRANSFORM_BACKBONE_TOLERANCE_A = 1e-3
+
+
+def _closure_bond_label(record: TopologyBondRecord) -> str:
+    """Label used by both distance maps; identity still comes from the record."""
+    return f"{record.bond_type}_{record.residue1_index}_{record.residue2_index}"
+
+
+def _closure_limit_for(config: PeptidePrepConfig, bond_type: str) -> float | None:
+    """Configured covalent limit for a supported typed bond, else ``None``."""
+    if bond_type == "disulfide":
+        return float(config.max_disulfide_distance_angstrom)
+    if bond_type == "head_to_tail":
+        return float(config.max_head_to_tail_distance_angstrom)
+    return None
+
+
+def _expected_closure_bond_count(config: PeptidePrepConfig) -> int:
+    """Number of closure bonds the configured topology requires."""
+    count = 1 if config.topology.head_to_tail is not None else 0
+    return count + len(config.topology.disulfides)
+
+
+def _evaluate_closure_bonds(
+    config: PeptidePrepConfig,
+    bond_graph: list[Any],
+    distances: dict[str, float],
+    *,
+    require_covalent: bool,
+) -> tuple[ClosureBondCheck, ...]:
+    """Build typed closure evidence from one distance snapshot.
+
+    ``require_covalent`` is False for the pre-relax snapshot (a freshly
+    created macrocycle is intentionally not yet covalent) and True for
+    the post-relax snapshot, where the configured limit is enforced.
+    Missing, non-finite and unsupported evidence is always fail-closed,
+    and is kept distinct from a measured zero distance.
+    """
+    import math
+
+    checks: list[ClosureBondCheck] = []
+    for record in bond_graph:
+        bond_type = str(getattr(record, "bond_type", "") or "")
+        label = _closure_bond_label(record)
+        limit = _closure_limit_for(config, bond_type)
+        distance = distances.get(label)
+        if limit is None:
+            status, reason = "unsupported", f"unsupported closure bond_type {bond_type!r}"
+        elif distance is None:
+            status, reason = "missing", f"missing closure distance for {label}"
+        elif not math.isfinite(float(distance)):
+            status, reason = "nonfinite", f"nonfinite closure distance for {label}"
+        elif not require_covalent:
+            status, reason = "pass", f"pre-relax closure evidence present for {label}"
+        elif float(distance) <= limit:
+            status, reason = (
+                "pass",
+                (f"{label} is {float(distance):.3f} Å within configured limit ({limit:.3f} Å)"),
+            )
+        else:
+            status, reason = (
+                "fail",
+                (
+                    f"{bond_type} {label} is {float(distance):.3f} Å after relaxation; "
+                    f"exceeds configured limit ({limit:.3f} Å)"
+                ),
+            )
+        checks.append(
+            ClosureBondCheck(
+                bond_type=bond_type,
+                bond_label=label,
+                residue1_index=int(getattr(record, "residue1_index", -1)),
+                residue2_index=int(getattr(record, "residue2_index", -1)),
+                distance_angstrom=None if distance is None else float(distance),
+                limit_angstrom=limit,
+                status=status,
+                reason=reason,
+            )
+        )
+    return tuple(checks)
+
+
+def _closure_check_from_manifest(entry: dict[str, Any]) -> ClosureBondCheck:
+    """Reconstruct a typed check from its manifest dict on the reuse path."""
+    return ClosureBondCheck(**entry)
 
 
 def _resolve_design_chain(  # pyright: ignore[reportUnusedFunction]
