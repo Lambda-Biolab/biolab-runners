@@ -3287,7 +3287,10 @@ class TestPeptidePrepReuseTypedRecords:
             backbone_pdb=backbone,
             sequence=sequence,
             topology=PeptideTopologyDescriptor(**topology_kwargs),
-            minimization_max_iterations=20,
+            # The head-to-tail C-N needs enough iterations to reach its
+            # covalent limit; the typed closure gate now rejects an
+            # unconverged ring rather than recording it as a success.
+            minimization_max_iterations=300,
             coordinate_transformer_identity="test-ct-v1",
             chirality_validator_identity="test-cv-v1",
         )
@@ -5325,3 +5328,308 @@ def test_poly_gly_d_substitution_chirality_is_stable_across_five_minimizations(
                 f"expected {expected[residue_index]}, signed volume {volume:+.6g}; "
                 f"all repeats={observed_repeats!r}"
             )
+
+
+# ---------------------------------------------------------------------------
+# VS07 — typed bond identity and fail-closed closure gate
+# ---------------------------------------------------------------------------
+
+
+class TestVS07ClosureGate:
+    """The closure gate reads typed bond identity, never an underscore split."""
+
+    @staticmethod
+    def _config(
+        tmp_path: Path,
+        *,
+        topology: PeptideTopologyDescriptor,
+        sequence: str = "AAAAA",
+    ) -> PeptidePrepConfig:
+        return _make_linear_config(str(tmp_path), name="vs07", sequence=sequence, topology=topology)
+
+    @staticmethod
+    def _artifacts(bond_graph: list[Any]) -> SimpleNamespace:
+        return SimpleNamespace(
+            bond_graph=bond_graph,
+            net_charge=0.0,
+            closure_distances_before={},
+            chirality_reports_before=(),
+            chirality_reports_after=(),
+            energy_before_kjmol=0.0,
+            backbone_displacement=(),
+            max_backbone_displacement_angstrom=0.0,
+        )
+
+    @staticmethod
+    def _bond(
+        bond_type: str,
+        *,
+        residue1_index: int = 0,
+        residue2_index: int = 4,
+    ) -> Any:
+        from biolab_runners.peptide_prep.utils import TopologyBondRecord
+
+        return TopologyBondRecord(
+            atom1_index=10,
+            atom2_index=20,
+            bond_type=bond_type,
+            residue1_index=residue1_index,
+            residue2_index=residue2_index,
+        )
+
+    def test_head_to_tail_over_limit_is_rejected_by_typed_gate(self, tmp_path: Path) -> None:
+        """An over-limit head-to-tail C-N must be rejected, not read as 'head'.
+
+        The audited defect derived ``bond_type`` from ``label.split('_')[0]``,
+        so the ``head_to_tail`` branch was unreachable and a 5.0 Å C-N was
+        accepted. The typed record's ``bond_type`` must drive the decision.
+        """
+        from biolab_runners.peptide_prep.runner import PeptidePrepRunner
+
+        cfg = self._config(
+            tmp_path, topology=PeptideTopologyDescriptor(head_to_tail=_FakeCyclic(1, 5))
+        )
+        rec = self._bond("head_to_tail")
+        artifacts = self._artifacts([rec])
+
+        failure = PeptidePrepRunner()._check_closure_integrity(
+            cfg,
+            tmp_path,
+            tmp_path / "peptide_prep_manifest.json",
+            "src-digest",
+            "cfg-digest",
+            artifacts,
+            (),
+            (),
+            0.0,
+            {"head_to_tail_0_4": 5.0},
+        )
+
+        assert failure is not None
+        assert "closure-integrity" in failure.error.lower()
+        assert "head_to_tail" in failure.error.lower()
+
+    def test_nonfinite_disulfide_distance_fails_closed(self, tmp_path: Path) -> None:
+        """A non-finite S-S distance must fail closed, not pass vacuously."""
+        from biolab_runners.peptide_prep.runner import PeptidePrepRunner
+
+        cfg = self._config(
+            tmp_path,
+            sequence="CAAAC",
+            topology=PeptideTopologyDescriptor(disulfides=(_FakeDisulfide(1, 5),)),
+        )
+        artifacts = self._artifacts([self._bond("disulfide")])
+
+        failure = PeptidePrepRunner()._check_closure_integrity(
+            cfg,
+            tmp_path,
+            tmp_path / "peptide_prep_manifest.json",
+            "src-digest",
+            "cfg-digest",
+            artifacts,
+            (),
+            (),
+            0.0,
+            {"disulfide_0_4": math.nan},
+        )
+
+        assert failure is not None
+        assert "nonfinite" in failure.error.lower()
+
+    def test_missing_closure_distance_fails_closed(self, tmp_path: Path) -> None:
+        """A typed bond with no distance evidence must fail closed."""
+        from biolab_runners.peptide_prep.runner import PeptidePrepRunner
+
+        cfg = self._config(
+            tmp_path, topology=PeptideTopologyDescriptor(head_to_tail=_FakeCyclic(1, 5))
+        )
+        artifacts = self._artifacts([self._bond("head_to_tail")])
+
+        failure = PeptidePrepRunner()._check_closure_integrity(
+            cfg,
+            tmp_path,
+            tmp_path / "peptide_prep_manifest.json",
+            "src-digest",
+            "cfg-digest",
+            artifacts,
+            (),
+            (),
+            0.0,
+            {},
+        )
+
+        assert failure is not None
+        assert "missing" in failure.error.lower()
+
+    def test_unsupported_bond_type_fails_closed(self, tmp_path: Path) -> None:
+        """An unsupported typed bond must fail closed, distinct from zero distance."""
+        from biolab_runners.peptide_prep.runner import PeptidePrepRunner
+
+        cfg = self._config(
+            tmp_path, topology=PeptideTopologyDescriptor(head_to_tail=_FakeCyclic(1, 5))
+        )
+        artifacts = self._artifacts([self._bond("head_to_tail_custom")])
+
+        failure = PeptidePrepRunner()._check_closure_integrity(
+            cfg,
+            tmp_path,
+            tmp_path / "peptide_prep_manifest.json",
+            "src-digest",
+            "cfg-digest",
+            artifacts,
+            (),
+            (),
+            0.0,
+            {"head_to_tail_custom_0_4": 1.3},
+        )
+
+        assert failure is not None
+        assert "unsupported" in failure.error.lower()
+
+    def test_pre_relax_gate_fails_closed_on_missing_topology(self, tmp_path: Path) -> None:
+        """Missing topology prevents minimization before any closure work."""
+        from biolab_runners.peptide_prep.runner import PeptidePrepRunner
+
+        cfg = self._config(
+            tmp_path, topology=PeptideTopologyDescriptor(head_to_tail=_FakeCyclic(1, 5))
+        )
+        artifacts = SimpleNamespace(
+            topology=None,
+            bond_graph=[self._bond("head_to_tail")],
+            closure_distances_before={"head_to_tail_0_4": 6.5},
+            net_charge=0.0,
+            energy_before_kjmol=0.0,
+        )
+
+        failure, _checks = PeptidePrepRunner()._check_pre_relax_closure(
+            cfg, tmp_path, tmp_path / "peptide_prep_manifest.json", "src", "cfg", artifacts
+        )
+
+        assert failure is not None
+        assert "topology" in failure.error.lower()
+
+    @pytest.mark.parametrize(
+        ("bond_type", "distances", "expected"),
+        [
+            ("head_to_tail", {}, "missing"),
+            ("head_to_tail", {"head_to_tail_0_4": math.nan}, "nonfinite"),
+            ("disulfide_custom", {"disulfide_custom_0_4": 2.05}, "unsupported"),
+        ],
+    )
+    def test_pre_relax_gate_fails_closed_on_bad_evidence(
+        self, tmp_path: Path, bond_type: str, distances: dict[str, float], expected: str
+    ) -> None:
+        """Missing/nonfinite/unsupported evidence is distinct from a zero distance."""
+        from biolab_runners.peptide_prep.runner import PeptidePrepRunner
+
+        cfg = self._config(
+            tmp_path, topology=PeptideTopologyDescriptor(head_to_tail=_FakeCyclic(1, 5))
+        )
+        artifacts = SimpleNamespace(
+            topology=object(),
+            bond_graph=[self._bond(bond_type)],
+            closure_distances_before=distances,
+            net_charge=0.0,
+            energy_before_kjmol=0.0,
+        )
+
+        failure, checks = PeptidePrepRunner()._check_pre_relax_closure(
+            cfg, tmp_path, tmp_path / "peptide_prep_manifest.json", "src", "cfg", artifacts
+        )
+
+        assert failure is not None
+        assert expected in failure.error.lower()
+        assert checks[0].status == expected
+        if expected == "missing":
+            assert checks[0].distance_angstrom is None
+        else:
+            assert checks[0].status != "pass"
+
+    def test_pre_relax_gate_accepts_finite_evidence_without_covalent_limit(
+        self, tmp_path: Path
+    ) -> None:
+        """A non-covalent pre-relax distance is finite evidence, not a failure."""
+        from biolab_runners.peptide_prep.runner import PeptidePrepRunner
+
+        cfg = self._config(
+            tmp_path, topology=PeptideTopologyDescriptor(head_to_tail=_FakeCyclic(1, 5))
+        )
+        artifacts = SimpleNamespace(
+            topology=object(),
+            bond_graph=[self._bond("head_to_tail")],
+            closure_distances_before={"head_to_tail_0_4": 6.5},
+            net_charge=0.0,
+            energy_before_kjmol=0.0,
+        )
+
+        failure, checks = PeptidePrepRunner()._check_pre_relax_closure(
+            cfg, tmp_path, tmp_path / "peptide_prep_manifest.json", "src", "cfg", artifacts
+        )
+
+        assert failure is None
+        assert len(checks) == 1
+        assert checks[0].bond_type == "head_to_tail"
+        assert checks[0].distance_angstrom == 6.5
+        assert checks[0].limit_angstrom == cfg.max_head_to_tail_distance_angstrom
+        assert checks[0].units == "angstrom"
+        assert checks[0].status == "pass"
+
+    def test_mapped_chain_retains_explicit_pre_post_evidence(self, tmp_path: Path) -> None:
+        """A provenance-supplied binder chain keeps typed pre/post closure evidence."""
+        chain_pdb = tmp_path / "ala5_chain_c.pdb"
+        lines = []
+        for line in Path(COMMITTED_BACKBONE_PDB).read_text().splitlines():
+            if line.startswith(("ATOM", "TER")):
+                line = f"{line[:21]}C{line[22:]}"
+            lines.append(line)
+        chain_pdb.write_text("\n".join(lines) + "\n")
+
+        cfg = _make_linear_config(
+            str(tmp_path / "out"),
+            name="ala5_chain_c",
+            backbone_pdb=str(chain_pdb),
+            sequence="AAAAA",
+            chain_id="C",
+            topology=PeptideTopologyDescriptor(head_to_tail=_FakeCyclic(1, 5)),
+            minimization_max_iterations=300,
+        )
+        result = PeptidePrepRunner().run(cfg)
+
+        assert result.success, f"chain-C head-to-tail prep failed: {result.error}"
+        assert len(result.closure_checks_before) == 1
+        assert len(result.closure_checks_after) == 1
+        assert result.closure_checks_before[0].status == "pass"
+        assert result.closure_checks_after[0].status == "pass"
+        assert result.closure_checks_after[0].bond_type == "head_to_tail"
+        after_distance = result.closure_checks_after[0].distance_angstrom
+        assert after_distance is not None
+        assert 1.20 < after_distance < 1.50
+
+    def test_structured_closure_checks_serialize(self, tmp_path: Path) -> None:
+        """The JSON result surface carries identity, distance, units, limit and status."""
+        check = self._bond("head_to_tail")
+        from biolab_runners.peptide_prep.runner import ClosureBondCheck
+
+        evidence = ClosureBondCheck(
+            bond_type="head_to_tail",
+            bond_label="head_to_tail_0_4",
+            residue1_index=0,
+            residue2_index=4,
+            distance_angstrom=1.33,
+            limit_angstrom=2.0,
+            status="pass",
+            reason="within configured limit",
+        )
+        result = PeptidePrepResult(
+            name="vs07",
+            output_dir=str(tmp_path),
+            success=True,
+            closure_checks_before=(evidence,),
+            closure_checks_after=(evidence,),
+        )
+        payload = result.to_dict()
+        assert payload["closure_checks_before"][0]["bond_type"] == "head_to_tail"
+        assert payload["closure_checks_after"][0]["units"] == "angstrom"
+        assert payload["closure_checks_after"][0]["limit_angstrom"] == 2.0
+        assert payload["closure_checks_after"][0]["status"] == "pass"
+        assert check.bond_type == "head_to_tail"
