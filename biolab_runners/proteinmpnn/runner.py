@@ -109,12 +109,14 @@ class SamplingSummary:
 
 
 def logical_sequence_seeds(base_seed: int, count: int) -> tuple[int, ...]:
-    """Deterministic per-sequence seeds for a requested ``count``.
+    """Deterministic logical seed labels for a requested ``count``.
 
-    Mirrors the upstream contract: ProteinMPNN seeds sequence ``i`` with
-    ``seed + i``. The result depends only on ``base_seed`` and ``count``;
-    an execution-level ``--batch_size`` never appears here, so changing
-    batch size cannot alter a logical sequence seed.
+    ProteinMPNN forwards a single ``--seed`` to upstream (the runner
+    records ``RNG_INTENT_SINGLE_STREAM``), so these labels are stable
+    per-sequence audit identities, not independent upstream RNG seeds.
+    The labels depend only on ``base_seed`` and ``count``; an
+    execution-level ``--batch_size`` never appears here, so changing
+    batch size cannot alter a logical seed label.
     """
     if base_seed < 0:
         raise ValueError(f"base_seed must be >= 0; got {base_seed}")
